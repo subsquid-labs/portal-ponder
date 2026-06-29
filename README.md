@@ -70,16 +70,16 @@ All against a **dedicated SQD Portal** (`cu_per_epoch` 10M / 1200s ≈ 8,333 CU/
 | Read-ahead buffer (depth 1) | ~17 min | ~2× |
 | **Read-ahead + parallel prefetch (depth 6)** | **4m 45s** | **~8×** |
 
-**Multi-chain — Ethereum + Base + Arbitrum concurrently** (full Euler history per chain, one `ponder start`):
+**Multi-chain — Ethereum + Base + Arbitrum concurrently** (full Euler history per chain, one `ponder start`, ~16 min total wall-clock, **0 errors**):
 
-| Chain | Blocks (head) | Events indexed | |
+| Chain | Blocks (head) | Events indexed | Finished |
 |---|---|---|---|
-| ethereum | 25.4M | 457,931 | |
-| base | 48.0M | 161,991 | |
-| arbitrum | **478.6M** (~19× ETH) | 244,645 | handled via block-density auto-scaling |
-| **total** | | **~865k events** | **~11 min wall-clock, 0 errors** |
+| ethereum | 25.4M | 457,931 | ~10 min |
+| base | 48.0M | 346,198 | ~16 min (long pole) |
+| arbitrum | **478.6M** (~19× ETH) | 244,645 | **~7.5 min — *first*** |
+| **total** | | **~1.05M events** | **~16 min wall-clock** |
 
-Arbitrum is the interesting case: with a fixed 500k-block chunk it would need ~436 chunks (≈40× more round-trips than ETH); auto-scaling collapses that to ~23, so it finishes alongside the others instead of dominating.
+The headline result is the twist: **Arbitrum — the chain we expected to dominate — finished *first*.** With a fixed 500k-block chunk it would need ~436 chunks (≈40× more round-trips than ETH) and crawl; block-density auto-scaling collapses that to ~23 chunks, so its 478M-block range backfills faster than Base's. (Base became the long pole, partly shared-portal load during this run.)
 
 **Raw Portal scan rate** (stress harness, ballast not indexing): peak ~10M blocks/s, ~3.5M sustained at concurrency 30, 0 errors — included for context but *not* the metric that matters; resync wall-clock is.
 
