@@ -1,0 +1,16 @@
+{
+  "name": "euler-portal",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "ponder dev",
+    "start": "ponder start",
+    "codegen": "ponder codegen"
+  },
+  "dependencies": {
+    "ponder": "workspace:*",
+    "abitype": "^0.10.2",
+    "hono": "^4.5.0",
+    "viem": "^2.21.3"
+  }
+}

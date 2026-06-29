@@ -1,0 +1,2204 @@
+{
+  "generatedNote": "Machine-readable map of Euler Protocol multi-chain indexer sources. Generated from euler-interfaces (addresses/<chainId>/*.json + abis/*.json) cross-referenced with the SQD Portal dataset catalog (datasets.json). All event signatures are quoted verbatim from euler-interfaces/abis (GenericFactory, EulerEarnFactory, EulerSwapFactory, EVault, EulerEarn, EulerSwap, EthereumVaultConnector); indexed flags preserved (topic vs data). Addresses are copied verbatim (checksummed) from the per-chain address JSON. Sources: EVault=factory GenericFactory(ProxyCreated)->EVault proxies; EulerEarn=factory(CreateEulerEarn)->EulerEarn vaults; EulerSwapPool=factory EulerSwapFactory(PoolDeployed)->EulerSwap pools (address[]=V1/V2 factories, both share the same PoolDeployed ABI in this repo); EVC=singleton EthereumVaultConnector status-check events. A factory whose address is zero/absent on a chain is omitted and flagged in notes. Chains with no Portal dataset are kept with portalDataset=null.",
+  "generatedAt": "2026-06-29",
+  "notes": [
+    "chain 137 (polygon): eulerEarnFactory zero - EulerEarn source omitted",
+    "chain 137 (polygon): no EulerSwap factory (V1 & V2 zero) - EulerSwapPool source omitted",
+    "chain 143 (monad): eulerSwapV2Factory zero - EulerSwap V1 only",
+    "chain 999 (hyperEVM): eulerSwapV1Factory zero - EulerSwap V2 only",
+    "chain 1923 (swell): NO matching Portal dataset - portalDataset=null (flagged, sources still mapped)",
+    "chain 2818 (morph): eulerSwapV1Factory zero - EulerSwap V2 only",
+    "chain 2818 (morph): NO matching Portal dataset - portalDataset=null (flagged, sources still mapped)"
+  ],
+  "chains": [
+    {
+      "chainId": 1,
+      "eulerName": "ethereum",
+      "portalDataset": "ethereum-mainnet",
+      "realTime": true,
+      "sources": [
+        {
+          "name": "EVault",
+          "kind": "factory",
+          "address": "0x29a56a1b8214D9Cf7c5561811750D5cBDb45CC8e",
+          "factoryContract": "GenericFactory",
+          "discoveryEvent": {
+            "name": "ProxyCreated",
+            "signature": "event ProxyCreated(address indexed proxy, bool upgradeable, address implementation, bytes trailingData)"
+          },
+          "childContract": "EVault",
+          "childEvents": [
+            {
+              "name": "Deposit",
+              "signature": "event Deposit(address indexed sender, address indexed owner, uint256 assets, uint256 shares)"
+            },
+            {
+              "name": "Withdraw",
+              "signature": "event Withdraw(address indexed sender, address indexed receiver, address indexed owner, uint256 assets, uint256 shares)"
+            },
+            {
+              "name": "Borrow",
+              "signature": "event Borrow(address indexed account, uint256 assets)"
+            },
+            {
+              "name": "Repay",
+              "signature": "event Repay(address indexed account, uint256 assets)"
+            },
+            {
+              "name": "InterestAccrued",
+              "signature": "event InterestAccrued(address indexed account, uint256 assets)"
+            },
+            {
+              "name": "VaultStatus",
+              "signature": "event VaultStatus(uint256 totalShares, uint256 totalBorrows, uint256 accumulatedFees, uint256 cash, uint256 interestAccumulator, uint256 interestRate, uint256 timestamp)"
+            },
+            {
+              "name": "Liquidate",
+              "signature": "event Liquidate(address indexed liquidator, address indexed violator, address collateral, uint256 repayAssets, uint256 yieldBalance)"
+            },
+            {
+              "name": "Transfer",
+              "signature": "event Transfer(address indexed from, address indexed to, uint256 value)"
+            },
+            {
+              "name": "Approval",
+              "signature": "event Approval(address indexed owner, address indexed spender, uint256 value)"
+            }
+          ]
+        },
+        {
+          "name": "EulerEarn",
+          "kind": "factory",
+          "address": "0x59709B029B140C853FE28d277f83C3a65e308aF4",
+          "factoryContract": "EulerEarnFactory",
+          "discoveryEvent": {
+            "name": "CreateEulerEarn",
+            "signature": "event CreateEulerEarn(address indexed eulerEarn, address indexed caller, address initialOwner, uint256 initialTimelock, address indexed asset, string name, string symbol, bytes32 salt)"
+          },
+          "childContract": "EulerEarn",
+          "childEvents": [
+            {
+              "name": "Deposit",
+              "signature": "event Deposit(address indexed sender, address indexed owner, uint256 assets, uint256 shares)"
+            },
+            {
+              "name": "Withdraw",
+              "signature": "event Withdraw(address indexed sender, address indexed receiver, address indexed owner, uint256 assets, uint256 shares)"
+            },
+            {
+              "name": "Transfer",
+              "signature": "event Transfer(address indexed from, address indexed to, uint256 value)"
+            },
+            {
+              "name": "Approval",
+              "signature": "event Approval(address indexed owner, address indexed spender, uint256 value)"
+            },
+            {
+              "name": "AccrueInterest",
+              "signature": "event AccrueInterest(uint256 newTotalAssets, uint256 feeShares)"
+            }
+          ]
+        },
+        {
+          "name": "EulerSwapPool",
+          "kind": "factory",
+          "address": "0xb013be1D0D380C13B58e889f412895970A2Cf228",
+          "addresses": [
+            {
+              "version": "v1",
+              "address": "0xb013be1D0D380C13B58e889f412895970A2Cf228"
+            },
+            {
+              "version": "v2",
+              "address": "0xD05213331221fAB8a3C387F2affBb605Bb04DF5F"
+            }
+          ],
+          "factoryContract": "EulerSwapFactory",
+          "discoveryEvent": {
+            "name": "PoolDeployed",
+            "signature": "event PoolDeployed(address indexed asset0, address indexed asset1, address indexed eulerAccount, address pool, (address,address,address,address,address,address) sParams)"
+          },
+          "childContract": "EulerSwap",
+          "childEvents": [
+            {
+              "name": "Swap",
+              "signature": "event Swap(address indexed sender, uint256 amount0In, uint256 amount1In, uint256 amount0Out, uint256 amount1Out, uint256 fee0, uint256 fee1, uint112 reserve0, uint112 reserve1, address indexed to)"
+            }
+          ]
+        },
+        {
+          "name": "EVC",
+          "kind": "singleton",
+          "address": "0x0C9a3dd6b8F28529d72d7f9cE918D493519EE383",
+          "contract": "EthereumVaultConnector",
+          "events": [
+            {
+              "name": "VaultStatusCheck",
+              "signature": "event VaultStatusCheck(address indexed vault)"
+            },
+            {
+              "name": "AccountStatusCheck",
+              "signature": "event AccountStatusCheck(address indexed account, address indexed controller)"
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "chainId": 56,
+      "eulerName": "BSC",
+      "portalDataset": "binance-mainnet",
+      "realTime": true,
+      "sources": [
+        {
+          "name": "EVault",
+          "kind": "factory",
+          "address": "0x7F53E2755eB3c43824E162F7F6F087832B9C9Df6",
+          "factoryContract": "GenericFactory",
+          "discoveryEvent": {
+            "name": "ProxyCreated",
+            "signature": "event ProxyCreated(address indexed proxy, bool upgradeable, address implementation, bytes trailingData)"
+          },
+          "childContract": "EVault",
+          "childEvents": [
+            {
+              "name": "Deposit",
+              "signature": "event Deposit(address indexed sender, address indexed owner, uint256 assets, uint256 shares)"
+            },
+            {
+              "name": "Withdraw",
+              "signature": "event Withdraw(address indexed sender, address indexed receiver, address indexed owner, uint256 assets, uint256 shares)"
+            },
+            {
+              "name": "Borrow",
+              "signature": "event Borrow(address indexed account, uint256 assets)"
+            },
+            {
+              "name": "Repay",
+              "signature": "event Repay(address indexed account, uint256 assets)"
+            },
+            {
+              "name": "InterestAccrued",
+              "signature": "event InterestAccrued(address indexed account, uint256 assets)"
+            },
+            {
+              "name": "VaultStatus",
+              "signature": "event VaultStatus(uint256 totalShares, uint256 totalBorrows, uint256 accumulatedFees, uint256 cash, uint256 interestAccumulator, uint256 interestRate, uint256 timestamp)"
+            },
+            {
+              "name": "Liquidate",
+              "signature": "event Liquidate(address indexed liquidator, address indexed violator, address collateral, uint256 repayAssets, uint256 yieldBalance)"
+            },
+            {
+              "name": "Transfer",
+              "signature": "event Transfer(address indexed from, address indexed to, uint256 value)"
+            },
+            {
+              "name": "Approval",
+              "signature": "event Approval(address indexed owner, address indexed spender, uint256 value)"
+            }
+          ]
+        },
+        {
+          "name": "EulerEarn",
+          "kind": "factory",
+          "address": "0xc456d04E3F43597CC7E5a2AF284fF4C4AdDA0cb1",
+          "factoryContract": "EulerEarnFactory",
+          "discoveryEvent": {
+            "name": "CreateEulerEarn",
+            "signature": "event CreateEulerEarn(address indexed eulerEarn, address indexed caller, address initialOwner, uint256 initialTimelock, address indexed asset, string name, string symbol, bytes32 salt)"
+          },
+          "childContract": "EulerEarn",
+          "childEvents": [
+            {
+              "name": "Deposit",
+              "signature": "event Deposit(address indexed sender, address indexed owner, uint256 assets, uint256 shares)"
+            },
+            {
+              "name": "Withdraw",
+              "signature": "event Withdraw(address indexed sender, address indexed receiver, address indexed owner, uint256 assets, uint256 shares)"
+            },
+            {
+              "name": "Transfer",
+              "signature": "event Transfer(address indexed from, address indexed to, uint256 value)"
+            },
+            {
+              "name": "Approval",
+              "signature": "event Approval(address indexed owner, address indexed spender, uint256 value)"
+            },
+            {
+              "name": "AccrueInterest",
+              "signature": "event AccrueInterest(uint256 newTotalAssets, uint256 feeShares)"
+            }
+          ]
+        },
+        {
+          "name": "EulerSwapPool",
+          "kind": "factory",
+          "address": "0x3e378e5E339DF5e0Da32964F9EEC2CDb90D28Cc7",
+          "addresses": [
+            {
+              "version": "v1",
+              "address": "0x3e378e5E339DF5e0Da32964F9EEC2CDb90D28Cc7"
+            },
+            {
+              "version": "v2",
+              "address": "0xA1F83E3d1819C912122A1582B4B6D3d2a1E83bb7"
+            }
+          ],
+          "factoryContract": "EulerSwapFactory",
+          "discoveryEvent": {
+            "name": "PoolDeployed",
+            "signature": "event PoolDeployed(address indexed asset0, address indexed asset1, address indexed eulerAccount, address pool, (address,address,address,address,address,address) sParams)"
+          },
+          "childContract": "EulerSwap",
+          "childEvents": [
+            {
+              "name": "Swap",
+              "signature": "event Swap(address indexed sender, uint256 amount0In, uint256 amount1In, uint256 amount0Out, uint256 amount1Out, uint256 fee0, uint256 fee1, uint112 reserve0, uint112 reserve1, address indexed to)"
+            }
+          ]
+        },
+        {
+          "name": "EVC",
+          "kind": "singleton",
+          "address": "0xb2E5a73CeE08593d1a076a2AE7A6e02925a640ea",
+          "contract": "EthereumVaultConnector",
+          "events": [
+            {
+              "name": "VaultStatusCheck",
+              "signature": "event VaultStatusCheck(address indexed vault)"
+            },
+            {
+              "name": "AccountStatusCheck",
+              "signature": "event AccountStatusCheck(address indexed account, address indexed controller)"
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "chainId": 130,
+      "eulerName": "unichain",
+      "portalDataset": "unichain-mainnet",
+      "realTime": true,
+      "sources": [
+        {
+          "name": "EVault",
+          "kind": "factory",
+          "address": "0xbAd8b5BDFB2bcbcd78Cc9f1573D3Aad6E865e752",
+          "factoryContract": "GenericFactory",
+          "discoveryEvent": {
+            "name": "ProxyCreated",
+            "signature": "event ProxyCreated(address indexed proxy, bool upgradeable, address implementation, bytes trailingData)"
+          },
+          "childContract": "EVault",
+          "childEvents": [
+            {
+              "name": "Deposit",
+              "signature": "event Deposit(address indexed sender, address indexed owner, uint256 assets, uint256 shares)"
+            },
+            {
+              "name": "Withdraw",
+              "signature": "event Withdraw(address indexed sender, address indexed receiver, address indexed owner, uint256 assets, uint256 shares)"
+            },
+            {
+              "name": "Borrow",
+              "signature": "event Borrow(address indexed account, uint256 assets)"
+            },
+            {
+              "name": "Repay",
+              "signature": "event Repay(address indexed account, uint256 assets)"
+            },
+            {
+              "name": "InterestAccrued",
+              "signature": "event InterestAccrued(address indexed account, uint256 assets)"
+            },
+            {
+              "name": "VaultStatus",
+              "signature": "event VaultStatus(uint256 totalShares, uint256 totalBorrows, uint256 accumulatedFees, uint256 cash, uint256 interestAccumulator, uint256 interestRate, uint256 timestamp)"
+            },
+            {
+              "name": "Liquidate",
+              "signature": "event Liquidate(address indexed liquidator, address indexed violator, address collateral, uint256 repayAssets, uint256 yieldBalance)"
+            },
+            {
+              "name": "Transfer",
+              "signature": "event Transfer(address indexed from, address indexed to, uint256 value)"
+            },
+            {
+              "name": "Approval",
+              "signature": "event Approval(address indexed owner, address indexed spender, uint256 value)"
+            }
+          ]
+        },
+        {
+          "name": "EulerEarn",
+          "kind": "factory",
+          "address": "0xD785adD5F081F56616898E45b90dE307e3DC7d3E",
+          "factoryContract": "EulerEarnFactory",
+          "discoveryEvent": {
+            "name": "CreateEulerEarn",
+            "signature": "event CreateEulerEarn(address indexed eulerEarn, address indexed caller, address initialOwner, uint256 initialTimelock, address indexed asset, string name, string symbol, bytes32 salt)"
+          },
+          "childContract": "EulerEarn",
+          "childEvents": [
+            {
+              "name": "Deposit",
+              "signature": "event Deposit(address indexed sender, address indexed owner, uint256 assets, uint256 shares)"
+            },
+            {
+              "name": "Withdraw",
+              "signature": "event Withdraw(address indexed sender, address indexed receiver, address indexed owner, uint256 assets, uint256 shares)"
+            },
+            {
+              "name": "Transfer",
+              "signature": "event Transfer(address indexed from, address indexed to, uint256 value)"
+            },
+            {
+              "name": "Approval",
+              "signature": "event Approval(address indexed owner, address indexed spender, uint256 value)"
+            },
+            {
+              "name": "AccrueInterest",
+              "signature": "event AccrueInterest(uint256 newTotalAssets, uint256 feeShares)"
+            }
+          ]
+        },
+        {
+          "name": "EulerSwapPool",
+          "kind": "factory",
+          "address": "0x45b146BC07c9985589B52df651310e75C6BE066A",
+          "addresses": [
+            {
+              "version": "v1",
+              "address": "0x45b146BC07c9985589B52df651310e75C6BE066A"
+            },
+            {
+              "version": "v2",
+              "address": "0xf211d70Ed785f0e981E9F3188804Af43734502F1"
+            }
+          ],
+          "factoryContract": "EulerSwapFactory",
+          "discoveryEvent": {
+            "name": "PoolDeployed",
+            "signature": "event PoolDeployed(address indexed asset0, address indexed asset1, address indexed eulerAccount, address pool, (address,address,address,address,address,address) sParams)"
+          },
+          "childContract": "EulerSwap",
+          "childEvents": [
+            {
+              "name": "Swap",
+              "signature": "event Swap(address indexed sender, uint256 amount0In, uint256 amount1In, uint256 amount0Out, uint256 amount1Out, uint256 fee0, uint256 fee1, uint112 reserve0, uint112 reserve1, address indexed to)"
+            }
+          ]
+        },
+        {
+          "name": "EVC",
+          "kind": "singleton",
+          "address": "0x2A1176964F5D7caE5406B627Bf6166664FE83c60",
+          "contract": "EthereumVaultConnector",
+          "events": [
+            {
+              "name": "VaultStatusCheck",
+              "signature": "event VaultStatusCheck(address indexed vault)"
+            },
+            {
+              "name": "AccountStatusCheck",
+              "signature": "event AccountStatusCheck(address indexed account, address indexed controller)"
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "chainId": 137,
+      "eulerName": "polygon",
+      "portalDataset": "polygon-mainnet",
+      "realTime": true,
+      "sources": [
+        {
+          "name": "EVault",
+          "kind": "factory",
+          "address": "0xB1771a13e2a13fCafA89B00335915E732B9466b7",
+          "factoryContract": "GenericFactory",
+          "discoveryEvent": {
+            "name": "ProxyCreated",
+            "signature": "event ProxyCreated(address indexed proxy, bool upgradeable, address implementation, bytes trailingData)"
+          },
+          "childContract": "EVault",
+          "childEvents": [
+            {
+              "name": "Deposit",
+              "signature": "event Deposit(address indexed sender, address indexed owner, uint256 assets, uint256 shares)"
+            },
+            {
+              "name": "Withdraw",
+              "signature": "event Withdraw(address indexed sender, address indexed receiver, address indexed owner, uint256 assets, uint256 shares)"
+            },
+            {
+              "name": "Borrow",
+              "signature": "event Borrow(address indexed account, uint256 assets)"
+            },
+            {
+              "name": "Repay",
+              "signature": "event Repay(address indexed account, uint256 assets)"
+            },
+            {
+              "name": "InterestAccrued",
+              "signature": "event InterestAccrued(address indexed account, uint256 assets)"
+            },
+            {
+              "name": "VaultStatus",
+              "signature": "event VaultStatus(uint256 totalShares, uint256 totalBorrows, uint256 accumulatedFees, uint256 cash, uint256 interestAccumulator, uint256 interestRate, uint256 timestamp)"
+            },
+            {
+              "name": "Liquidate",
+              "signature": "event Liquidate(address indexed liquidator, address indexed violator, address collateral, uint256 repayAssets, uint256 yieldBalance)"
+            },
+            {
+              "name": "Transfer",
+              "signature": "event Transfer(address indexed from, address indexed to, uint256 value)"
+            },
+            {
+              "name": "Approval",
+              "signature": "event Approval(address indexed owner, address indexed spender, uint256 value)"
+            }
+          ]
+        },
+        {
+          "name": "EVC",
+          "kind": "singleton",
+          "address": "0x90811DacA4BD23Fc79A87FBdff7522bED2d24B4B",
+          "contract": "EthereumVaultConnector",
+          "events": [
+            {
+              "name": "VaultStatusCheck",
+              "signature": "event VaultStatusCheck(address indexed vault)"
+            },
+            {
+              "name": "AccountStatusCheck",
+              "signature": "event AccountStatusCheck(address indexed account, address indexed controller)"
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "chainId": 143,
+      "eulerName": "monad",
+      "portalDataset": "monad-mainnet",
+      "realTime": true,
+      "sources": [
+        {
+          "name": "EVault",
+          "kind": "factory",
+          "address": "0xba4Dd672062dE8FeeDb665DD4410658864483f1E",
+          "factoryContract": "GenericFactory",
+          "discoveryEvent": {
+            "name": "ProxyCreated",
+            "signature": "event ProxyCreated(address indexed proxy, bool upgradeable, address implementation, bytes trailingData)"
+          },
+          "childContract": "EVault",
+          "childEvents": [
+            {
+              "name": "Deposit",
+              "signature": "event Deposit(address indexed sender, address indexed owner, uint256 assets, uint256 shares)"
+            },
+            {
+              "name": "Withdraw",
+              "signature": "event Withdraw(address indexed sender, address indexed receiver, address indexed owner, uint256 assets, uint256 shares)"
+            },
+            {
+              "name": "Borrow",
+              "signature": "event Borrow(address indexed account, uint256 assets)"
+            },
+            {
+              "name": "Repay",
+              "signature": "event Repay(address indexed account, uint256 assets)"
+            },
+            {
+              "name": "InterestAccrued",
+              "signature": "event InterestAccrued(address indexed account, uint256 assets)"
+            },
+            {
+              "name": "VaultStatus",
+              "signature": "event VaultStatus(uint256 totalShares, uint256 totalBorrows, uint256 accumulatedFees, uint256 cash, uint256 interestAccumulator, uint256 interestRate, uint256 timestamp)"
+            },
+            {
+              "name": "Liquidate",
+              "signature": "event Liquidate(address indexed liquidator, address indexed violator, address collateral, uint256 repayAssets, uint256 yieldBalance)"
+            },
+            {
+              "name": "Transfer",
+              "signature": "event Transfer(address indexed from, address indexed to, uint256 value)"
+            },
+            {
+              "name": "Approval",
+              "signature": "event Approval(address indexed owner, address indexed spender, uint256 value)"
+            }
+          ]
+        },
+        {
+          "name": "EulerEarn",
+          "kind": "factory",
+          "address": "0xF463d4Acb650cc6C4E1D6cD4D0d1b0cb224094cF",
+          "factoryContract": "EulerEarnFactory",
+          "discoveryEvent": {
+            "name": "CreateEulerEarn",
+            "signature": "event CreateEulerEarn(address indexed eulerEarn, address indexed caller, address initialOwner, uint256 initialTimelock, address indexed asset, string name, string symbol, bytes32 salt)"
+          },
+          "childContract": "EulerEarn",
+          "childEvents": [
+            {
+              "name": "Deposit",
+              "signature": "event Deposit(address indexed sender, address indexed owner, uint256 assets, uint256 shares)"
+            },
+            {
+              "name": "Withdraw",
+              "signature": "event Withdraw(address indexed sender, address indexed receiver, address indexed owner, uint256 assets, uint256 shares)"
+            },
+            {
+              "name": "Transfer",
+              "signature": "event Transfer(address indexed from, address indexed to, uint256 value)"
+            },
+            {
+              "name": "Approval",
+              "signature": "event Approval(address indexed owner, address indexed spender, uint256 value)"
+            },
+            {
+              "name": "AccrueInterest",
+              "signature": "event AccrueInterest(uint256 newTotalAssets, uint256 feeShares)"
+            }
+          ]
+        },
+        {
+          "name": "EulerSwapPool",
+          "kind": "factory",
+          "address": "0x34f8F028C6a446A464c10a135F44Fc6fB2CEe1A9",
+          "addresses": [
+            {
+              "version": "v1",
+              "address": "0x34f8F028C6a446A464c10a135F44Fc6fB2CEe1A9"
+            }
+          ],
+          "factoryContract": "EulerSwapFactory",
+          "discoveryEvent": {
+            "name": "PoolDeployed",
+            "signature": "event PoolDeployed(address indexed asset0, address indexed asset1, address indexed eulerAccount, address pool, (address,address,address,address,address,address) sParams)"
+          },
+          "childContract": "EulerSwap",
+          "childEvents": [
+            {
+              "name": "Swap",
+              "signature": "event Swap(address indexed sender, uint256 amount0In, uint256 amount1In, uint256 amount0Out, uint256 amount1Out, uint256 fee0, uint256 fee1, uint112 reserve0, uint112 reserve1, address indexed to)"
+            }
+          ]
+        },
+        {
+          "name": "EVC",
+          "kind": "singleton",
+          "address": "0x7a9324E8f270413fa2E458f5831226d99C7477CD",
+          "contract": "EthereumVaultConnector",
+          "events": [
+            {
+              "name": "VaultStatusCheck",
+              "signature": "event VaultStatusCheck(address indexed vault)"
+            },
+            {
+              "name": "AccountStatusCheck",
+              "signature": "event AccountStatusCheck(address indexed account, address indexed controller)"
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "chainId": 146,
+      "eulerName": "sonic",
+      "portalDataset": "sonic-mainnet",
+      "realTime": false,
+      "sources": [
+        {
+          "name": "EVault",
+          "kind": "factory",
+          "address": "0xF075cC8660B51D0b8a4474e3f47eDAC5fA034cFB",
+          "factoryContract": "GenericFactory",
+          "discoveryEvent": {
+            "name": "ProxyCreated",
+            "signature": "event ProxyCreated(address indexed proxy, bool upgradeable, address implementation, bytes trailingData)"
+          },
+          "childContract": "EVault",
+          "childEvents": [
+            {
+              "name": "Deposit",
+              "signature": "event Deposit(address indexed sender, address indexed owner, uint256 assets, uint256 shares)"
+            },
+            {
+              "name": "Withdraw",
+              "signature": "event Withdraw(address indexed sender, address indexed receiver, address indexed owner, uint256 assets, uint256 shares)"
+            },
+            {
+              "name": "Borrow",
+              "signature": "event Borrow(address indexed account, uint256 assets)"
+            },
+            {
+              "name": "Repay",
+              "signature": "event Repay(address indexed account, uint256 assets)"
+            },
+            {
+              "name": "InterestAccrued",
+              "signature": "event InterestAccrued(address indexed account, uint256 assets)"
+            },
+            {
+              "name": "VaultStatus",
+              "signature": "event VaultStatus(uint256 totalShares, uint256 totalBorrows, uint256 accumulatedFees, uint256 cash, uint256 interestAccumulator, uint256 interestRate, uint256 timestamp)"
+            },
+            {
+              "name": "Liquidate",
+              "signature": "event Liquidate(address indexed liquidator, address indexed violator, address collateral, uint256 repayAssets, uint256 yieldBalance)"
+            },
+            {
+              "name": "Transfer",
+              "signature": "event Transfer(address indexed from, address indexed to, uint256 value)"
+            },
+            {
+              "name": "Approval",
+              "signature": "event Approval(address indexed owner, address indexed spender, uint256 value)"
+            }
+          ]
+        },
+        {
+          "name": "EulerEarn",
+          "kind": "factory",
+          "address": "0x3397ec7d28cF645A017869Fe4B41c75f5B0b75a8",
+          "factoryContract": "EulerEarnFactory",
+          "discoveryEvent": {
+            "name": "CreateEulerEarn",
+            "signature": "event CreateEulerEarn(address indexed eulerEarn, address indexed caller, address initialOwner, uint256 initialTimelock, address indexed asset, string name, string symbol, bytes32 salt)"
+          },
+          "childContract": "EulerEarn",
+          "childEvents": [
+            {
+              "name": "Deposit",
+              "signature": "event Deposit(address indexed sender, address indexed owner, uint256 assets, uint256 shares)"
+            },
+            {
+              "name": "Withdraw",
+              "signature": "event Withdraw(address indexed sender, address indexed receiver, address indexed owner, uint256 assets, uint256 shares)"
+            },
+            {
+              "name": "Transfer",
+              "signature": "event Transfer(address indexed from, address indexed to, uint256 value)"
+            },
+            {
+              "name": "Approval",
+              "signature": "event Approval(address indexed owner, address indexed spender, uint256 value)"
+            },
+            {
+              "name": "AccrueInterest",
+              "signature": "event AccrueInterest(uint256 newTotalAssets, uint256 feeShares)"
+            }
+          ]
+        },
+        {
+          "name": "EulerSwapPool",
+          "kind": "factory",
+          "address": "0x94041db6deC15f79666B07846c13e6F7341b4a80",
+          "addresses": [
+            {
+              "version": "v1",
+              "address": "0x94041db6deC15f79666B07846c13e6F7341b4a80"
+            },
+            {
+              "version": "v2",
+              "address": "0x46D23b2d948b159859A5BB9C96c3190F4b43Ebb6"
+            }
+          ],
+          "factoryContract": "EulerSwapFactory",
+          "discoveryEvent": {
+            "name": "PoolDeployed",
+            "signature": "event PoolDeployed(address indexed asset0, address indexed asset1, address indexed eulerAccount, address pool, (address,address,address,address,address,address) sParams)"
+          },
+          "childContract": "EulerSwap",
+          "childEvents": [
+            {
+              "name": "Swap",
+              "signature": "event Swap(address indexed sender, uint256 amount0In, uint256 amount1In, uint256 amount0Out, uint256 amount1Out, uint256 fee0, uint256 fee1, uint112 reserve0, uint112 reserve1, address indexed to)"
+            }
+          ]
+        },
+        {
+          "name": "EVC",
+          "kind": "singleton",
+          "address": "0x4860C903f6Ad709c3eDA46D3D502943f184D4315",
+          "contract": "EthereumVaultConnector",
+          "events": [
+            {
+              "name": "VaultStatusCheck",
+              "signature": "event VaultStatusCheck(address indexed vault)"
+            },
+            {
+              "name": "AccountStatusCheck",
+              "signature": "event AccountStatusCheck(address indexed account, address indexed controller)"
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "chainId": 239,
+      "eulerName": "TAC",
+      "portalDataset": "tac-mainnet",
+      "realTime": true,
+      "sources": [
+        {
+          "name": "EVault",
+          "kind": "factory",
+          "address": "0x2b21621b8Ef1406699a99071ce04ec14cCd50677",
+          "factoryContract": "GenericFactory",
+          "discoveryEvent": {
+            "name": "ProxyCreated",
+            "signature": "event ProxyCreated(address indexed proxy, bool upgradeable, address implementation, bytes trailingData)"
+          },
+          "childContract": "EVault",
+          "childEvents": [
+            {
+              "name": "Deposit",
+              "signature": "event Deposit(address indexed sender, address indexed owner, uint256 assets, uint256 shares)"
+            },
+            {
+              "name": "Withdraw",
+              "signature": "event Withdraw(address indexed sender, address indexed receiver, address indexed owner, uint256 assets, uint256 shares)"
+            },
+            {
+              "name": "Borrow",
+              "signature": "event Borrow(address indexed account, uint256 assets)"
+            },
+            {
+              "name": "Repay",
+              "signature": "event Repay(address indexed account, uint256 assets)"
+            },
+            {
+              "name": "InterestAccrued",
+              "signature": "event InterestAccrued(address indexed account, uint256 assets)"
+            },
+            {
+              "name": "VaultStatus",
+              "signature": "event VaultStatus(uint256 totalShares, uint256 totalBorrows, uint256 accumulatedFees, uint256 cash, uint256 interestAccumulator, uint256 interestRate, uint256 timestamp)"
+            },
+            {
+              "name": "Liquidate",
+              "signature": "event Liquidate(address indexed liquidator, address indexed violator, address collateral, uint256 repayAssets, uint256 yieldBalance)"
+            },
+            {
+              "name": "Transfer",
+              "signature": "event Transfer(address indexed from, address indexed to, uint256 value)"
+            },
+            {
+              "name": "Approval",
+              "signature": "event Approval(address indexed owner, address indexed spender, uint256 value)"
+            }
+          ]
+        },
+        {
+          "name": "EulerEarn",
+          "kind": "factory",
+          "address": "0x7670572aa76E6140400A948e7AAFAB0210a86d9f",
+          "factoryContract": "EulerEarnFactory",
+          "discoveryEvent": {
+            "name": "CreateEulerEarn",
+            "signature": "event CreateEulerEarn(address indexed eulerEarn, address indexed caller, address initialOwner, uint256 initialTimelock, address indexed asset, string name, string symbol, bytes32 salt)"
+          },
+          "childContract": "EulerEarn",
+          "childEvents": [
+            {
+              "name": "Deposit",
+              "signature": "event Deposit(address indexed sender, address indexed owner, uint256 assets, uint256 shares)"
+            },
+            {
+              "name": "Withdraw",
+              "signature": "event Withdraw(address indexed sender, address indexed receiver, address indexed owner, uint256 assets, uint256 shares)"
+            },
+            {
+              "name": "Transfer",
+              "signature": "event Transfer(address indexed from, address indexed to, uint256 value)"
+            },
+            {
+              "name": "Approval",
+              "signature": "event Approval(address indexed owner, address indexed spender, uint256 value)"
+            },
+            {
+              "name": "AccrueInterest",
+              "signature": "event AccrueInterest(uint256 newTotalAssets, uint256 feeShares)"
+            }
+          ]
+        },
+        {
+          "name": "EulerSwapPool",
+          "kind": "factory",
+          "address": "0x6A72160963a562f21387B166aF31a92D154106fb",
+          "addresses": [
+            {
+              "version": "v1",
+              "address": "0x6A72160963a562f21387B166aF31a92D154106fb"
+            },
+            {
+              "version": "v2",
+              "address": "0xb0b53c1A8046D92027B69D9f6D9C7cFC0f363933"
+            }
+          ],
+          "factoryContract": "EulerSwapFactory",
+          "discoveryEvent": {
+            "name": "PoolDeployed",
+            "signature": "event PoolDeployed(address indexed asset0, address indexed asset1, address indexed eulerAccount, address pool, (address,address,address,address,address,address) sParams)"
+          },
+          "childContract": "EulerSwap",
+          "childEvents": [
+            {
+              "name": "Swap",
+              "signature": "event Swap(address indexed sender, uint256 amount0In, uint256 amount1In, uint256 amount0Out, uint256 amount1Out, uint256 fee0, uint256 fee1, uint112 reserve0, uint112 reserve1, address indexed to)"
+            }
+          ]
+        },
+        {
+          "name": "EVC",
+          "kind": "singleton",
+          "address": "0x01F594c66A5561b90Bc782dD0297f294cD668b64",
+          "contract": "EthereumVaultConnector",
+          "events": [
+            {
+              "name": "VaultStatusCheck",
+              "signature": "event VaultStatusCheck(address indexed vault)"
+            },
+            {
+              "name": "AccountStatusCheck",
+              "signature": "event AccountStatusCheck(address indexed account, address indexed controller)"
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "chainId": 999,
+      "eulerName": "hyperEVM",
+      "portalDataset": "hyperliquid-mainnet",
+      "realTime": true,
+      "sources": [
+        {
+          "name": "EVault",
+          "kind": "factory",
+          "address": "0xcF5552580fD364cdBBFcB5Ae345f75674c59273A",
+          "factoryContract": "GenericFactory",
+          "discoveryEvent": {
+            "name": "ProxyCreated",
+            "signature": "event ProxyCreated(address indexed proxy, bool upgradeable, address implementation, bytes trailingData)"
+          },
+          "childContract": "EVault",
+          "childEvents": [
+            {
+              "name": "Deposit",
+              "signature": "event Deposit(address indexed sender, address indexed owner, uint256 assets, uint256 shares)"
+            },
+            {
+              "name": "Withdraw",
+              "signature": "event Withdraw(address indexed sender, address indexed receiver, address indexed owner, uint256 assets, uint256 shares)"
+            },
+            {
+              "name": "Borrow",
+              "signature": "event Borrow(address indexed account, uint256 assets)"
+            },
+            {
+              "name": "Repay",
+              "signature": "event Repay(address indexed account, uint256 assets)"
+            },
+            {
+              "name": "InterestAccrued",
+              "signature": "event InterestAccrued(address indexed account, uint256 assets)"
+            },
+            {
+              "name": "VaultStatus",
+              "signature": "event VaultStatus(uint256 totalShares, uint256 totalBorrows, uint256 accumulatedFees, uint256 cash, uint256 interestAccumulator, uint256 interestRate, uint256 timestamp)"
+            },
+            {
+              "name": "Liquidate",
+              "signature": "event Liquidate(address indexed liquidator, address indexed violator, address collateral, uint256 repayAssets, uint256 yieldBalance)"
+            },
+            {
+              "name": "Transfer",
+              "signature": "event Transfer(address indexed from, address indexed to, uint256 value)"
+            },
+            {
+              "name": "Approval",
+              "signature": "event Approval(address indexed owner, address indexed spender, uint256 value)"
+            }
+          ]
+        },
+        {
+          "name": "EulerEarn",
+          "kind": "factory",
+          "address": "0x587DD8285c01526769aB4803e4F02433ddbBc00E",
+          "factoryContract": "EulerEarnFactory",
+          "discoveryEvent": {
+            "name": "CreateEulerEarn",
+            "signature": "event CreateEulerEarn(address indexed eulerEarn, address indexed caller, address initialOwner, uint256 initialTimelock, address indexed asset, string name, string symbol, bytes32 salt)"
+          },
+          "childContract": "EulerEarn",
+          "childEvents": [
+            {
+              "name": "Deposit",
+              "signature": "event Deposit(address indexed sender, address indexed owner, uint256 assets, uint256 shares)"
+            },
+            {
+              "name": "Withdraw",
+              "signature": "event Withdraw(address indexed sender, address indexed receiver, address indexed owner, uint256 assets, uint256 shares)"
+            },
+            {
+              "name": "Transfer",
+              "signature": "event Transfer(address indexed from, address indexed to, uint256 value)"
+            },
+            {
+              "name": "Approval",
+              "signature": "event Approval(address indexed owner, address indexed spender, uint256 value)"
+            },
+            {
+              "name": "AccrueInterest",
+              "signature": "event AccrueInterest(uint256 newTotalAssets, uint256 feeShares)"
+            }
+          ]
+        },
+        {
+          "name": "EulerSwapPool",
+          "kind": "factory",
+          "address": "0xFbF2a49CB0cc50F4ccd4eAc826eF1A76D99D29Eb",
+          "addresses": [
+            {
+              "version": "v2",
+              "address": "0xFbF2a49CB0cc50F4ccd4eAc826eF1A76D99D29Eb"
+            }
+          ],
+          "factoryContract": "EulerSwapFactory",
+          "discoveryEvent": {
+            "name": "PoolDeployed",
+            "signature": "event PoolDeployed(address indexed asset0, address indexed asset1, address indexed eulerAccount, address pool, (address,address,address,address,address,address) sParams)"
+          },
+          "childContract": "EulerSwap",
+          "childEvents": [
+            {
+              "name": "Swap",
+              "signature": "event Swap(address indexed sender, uint256 amount0In, uint256 amount1In, uint256 amount0Out, uint256 amount1Out, uint256 fee0, uint256 fee1, uint112 reserve0, uint112 reserve1, address indexed to)"
+            }
+          ]
+        },
+        {
+          "name": "EVC",
+          "kind": "singleton",
+          "address": "0xceAA7cdCD7dDBee8601127a9Abb17A974d613db4",
+          "contract": "EthereumVaultConnector",
+          "events": [
+            {
+              "name": "VaultStatusCheck",
+              "signature": "event VaultStatusCheck(address indexed vault)"
+            },
+            {
+              "name": "AccountStatusCheck",
+              "signature": "event AccountStatusCheck(address indexed account, address indexed controller)"
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "chainId": 1923,
+      "eulerName": "swell",
+      "portalDataset": null,
+      "realTime": null,
+      "sources": [
+        {
+          "name": "EVault",
+          "kind": "factory",
+          "address": "0x238bF86bb451ec3CA69BB855f91BDA001aB118b9",
+          "factoryContract": "GenericFactory",
+          "discoveryEvent": {
+            "name": "ProxyCreated",
+            "signature": "event ProxyCreated(address indexed proxy, bool upgradeable, address implementation, bytes trailingData)"
+          },
+          "childContract": "EVault",
+          "childEvents": [
+            {
+              "name": "Deposit",
+              "signature": "event Deposit(address indexed sender, address indexed owner, uint256 assets, uint256 shares)"
+            },
+            {
+              "name": "Withdraw",
+              "signature": "event Withdraw(address indexed sender, address indexed receiver, address indexed owner, uint256 assets, uint256 shares)"
+            },
+            {
+              "name": "Borrow",
+              "signature": "event Borrow(address indexed account, uint256 assets)"
+            },
+            {
+              "name": "Repay",
+              "signature": "event Repay(address indexed account, uint256 assets)"
+            },
+            {
+              "name": "InterestAccrued",
+              "signature": "event InterestAccrued(address indexed account, uint256 assets)"
+            },
+            {
+              "name": "VaultStatus",
+              "signature": "event VaultStatus(uint256 totalShares, uint256 totalBorrows, uint256 accumulatedFees, uint256 cash, uint256 interestAccumulator, uint256 interestRate, uint256 timestamp)"
+            },
+            {
+              "name": "Liquidate",
+              "signature": "event Liquidate(address indexed liquidator, address indexed violator, address collateral, uint256 repayAssets, uint256 yieldBalance)"
+            },
+            {
+              "name": "Transfer",
+              "signature": "event Transfer(address indexed from, address indexed to, uint256 value)"
+            },
+            {
+              "name": "Approval",
+              "signature": "event Approval(address indexed owner, address indexed spender, uint256 value)"
+            }
+          ]
+        },
+        {
+          "name": "EulerEarn",
+          "kind": "factory",
+          "address": "0x3073e1B42f8Cc933f2d678DdA10acDE51F4E49a3",
+          "factoryContract": "EulerEarnFactory",
+          "discoveryEvent": {
+            "name": "CreateEulerEarn",
+            "signature": "event CreateEulerEarn(address indexed eulerEarn, address indexed caller, address initialOwner, uint256 initialTimelock, address indexed asset, string name, string symbol, bytes32 salt)"
+          },
+          "childContract": "EulerEarn",
+          "childEvents": [
+            {
+              "name": "Deposit",
+              "signature": "event Deposit(address indexed sender, address indexed owner, uint256 assets, uint256 shares)"
+            },
+            {
+              "name": "Withdraw",
+              "signature": "event Withdraw(address indexed sender, address indexed receiver, address indexed owner, uint256 assets, uint256 shares)"
+            },
+            {
+              "name": "Transfer",
+              "signature": "event Transfer(address indexed from, address indexed to, uint256 value)"
+            },
+            {
+              "name": "Approval",
+              "signature": "event Approval(address indexed owner, address indexed spender, uint256 value)"
+            },
+            {
+              "name": "AccrueInterest",
+              "signature": "event AccrueInterest(uint256 newTotalAssets, uint256 feeShares)"
+            }
+          ]
+        },
+        {
+          "name": "EulerSwapPool",
+          "kind": "factory",
+          "address": "0x976dd85654B3b2f9fb66280ACE30Cab7C81a2130",
+          "addresses": [
+            {
+              "version": "v1",
+              "address": "0x976dd85654B3b2f9fb66280ACE30Cab7C81a2130"
+            },
+            {
+              "version": "v2",
+              "address": "0x980cd01dB708C2B008cF8076aa856fcAeF60698c"
+            }
+          ],
+          "factoryContract": "EulerSwapFactory",
+          "discoveryEvent": {
+            "name": "PoolDeployed",
+            "signature": "event PoolDeployed(address indexed asset0, address indexed asset1, address indexed eulerAccount, address pool, (address,address,address,address,address,address) sParams)"
+          },
+          "childContract": "EulerSwap",
+          "childEvents": [
+            {
+              "name": "Swap",
+              "signature": "event Swap(address indexed sender, uint256 amount0In, uint256 amount1In, uint256 amount0Out, uint256 amount1Out, uint256 fee0, uint256 fee1, uint112 reserve0, uint112 reserve1, address indexed to)"
+            }
+          ]
+        },
+        {
+          "name": "EVC",
+          "kind": "singleton",
+          "address": "0x08739CBede6E28E387685ba20e6409bD16969Cde",
+          "contract": "EthereumVaultConnector",
+          "events": [
+            {
+              "name": "VaultStatusCheck",
+              "signature": "event VaultStatusCheck(address indexed vault)"
+            },
+            {
+              "name": "AccountStatusCheck",
+              "signature": "event AccountStatusCheck(address indexed account, address indexed controller)"
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "chainId": 2818,
+      "eulerName": "morph",
+      "portalDataset": null,
+      "realTime": null,
+      "sources": [
+        {
+          "name": "EVault",
+          "kind": "factory",
+          "address": "0x1a1bdF62Fe7170c652f03fF153977C26fBe7b2E1",
+          "factoryContract": "GenericFactory",
+          "discoveryEvent": {
+            "name": "ProxyCreated",
+            "signature": "event ProxyCreated(address indexed proxy, bool upgradeable, address implementation, bytes trailingData)"
+          },
+          "childContract": "EVault",
+          "childEvents": [
+            {
+              "name": "Deposit",
+              "signature": "event Deposit(address indexed sender, address indexed owner, uint256 assets, uint256 shares)"
+            },
+            {
+              "name": "Withdraw",
+              "signature": "event Withdraw(address indexed sender, address indexed receiver, address indexed owner, uint256 assets, uint256 shares)"
+            },
+            {
+              "name": "Borrow",
+              "signature": "event Borrow(address indexed account, uint256 assets)"
+            },
+            {
+              "name": "Repay",
+              "signature": "event Repay(address indexed account, uint256 assets)"
+            },
+            {
+              "name": "InterestAccrued",
+              "signature": "event InterestAccrued(address indexed account, uint256 assets)"
+            },
+            {
+              "name": "VaultStatus",
+              "signature": "event VaultStatus(uint256 totalShares, uint256 totalBorrows, uint256 accumulatedFees, uint256 cash, uint256 interestAccumulator, uint256 interestRate, uint256 timestamp)"
+            },
+            {
+              "name": "Liquidate",
+              "signature": "event Liquidate(address indexed liquidator, address indexed violator, address collateral, uint256 repayAssets, uint256 yieldBalance)"
+            },
+            {
+              "name": "Transfer",
+              "signature": "event Transfer(address indexed from, address indexed to, uint256 value)"
+            },
+            {
+              "name": "Approval",
+              "signature": "event Approval(address indexed owner, address indexed spender, uint256 value)"
+            }
+          ]
+        },
+        {
+          "name": "EulerEarn",
+          "kind": "factory",
+          "address": "0x4A6727aA2d1979C0366751c7a81615500f0186E4",
+          "factoryContract": "EulerEarnFactory",
+          "discoveryEvent": {
+            "name": "CreateEulerEarn",
+            "signature": "event CreateEulerEarn(address indexed eulerEarn, address indexed caller, address initialOwner, uint256 initialTimelock, address indexed asset, string name, string symbol, bytes32 salt)"
+          },
+          "childContract": "EulerEarn",
+          "childEvents": [
+            {
+              "name": "Deposit",
+              "signature": "event Deposit(address indexed sender, address indexed owner, uint256 assets, uint256 shares)"
+            },
+            {
+              "name": "Withdraw",
+              "signature": "event Withdraw(address indexed sender, address indexed receiver, address indexed owner, uint256 assets, uint256 shares)"
+            },
+            {
+              "name": "Transfer",
+              "signature": "event Transfer(address indexed from, address indexed to, uint256 value)"
+            },
+            {
+              "name": "Approval",
+              "signature": "event Approval(address indexed owner, address indexed spender, uint256 value)"
+            },
+            {
+              "name": "AccrueInterest",
+              "signature": "event AccrueInterest(uint256 newTotalAssets, uint256 feeShares)"
+            }
+          ]
+        },
+        {
+          "name": "EulerSwapPool",
+          "kind": "factory",
+          "address": "0x5965230117acd46E88CA13e7D44E33cD166c1E44",
+          "addresses": [
+            {
+              "version": "v2",
+              "address": "0x5965230117acd46E88CA13e7D44E33cD166c1E44"
+            }
+          ],
+          "factoryContract": "EulerSwapFactory",
+          "discoveryEvent": {
+            "name": "PoolDeployed",
+            "signature": "event PoolDeployed(address indexed asset0, address indexed asset1, address indexed eulerAccount, address pool, (address,address,address,address,address,address) sParams)"
+          },
+          "childContract": "EulerSwap",
+          "childEvents": [
+            {
+              "name": "Swap",
+              "signature": "event Swap(address indexed sender, uint256 amount0In, uint256 amount1In, uint256 amount0Out, uint256 amount1Out, uint256 fee0, uint256 fee1, uint112 reserve0, uint112 reserve1, address indexed to)"
+            }
+          ]
+        },
+        {
+          "name": "EVC",
+          "kind": "singleton",
+          "address": "0xC7c31B1E7Cac36478C62f876F357b95d9cAd9817",
+          "contract": "EthereumVaultConnector",
+          "events": [
+            {
+              "name": "VaultStatusCheck",
+              "signature": "event VaultStatusCheck(address indexed vault)"
+            },
+            {
+              "name": "AccountStatusCheck",
+              "signature": "event AccountStatusCheck(address indexed account, address indexed controller)"
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "chainId": 8453,
+      "eulerName": "base",
+      "portalDataset": "base-mainnet",
+      "realTime": true,
+      "sources": [
+        {
+          "name": "EVault",
+          "kind": "factory",
+          "address": "0x7F321498A801A191a93C840750ed637149dDf8D0",
+          "factoryContract": "GenericFactory",
+          "discoveryEvent": {
+            "name": "ProxyCreated",
+            "signature": "event ProxyCreated(address indexed proxy, bool upgradeable, address implementation, bytes trailingData)"
+          },
+          "childContract": "EVault",
+          "childEvents": [
+            {
+              "name": "Deposit",
+              "signature": "event Deposit(address indexed sender, address indexed owner, uint256 assets, uint256 shares)"
+            },
+            {
+              "name": "Withdraw",
+              "signature": "event Withdraw(address indexed sender, address indexed receiver, address indexed owner, uint256 assets, uint256 shares)"
+            },
+            {
+              "name": "Borrow",
+              "signature": "event Borrow(address indexed account, uint256 assets)"
+            },
+            {
+              "name": "Repay",
+              "signature": "event Repay(address indexed account, uint256 assets)"
+            },
+            {
+              "name": "InterestAccrued",
+              "signature": "event InterestAccrued(address indexed account, uint256 assets)"
+            },
+            {
+              "name": "VaultStatus",
+              "signature": "event VaultStatus(uint256 totalShares, uint256 totalBorrows, uint256 accumulatedFees, uint256 cash, uint256 interestAccumulator, uint256 interestRate, uint256 timestamp)"
+            },
+            {
+              "name": "Liquidate",
+              "signature": "event Liquidate(address indexed liquidator, address indexed violator, address collateral, uint256 repayAssets, uint256 yieldBalance)"
+            },
+            {
+              "name": "Transfer",
+              "signature": "event Transfer(address indexed from, address indexed to, uint256 value)"
+            },
+            {
+              "name": "Approval",
+              "signature": "event Approval(address indexed owner, address indexed spender, uint256 value)"
+            }
+          ]
+        },
+        {
+          "name": "EulerEarn",
+          "kind": "factory",
+          "address": "0x75F49a2621b6DeC6a5baB22ce961bF3e676EFAE6",
+          "factoryContract": "EulerEarnFactory",
+          "discoveryEvent": {
+            "name": "CreateEulerEarn",
+            "signature": "event CreateEulerEarn(address indexed eulerEarn, address indexed caller, address initialOwner, uint256 initialTimelock, address indexed asset, string name, string symbol, bytes32 salt)"
+          },
+          "childContract": "EulerEarn",
+          "childEvents": [
+            {
+              "name": "Deposit",
+              "signature": "event Deposit(address indexed sender, address indexed owner, uint256 assets, uint256 shares)"
+            },
+            {
+              "name": "Withdraw",
+              "signature": "event Withdraw(address indexed sender, address indexed receiver, address indexed owner, uint256 assets, uint256 shares)"
+            },
+            {
+              "name": "Transfer",
+              "signature": "event Transfer(address indexed from, address indexed to, uint256 value)"
+            },
+            {
+              "name": "Approval",
+              "signature": "event Approval(address indexed owner, address indexed spender, uint256 value)"
+            },
+            {
+              "name": "AccrueInterest",
+              "signature": "event AccrueInterest(uint256 newTotalAssets, uint256 feeShares)"
+            }
+          ]
+        },
+        {
+          "name": "EulerSwapPool",
+          "kind": "factory",
+          "address": "0xf0CFe22d23699ff1B2CFe6B8f706A6DB63911262",
+          "addresses": [
+            {
+              "version": "v1",
+              "address": "0xf0CFe22d23699ff1B2CFe6B8f706A6DB63911262"
+            },
+            {
+              "version": "v2",
+              "address": "0x6C5f4c239ceD289447737EAB8eEA64523bd9c05E"
+            }
+          ],
+          "factoryContract": "EulerSwapFactory",
+          "discoveryEvent": {
+            "name": "PoolDeployed",
+            "signature": "event PoolDeployed(address indexed asset0, address indexed asset1, address indexed eulerAccount, address pool, (address,address,address,address,address,address) sParams)"
+          },
+          "childContract": "EulerSwap",
+          "childEvents": [
+            {
+              "name": "Swap",
+              "signature": "event Swap(address indexed sender, uint256 amount0In, uint256 amount1In, uint256 amount0Out, uint256 amount1Out, uint256 fee0, uint256 fee1, uint112 reserve0, uint112 reserve1, address indexed to)"
+            }
+          ]
+        },
+        {
+          "name": "EVC",
+          "kind": "singleton",
+          "address": "0x5301c7dD20bD945D2013b48ed0DEE3A284ca8989",
+          "contract": "EthereumVaultConnector",
+          "events": [
+            {
+              "name": "VaultStatusCheck",
+              "signature": "event VaultStatusCheck(address indexed vault)"
+            },
+            {
+              "name": "AccountStatusCheck",
+              "signature": "event AccountStatusCheck(address indexed account, address indexed controller)"
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "chainId": 9745,
+      "eulerName": "plasma",
+      "portalDataset": "plasma-mainnet",
+      "realTime": true,
+      "sources": [
+        {
+          "name": "EVault",
+          "kind": "factory",
+          "address": "0x42388213C6F56D7E1477632b58Ae6Bba9adeEeA3",
+          "factoryContract": "GenericFactory",
+          "discoveryEvent": {
+            "name": "ProxyCreated",
+            "signature": "event ProxyCreated(address indexed proxy, bool upgradeable, address implementation, bytes trailingData)"
+          },
+          "childContract": "EVault",
+          "childEvents": [
+            {
+              "name": "Deposit",
+              "signature": "event Deposit(address indexed sender, address indexed owner, uint256 assets, uint256 shares)"
+            },
+            {
+              "name": "Withdraw",
+              "signature": "event Withdraw(address indexed sender, address indexed receiver, address indexed owner, uint256 assets, uint256 shares)"
+            },
+            {
+              "name": "Borrow",
+              "signature": "event Borrow(address indexed account, uint256 assets)"
+            },
+            {
+              "name": "Repay",
+              "signature": "event Repay(address indexed account, uint256 assets)"
+            },
+            {
+              "name": "InterestAccrued",
+              "signature": "event InterestAccrued(address indexed account, uint256 assets)"
+            },
+            {
+              "name": "VaultStatus",
+              "signature": "event VaultStatus(uint256 totalShares, uint256 totalBorrows, uint256 accumulatedFees, uint256 cash, uint256 interestAccumulator, uint256 interestRate, uint256 timestamp)"
+            },
+            {
+              "name": "Liquidate",
+              "signature": "event Liquidate(address indexed liquidator, address indexed violator, address collateral, uint256 repayAssets, uint256 yieldBalance)"
+            },
+            {
+              "name": "Transfer",
+              "signature": "event Transfer(address indexed from, address indexed to, uint256 value)"
+            },
+            {
+              "name": "Approval",
+              "signature": "event Approval(address indexed owner, address indexed spender, uint256 value)"
+            }
+          ]
+        },
+        {
+          "name": "EulerEarn",
+          "kind": "factory",
+          "address": "0xA3843A73e6a9F81309B931237Ca4759B3B02ff0E",
+          "factoryContract": "EulerEarnFactory",
+          "discoveryEvent": {
+            "name": "CreateEulerEarn",
+            "signature": "event CreateEulerEarn(address indexed eulerEarn, address indexed caller, address initialOwner, uint256 initialTimelock, address indexed asset, string name, string symbol, bytes32 salt)"
+          },
+          "childContract": "EulerEarn",
+          "childEvents": [
+            {
+              "name": "Deposit",
+              "signature": "event Deposit(address indexed sender, address indexed owner, uint256 assets, uint256 shares)"
+            },
+            {
+              "name": "Withdraw",
+              "signature": "event Withdraw(address indexed sender, address indexed receiver, address indexed owner, uint256 assets, uint256 shares)"
+            },
+            {
+              "name": "Transfer",
+              "signature": "event Transfer(address indexed from, address indexed to, uint256 value)"
+            },
+            {
+              "name": "Approval",
+              "signature": "event Approval(address indexed owner, address indexed spender, uint256 value)"
+            },
+            {
+              "name": "AccrueInterest",
+              "signature": "event AccrueInterest(uint256 newTotalAssets, uint256 feeShares)"
+            }
+          ]
+        },
+        {
+          "name": "EulerSwapPool",
+          "kind": "factory",
+          "address": "0xD7aA03104c2CCaC58acB00CbE90865FA64BbE77D",
+          "addresses": [
+            {
+              "version": "v1",
+              "address": "0xD7aA03104c2CCaC58acB00CbE90865FA64BbE77D"
+            },
+            {
+              "version": "v2",
+              "address": "0x29FAFDbf952e7b5c0A6Cd26957829334d54E872A"
+            }
+          ],
+          "factoryContract": "EulerSwapFactory",
+          "discoveryEvent": {
+            "name": "PoolDeployed",
+            "signature": "event PoolDeployed(address indexed asset0, address indexed asset1, address indexed eulerAccount, address pool, (address,address,address,address,address,address) sParams)"
+          },
+          "childContract": "EulerSwap",
+          "childEvents": [
+            {
+              "name": "Swap",
+              "signature": "event Swap(address indexed sender, uint256 amount0In, uint256 amount1In, uint256 amount0Out, uint256 amount1Out, uint256 fee0, uint256 fee1, uint112 reserve0, uint112 reserve1, address indexed to)"
+            }
+          ]
+        },
+        {
+          "name": "EVC",
+          "kind": "singleton",
+          "address": "0x7bdbd0A7114aA42CA957F292145F6a931a345583",
+          "contract": "EthereumVaultConnector",
+          "events": [
+            {
+              "name": "VaultStatusCheck",
+              "signature": "event VaultStatusCheck(address indexed vault)"
+            },
+            {
+              "name": "AccountStatusCheck",
+              "signature": "event AccountStatusCheck(address indexed account, address indexed controller)"
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "chainId": 42161,
+      "eulerName": "arbitrum",
+      "portalDataset": "arbitrum-one",
+      "realTime": true,
+      "sources": [
+        {
+          "name": "EVault",
+          "kind": "factory",
+          "address": "0x78Df1CF5bf06a7f27f2ACc580B934238C1b80D50",
+          "factoryContract": "GenericFactory",
+          "discoveryEvent": {
+            "name": "ProxyCreated",
+            "signature": "event ProxyCreated(address indexed proxy, bool upgradeable, address implementation, bytes trailingData)"
+          },
+          "childContract": "EVault",
+          "childEvents": [
+            {
+              "name": "Deposit",
+              "signature": "event Deposit(address indexed sender, address indexed owner, uint256 assets, uint256 shares)"
+            },
+            {
+              "name": "Withdraw",
+              "signature": "event Withdraw(address indexed sender, address indexed receiver, address indexed owner, uint256 assets, uint256 shares)"
+            },
+            {
+              "name": "Borrow",
+              "signature": "event Borrow(address indexed account, uint256 assets)"
+            },
+            {
+              "name": "Repay",
+              "signature": "event Repay(address indexed account, uint256 assets)"
+            },
+            {
+              "name": "InterestAccrued",
+              "signature": "event InterestAccrued(address indexed account, uint256 assets)"
+            },
+            {
+              "name": "VaultStatus",
+              "signature": "event VaultStatus(uint256 totalShares, uint256 totalBorrows, uint256 accumulatedFees, uint256 cash, uint256 interestAccumulator, uint256 interestRate, uint256 timestamp)"
+            },
+            {
+              "name": "Liquidate",
+              "signature": "event Liquidate(address indexed liquidator, address indexed violator, address collateral, uint256 repayAssets, uint256 yieldBalance)"
+            },
+            {
+              "name": "Transfer",
+              "signature": "event Transfer(address indexed from, address indexed to, uint256 value)"
+            },
+            {
+              "name": "Approval",
+              "signature": "event Approval(address indexed owner, address indexed spender, uint256 value)"
+            }
+          ]
+        },
+        {
+          "name": "EulerEarn",
+          "kind": "factory",
+          "address": "0xB9B5d62B9fE9E1B505466e75817aB178A1D2ec9d",
+          "factoryContract": "EulerEarnFactory",
+          "discoveryEvent": {
+            "name": "CreateEulerEarn",
+            "signature": "event CreateEulerEarn(address indexed eulerEarn, address indexed caller, address initialOwner, uint256 initialTimelock, address indexed asset, string name, string symbol, bytes32 salt)"
+          },
+          "childContract": "EulerEarn",
+          "childEvents": [
+            {
+              "name": "Deposit",
+              "signature": "event Deposit(address indexed sender, address indexed owner, uint256 assets, uint256 shares)"
+            },
+            {
+              "name": "Withdraw",
+              "signature": "event Withdraw(address indexed sender, address indexed receiver, address indexed owner, uint256 assets, uint256 shares)"
+            },
+            {
+              "name": "Transfer",
+              "signature": "event Transfer(address indexed from, address indexed to, uint256 value)"
+            },
+            {
+              "name": "Approval",
+              "signature": "event Approval(address indexed owner, address indexed spender, uint256 value)"
+            },
+            {
+              "name": "AccrueInterest",
+              "signature": "event AccrueInterest(uint256 newTotalAssets, uint256 feeShares)"
+            }
+          ]
+        },
+        {
+          "name": "EulerSwapPool",
+          "kind": "factory",
+          "address": "0x7949bE8B154D7B5ce6E75cBfc646AeF3a25970E2",
+          "addresses": [
+            {
+              "version": "v1",
+              "address": "0x7949bE8B154D7B5ce6E75cBfc646AeF3a25970E2"
+            },
+            {
+              "version": "v2",
+              "address": "0x138AB9B33741B25bb7BcDa466175c8B2E2b96dc4"
+            }
+          ],
+          "factoryContract": "EulerSwapFactory",
+          "discoveryEvent": {
+            "name": "PoolDeployed",
+            "signature": "event PoolDeployed(address indexed asset0, address indexed asset1, address indexed eulerAccount, address pool, (address,address,address,address,address,address) sParams)"
+          },
+          "childContract": "EulerSwap",
+          "childEvents": [
+            {
+              "name": "Swap",
+              "signature": "event Swap(address indexed sender, uint256 amount0In, uint256 amount1In, uint256 amount0Out, uint256 amount1Out, uint256 fee0, uint256 fee1, uint112 reserve0, uint112 reserve1, address indexed to)"
+            }
+          ]
+        },
+        {
+          "name": "EVC",
+          "kind": "singleton",
+          "address": "0x6302ef0F34100CDDFb5489fbcB6eE1AA95CD1066",
+          "contract": "EthereumVaultConnector",
+          "events": [
+            {
+              "name": "VaultStatusCheck",
+              "signature": "event VaultStatusCheck(address indexed vault)"
+            },
+            {
+              "name": "AccountStatusCheck",
+              "signature": "event AccountStatusCheck(address indexed account, address indexed controller)"
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "chainId": 43114,
+      "eulerName": "avalanche",
+      "portalDataset": "avalanche-mainnet",
+      "realTime": true,
+      "sources": [
+        {
+          "name": "EVault",
+          "kind": "factory",
+          "address": "0xaf4B4c18B17F6a2B32F6c398a3910bdCD7f26181",
+          "factoryContract": "GenericFactory",
+          "discoveryEvent": {
+            "name": "ProxyCreated",
+            "signature": "event ProxyCreated(address indexed proxy, bool upgradeable, address implementation, bytes trailingData)"
+          },
+          "childContract": "EVault",
+          "childEvents": [
+            {
+              "name": "Deposit",
+              "signature": "event Deposit(address indexed sender, address indexed owner, uint256 assets, uint256 shares)"
+            },
+            {
+              "name": "Withdraw",
+              "signature": "event Withdraw(address indexed sender, address indexed receiver, address indexed owner, uint256 assets, uint256 shares)"
+            },
+            {
+              "name": "Borrow",
+              "signature": "event Borrow(address indexed account, uint256 assets)"
+            },
+            {
+              "name": "Repay",
+              "signature": "event Repay(address indexed account, uint256 assets)"
+            },
+            {
+              "name": "InterestAccrued",
+              "signature": "event InterestAccrued(address indexed account, uint256 assets)"
+            },
+            {
+              "name": "VaultStatus",
+              "signature": "event VaultStatus(uint256 totalShares, uint256 totalBorrows, uint256 accumulatedFees, uint256 cash, uint256 interestAccumulator, uint256 interestRate, uint256 timestamp)"
+            },
+            {
+              "name": "Liquidate",
+              "signature": "event Liquidate(address indexed liquidator, address indexed violator, address collateral, uint256 repayAssets, uint256 yieldBalance)"
+            },
+            {
+              "name": "Transfer",
+              "signature": "event Transfer(address indexed from, address indexed to, uint256 value)"
+            },
+            {
+              "name": "Approval",
+              "signature": "event Approval(address indexed owner, address indexed spender, uint256 value)"
+            }
+          ]
+        },
+        {
+          "name": "EulerEarn",
+          "kind": "factory",
+          "address": "0x574B00f5a0C56D370F19fa887a5545d74F52fAC2",
+          "factoryContract": "EulerEarnFactory",
+          "discoveryEvent": {
+            "name": "CreateEulerEarn",
+            "signature": "event CreateEulerEarn(address indexed eulerEarn, address indexed caller, address initialOwner, uint256 initialTimelock, address indexed asset, string name, string symbol, bytes32 salt)"
+          },
+          "childContract": "EulerEarn",
+          "childEvents": [
+            {
+              "name": "Deposit",
+              "signature": "event Deposit(address indexed sender, address indexed owner, uint256 assets, uint256 shares)"
+            },
+            {
+              "name": "Withdraw",
+              "signature": "event Withdraw(address indexed sender, address indexed receiver, address indexed owner, uint256 assets, uint256 shares)"
+            },
+            {
+              "name": "Transfer",
+              "signature": "event Transfer(address indexed from, address indexed to, uint256 value)"
+            },
+            {
+              "name": "Approval",
+              "signature": "event Approval(address indexed owner, address indexed spender, uint256 value)"
+            },
+            {
+              "name": "AccrueInterest",
+              "signature": "event AccrueInterest(uint256 newTotalAssets, uint256 feeShares)"
+            }
+          ]
+        },
+        {
+          "name": "EulerSwapPool",
+          "kind": "factory",
+          "address": "0x8A1D3a4850ed7deeC9003680Cf41b8E75D27e440",
+          "addresses": [
+            {
+              "version": "v1",
+              "address": "0x8A1D3a4850ed7deeC9003680Cf41b8E75D27e440"
+            },
+            {
+              "version": "v2",
+              "address": "0xd80e68B39e4408cb7D6c8E3343Bde46587013F62"
+            }
+          ],
+          "factoryContract": "EulerSwapFactory",
+          "discoveryEvent": {
+            "name": "PoolDeployed",
+            "signature": "event PoolDeployed(address indexed asset0, address indexed asset1, address indexed eulerAccount, address pool, (address,address,address,address,address,address) sParams)"
+          },
+          "childContract": "EulerSwap",
+          "childEvents": [
+            {
+              "name": "Swap",
+              "signature": "event Swap(address indexed sender, uint256 amount0In, uint256 amount1In, uint256 amount0Out, uint256 amount1Out, uint256 fee0, uint256 fee1, uint112 reserve0, uint112 reserve1, address indexed to)"
+            }
+          ]
+        },
+        {
+          "name": "EVC",
+          "kind": "singleton",
+          "address": "0xddcbe30A761Edd2e19bba930A977475265F36Fa1",
+          "contract": "EthereumVaultConnector",
+          "events": [
+            {
+              "name": "VaultStatusCheck",
+              "signature": "event VaultStatusCheck(address indexed vault)"
+            },
+            {
+              "name": "AccountStatusCheck",
+              "signature": "event AccountStatusCheck(address indexed account, address indexed controller)"
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "chainId": 59144,
+      "eulerName": "linea",
+      "portalDataset": "linea-mainnet",
+      "realTime": true,
+      "sources": [
+        {
+          "name": "EVault",
+          "kind": "factory",
+          "address": "0x84711986Fd3BF0bFe4a8e6d7f4E22E67f7f27F04",
+          "factoryContract": "GenericFactory",
+          "discoveryEvent": {
+            "name": "ProxyCreated",
+            "signature": "event ProxyCreated(address indexed proxy, bool upgradeable, address implementation, bytes trailingData)"
+          },
+          "childContract": "EVault",
+          "childEvents": [
+            {
+              "name": "Deposit",
+              "signature": "event Deposit(address indexed sender, address indexed owner, uint256 assets, uint256 shares)"
+            },
+            {
+              "name": "Withdraw",
+              "signature": "event Withdraw(address indexed sender, address indexed receiver, address indexed owner, uint256 assets, uint256 shares)"
+            },
+            {
+              "name": "Borrow",
+              "signature": "event Borrow(address indexed account, uint256 assets)"
+            },
+            {
+              "name": "Repay",
+              "signature": "event Repay(address indexed account, uint256 assets)"
+            },
+            {
+              "name": "InterestAccrued",
+              "signature": "event InterestAccrued(address indexed account, uint256 assets)"
+            },
+            {
+              "name": "VaultStatus",
+              "signature": "event VaultStatus(uint256 totalShares, uint256 totalBorrows, uint256 accumulatedFees, uint256 cash, uint256 interestAccumulator, uint256 interestRate, uint256 timestamp)"
+            },
+            {
+              "name": "Liquidate",
+              "signature": "event Liquidate(address indexed liquidator, address indexed violator, address collateral, uint256 repayAssets, uint256 yieldBalance)"
+            },
+            {
+              "name": "Transfer",
+              "signature": "event Transfer(address indexed from, address indexed to, uint256 value)"
+            },
+            {
+              "name": "Approval",
+              "signature": "event Approval(address indexed owner, address indexed spender, uint256 value)"
+            }
+          ]
+        },
+        {
+          "name": "EulerEarn",
+          "kind": "factory",
+          "address": "0x377879A039343FEc7564e54616e519328951DA6D",
+          "factoryContract": "EulerEarnFactory",
+          "discoveryEvent": {
+            "name": "CreateEulerEarn",
+            "signature": "event CreateEulerEarn(address indexed eulerEarn, address indexed caller, address initialOwner, uint256 initialTimelock, address indexed asset, string name, string symbol, bytes32 salt)"
+          },
+          "childContract": "EulerEarn",
+          "childEvents": [
+            {
+              "name": "Deposit",
+              "signature": "event Deposit(address indexed sender, address indexed owner, uint256 assets, uint256 shares)"
+            },
+            {
+              "name": "Withdraw",
+              "signature": "event Withdraw(address indexed sender, address indexed receiver, address indexed owner, uint256 assets, uint256 shares)"
+            },
+            {
+              "name": "Transfer",
+              "signature": "event Transfer(address indexed from, address indexed to, uint256 value)"
+            },
+            {
+              "name": "Approval",
+              "signature": "event Approval(address indexed owner, address indexed spender, uint256 value)"
+            },
+            {
+              "name": "AccrueInterest",
+              "signature": "event AccrueInterest(uint256 newTotalAssets, uint256 feeShares)"
+            }
+          ]
+        },
+        {
+          "name": "EulerSwapPool",
+          "kind": "factory",
+          "address": "0x970B065B572CC0118535Ad1101663CDBE7Db1e21",
+          "addresses": [
+            {
+              "version": "v1",
+              "address": "0x970B065B572CC0118535Ad1101663CDBE7Db1e21"
+            },
+            {
+              "version": "v2",
+              "address": "0xB0cc1D8e6fAc157c76d2c08B7D55Eca1573BcBDF"
+            }
+          ],
+          "factoryContract": "EulerSwapFactory",
+          "discoveryEvent": {
+            "name": "PoolDeployed",
+            "signature": "event PoolDeployed(address indexed asset0, address indexed asset1, address indexed eulerAccount, address pool, (address,address,address,address,address,address) sParams)"
+          },
+          "childContract": "EulerSwap",
+          "childEvents": [
+            {
+              "name": "Swap",
+              "signature": "event Swap(address indexed sender, uint256 amount0In, uint256 amount1In, uint256 amount0Out, uint256 amount1Out, uint256 fee0, uint256 fee1, uint112 reserve0, uint112 reserve1, address indexed to)"
+            }
+          ]
+        },
+        {
+          "name": "EVC",
+          "kind": "singleton",
+          "address": "0xd8CeCEe9A04eA3d941a959F68fb4486f23271d09",
+          "contract": "EthereumVaultConnector",
+          "events": [
+            {
+              "name": "VaultStatusCheck",
+              "signature": "event VaultStatusCheck(address indexed vault)"
+            },
+            {
+              "name": "AccountStatusCheck",
+              "signature": "event AccountStatusCheck(address indexed account, address indexed controller)"
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "chainId": 60808,
+      "eulerName": "BOB",
+      "portalDataset": "bob-mainnet",
+      "realTime": false,
+      "sources": [
+        {
+          "name": "EVault",
+          "kind": "factory",
+          "address": "0x046a9837A61d6b6263f54F4E27EE072bA4bdC7e4",
+          "factoryContract": "GenericFactory",
+          "discoveryEvent": {
+            "name": "ProxyCreated",
+            "signature": "event ProxyCreated(address indexed proxy, bool upgradeable, address implementation, bytes trailingData)"
+          },
+          "childContract": "EVault",
+          "childEvents": [
+            {
+              "name": "Deposit",
+              "signature": "event Deposit(address indexed sender, address indexed owner, uint256 assets, uint256 shares)"
+            },
+            {
+              "name": "Withdraw",
+              "signature": "event Withdraw(address indexed sender, address indexed receiver, address indexed owner, uint256 assets, uint256 shares)"
+            },
+            {
+              "name": "Borrow",
+              "signature": "event Borrow(address indexed account, uint256 assets)"
+            },
+            {
+              "name": "Repay",
+              "signature": "event Repay(address indexed account, uint256 assets)"
+            },
+            {
+              "name": "InterestAccrued",
+              "signature": "event InterestAccrued(address indexed account, uint256 assets)"
+            },
+            {
+              "name": "VaultStatus",
+              "signature": "event VaultStatus(uint256 totalShares, uint256 totalBorrows, uint256 accumulatedFees, uint256 cash, uint256 interestAccumulator, uint256 interestRate, uint256 timestamp)"
+            },
+            {
+              "name": "Liquidate",
+              "signature": "event Liquidate(address indexed liquidator, address indexed violator, address collateral, uint256 repayAssets, uint256 yieldBalance)"
+            },
+            {
+              "name": "Transfer",
+              "signature": "event Transfer(address indexed from, address indexed to, uint256 value)"
+            },
+            {
+              "name": "Approval",
+              "signature": "event Approval(address indexed owner, address indexed spender, uint256 value)"
+            }
+          ]
+        },
+        {
+          "name": "EulerEarn",
+          "kind": "factory",
+          "address": "0x8F01c6640A1c0a6085C79843F861fF0F89b9fED6",
+          "factoryContract": "EulerEarnFactory",
+          "discoveryEvent": {
+            "name": "CreateEulerEarn",
+            "signature": "event CreateEulerEarn(address indexed eulerEarn, address indexed caller, address initialOwner, uint256 initialTimelock, address indexed asset, string name, string symbol, bytes32 salt)"
+          },
+          "childContract": "EulerEarn",
+          "childEvents": [
+            {
+              "name": "Deposit",
+              "signature": "event Deposit(address indexed sender, address indexed owner, uint256 assets, uint256 shares)"
+            },
+            {
+              "name": "Withdraw",
+              "signature": "event Withdraw(address indexed sender, address indexed receiver, address indexed owner, uint256 assets, uint256 shares)"
+            },
+            {
+              "name": "Transfer",
+              "signature": "event Transfer(address indexed from, address indexed to, uint256 value)"
+            },
+            {
+              "name": "Approval",
+              "signature": "event Approval(address indexed owner, address indexed spender, uint256 value)"
+            },
+            {
+              "name": "AccrueInterest",
+              "signature": "event AccrueInterest(uint256 newTotalAssets, uint256 feeShares)"
+            }
+          ]
+        },
+        {
+          "name": "EulerSwapPool",
+          "kind": "factory",
+          "address": "0xE25B3cdA6fccAcbD794aEA64eE1B496d7b441644",
+          "addresses": [
+            {
+              "version": "v1",
+              "address": "0xE25B3cdA6fccAcbD794aEA64eE1B496d7b441644"
+            },
+            {
+              "version": "v2",
+              "address": "0xa077991e2929d97f29fE39372E736FC118a4FAd3"
+            }
+          ],
+          "factoryContract": "EulerSwapFactory",
+          "discoveryEvent": {
+            "name": "PoolDeployed",
+            "signature": "event PoolDeployed(address indexed asset0, address indexed asset1, address indexed eulerAccount, address pool, (address,address,address,address,address,address) sParams)"
+          },
+          "childContract": "EulerSwap",
+          "childEvents": [
+            {
+              "name": "Swap",
+              "signature": "event Swap(address indexed sender, uint256 amount0In, uint256 amount1In, uint256 amount0Out, uint256 amount1Out, uint256 fee0, uint256 fee1, uint112 reserve0, uint112 reserve1, address indexed to)"
+            }
+          ]
+        },
+        {
+          "name": "EVC",
+          "kind": "singleton",
+          "address": "0x59f0FeEc4fA474Ad4ffC357cC8d8595B68abE47d",
+          "contract": "EthereumVaultConnector",
+          "events": [
+            {
+              "name": "VaultStatusCheck",
+              "signature": "event VaultStatusCheck(address indexed vault)"
+            },
+            {
+              "name": "AccountStatusCheck",
+              "signature": "event AccountStatusCheck(address indexed account, address indexed controller)"
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "chainId": 80094,
+      "eulerName": "berachain",
+      "portalDataset": "berachain-mainnet",
+      "realTime": true,
+      "sources": [
+        {
+          "name": "EVault",
+          "kind": "factory",
+          "address": "0x5C13fb43ae9BAe8470f646ea647784534E9543AF",
+          "factoryContract": "GenericFactory",
+          "discoveryEvent": {
+            "name": "ProxyCreated",
+            "signature": "event ProxyCreated(address indexed proxy, bool upgradeable, address implementation, bytes trailingData)"
+          },
+          "childContract": "EVault",
+          "childEvents": [
+            {
+              "name": "Deposit",
+              "signature": "event Deposit(address indexed sender, address indexed owner, uint256 assets, uint256 shares)"
+            },
+            {
+              "name": "Withdraw",
+              "signature": "event Withdraw(address indexed sender, address indexed receiver, address indexed owner, uint256 assets, uint256 shares)"
+            },
+            {
+              "name": "Borrow",
+              "signature": "event Borrow(address indexed account, uint256 assets)"
+            },
+            {
+              "name": "Repay",
+              "signature": "event Repay(address indexed account, uint256 assets)"
+            },
+            {
+              "name": "InterestAccrued",
+              "signature": "event InterestAccrued(address indexed account, uint256 assets)"
+            },
+            {
+              "name": "VaultStatus",
+              "signature": "event VaultStatus(uint256 totalShares, uint256 totalBorrows, uint256 accumulatedFees, uint256 cash, uint256 interestAccumulator, uint256 interestRate, uint256 timestamp)"
+            },
+            {
+              "name": "Liquidate",
+              "signature": "event Liquidate(address indexed liquidator, address indexed violator, address collateral, uint256 repayAssets, uint256 yieldBalance)"
+            },
+            {
+              "name": "Transfer",
+              "signature": "event Transfer(address indexed from, address indexed to, uint256 value)"
+            },
+            {
+              "name": "Approval",
+              "signature": "event Approval(address indexed owner, address indexed spender, uint256 value)"
+            }
+          ]
+        },
+        {
+          "name": "EulerEarn",
+          "kind": "factory",
+          "address": "0x9cbc3030e6d133D1AAa148D598FD82D70263495c",
+          "factoryContract": "EulerEarnFactory",
+          "discoveryEvent": {
+            "name": "CreateEulerEarn",
+            "signature": "event CreateEulerEarn(address indexed eulerEarn, address indexed caller, address initialOwner, uint256 initialTimelock, address indexed asset, string name, string symbol, bytes32 salt)"
+          },
+          "childContract": "EulerEarn",
+          "childEvents": [
+            {
+              "name": "Deposit",
+              "signature": "event Deposit(address indexed sender, address indexed owner, uint256 assets, uint256 shares)"
+            },
+            {
+              "name": "Withdraw",
+              "signature": "event Withdraw(address indexed sender, address indexed receiver, address indexed owner, uint256 assets, uint256 shares)"
+            },
+            {
+              "name": "Transfer",
+              "signature": "event Transfer(address indexed from, address indexed to, uint256 value)"
+            },
+            {
+              "name": "Approval",
+              "signature": "event Approval(address indexed owner, address indexed spender, uint256 value)"
+            },
+            {
+              "name": "AccrueInterest",
+              "signature": "event AccrueInterest(uint256 newTotalAssets, uint256 feeShares)"
+            }
+          ]
+        },
+        {
+          "name": "EulerSwapPool",
+          "kind": "factory",
+          "address": "0xD14c95dc228E8851F63d9b83A0001F4D021B5DFf",
+          "addresses": [
+            {
+              "version": "v1",
+              "address": "0xD14c95dc228E8851F63d9b83A0001F4D021B5DFf"
+            },
+            {
+              "version": "v2",
+              "address": "0x1A4546b988Ee133F72b7E27a4890355b0a341554"
+            }
+          ],
+          "factoryContract": "EulerSwapFactory",
+          "discoveryEvent": {
+            "name": "PoolDeployed",
+            "signature": "event PoolDeployed(address indexed asset0, address indexed asset1, address indexed eulerAccount, address pool, (address,address,address,address,address,address) sParams)"
+          },
+          "childContract": "EulerSwap",
+          "childEvents": [
+            {
+              "name": "Swap",
+              "signature": "event Swap(address indexed sender, uint256 amount0In, uint256 amount1In, uint256 amount0Out, uint256 amount1Out, uint256 fee0, uint256 fee1, uint112 reserve0, uint112 reserve1, address indexed to)"
+            }
+          ]
+        },
+        {
+          "name": "EVC",
+          "kind": "singleton",
+          "address": "0x45334608ECE7B2775136bC847EB92B5D332806A9",
+          "contract": "EthereumVaultConnector",
+          "events": [
+            {
+              "name": "VaultStatusCheck",
+              "signature": "event VaultStatusCheck(address indexed vault)"
+            },
+            {
+              "name": "AccountStatusCheck",
+              "signature": "event AccountStatusCheck(address indexed account, address indexed controller)"
+            }
+          ]
+        }
+      ]
+    }
+  ]
+}

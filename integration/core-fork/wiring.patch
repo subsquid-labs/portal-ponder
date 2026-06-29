@@ -1,0 +1,65 @@
+diff --git a/packages/core/src/build/config.ts b/packages/core/src/build/config.ts
+index f640198..a5d80ed 100644
+--- a/packages/core/src/build/config.ts
++++ b/packages/core/src/build/config.ts
+@@ -1053,6 +1053,7 @@ export function buildConfig({
+         id: chain.id,
+         name: chainName,
+         rpc: chain.rpc,
++        portal: chain.portal,
+         ws: chain.ws,
+         pollingInterval: chain.pollingInterval ?? 1_000,
+         finalityBlockCount: getFinalityBlockCount({ chain: matchedChain }),
+diff --git a/packages/core/src/config/index.ts b/packages/core/src/config/index.ts
+index fd6e416..278804d 100644
+--- a/packages/core/src/config/index.ts
++++ b/packages/core/src/config/index.ts
+@@ -94,6 +94,12 @@ type ChainConfig<chain> = {
+   id: chain extends { id: infer id extends number } ? id | number : number;
+   /** RPC url. */
+   rpc: string | string[] | Transport | undefined;
++  /**
++   * SQD Portal dataset URL for historical backfill (e.g.
++   * "https://portal.sqd.dev/datasets/ethereum-mainnet"). When set, historical
++   * sync streams from Portal; realtime/frontfill still uses `rpc`.
++   */
++  portal?: string;
+   ws?: string;
+   /** Polling interval (in ms). Default: `1_000`. */
+   pollingInterval?: number;
+diff --git a/packages/core/src/internal/types.ts b/packages/core/src/internal/types.ts
+index acea95b..c502c66 100644
+--- a/packages/core/src/internal/types.ts
++++ b/packages/core/src/internal/types.ts
+@@ -300,6 +300,8 @@ export type Chain = {
+   name: string;
+   id: number;
+   rpc: string | string[] | Transport;
++  /** SQD Portal dataset URL for historical backfill. Realtime still uses `rpc`. */
++  portal: string | undefined;
+   ws: string | undefined;
+   pollingInterval: number;
+   finalityBlockCount: number;
+diff --git a/packages/core/src/runtime/historical.ts b/packages/core/src/runtime/historical.ts
+index 0bd78dc..ea04c9f 100644
+--- a/packages/core/src/runtime/historical.ts
++++ b/packages/core/src/runtime/historical.ts
+@@ -14,6 +14,7 @@ import { eth_getBlockByNumber } from "@/rpc/actions.js";
+ import type { Rpc } from "@/rpc/index.js";
+ import { buildEvents, decodeEvents } from "@/runtime/events.js";
+ import { createHistoricalSync } from "@/sync-historical/index.js";
++import { createPortalHistoricalSync } from "@/sync-historical/portal.js";
+ import { type SyncStore, createSyncStore } from "@/sync-store/index.js";
+ import {
+   MAX_CHECKPOINT,
+@@ -1221,7 +1222,9 @@ export async function* getLocalSyncGenerator(params: {
+     });
+   }
+ 
+-  const historicalSync = createHistoricalSync(params);
++  const historicalSync = params.chain.portal
++    ? createPortalHistoricalSync(params)
++    : createHistoricalSync(params);
+ 
+   const { callback: intervalCallback, generator: intervalGenerator } =
+     createCallbackGenerator<{

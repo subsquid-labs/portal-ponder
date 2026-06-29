@@ -1,0 +1,17 @@
+{
+  "name": "portal-ponder",
+  "version": "0.0.1",
+  "private": true,
+  "type": "module",
+  "description": "Fork of Ponder's historical sync that backfills from SQD Portal (range-scan) while realtime stays on JSON-RPC. Engine + real-Euler multi-chain e2e harness + eval gates + Portal-specific observability.",
+  "engines": { "node": ">=22.15" },
+  "scripts": {
+    "head": "node --experimental-strip-types harness/head.ts",
+    "discover": "node --experimental-strip-types harness/discover.ts",
+    "backfill": "node --experimental-strip-types harness/run-backfill.ts",
+    "gates": "node --experimental-strip-types harness/check-gates.ts"
+  },
+  "dependencies": {
+    "viem": "^2.21.0"
+  }
+}

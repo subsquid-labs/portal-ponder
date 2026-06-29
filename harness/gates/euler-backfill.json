@@ -1,0 +1,11 @@
+{
+  "description": "Eval gate for a single-chain Euler backfill via createPortalHistoricalSync against Portal. Mirrors the proxy harness's gates (benches/replay/gates/cold-start.json) but asserted on the fork's own behavior.",
+  "gates": {
+    "client_facing_503_529": { "max": 0, "rationale": "fork self-paces to Portal CU/worker economics; must never surface worker-pool exhaustion" },
+    "client_facing_timeouts": { "max": 0, "rationale": "range-scan latency is normal, not a failure" },
+    "logical_streams_per_chain": { "max": 2, "rationale": "discovery + data = 2 streams for a full backfill (vs proxy's tens of thousands of getLogs)" },
+    "streams_per_1000_blocks": { "max": 1.5, "rationale": "proxy path was 3-10; fork target <1 amortized" },
+    "forward_progress_blocks_pct": { "min": 1.0, "rationale": "must complete the requested range (proxy died at 0%)" },
+    "blocks_per_sec": { "min": 50000, "rationale": "columnar range-scan throughput floor" }
+  }
+}
