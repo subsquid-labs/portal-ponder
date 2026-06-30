@@ -22,7 +22,7 @@ export const BENCHES: BenchSpec[] = [
   { name: "feature-call-traces", dir: join(EX, "feature-call-traces"), schema: "bench_traces", port: 42202,
     start: 22_200_000, end: 22_205_000, chainIds: [1], env: { PORTAL_URL_1: ETH } },
   { name: "feature-blocks", dir: join(EX, "feature-blocks"), schema: "bench_blocks", port: 42203,
-    start: 22_200_000, end: 22_260_000, chainIds: [1], env: { PORTAL_URL_1: ETH } },
+    start: 22_200_000, end: 22_220_000, chainIds: [1], env: { PORTAL_URL_1: ETH } },
   { name: "feature-accounts", dir: join(EX, "feature-accounts"), schema: "bench_accts", port: 42204,
     start: 22_200_000, end: 22_205_000, chainIds: [1], env: { PORTAL_URL_1: ETH } },
   { name: "feature-factory (sepolia)", dir: join(EX, "feature-factory"), schema: "bench_factory", port: 42205,

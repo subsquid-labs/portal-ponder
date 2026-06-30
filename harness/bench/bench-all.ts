@@ -9,8 +9,8 @@ import { writeFileSync } from "node:fs";
 import { BENCHES } from "./benches.ts";
 import { type BenchResult, runBench } from "./run-bench.ts";
 
-const filter = process.argv[2];
-const specs = BENCHES.filter((b) => !filter || b.name.includes(filter));
+const filter = process.argv[2]; // comma-separated substrings, e.g. "uniswap,traces,blocks"
+const specs = BENCHES.filter((b) => !filter || filter.split(",").some((f) => b.name.includes(f.trim())));
 if (specs.length === 0) { console.error(`no benches match '${filter}'. available: ${BENCHES.map((b) => b.name).join(", ")}`); process.exit(1); }
 
 const pad = (s: string | number, n: number) => String(s).padEnd(n);

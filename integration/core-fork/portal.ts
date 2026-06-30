@@ -435,17 +435,17 @@ export const createPortalHistoricalSync = (
         transactionFilters = requiredIntervals.filter((r) => r.filter.type === "transaction").map((r) => r.filter);
         needTxFilter = transactionFilters.length > 0;
       }
-      // detect trace sources + cap the chunk grid BEFORE any idxOf() (memory safety)
       if (!needTraces && requiredIntervals.some((r) => r.filter.type === "trace" || r.filter.type === "transfer")) {
         traceFilters = requiredIntervals.filter((r) => r.filter.type === "trace").map((r) => r.filter);
         transferFilters = requiredIntervals.filter((r) => r.filter.type === "transfer").map((r) => r.filter);
         needTraces = traceFilters.length + transferFilters.length > 0;
-        const capped = traceSafeChunkBlocks(chunkBlocks, needTraces);
-        if (capped !== chunkBlocks) {
-          // grid shrank: drop caches/discovery keyed by the old (wider) grid, then re-pin below
-          chunkBlocks = capped; dataCache.clear(); discCache.clear(); discStartIdx = undefined;
-          log.debug({ service: "portal", msg: `Portal ${args.chain.name}: trace sources → chunkBlocks capped to ${chunkBlocks} (grid reset)` });
-        }
+      }
+      // cap the chunk grid BEFORE any idxOf() for DENSE sources (traces fetch every trace;
+      // block sources includeAllBlocks-scan the WHOLE chunk range) — bounds memory + overfetch.
+      const capped = traceSafeChunkBlocks(chunkBlocks, needTraces || needBlocks);
+      if (capped !== chunkBlocks) {
+        chunkBlocks = capped; dataCache.clear(); discCache.clear(); discStartIdx = undefined;
+        log.debug({ service: "portal", msg: `Portal ${args.chain.name}: dense sources → chunkBlocks capped to ${chunkBlocks} (grid reset)` });
       }
 
       // pin the discovery floor at the factory's real start (NOT block 0) — after any chunk cap
