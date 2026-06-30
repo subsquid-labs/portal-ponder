@@ -1,0 +1,56 @@
+name: release
+
+# Publish @subsquid/ponder@<version> = ponder@<version> + the Portal layer.
+# Trigger: manually (Actions → release → Run workflow → enter the ponder version), or push a
+# tag `v<version>` (e.g. v0.16.6). Auth is npm **Trusted Publishing via OIDC** — no NPM_TOKEN.
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "ponder version to publish as @subsquid/ponder@<version> (e.g. 0.16.6). Must have portal/wiring/<version>.patch + a versions.json row."
+        required: true
+  push:
+    tags: ["v*.*.*"]
+
+permissions:
+  contents: read
+  id-token: write # OIDC token for npm Trusted Publishing (replaces NPM_TOKEN)
+
+concurrency:
+  group: release-${{ github.event.inputs.version || github.ref_name }}
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          registry-url: "https://registry.npmjs.org"
+      - run: corepack enable
+      # npm Trusted Publishing (OIDC) requires npm >= 11.5.1; node 22 ships an older npm.
+      - run: npm install -g npm@latest && npm --version
+
+      - name: Resolve version (workflow input or v<version> tag)
+        id: v
+        run: |
+          V="${{ github.event.inputs.version }}"
+          [ -z "$V" ] && V="${GITHUB_REF_NAME#v}"
+          echo "version=$V" >> "$GITHUB_OUTPUT"
+          echo "→ publishing @subsquid/ponder@$V"
+
+      - name: Guard — version must be declared in versions.json
+        run: |
+          node -e "const v='${{ steps.v.outputs.version }}'; const j=require('./versions.json'); if(!j.versions.some(r=>r.ponder===v)){console.error('✗ '+v+' not in versions.json — add a row + portal/wiring/'+v+'.patch first (PUBLISHING.md)');process.exit(1)} console.log('✓ '+v+' declared')"
+
+      - name: Build + test the fork (apply Portal layer to ponder@<version>)
+        run: bash scripts/sync-upstream.sh "${{ steps.v.outputs.version }}" --test
+        env:
+          SYNC_WORKDIR: ${{ runner.temp }}/fork
+
+      - name: Publish to npm (Trusted Publishing via OIDC — no token)
+        working-directory: ${{ runner.temp }}/fork/${{ steps.v.outputs.version }}/packages/core
+        # When this repo is PUBLIC, append `--provenance` for a signed provenance attestation.
+        run: npm publish --access public

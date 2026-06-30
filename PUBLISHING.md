@@ -18,15 +18,32 @@ field per chain that routes the historical backfill through SQD Portal (realtime
   `compat.tested` list the CI matrix proves the seam against. We publish a fork release **only for ponder
   versions a client needs** (the economy), but we *know* which past/future versions hold (the awareness).
 
-## Cut a release for an existing version
+## Releasing — automated (npm Trusted Publishing via OIDC, no token)
+
+Releases run through [`.github/workflows/release.yml`](.github/workflows/release.yml) and
+authenticate to npm with **OIDC Trusted Publishing** — no `NPM_TOKEN` (npm deprecated long-lived
+tokens for CI in favour of the GitHub integration). The job applies the Portal layer to
+`ponder@<version>`, builds, runs the Portal tests, then publishes.
+
+**One-time setup** (a maintainer with publish rights on the `@subsquid` scope):
+
+1. On npmjs.com → `@subsquid/ponder` → *Settings → Trusted Publisher → GitHub Actions*, pointing at
+   repo `subsquid/portal-ponder`, workflow `release.yml`.
+   - *Brand-new package:* if npm requires the package to exist before you can add a trusted publisher,
+     seed it with one manual publish (below), then configure the trusted publisher — every release
+     after that is tokenless.
+2. *(When the repo is public)* add `--provenance` to the publish step for a signed provenance attestation.
+
+**Cut a release:** Actions → **release** → *Run workflow* → enter the ponder version (e.g. `0.16.6`),
+or push a tag `v0.16.6`. The workflow guards that the version is in `versions.json`, builds + tests, and
+publishes `@subsquid/ponder@<version>`. Then flip that row's `status`→`published` in `versions.json`.
+
+**Manual / local** (to seed the first publish, or as a fallback):
 
 ```bash
-scripts/sync-upstream.sh 0.16.6 --test        # clone + apply layer + build + run Portal tests
-cd /tmp/sqd-ponder-fork/0.16.6/packages/core
-npm publish --access public                   # publishes @subsquid/ponder@0.16.6
+scripts/sync-upstream.sh 0.16.6 --test                       # clone + apply layer + build + test
+cd "$SYNC_WORKDIR/0.16.6/packages/core" && npm publish --access public   # uses your local npm login
 ```
-
-Then flip that row's `status`→`published` in `versions.json` and commit.
 
 ## Add a new ponder version
 
