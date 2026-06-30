@@ -8,9 +8,9 @@
     {
       "ponder": "0.16.6",
       "wiring": "wiring/0.16.6.patch",
-      "status": "verified",
-      "published": false,
-      "note": "current latest; the layer + wiring were authored against this"
+      "status": "published",
+      "published": true,
+      "note": "current latest; seed publish 2026-06-30 (@subsquid/ponder@0.16.6, by subsquid-admin)"
     },
     {
       "ponder": "0.15.17",
