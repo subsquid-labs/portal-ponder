@@ -245,6 +245,8 @@ export const createPortalHistoricalSync = (
   let transactionFilters: any[] = [];
   let logFilters: LogFilter[] = [];
   let allFactories: any[] = [];
+  let backfillStartBlock = 0;
+  let backfillEndBlock: number | undefined; // undefined ⇒ unbounded (backfill to the finalized head)
   // Resolve the COMPLETE chain-wide fetch-spec ONCE from args.eventCallbacks (the FULL per-chain
   // filter set), NOT from per-call requiredIntervals (only the subset Ponder still needs, which
   // shrinks as fragments cache). Chunks are cached by idx ALONE, so every chunk MUST be filter-
@@ -263,6 +265,19 @@ export const createPortalHistoricalSync = (
     traceFilters = fs.filter((f) => f.type === "trace");
     transferFilters = fs.filter((f) => f.type === "transfer");
     needTraces = traceFilters.length + transferFilters.length > 0;
+    // the chain's actual backfill window, from the filters — used to bound chunk fetches so a
+    // bounded backfill (or the backfill tail) never over-fetches. Fully automatic; no client tuning.
+    const froms = fs.map((f) => (f as any).fromBlock).filter((b) => b != null);
+    backfillStartBlock = froms.length ? Math.min(...froms) : 0;
+    const tos = fs.map((f) => (f as any).toBlock);
+    backfillEndBlock = tos.length && tos.every((t) => t != null) ? Math.max(...tos) : undefined;
+  };
+  // a chunk's grid-aligned [from,to] clamped to the real backfill window (end ⇒ explicit toBlock,
+  // else the finalized head). Bounds fetch on BOTH sides so a small/bounded range isn't widened to
+  // the 500k grid — the reason the diff harness needs no PORTAL_CHUNK_* tuning.
+  const chunkRange = (idx: number): [number, number] => {
+    const end = backfillEndBlock ?? portalHead ?? Number.POSITIVE_INFINITY;
+    return [Math.max(idx * chunkBlocks, backfillStartBlock), Math.min(idx * chunkBlocks + chunkBlocks - 1, end)];
   };
   const blockFieldsFor = (filters: Filter[]): Record<string, boolean> => {
     const inc = new Set<string>();
@@ -282,7 +297,7 @@ export const createPortalHistoricalSync = (
     if (p) return p;
     p = (async () => {
       stats.discChunks++;
-      const from = idx * chunkBlocks, to = from + chunkBlocks - 1;
+      const [from, to] = chunkRange(idx);
       for (const factory of factories) {
         const needsData = factory.childAddressLocation.startsWith("offset");
         const q = { type: "evm", fields: { block: { number: true }, log: { address: true, topics: true, data: needsData } }, logs: [{ address: factory.address ? (Array.isArray(factory.address) ? factory.address : [factory.address]).map((a: string) => a.toLowerCase()) : undefined, topic0: [factory.eventSelector.toLowerCase()] }] };
@@ -317,7 +332,7 @@ export const createPortalHistoricalSync = (
     p = (async () => {
       await ensureDiscoveredThrough(idx, factories); // correctness: children ≤ this chunk are known
       stats.dataChunks++;
-      const from = idx * chunkBlocks, to = from + chunkBlocks - 1;
+      const [from, to] = chunkRange(idx);
       const logRequests = filters.flatMap((f) => logRequestsFor(f)).map((r) => ({ ...r, transaction: true }));
       const data: ChunkData = { headers: new Map(), logs: new Map(), txs: new Map(), traceBlocks: new Map(), blockHeaders: new Map(), txBlocks: new Map() };
       if (logRequests.length > 0) {
@@ -468,8 +483,10 @@ export const createPortalHistoricalSync = (
       const idxs: number[] = [];
       for (let i = startIdx; i <= endIdx; i++) idxs.push(i);
       const data = await Promise.all(idxs.map((i) => dataChunk(i, factories, filters)));
-      // PARALLEL read-ahead: prefetch the next READAHEAD chunks concurrently
-      for (let d = 1; d <= READAHEAD; d++) void dataChunk(endIdx + d, factories, filters).catch(() => {});
+      // PARALLEL read-ahead: prefetch the next READAHEAD chunks concurrently — but never past the
+      // backfill end (bounded toBlock or finalized head), so the tail doesn't waste CU / hit 204s.
+      const raEnd = backfillEndBlock ?? portalHead ?? Number.POSITIVE_INFINITY;
+      for (let d = 1; d <= READAHEAD; d++) { if ((endIdx + d) * chunkBlocks > raEnd) break; void dataChunk(endIdx + d, factories, filters).catch(() => {}); }
 
       const syncLogs: SyncLog[] = [];
       const blocksByNumber = new Map<number, SyncBlockHeader>();

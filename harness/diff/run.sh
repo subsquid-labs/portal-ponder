@@ -13,9 +13,6 @@ ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
 APP="${DIFF_APP:-$ROOT/harness/diff/app}"   # DIFF_APP=harness/diff/euler-app for the larger factory run
 START="${1:-${PONDER_START:-22200000}}"; END="${2:-${PONDER_END:-22200030}}"   # small default; the diff is per-block deterministic, so a wider range only adds coverage
 PORTAL="${PORTAL_URL_1:-https://portal.sqd.dev/datasets/ethereum-mainnet}"
-# Portal chunk: bound to the range (no over-fetch past it) but cap so a large range streams in
-# several chunks with read-ahead instead of one giant chunk that pins progress at 0%.
-CHUNK=$(( END - START + 1 )); [ "$CHUNK" -gt 50000 ] && CHUNK=50000
 : "${PONDER_RPC_URL_1:?set PONDER_RPC_URL_1 to an eth archive RPC that supports debug_traceBlockByNumber}"
 
 pkill -f 'ponder start --schema diff_' 2>/dev/null
@@ -29,7 +26,13 @@ run () { # $1=label  $2=portal-url-or-empty  $3=db  $4=port
   echo "▶ $1 backfill …"
   rm -rf "$3"
   export PONDER_START="$START" PONDER_END="$END" PGLITE_DIR="$3" PONDER_LOG_LEVEL=info CI=true
-  if [ -n "$2" ]; then export PORTAL_URL_1="$2" PORTAL_CHUNK_FIXED=1 PORTAL_CHUNK_BLOCKS="$CHUNK" PORTAL_READAHEAD="${READAHEAD:-2}"
+  if [ -n "$2" ]; then
+    export PORTAL_URL_1="$2"
+    # NO chunk tuning for normal ranges — the fork's intrinsic clamp bounds the fetch to the
+    # backfill window automatically (this is what a real deploy→head client gets: zero params).
+    # Only for a LARGE bounded *test* range do we split it into chunks, purely so a 500k-block
+    # comparison shows incremental progress / read-ahead instead of one big fetch.
+    if [ "$(( END - START ))" -gt 60000 ]; then export PORTAL_CHUNK_FIXED=1 PORTAL_CHUNK_BLOCKS=50000 PORTAL_READAHEAD="${READAHEAD:-4}"; else unset PORTAL_CHUNK_FIXED PORTAL_CHUNK_BLOCKS PORTAL_READAHEAD; fi
   else unset PORTAL_URL_1 PORTAL_CHUNK_FIXED PORTAL_CHUNK_BLOCKS PORTAL_READAHEAD; fi
   local t0=$SECONDS
   ./node_modules/.bin/ponder start --schema "diff_$1" --port "$4" > "/tmp/diff-$1.log" 2>&1 &
@@ -42,8 +45,8 @@ run () { # $1=label  $2=portal-url-or-empty  $3=db  $4=port
   done
   kill "$pid" 2>/dev/null; wait "$pid" 2>/dev/null; sleep 1
   [ "$done" = 1 ] || { echo "✗ $1 did not complete:"; tail -4 "/tmp/diff-$1.log" | sed -E 's/\x1b\[[0-9;]*m//g'; exit 1; }
-  eval "WALL_$1=$(( SECONDS - t0 ))"
-  echo "  ⏱ $1 backfill ${SECONDS}s wall — $(grep -oiE 'Completed indexing across all chains \([^)]*\)' "/tmp/diff-$1.log" | tail -1)"
+  local el=$(( SECONDS - t0 )); eval "WALL_$1=$el"
+  echo "  ⏱ $1 backfill ${el}s — $(grep -oiE 'Completed indexing across all chains \([^)]*\)' "/tmp/diff-$1.log" | tail -1)"
 }
 
 run portal "$PORTAL" "$WORK/dbPortal" 42270
