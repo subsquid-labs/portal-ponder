@@ -28,7 +28,7 @@ tokens for CI in favour of the GitHub integration). The job applies the Portal l
 **One-time setup** (a maintainer with publish rights on the `@subsquid` scope):
 
 1. On npmjs.com → `@subsquid/ponder` → *Settings → Trusted Publisher → GitHub Actions*, pointing at
-   repo `subsquid/portal-ponder`, workflow `release.yml`.
+   repo `subsquid-labs/portal-ponder`, workflow `release.yml`.
    - *Brand-new package:* if npm requires the package to exist before you can add a trusted publisher,
      seed it with one manual publish (below), then configure the trusted publisher — every release
      after that is tokenless.
