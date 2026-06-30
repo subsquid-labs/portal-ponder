@@ -28,6 +28,10 @@ export default createConfig({
     // block-interval source: fires every 1000 blocks (exercises BlockFilter)
     Every1000: { chain: "mainnet", interval: 1000, startBlock: START, endBlock: END },
   },
+  accounts: {
+    // account source: transactions to/from WETH (exercises TransactionFilter, from/to pushed to Portal)
+    Weth: { chain: "mainnet", address: "0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2", startBlock: START, endBlock: END },
+  },
   contracts: {
     UsdcWethPool: {
       chain: "mainnet",

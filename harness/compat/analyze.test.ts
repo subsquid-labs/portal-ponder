@@ -41,6 +41,14 @@ test("capability: Arbitrum HAS traces per docs → trace source READY (the docs 
   assert.equal(analyzeConfig(cfg, new Map()).sources[0]!.verdict, "READY");
 });
 
+test("account source (transactions from/to) → READY where the dataset is served", () => {
+  const cfg = { chains: { eth: { id: 1 } }, accounts: { Wallet: { chain: "eth", address: "0xabc" } } };
+  const s = analyzeConfig(cfg, new Map()).sources[0]!;
+  assert.equal(s.source, "account:Wallet");
+  assert.ok(s.needs.includes("accountTx"));
+  assert.equal(s.verdict, "READY");
+});
+
 test("per-portal existence: a portal that doesn't serve the dataset → NO_DATASET", () => {
   const catalog = new Map<string, DatasetInfo>([["some-other-chain", { dataset: "some-other-chain", realTime: true, aliases: [] }]]);
   const cfg = { chains: { eth: { id: 1 } }, contracts: { C: { chain: "eth", address: "0xabc" } } };

@@ -16,7 +16,7 @@ PORTAL_API_KEY=<key> node <path>/harness/compat/report.ts ./ponder.config.ts --d
 ```
 
 It does two things:
-1. **Coverage** — per source: (a) does our backfill implement the type (logs, log-factories, transactions, receipts, traces, block-interval today; account-transaction sources not yet); (b) does the **target portal** serve that chain's dataset — checked live against *its* `/datasets`, because **different portals serve different subsets**, so point `PORTAL_BASE` at the portal the client will actually use; (c) does the network have the data a source needs (traces), per the [authoritative docs matrix](https://docs.sqd.dev/en/data/all-networks) of 300+ networks (`traces`/`stateDiffs` flags + block-range notes, e.g. Optimism's Bedrock cutoff). A trace source on a chain with `traces:false` is flagged; block-range notes are surfaced for you to check against your `startBlock`.
+1. **Coverage** — per source: (a) does our backfill implement the type (logs, log-factories, transactions, receipts, traces, block-interval, account transactions — every Ponder source type today); (b) does the **target portal** serve that chain's dataset — checked live against *its* `/datasets`, because **different portals serve different subsets**, so point `PORTAL_BASE` at the portal the client will actually use; (c) does the network have the data a source needs (traces), per the [authoritative docs matrix](https://docs.sqd.dev/en/data/all-networks) of 300+ networks (`traces`/`stateDiffs` flags + block-range notes, e.g. Optimism's Bedrock cutoff). A trace source on a chain with `traces:false` is flagged; block-range notes are surfaced for you to check against your `startBlock`.
 2. **Parity** — fetches the same `eth_getLogs` from Portal and from the client's RPC and confirms they're byte-identical.
 
 Output is a per-source `READY` / `NEEDS_*` verdict. For the common case (event + factory indexers like Uniswap/Euler) it's `READY NOW`. This report is the onboarding artifact and the trust gate — a client sees parity proven on *their* indexer before touching anything.
@@ -72,7 +72,7 @@ The `HistoricalSync` seam (`syncBlockRangeData`/`syncBlockData`) is **identical 
 | receipts (`includeTransactionReceipts`) | ✅ |
 | traces (`includeCallTraces`) / transfers | ✅ |
 | block-interval sources (`blocks: { … interval }`) | ✅ |
-| account transaction (from/to) sources | ⬜ (next; transfers work via traces) |
+| account transaction (from/to) sources (`accounts: { … }`) | ✅ |
 | state diffs | n/a — Portal has them, but Ponder has no state-diff source (available via the standalone engine only) |
 
 The compatibility report tells you which bucket each of a client's sources falls in, so you never enable a boost that would miss data.

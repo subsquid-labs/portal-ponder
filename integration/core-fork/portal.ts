@@ -18,6 +18,7 @@ import {
   isBlockFilterMatched,
   isLogFactoryMatched,
   isTraceFilterMatched,
+  isTransactionFilterMatched,
   isTransferFilterMatched,
 } from "@/runtime/filter.js";
 import type { Interval } from "@/utils/interval.js";
@@ -58,6 +59,8 @@ type ChunkData = {
   traceBlocks: Map<number, { header: RawHeader; traces: any[]; txs: any[] }>;
   // for block-interval sources: headers of blocks matching a BlockFilter (interval/offset)
   blockHeaders: Map<number, RawHeader>;
+  // for account transaction sources: blocks + their from/to-matched txs, by block number
+  txBlocks: Map<number, { header: RawHeader; txs: any[] }>;
 };
 
 const PORTAL_MAX_ADDRESSES = 1000;
@@ -174,6 +177,12 @@ export const createPortalHistoricalSync = (
     return out;
   }
 
+  // FILTER/PROJECTION STRATEGY (max Portal leverage): every row filter is pushed to
+  // Portal's native server-side filters — logs by address+topics (logRequestsFor),
+  // traces by callTo/callFrom/callSighash (tracePortalRequests), account txs by from/to
+  // (txPortalRequests). Field projection below requests exactly the columns the sync
+  // store persists and no more. The only client-side row filter is block-interval
+  // (Portal has no modulo filter), and receipt fields are added only on demand.
   const REQUIRED_BLOCK_FIELDS = ["number", "hash", "parentHash", "timestamp", "logsBloom", "miner", "gasUsed", "gasLimit", "stateRoot", "receiptsRoot", "transactionsRoot", "size", "difficulty", "extraData"];
   const NULLABLE_BLOCK_FIELDS = ["baseFeePerGas", "nonce", "mixHash", "sha3Uncles", "totalDifficulty"];
   const LOG_FIELDS = { address: true, topics: true, data: true, transactionHash: true, transactionIndex: true, logIndex: true };
@@ -196,6 +205,8 @@ export const createPortalHistoricalSync = (
   let transferFilters: any[] = [];
   let needBlocks = false;
   let blockFilters: any[] = [];
+  let needTxFilter = false;
+  let transactionFilters: any[] = [];
   const blockFieldsFor = (filters: Filter[]): Record<string, boolean> => {
     const inc = new Set<string>();
     for (const f of filters) for (const i of f.include ?? []) if (i.startsWith("block.")) inc.add(i.slice(6));
@@ -248,7 +259,7 @@ export const createPortalHistoricalSync = (
       stats.dataChunks++;
       const from = idx * chunkBlocks, to = from + chunkBlocks - 1;
       const logRequests = filters.flatMap((f) => logRequestsFor(f)).map((r) => ({ ...r, transaction: true }));
-      const data: ChunkData = { headers: new Map(), logs: new Map(), txs: new Map(), traceBlocks: new Map(), blockHeaders: new Map() };
+      const data: ChunkData = { headers: new Map(), logs: new Map(), txs: new Map(), traceBlocks: new Map(), blockHeaders: new Map(), txBlocks: new Map() };
       if (logRequests.length > 0) {
         const q = { type: "evm", fields: { block: blockFieldsFor(filters), log: LOG_FIELDS, transaction: needReceipts ? { ...TX_FIELDS, ...RECEIPT_FIELDS } : TX_FIELDS }, logs: logRequests };
         for await (const blocks of stream(q, from, to)) {
@@ -278,6 +289,20 @@ export const createPortalHistoricalSync = (
           for (const b of blocks) {
             const bn = b.header.number;
             if (blockFilters.some((f) => isBlockFilterMatched({ filter: f, block: { number: BigInt(bn) } }))) data.blockHeaders.set(bn, b.header);
+          }
+        }
+      }
+      // account transaction sources: Portal transactions[] from/to filter pushed server-side
+      if (needTxFilter) {
+        const txReqs = txPortalRequests();
+        if (txReqs.length) {
+          const tq = { type: "evm", fields: { block: blockFieldsFor(transactionFilters), transaction: needReceipts ? { ...TX_FIELDS, ...RECEIPT_FIELDS } : TX_FIELDS }, transactions: txReqs };
+          for await (const blocks of stream(tq, from, to)) {
+            for (const b of blocks) if (b.transactions?.length) {
+              const ex = data.txBlocks.get(b.header.number);
+              if (ex) ex.txs.push(...b.transactions);
+              else data.txBlocks.set(b.header.number, { header: b.header, txs: b.transactions });
+            }
           }
         }
       }
@@ -334,6 +359,22 @@ export const createPortalHistoricalSync = (
     }
     return reqs.length ? reqs : [{ transaction: true }];
   };
+  // push account TransactionFilters (from/to) to Portal's transactions[] (server-side row filter)
+  const txPortalRequests = (): any[] => {
+    const reqs: any[] = [];
+    const addrsOf = (a: any): string[] | undefined => {
+      if (a === undefined) return undefined;
+      if (isAddressFactory(a)) return Array.from(args.childAddresses.get(a.id)?.keys() ?? []);
+      return (Array.isArray(a) ? a : [a]).map((x: string) => x.toLowerCase());
+    };
+    for (const f of transactionFilters) {
+      const req: any = {};
+      const from = addrsOf(f.fromAddress); if (from?.length) req.from = from;
+      const to = addrsOf(f.toAddress); if (to?.length) req.to = to;
+      if (req.from || req.to) reqs.push(req); // skip match-all (never fetch every tx)
+    }
+    return reqs;
+  };
 
   return {
     async syncBlockRangeData({ interval, requiredIntervals, requiredFactoryIntervals, syncStore }) {
@@ -345,6 +386,10 @@ export const createPortalHistoricalSync = (
       if (!needBlocks && requiredIntervals.some((r) => r.filter.type === "block")) {
         blockFilters = requiredIntervals.filter((r) => r.filter.type === "block").map((r) => r.filter);
         needBlocks = blockFilters.length > 0;
+      }
+      if (!needTxFilter && requiredIntervals.some((r) => r.filter.type === "transaction")) {
+        transactionFilters = requiredIntervals.filter((r) => r.filter.type === "transaction").map((r) => r.filter);
+        needTxFilter = transactionFilters.length > 0;
       }
       // detect trace sources + cap the chunk grid BEFORE any idxOf() (memory safety)
       if (!needTraces && requiredIntervals.some((r) => r.filter.type === "trace" || r.filter.type === "transfer")) {
@@ -393,6 +438,19 @@ export const createPortalHistoricalSync = (
       // block-interval sources: ensure each matched block is in the blocks table
       if (needBlocks) for (const cd of data) for (const [bn, hdr] of cd.blockHeaders) {
         if (bn >= interval[0] && bn <= interval[1] && !blocksByNumber.has(bn)) blocksByNumber.set(bn, toSyncBlockHeader(hdr));
+      }
+      // account transaction sources: re-match Portal's from/to-filtered txs (+ factory + range), insert tx/receipt/block
+      if (needTxFilter) for (const cd of data) for (const [bn, tb] of cd.txBlocks) {
+        if (bn < interval[0] || bn > interval[1]) continue;
+        for (const raw of tb.txs) {
+          if (seenTx.has(raw.hash)) continue;
+          const tx = toSyncTransaction(raw, tb.header);
+          if (!transactionFilters.some((f) => isTransactionFilterMatched({ filter: f, transaction: tx }) && factoryAddrOk(f.fromAddress, tx.from, bn) && factoryAddrOk(f.toAddress, (tx.to ?? undefined) as any, bn))) continue;
+          seenTx.add(raw.hash);
+          blocksByNumber.set(bn, toSyncBlockHeader(tb.header));
+          syncTxs.push(tx);
+          if (needReceipts) syncReceipts.push(toSyncReceipt(raw, tb.header));
+        }
       }
       for (const i of dataCache.keys()) if ((i + 1) * chunkBlocks <= interval[0]) dataCache.delete(i); // evict behind
 

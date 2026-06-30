@@ -1,5 +1,15 @@
 import { ponder } from "ponder:registry";
-import { blockTick, routerCall, swap } from "ponder:schema";
+import { accountTx, blockTick, routerCall, swap } from "ponder:schema";
+
+// ACCOUNT (TransactionFilter): txs to/from WETH — from/to pushed to Portal's transactions[] filter
+const onAccountTx = (dir: "from" | "to") => async ({ event, context }: any) => {
+  await context.db
+    .insert(accountTx)
+    .values({ hash: event.transaction.hash, dir, from: event.transaction.from, to: event.transaction.to ?? null, blockNumber: event.block.number })
+    .onConflictDoNothing();
+};
+ponder.on("Weth:transaction:from", onAccountTx("from"));
+ponder.on("Weth:transaction:to", onAccountTx("to"));
 
 // BLOCK-INTERVAL: fires on every 1000th block (only possible if block headers are synced)
 ponder.on("Every1000:block", async ({ event, context }) => {

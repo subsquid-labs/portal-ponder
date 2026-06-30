@@ -17,7 +17,7 @@ export const SUPPORT = {
   receipts: "yes",
   traces: "yes",
   blockInterval: "yes",
-  accountTx: "todo",
+  accountTx: "yes",
 } as const;
 
 export type Need = keyof typeof SUPPORT;

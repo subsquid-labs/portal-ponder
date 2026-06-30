@@ -23,3 +23,12 @@ export const blockTick = onchainTable("block_tick", (t) => ({
   number: t.bigint().primaryKey(),
   timestamp: t.bigint().notNull(),
 }));
+
+// account-transaction rows → proves TransactionFilter (from/to) sources are synced
+export const accountTx = onchainTable("account_tx", (t) => ({
+  hash: t.hex().primaryKey(),
+  dir: t.text().notNull(),
+  from: t.hex().notNull(),
+  to: t.hex(),
+  blockNumber: t.bigint().notNull(),
+}));
