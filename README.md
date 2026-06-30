@@ -88,6 +88,37 @@ Tunables: `PORTAL_CHUNK_BLOCKS`, `PORTAL_READAHEAD`, `PORTAL_TRACE_CHUNK_BLOCKS`
 
 ---
 
+## Metrics & observability
+
+The Portal backfill emits its own metrics alongside Ponder's normal logging/UI (the indexing side — progress, the dev UI, Ponder's `/metrics` — is unchanged).
+
+**Per-chain backfill metrics file.** Set `PORTAL_METRICS_FILE=<path>` and the sync writes `<path>.<chainId>` (JSON, refreshed each interval) — read it live or after the run:
+
+```bash
+PORTAL_METRICS_FILE=/tmp/portal-metrics ponder start
+cat /tmp/portal-metrics.1 | jq      # chainId 1
+```
+```jsonc
+{
+  "chain": "mainnet", "chainId": 1,
+  "wallMs": 285000,                  // backfill wall-clock so far
+  "chunkBlocks": 25000,              // effective chunk width (after density-scaling / dense-cap)
+  "portalFinalizedHead": 25429590,
+  "fetch":    { "dataChunks": 9, "discChunks": 2, "http": 12, "bytes": 1102500000,
+                "errors": 0, "retries": 0, "cacheHits": 31, "maxInflight": 6 },
+  "inserted": { "logs": 179245, "blocks": 50000, "txs": 48210, "receipts": 0, "traces": 6064 },
+  "rpcFallbackIntervals": 0          // intervals delegated to RPC past Portal's finalized head
+}
+```
+
+Read it as: **stability** = `fetch.errors` / `fetch.retries` / `rpcFallbackIntervals` (all 0 in a healthy run); **efficiency** = `fetch.http` + `fetch.bytes` vs `inserted.*` (bytes-per-event); **what the chunker chose** = `chunkBlocks` + `dataChunks` + `cacheHits`.
+
+**Per-interval debug logs.** `PONDER_LOG_LEVEL=debug` logs a `service=portal` line per interval (chunk counts, http, inflight, errors) plus the chunk-cap / finality-fallback decisions.
+
+**The bench harness** (`harness/bench/`) consumes `PORTAL_METRICS_FILE` and adds wall-clock, events/sec, and peak RSS into a comparable table — see [`harness/bench/BENCHMARKS.md`](harness/bench/BENCHMARKS.md).
+
+---
+
 ## Examples
 
 Each is a real indexer that runs end-to-end on `@subsquid/ponder` (backfill from Portal, realtime + `readContract` on `rpc`):
