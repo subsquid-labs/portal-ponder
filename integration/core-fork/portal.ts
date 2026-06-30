@@ -22,7 +22,7 @@ import {
 import type { Interval } from "@/utils/interval.js";
 import { type Address, type Hex } from "viem";
 import type { HistoricalSync } from "./index.js";
-import { type RawHeader, hx, toSyncLog, toSyncBlockHeader, toSyncTransaction, toSyncReceipt, parityToCallFrame, cmpTraceAddr } from "./portal-transform.js";
+import { type RawHeader, hx, toSyncLog, toSyncBlockHeader, toSyncTransaction, toSyncReceipt, parityToCallFrame, cmpTraceAddr, traceSafeChunkBlocks } from "./portal-transform.js";
 
 /**
  * Portal-backed historical sync with a PARALLEL read-ahead chunk buffer.
@@ -324,17 +324,25 @@ export const createPortalHistoricalSync = (
       await ensureChunkSize(); // scale chunk to chain block-density before any idxOf()
       const filters = requiredIntervals.map((r) => r.filter).filter((f) => f.type === "log") as LogFilter[];
       const factories = [...new Map(requiredFactoryIntervals.map((r) => [r.factory.id, r.factory])).values()];
-      // pin the discovery floor at the factory's real start (NOT block 0)
-      if (discStartIdx === undefined && factories.length > 0) {
-        const starts = requiredFactoryIntervals.map((r) => r.interval[0]).concat(interval[0]);
-        discStartIdx = idxOf(Math.min(...starts));
-      }
 
       needReceipts ||= requiredIntervals.some((r) => (r.filter as any).hasTransactionReceipt === true);
-      if (!needTraces && (requiredIntervals.some((r) => r.filter.type === "trace" || r.filter.type === "transfer"))) {
+      // detect trace sources + cap the chunk grid BEFORE any idxOf() (memory safety)
+      if (!needTraces && requiredIntervals.some((r) => r.filter.type === "trace" || r.filter.type === "transfer")) {
         traceFilters = requiredIntervals.filter((r) => r.filter.type === "trace").map((r) => r.filter);
         transferFilters = requiredIntervals.filter((r) => r.filter.type === "transfer").map((r) => r.filter);
         needTraces = traceFilters.length + transferFilters.length > 0;
+        const capped = traceSafeChunkBlocks(chunkBlocks, needTraces);
+        if (capped !== chunkBlocks) {
+          // grid shrank: drop caches/discovery keyed by the old (wider) grid, then re-pin below
+          chunkBlocks = capped; dataCache.clear(); discCache.clear(); discStartIdx = undefined;
+          log.debug({ service: "portal", msg: `Portal ${args.chain.name}: trace sources → chunkBlocks capped to ${chunkBlocks} (grid reset)` });
+        }
+      }
+
+      // pin the discovery floor at the factory's real start (NOT block 0) — after any chunk cap
+      if (discStartIdx === undefined && factories.length > 0) {
+        const starts = requiredFactoryIntervals.map((r) => r.interval[0]).concat(interval[0]);
+        discStartIdx = idxOf(Math.min(...starts));
       }
 
       const startIdx = idxOf(interval[0]), endIdx = idxOf(interval[1]);

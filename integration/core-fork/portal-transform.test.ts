@@ -2,7 +2,7 @@ import { readFileSync } from "node:fs";
 import { join } from "node:path";
 import { hexToBigInt } from "viem";
 import { expect, test } from "vitest";
-import { cmpTraceAddr, parityToCallFrame, toStateDiff, toSyncReceipt } from "./portal-transform.js";
+import { cmpTraceAddr, parityToCallFrame, toStateDiff, toSyncReceipt, traceSafeChunkBlocks } from "./portal-transform.js";
 
 /**
  * Unit tests over REAL Portal NDJSON captured at eth block 21,000,000 (+ base).
@@ -88,6 +88,12 @@ test("trace: suicide → SELFDESTRUCT", () => {
 
 test("trace: traceAddress sorts in DFS pre-order", () => {
   expect([[1], [], [0, 0], [0]].sort(cmpTraceAddr)).toEqual([[], [0], [0, 0], [1]]);
+});
+
+test("traceSafeChunkBlocks: caps only when traces needed and base exceeds cap", () => {
+  expect(traceSafeChunkBlocks(500_000, false, 25_000)).toBe(500_000); // no traces → unchanged
+  expect(traceSafeChunkBlocks(500_000, true, 25_000)).toBe(25_000); // traces → capped
+  expect(traceSafeChunkBlocks(10_000, true, 25_000)).toBe(10_000); // already small → unchanged
 });
 
 test("stateDiff: kind/key preserved; prev:null ⟺ '+'; hex prev/next", () => {
