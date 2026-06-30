@@ -34,7 +34,10 @@ export const isFinalityGap = (intervalEnd: number, portalHead: number | undefine
 
 /** number|decimal-string|hex → 0x-hex; passes existing hex through. */
 export const hx = (v: unknown): Hex => {
-  if (typeof v === "string") return (v.startsWith("0x") ? v : toHex(BigInt(v))) as Hex;
+  if (typeof v === "string") {
+    if (v === "0x" || v === "") return "0x0"; // empty quantity → 0 (never the invalid "0x")
+    return (v.startsWith("0x") ? v : toHex(BigInt(v))) as Hex;
+  }
   if (typeof v === "number" || typeof v === "bigint") return numberToHex(v);
   return "0x0";
 };

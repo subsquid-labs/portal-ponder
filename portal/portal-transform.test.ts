@@ -2,7 +2,19 @@ import { readFileSync } from "node:fs";
 import { join } from "node:path";
 import { hexToBigInt } from "viem";
 import { expect, test } from "vitest";
-import { cmpTraceAddr, isFinalityGap, parityToCallFrame, toStateDiff, toSyncReceipt, toSyncTransaction, traceSafeChunkBlocks } from "./portal-transform.js";
+import { cmpTraceAddr, hx, isFinalityGap, parityToCallFrame, toStateDiff, toSyncReceipt, toSyncTransaction, traceSafeChunkBlocks } from "./portal-transform.js";
+
+// C7: hx("0x") used to return the invalid quantity "0x" (throws downstream in BigInt); empty
+// strings must normalize to "0x0". Decimal numbers/strings and existing hex pass through.
+test("hx: empty quantity → 0x0 (never invalid 0x); decimal/hex normalize", () => {
+  expect(hx("0x")).toBe("0x0");
+  expect(hx("")).toBe("0x0");
+  expect(hx("0x1a")).toBe("0x1a");
+  expect(hx(26)).toBe("0x1a");
+  expect(hx("26")).toBe("0x1a"); // decimal string
+  expect(hx(0)).toBe("0x0");
+  expect(hx(0n)).toBe("0x0");
+});
 
 /**
  * Unit tests over REAL Portal NDJSON captured at eth block 21,000,000 (+ base).
