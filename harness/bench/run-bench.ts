@@ -65,6 +65,13 @@ export async function runBench(spec: BenchSpec): Promise<BenchResult> {
     PONDER_LOG_LEVEL: "info", CI: "true",
     PORTAL_METRICS_FILE: metricsBase,
     NODE_OPTIONS: `--max-old-space-size=${spec.maxOldSpaceMB ?? 4096}`,
+    // size the chunk to the bench range so we measure the PURE backfill of that range,
+    // not chunk over-fetch (the big chunk amortizes only over a full multi-interval backfill).
+    // dense sources (traces/blocks) still auto-cap below this.
+    PORTAL_CHUNK_FIXED: "1", PORTAL_CHUNK_BLOCKS: String(Math.max(1000, spec.end - spec.start)),
+    // read-ahead prefetches chunks BEYOND the bounded endBlock (pure waste in a bounded bench;
+    // amortizes only in an open-ended backfill) — keep it shallow here.
+    PORTAL_READAHEAD: "1",
     ...(spec.env ?? {}),
   };
   const bin = join(spec.dir, "node_modules/.bin/ponder");
@@ -82,7 +89,7 @@ export async function runBench(spec: BenchSpec): Promise<BenchResult> {
   proc.stdout.on("data", onData); proc.stderr.on("data", onData);
   proc.on("error", (e) => (failed ||= String(e)));
 
-  const timeoutMs = (spec.timeoutMin ?? 30) * 60_000;
+  const timeoutMs = (spec.timeoutMin ?? 10) * 60_000;
   while (!done && !failed && Date.now() - t0 < timeoutMs && proc.exitCode === null) {
     if (proc.pid) peakRssMB = Math.max(peakRssMB, await rssTreeMB(proc.pid).catch(() => 0));
     await sleep(1000);

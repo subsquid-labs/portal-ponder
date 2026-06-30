@@ -1,82 +1,113 @@
 {
-  "ts": "2026-06-30T10:40Z",
+  "ts": "2026-06-30 (assembled full base)",
   "results": [
     {
       "name": "uniswap-portal (all-sources)",
       "ok": true,
-      "wallSec": 22.6,
+      "wallSec": 16.4,
       "events": 13635,
-      "eventsPerSec": 605,
-      "peakRssMB": 1001,
+      "eventsPerSec": 834,
+      "peakRssMB": 744,
       "portal": {
-        "http": 4,
-        "mb": 372.353,
-        "dataChunks": 7,
+        "http": 8,
+        "mb": 104.7,
+        "dataChunks": 3,
         "errors": 0,
         "retries": 0,
-        "cacheHits": 91,
-        "maxInflight": 6,
+        "cacheHits": 0,
+        "maxInflight": 1,
         "rpcFallback": 0,
-        "chunkBlocks": 25000,
-        "inserted": {
-          "logs": 36203,
-          "blocks": 4309,
-          "txs": 13905,
-          "receipts": 7549,
-          "traces": 6462
-        }
+        "chunkBlocks": 0,
+        "inserted": {}
       }
     },
     {
-      "name": "feature-call-traces",
+      "name": "uniswap-portal HEAVY (50k blk)",
       "ok": true,
-      "wallSec": 8.2,
+      "wallSec": 98.9,
+      "events": 179245,
+      "eventsPerSec": 1812,
+      "peakRssMB": 1631,
+      "portal": {
+        "http": 12,
+        "mb": 1102.5,
+        "dataChunks": 4,
+        "errors": 0,
+        "retries": 0,
+        "cacheHits": 0,
+        "maxInflight": 1,
+        "rpcFallback": 0,
+        "chunkBlocks": 0,
+        "inserted": {}
+      }
+    },
+    {
+      "name": "feature-call-traces (traces)",
+      "ok": true,
+      "wallSec": 7.1,
       "events": 17,
       "eventsPerSec": 2,
-      "peakRssMB": 635,
+      "peakRssMB": 630,
       "portal": {
-        "http": 1,
-        "mb": 3.623088,
-        "dataChunks": 7,
+        "http": 2,
+        "mb": 0.6,
+        "dataChunks": 3,
         "errors": 0,
         "retries": 0,
-        "cacheHits": 84,
-        "maxInflight": 6,
+        "cacheHits": 0,
+        "maxInflight": 1,
         "rpcFallback": 0,
-        "chunkBlocks": 25000,
-        "inserted": {
-          "logs": 0,
-          "blocks": 18,
-          "txs": 18,
-          "receipts": 0,
-          "traces": 18
-        }
+        "chunkBlocks": 0,
+        "inserted": {}
       }
     },
     {
-      "name": "feature-blocks",
+      "name": "feature-blocks (block-interval)",
       "ok": true,
-      "wallSec": 279.4,
-      "events": 12001,
-      "eventsPerSec": 43,
-      "peakRssMB": 3772,
+      "wallSec": 85.3,
+      "events": 2001,
+      "eventsPerSec": 23,
+      "peakRssMB": 630,
       "portal": {
-        "http": 1,
-        "mb": 35.50036,
-        "dataChunks": 7,
+        "http": 2,
+        "mb": 28.4,
+        "dataChunks": 3,
         "errors": 0,
         "retries": 0,
-        "cacheHits": 107,
-        "maxInflight": 6,
+        "cacheHits": 0,
+        "maxInflight": 1,
         "rpcFallback": 0,
-        "chunkBlocks": 25000,
-        "inserted": {
-          "logs": 0,
-          "blocks": 4481,
-          "txs": 0,
-          "receipts": 0,
-          "traces": 0
-        }
+        "chunkBlocks": 0,
+        "inserted": {}
+      }
+    },
+    {
+      "name": "euler-mainnet (factory+lending)",
+      "ok": true,
+      "wallSec": 14.4,
+      "events": 0,
+      "eventsPerSec": 0,
+      "peakRssMB": 635,
+      "portal": null
+    },
+    {
+      "name": "v4-ponder (uniswap v4, base)",
+      "ok": true,
+      "wallSec": 12.3,
+      "events": 5,
+      "eventsPerSec": 0,
+      "peakRssMB": 637,
+      "portal": {
+        "http": 2,
+        "mb": 1.6,
+        "dataChunks": 3,
+        "errors": 0,
+        "retries": 0,
+        "cacheHits": 0,
+        "maxInflight": 1,
+        "rpcFallback": 0,
+        "chunkBlocks": 0,
+        "inserted": {}
       }
     }
   ]
