@@ -26,8 +26,8 @@ This report is the onboarding artifact: a client sees parity proven on *their* i
 ## Step 1 — Switch the dependency, add one line per chain
 
 ```jsonc
-// package.json — pin the fork to the ponder version you're on (versions mirror exactly)
-"dependencies": { "@subsquid/ponder": "0.16.6" }   // == ponder@0.16.6 + the Portal layer
+// package.json — pin the fork; <ponder-version>-sqd.<rev> == ponder@<version> + the Portal layer
+"dependencies": { "@subsquid/ponder": "0.16.6-sqd.1" }   // == ponder@0.16.6 + the Portal layer
 ```
 
 ```ts

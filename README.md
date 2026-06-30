@@ -3,8 +3,10 @@
 A **drop-in fork of [Ponder](https://github.com/ponder-sh/ponder)** whose historical backfill streams from **[SQD Portal](https://docs.sqd.dev)** — a columnar, range-scan data lake — instead of JSON-RPC. Backfills run **~8× faster** (and finish on chains where RPC backfill is impractical); realtime/frontfill stays on your RPC. The switch is **one config line per chain**, and **your handlers and schema are unchanged**.
 
 ```bash
-npm install @subsquid/ponder@0.16.6   # == ponder@0.16.6 + the Portal layer (versions mirror ponder)
+npm install @subsquid/ponder          # latest; or pin a build: @subsquid/ponder@0.16.6-sqd.1
 ```
+
+> Versions are `<ponder-version>-sqd.<rev>` — e.g. `0.16.6-sqd.1` **is** `ponder@0.16.6` + the Portal layer (fork revision 1). The ponder version stays visible; pin it for reproducibility.
 
 ```ts
 // ponder.config.ts — import from the fork, add `portal:` per chain. Nothing else changes.
@@ -131,7 +133,7 @@ Each is a real indexer that runs end-to-end on `@subsquid/ponder` (backfill from
 
 ## Versioning & releases
 
-`@subsquid/ponder@X.Y.Z` **is** `ponder@X.Y.Z` + the Portal layer — the version is the match. The fork is *generated*, not hand-maintained: this repo holds only the Portal layer (`portal/`) + a per-version `wiring/<ver>.patch`; [`scripts/sync-upstream.sh`](scripts/sync-upstream.sh) clones `ponder@<ver>`, applies it, and builds. [`versions.json`](versions.json) is the supported-version matrix, and CI proves the seam against each. Releases publish via GitHub Actions + npm Trusted Publishing (OIDC, no token). Details: [`PUBLISHING.md`](PUBLISHING.md).
+`@subsquid/ponder@X.Y.Z-sqd.<rev>` **is** `ponder@X.Y.Z` + the Portal layer — the ponder version is visible in the number, and `-sqd.<rev>` lets the fork re-cut a fix on the same ponder version (npm retires unpublished version numbers, so a plain mirror can't be re-cut). Each is published with `--tag latest`, so `npm i @subsquid/ponder` resolves it. The fork is *generated*, not hand-maintained: this repo holds only the Portal layer (`portal/`) + a per-version `wiring/<ver>.patch`; [`scripts/sync-upstream.sh`](scripts/sync-upstream.sh) clones `ponder@<ver>`, applies it, and builds. [`versions.json`](versions.json) is the supported-version matrix, and CI proves the seam against each. Releases publish via GitHub Actions + npm Trusted Publishing (OIDC, no token). Details: [`PUBLISHING.md`](PUBLISHING.md).
 
 ---
 

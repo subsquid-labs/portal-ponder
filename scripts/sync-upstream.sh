@@ -29,8 +29,12 @@ mkdir -p "$SYNC/__fixtures__"; cp "$ROOT/portal/__fixtures__/"*.json "$SYNC/__fi
 cp "$ROOT/portal/vite.portal.config.ts" "$CORE/"
 ( cd "$WORK" && git apply --verbose "$WIRING" )
 
-echo "▶ renaming package → @subsquid/ponder (bin stays 'ponder' so it's drop-in)"
-node -e "const f='$CORE/package.json',p=require(f);p.name='@subsquid/ponder';require('fs').writeFileSync(f,JSON.stringify(p,null,2)+'\n')"
+# version = <ponder-version>-sqd.<rev> so the fork can re-cut within a ponder version (npm
+# permanently retires an unpublished version number, so exact-mirror can't absorb a fix).
+# The ponder version stays visible; SYNC_REV bumps the fork revision (default 1).
+REV="${SYNC_REV:-1}"
+echo "▶ renaming → @subsquid/ponder@$VER-sqd.$REV (bin stays 'ponder' so it's drop-in)"
+node -e "const f='$CORE/package.json',p=require(f);p.name='@subsquid/ponder';p.version='$VER-sqd.$REV';require('fs').writeFileSync(f,JSON.stringify(p,null,2)+'\n')"
 
 echo "▶ building"
 ( cd "$WORK" && $PNPM install --silent && $PNPM --filter @ponder/utils build && $PNPM --filter @subsquid/ponder build )
@@ -51,4 +55,5 @@ if [ "${2:-}" = "--test" ]; then
   ( cd "$CORE" && pnpm exec vitest run --config vite.portal.config.ts )
 fi
 
-echo "✓ built @subsquid/ponder@$VER → $CORE  (publish: cd $CORE && npm publish --access public)"
+echo "✓ built @subsquid/ponder@$VER-sqd.$REV → $CORE"
+echo "  publish: cd $CORE && npm publish --access public --tag latest   # --tag latest: make this prerelease the default install"

@@ -7,8 +7,12 @@ on:
   workflow_dispatch:
     inputs:
       version:
-        description: "ponder version to publish as @subsquid/ponder@<version> (e.g. 0.16.6). Must have portal/wiring/<version>.patch + a versions.json row."
+        description: "ponder version (e.g. 0.16.6). Must have portal/wiring/<version>.patch + a versions.json row."
         required: true
+      rev:
+        description: "fork revision N → publishes @subsquid/ponder@<version>-sqd.<N> (bump for a fork-side fix on the same ponder version)."
+        required: true
+        default: "1"
   push:
     tags: ["v*.*.*"]
 
@@ -49,8 +53,10 @@ jobs:
         run: bash scripts/sync-upstream.sh "${{ steps.v.outputs.version }}" --test
         env:
           SYNC_WORKDIR: ${{ runner.temp }}/fork
+          SYNC_REV: ${{ github.event.inputs.rev || '1' }}
 
       - name: Publish to npm (Trusted Publishing via OIDC — no token)
         working-directory: ${{ runner.temp }}/fork/${{ steps.v.outputs.version }}/packages/core
+        # --tag latest so this <version>-sqd.<rev> prerelease is the default `npm install`.
         # When this repo is PUBLIC, append `--provenance` for a signed provenance attestation.
-        run: npm publish --access public
+        run: npm publish --access public --tag latest

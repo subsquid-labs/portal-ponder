@@ -1,16 +1,17 @@
 {
   "fork": "@subsquid/ponder",
   "upstream": "ponder",
-  "policy": "The fork version mirrors the upstream ponder version EXACTLY: @subsquid/ponder@X.Y.Z is built from ponder@X.Y.Z + the Portal layer (portal/). The bin stays `ponder`, so it's a drop-in. We publish a fork release only for ponder versions a client actually needs; `compat.tested` records which versions the seam is proven against (past + future awareness).",
+  "policy": "Version = `<ponder-version>-sqd.<rev>`: @subsquid/ponder@X.Y.Z-sqd.N is built from ponder@X.Y.Z + the Portal layer (rev N). The ponder version stays visible; bump `-sqd.<rev>` for a fork-side fix on the SAME ponder version (npm permanently retires an unpublished version number, so a plain mirror like 0.16.6 can't be re-cut after a bad publish). Published with `--tag latest` so the prerelease-form version is the default `npm install`. The bin stays `ponder` (drop-in). We cut a release only for ponder versions a client needs; `compat.tested` records which versions the seam is proven against.",
   "layer": "portal/",
   "seam": "HistoricalSync.syncBlockRangeData / syncBlockData (interval-scoped) — identical in shape across the tested range",
   "versions": [
     {
       "ponder": "0.16.6",
       "wiring": "wiring/0.16.6.patch",
-      "status": "published",
-      "published": true,
-      "note": "current latest; seed publish 2026-06-30 (@subsquid/ponder@0.16.6, by subsquid-admin)"
+      "rev": 1,
+      "status": "verified",
+      "published": false,
+      "note": "bare 0.16.6 seed-publish (2026-06-30) is BROKEN (workspace: deps) — unpublish it; ship 0.16.6-sqd.1 once the byte-identity + correctness fixes land"
     },
     {
       "ponder": "0.15.17",
