@@ -1,4 +1,4 @@
-import { onchainTable } from "ponder";
+import { onchainTable } from "@subsquid/ponder";
 
 export const vault = onchainTable("vault", (t) => ({
   id: t.text().primaryKey(), // `${chain}:${address}`

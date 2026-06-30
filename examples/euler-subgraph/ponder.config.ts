@@ -1,5 +1,5 @@
 import { parseAbiItem } from "abitype";
-import { createConfig, factory } from "ponder";
+import { createConfig, factory } from "@subsquid/ponder";
 import { EVaultAbi } from "./abis/EVault";
 
 // Euler V2 subgraph → Ponder. The subgraph's GenericFactory template (ProxyCreated → EVault)

@@ -1,5 +1,5 @@
 import { parseAbiItem } from "abitype";
-import { createConfig, factory } from "ponder";
+import { createConfig, factory } from "@subsquid/ponder";
 
 const proxyCreated = parseAbiItem(
   "event ProxyCreated(address indexed proxy, bool upgradeable, address implementation, bytes trailingData)",

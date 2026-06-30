@@ -1,5 +1,5 @@
 import { parseAbiItem } from "abitype";
-import { createConfig } from "ponder";
+import { createConfig } from "@subsquid/ponder";
 
 // Uniswap V3 USDC/WETH 0.05% pool — guaranteed dense Swap volume (exercises RECEIPTS).
 const v3PoolAbi = [

@@ -35,6 +35,17 @@ node -e "const f='$CORE/package.json',p=require(f);p.name='@subsquid/ponder';req
 echo "▶ building"
 ( cd "$WORK" && $PNPM install --silent && $PNPM --filter @ponder/utils build && $PNPM --filter @subsquid/ponder build )
 
+# Rewrite `workspace:*` deps to real published versions. `npm publish` (unlike `pnpm publish`)
+# does NOT do this, so without it the package is uninstallable standalone — e.g.
+# @ponder/utils: workspace:* → @ponder/utils@0.2.18.
+echo "▶ resolving workspace: deps → real versions"
+node -e "
+const fs=require('fs'); const pkgPath='$CORE/package.json'; const pkg=JSON.parse(fs.readFileSync(pkgPath));
+const ver={}; for(const d of fs.readdirSync('$WORK/packages')){ try{ const p=JSON.parse(fs.readFileSync('$WORK/packages/'+d+'/package.json')); ver[p.name]=p.version; }catch{} }
+let n=0; for(const s of ['dependencies','devDependencies','peerDependencies']){ const deps=pkg[s]||{}; for(const k of Object.keys(deps)){ if(String(deps[k]).startsWith('workspace:')){ const v=ver[k]; if(!v){console.error('no local version for workspace dep '+k);process.exit(1);} deps[k]=v; n++; console.log('  '+k+' -> '+v); } } }
+fs.writeFileSync(pkgPath, JSON.stringify(pkg,null,2)+'\n'); console.log('  rewrote '+n+' workspace dep(s)');
+"
+
 if [ "${2:-}" = "--test" ]; then
   echo "▶ running Portal-layer tests"
   ( cd "$CORE" && pnpm exec vitest run --config vite.portal.config.ts )

@@ -1,4 +1,4 @@
-import { onchainTable } from "ponder";
+import { onchainTable } from "@subsquid/ponder";
 
 // swap rows carry the receipt's gasUsed → proves RECEIPTS are synced
 export const swap = onchainTable("swap", (t) => ({

@@ -1,4 +1,4 @@
-import { onchainTable, relations } from "ponder";
+import { onchainTable, relations } from "@subsquid/ponder";
 
 /**
  * Ported from the official Euler V2 subgraph (euler-xyz/euler-subgraph).
