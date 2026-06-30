@@ -10,7 +10,7 @@
 set -uo pipefail
 
 ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
-APP="$ROOT/harness/diff/app"
+APP="${DIFF_APP:-$ROOT/harness/diff/app}"   # DIFF_APP=harness/diff/euler-app for the larger factory run
 START="${1:-${PONDER_START:-22200000}}"; END="${2:-${PONDER_END:-22200030}}"   # small default; the diff is per-block deterministic, so a wider range only adds coverage
 PORTAL="${PORTAL_URL_1:-https://portal.sqd.dev/datasets/ethereum-mainnet}"
 CHUNK=$(( END - START + 1 ))   # size the Portal chunk to the diff range (no over-fetch)
@@ -29,9 +29,10 @@ run () { # $1=label  $2=portal-url-or-empty  $3=db  $4=port
   export PONDER_START="$START" PONDER_END="$END" PGLITE_DIR="$3" PONDER_LOG_LEVEL=info CI=true
   if [ -n "$2" ]; then export PORTAL_URL_1="$2" PORTAL_CHUNK_FIXED=1 PORTAL_CHUNK_BLOCKS="$CHUNK" PORTAL_READAHEAD=1
   else unset PORTAL_URL_1 PORTAL_CHUNK_FIXED PORTAL_CHUNK_BLOCKS PORTAL_READAHEAD; fi
+  local t0=$SECONDS
   ./node_modules/.bin/ponder start --schema "diff_$1" --port "$4" > "/tmp/diff-$1.log" 2>&1 &
   local pid=$! done=0
-  for _ in $(seq 1 100); do
+  for _ in $(seq 1 "${MAXPOLL:-200}"); do   # 200×3s = 10min; raise MAXPOLL for very large ranges
     grep -qiE 'Completed indexing across' "/tmp/diff-$1.log" 2>/dev/null && { done=1; break; }
     grep -qiE 'error while processing|Build failed|Cannot find' "/tmp/diff-$1.log" 2>/dev/null && break
     kill -0 "$pid" 2>/dev/null || break
@@ -39,11 +40,16 @@ run () { # $1=label  $2=portal-url-or-empty  $3=db  $4=port
   done
   kill "$pid" 2>/dev/null; wait "$pid" 2>/dev/null; sleep 1
   [ "$done" = 1 ] || { echo "✗ $1 did not complete:"; tail -4 "/tmp/diff-$1.log" | sed -E 's/\x1b\[[0-9;]*m//g'; exit 1; }
+  eval "WALL_$1=$(( SECONDS - t0 ))"
+  echo "  ⏱ $1 backfill ${SECONDS}s wall — $(grep -oiE 'Completed indexing across all chains \([^)]*\)' "/tmp/diff-$1.log" | tail -1)"
 }
 
 run portal "$PORTAL" "$WORK/dbPortal" 42270
 run rpc    ""         "$WORK/dbRpc"    42271
 
+echo ""
+echo "⏱ BACKFILL WALL-CLOCK [$START,$END] — Portal ${WALL_portal}s vs RPC ${WALL_rpc}s  $(awk "BEGIN{p=${WALL_portal:-0};r=${WALL_rpc:-0};if(p>0)printf \"→ %.1fx faster\", r/p}")"
+echo ""
 echo "▶ diffing ponder_sync stores"
 cp "$ROOT/harness/diff/diff.mjs" "$WORK/diff.mjs"   # run from $WORK so @electric-sql/pglite resolves
 node "$WORK/diff.mjs" "$WORK/dbPortal" "$WORK/dbRpc"
