@@ -53,7 +53,7 @@ logs, log-factories, transactions, **receipts** (`includeTransactionReceipts`), 
 ### Not implemented / TODO
 
 - **Block-interval** and **account transaction (from/to)** sources (transfers already work via traces).
-- **Per-chain / per-range trace coverage** is *detected* by the compat report (it probes live; Arbitrum/Polygon lack ancient-block traces), but a trace source whose range predates Portal's trace coverage on that chain must stay on RPC.
+- **Per-network capability** (traces/stateDiffs + block-range caveats) is checked by the compat report against the [authoritative docs matrix](https://docs.sqd.dev/en/data/all-networks) (snapshotted in `harness/compat/networks.json`); dataset **existence is per-portal** (checked live against the target portal's `/datasets`). A trace source on a chain without traces, or a block-range caveat (e.g. Optimism pre-Bedrock), is surfaced.
 - **Memory on trace-heavy chunks**: a wide chunk over a busy traced contract buffers all its traces; trace sources need a smaller `PORTAL_CHUNK_BLOCKS` (or streaming insert).
 - **Finality-gap RPC fallback** when Portal's finalized head lags Ponder's target.
 - **Chunk sizing by data volume** (vs the block-count heuristic); **CU-budget-aware** prefetch depth.
@@ -96,7 +96,7 @@ Reproduce: `integration/euler-portal-app/` is the demo indexer; `harness/` has t
 
 **Tests — honest state:**
 - **Transform unit tests** (`integration/core-fork/portal-transform.test.ts`, 10 tests) run over **real Portal NDJSON captured at eth block 21M** (in `__fixtures__/`) and pin every flagged type mismatch: decimal `status`/`type` → hex, gas/value stay hex, trace `callType` read from `action.callType` (→ DELEGATECALL), staticcall `value:null`, CREATE `init`/`code`, suicide → SELFDESTRUCT, stateDiff `prev:null` ⟺ `+`, DFS trace ordering.
-- **Analyzer tests** (`harness/compat/analyze.test.ts`, 6 tests) incl. the per-chain/per-range gate (a trace source whose `startBlock` is below a chain's trace cutoff is flagged — the Arbitrum/Polygon ancient-blocks case).
+- **Analyzer tests** (`harness/compat/analyze.test.ts`, 6 tests): docs-capability gate (a chain with `traces:false` flags trace sources; Arbitrum's traces are READY because the docs say so), per-portal existence (a portal that doesn't serve the dataset → `NO_DATASET`), and block-range notes (Optimism Bedrock surfaced).
 - **Integration regression** (`portal.test.ts`): a fixture Portal block → asserts `event.transaction` is populated (runs against a local HTTP server, no chain; isolate via `vite.portal.config.ts`, no Foundry `globalSetup`).
 - **End-to-end**: `integration/uniswap-portal-app/` backfills from Portal and proves receipts (V3 pool swaps carry `receiptGasUsed`/`status`) + traces (V2 Router calls reconstructed from call-traces); plus the differential harness + multi-chain Euler runs.
 - **Still wanted:** unit tests for the filter→Portal-query builder, chunk-index math, auto-scaling, and discovery/data ordering. Every bug fix ships with a fixture + regression (the convention).
@@ -123,8 +123,8 @@ integration/ponder-core.md         step-by-step integration guide
 packages/portal-sync/
   config.ts              withPortal() + registry — native-injection glue
   {portal-client,query,transform,metrics}.ts   standalone Portal engine
-harness/compat/          compat report — analyzer + live per-chain/per-range probe + tests
+harness/compat/          compat report — analyzer + networks.json (docs snapshot) + fetch-networks.ts + tests
 harness/                 stress test + live dashboard, multichain, differential, gates
 ```
 
-**Adoption:** start with the [compatibility report](harness/compat/report.ts) — it proves, per source, that Portal serves your indexer's data **for your chains and block-ranges** (probing trace/receipt coverage live against the [300+ network matrix](https://docs.sqd.dev/en/data/all-networks)) — then [`MIGRATION.md`](MIGRATION.md). There's a single delivery path (the native `HistoricalSync` seam); we deliberately don't ship a slow JSON-RPC transport shim (see the trade-off note above).
+**Adoption:** start with the [compatibility report](harness/compat/report.ts) — per source it checks that the **target portal** serves the chain's dataset (live `/datasets`, since different portals serve different subsets) and that the network has the needed capabilities (traces) per the [authoritative docs matrix](https://docs.sqd.dev/en/data/all-networks) — then [`MIGRATION.md`](MIGRATION.md). There's a single delivery path (the native `HistoricalSync` seam); we deliberately don't ship a slow JSON-RPC transport shim (see the trade-off note above).

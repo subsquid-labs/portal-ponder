@@ -1,77 +1,53 @@
 /**
- * Portal compatibility report for a Ponder project — per-chain & per-range aware.
+ * Portal compatibility report for a Ponder project.
  *
  *   cd <client-ponder-project>
- *   PORTAL_API_KEY=<key> node <path>/report.ts ./ponder.config.ts [--differential <rpcUrl>]
+ *   PORTAL_API_KEY=<key> PORTAL_BASE=<the portal you'll use> \
+ *     node <path>/harness/compat/report.ts ./ponder.config.ts
  *
- * Imports the resolved config, checks each source against (1) what our backfill
- * implements and (2) what Portal actually SERVES for that chain — including a live
- * probe of trace availability per block-range (Arbitrum/Polygon lack ancient traces).
+ * Per source it checks: (1) does our backfill implement the type, (2) does the TARGET
+ * portal serve that chain's dataset (live /datasets — per-portal!), (3) does the
+ * network have the data the source needs (traces) per the authoritative docs matrix.
  *
- * Env: PORTAL_BASE (default https://portal.sqd.dev/datasets), PORTAL_API_KEY.
+ * Env: PORTAL_BASE (default https://portal.sqd.dev/datasets) — set this to the portal
+ * the client will actually use, since different portals serve different datasets.
  */
 import { pathToFileURL } from "node:url";
-import { type ChainFeatures, analyzeConfig, type CompatReport } from "./analyze.ts";
+import { analyzeConfig, type CompatReport } from "./analyze.ts";
 import { ALL_NETWORKS_DOCS, fetchCatalog } from "./datasets.ts";
-import { probeChainFeatures } from "./probe.ts";
 
 const BASE = process.env.PORTAL_BASE ?? "https://portal.sqd.dev/datasets";
 const API_KEY = process.env.PORTAL_API_KEY;
 const ICON: Record<string, string> = { READY: "✅", NO_DATASET: "⛔", NEEDS_RECEIPTS: "🟡", NEEDS_TRACES: "🟡", NEEDS_BLOCK_FILTER: "🟡", NEEDS_ACCOUNT_SOURCES: "🟡" };
 
-const finalizedHead = async (dataset: string): Promise<number> => {
-  const headers: Record<string, string> = {}; if (API_KEY) headers["x-api-key"] = API_KEY;
-  const r = await fetch(`${BASE}/${dataset}/finalized-head`, { headers }).catch(() => null);
-  return r?.ok ? ((await r.json()).number ?? 0) : 0;
-};
-
-function fmtFeatures(f?: ChainFeatures): string {
-  if (!f) return "";
-  const t = f.traces ? (f.tracesFromBlock ? `from ~${f.tracesFromBlock.toLocaleString()}` : "yes") : "no";
-  return ` | traces:${t} receipts:${f.receipts ? "yes" : "no"} stateDiffs:${f.stateDiffs ? "yes" : "no"}`;
-}
-
 function print(report: CompatReport) {
   console.log(`\n=================  PORTAL COMPATIBILITY REPORT  =================`);
+  console.log(`portal:  ${BASE}`);
   console.log(`overall: ${report.overall}   (${report.ready} ready / ${report.blocked} blocked of ${report.sources.length} sources)\n`);
-  console.log(`CHAINS  (traces/receipts/stateDiffs probed live; full matrix: ${ALL_NETWORKS_DOCS})`);
+  console.log(`CHAINS   (existence = this portal's /datasets; caps = docs matrix ${ALL_NETWORKS_DOCS})`);
   for (const c of report.chains) {
-    const ds = c.dataset ? `${c.dataset}${c.realTime === false ? " (not real-time)" : ""}` : "⛔ NO PORTAL DATASET";
-    console.log(`  ${String(c.name).padEnd(12)} id=${String(c.chainId).padEnd(8)} → ${ds}${fmtFeatures(c.features)}`);
+    if (!c.dataset) { console.log(`  ${String(c.name).padEnd(12)} id=${String(c.chainId).padEnd(9)} ⛔ not in the docs network matrix`); continue; }
+    const served = c.servedByPortal === false ? "NOT served by this portal" : c.servedByPortal === true ? "served" : "served? (catalog unavailable)";
+    const caps = c.caps ? `traces:${c.caps.traces ? "yes" : "no"} stateDiffs:${c.caps.stateDiffs ? "yes" : "no"} realtime:${c.caps.realtime ? "yes" : "no"}` : "";
+    console.log(`  ${String(c.name).padEnd(12)} id=${String(c.chainId).padEnd(9)} → ${c.dataset} [${served}] ${caps}`);
+    if (c.caps?.note) console.log(`      ⓘ ${c.caps.note}`);
   }
   console.log(`\nSOURCES`);
   for (const s of report.sources) {
     console.log(`  ${ICON[s.verdict] ?? "•"} ${s.source} @ ${s.chain}  [${s.verdict}]`);
     console.log(`      needs: ${s.needs.join(", ")}${s.startBlock !== undefined ? ` | startBlock ${s.startBlock.toLocaleString()}` : ""}`);
     for (const b of s.blockers) console.log(`      ⚠ ${b}`);
+    for (const n of s.notes) console.log(`      ⓘ ${n}`);
   }
   console.log(`\nVERDICT`);
-  if (report.overall === "READY") console.log(`  ✅ READY NOW — Portal serves every source (on these chains & ranges). Enable the backfill boost.`);
-  else if (report.overall === "PARTIAL") console.log(`  🟡 PARTIAL — boost the ready sources now; the rest are blocked by an unimplemented feature OR a per-chain/per-range Portal gap (see ⚠).`);
+  if (report.overall === "READY") console.log(`  ✅ READY NOW — enable the backfill boost. (Check any ⓘ block-range notes against your startBlock.)`);
+  else if (report.overall === "PARTIAL") console.log(`  🟡 PARTIAL — boost the ready sources now; the rest are blocked by an unimplemented feature, a per-portal gap, or a missing capability (see ⚠).`);
   else console.log(`  ⛔ BLOCKED — see blockers.`);
 }
 
 const configPath = process.argv[2];
-if (!configPath) { console.error("usage: report.ts <ponder.config.ts> [--differential <rpcUrl>]"); process.exit(1); }
+if (!configPath) { console.error("usage: report.ts <ponder.config.ts>"); process.exit(1); }
 const config: any = (await import(pathToFileURL(configPath).href)).default;
-const catalog = await fetchCatalog(BASE, API_KEY);
-
-// pass 1 (static) to discover which chains have trace/receipt sources + their startBlocks
-const pre = analyzeConfig(config, catalog);
-const features = new Map<number, ChainFeatures>();
-for (const c of pre.chains) {
-  if (!c.dataset) continue;
-  const onChain = pre.sources.filter((s) => s.chainId === c.chainId);
-  const traceSrc = onChain.filter((s) => s.needs.includes("traces"));
-  const receiptSrc = onChain.filter((s) => s.needs.includes("receipts"));
-  const head = await finalizedHead(c.dataset);
-  if (head === 0) continue;
-  const probeStart = traceSrc.length ? Math.min(...traceSrc.map((s) => s.startBlock ?? head)) : head;
-  process.stderr.write(`  probing ${c.dataset}…\n`);
-  features.set(c.chainId, await probeChainFeatures(BASE, API_KEY, c.dataset, probeStart, head, { traces: traceSrc.length > 0, receipts: receiptSrc.length > 0 }));
-}
-
-// pass 2 with live per-chain/per-range features
-const report = analyzeConfig(config, catalog, features);
-print(report);
-process.exit(report.overall === "BLOCKED" ? 1 : 0);
+const catalog = await fetchCatalog(BASE, API_KEY); // per-portal existence
+print(analyzeConfig(config, catalog));
+process.exit(0);

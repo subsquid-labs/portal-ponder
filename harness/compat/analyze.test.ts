@@ -2,12 +2,14 @@ import assert from "node:assert";
 import { test } from "node:test";
 import { getPortalDataset, withPortal } from "../../packages/portal-sync/src/config.ts";
 import { analyzeConfig } from "./analyze.ts";
+import type { DatasetInfo } from "./datasets.ts";
 
-// Fixture: one config exercising every verdict branch. Empty catalog → static chain map trusted.
+// caps come from the committed docs snapshot (networks.json): eth=traces+stateDiffs,
+// arbitrum=traces only, flare(14)=no traces, optimism(10)=traces w/ Bedrock note.
 const FIXTURE = {
   chains: { eth: { id: 1 }, weird: { id: 999_999 } },
   contracts: {
-    Factory: { chain: "eth", address: { event: {}, parameter: "proxy" } }, // log factory
+    Factory: { chain: "eth", address: { event: {}, parameter: "proxy" } },
     WithReceipts: { chain: "eth", address: "0xabc", includeTransactionReceipts: true },
     WithTraces: { chain: "eth", address: "0xabc", includeCallTraces: true },
     NoDataset: { chain: "weird", address: "0xabc" },
@@ -15,49 +17,49 @@ const FIXTURE = {
   blocks: { Blk: { chain: "eth", interval: 100 } },
 };
 
-test("analyzeConfig: verdict per source type", () => {
+test("verdict per source type (empty catalog → trust docs caps)", () => {
   const r = analyzeConfig(FIXTURE, new Map());
   const v = (name: string) => r.sources.find((s) => s.source === name)?.verdict;
-  assert.equal(v("Factory"), "READY"); // logs + tx + factory
-  assert.equal(v("WithReceipts"), "READY"); // receipts now supported
-  assert.equal(v("WithTraces"), "READY"); // traces now supported
-  assert.equal(v("NoDataset"), "NO_DATASET");
-  assert.equal(v("block:Blk"), "NEEDS_BLOCK_FILTER"); // block-interval still todo
+  assert.equal(v("Factory"), "READY");
+  assert.equal(v("WithReceipts"), "READY");
+  assert.equal(v("WithTraces"), "READY"); // eth has traces per docs
+  assert.equal(v("NoDataset"), "NO_DATASET"); // chain 999999 not in docs matrix
+  assert.equal(v("block:Blk"), "NEEDS_BLOCK_FILTER");
   assert.equal(r.overall, "PARTIAL");
   assert.equal(r.ready, 3);
 });
 
-test("analyzeConfig: factory detected on the contract address", () => {
-  const r = analyzeConfig(FIXTURE, new Map());
-  assert.ok(r.sources.find((s) => s.source === "Factory")!.needs.includes("logFactory"));
-});
-
-test("per-range: trace source in the chain's trace-less range is flagged (Arbitrum ancient-blocks case)", () => {
-  const cfg = { chains: { arbitrum: { id: 42161 } }, contracts: { OldTraced: { chain: "arbitrum", address: "0xabc", includeCallTraces: true, startBlock: 1_000_000 } } };
-  const features = new Map([[42161, { traces: true, tracesFromBlock: 200_000_000, receipts: true, stateDiffs: false }]]);
-  const s = analyzeConfig(cfg, new Map(), features as any).sources[0]!;
+test("capability: a chain with traces:false (per docs) flags trace sources", () => {
+  const cfg = { chains: { flare: { id: 14 } }, contracts: { T: { chain: "flare", address: "0xabc", includeCallTraces: true } } };
+  const s = analyzeConfig(cfg, new Map()).sources[0]!;
   assert.equal(s.verdict, "NEEDS_TRACES");
-  assert.ok(s.blockers.some((b) => b.includes("trace-less range")));
+  assert.ok(s.blockers.some((b) => b.includes("no traces")));
 });
 
-test("per-range: same source ABOVE the trace cutoff is READY", () => {
-  const cfg = { chains: { arbitrum: { id: 42161 } }, contracts: { NewTraced: { chain: "arbitrum", address: "0xabc", includeCallTraces: true, startBlock: 300_000_000 } } };
-  const features = new Map([[42161, { traces: true, tracesFromBlock: 200_000_000, receipts: true, stateDiffs: false }]]);
-  assert.equal(analyzeConfig(cfg, new Map(), features as any).sources[0]!.verdict, "READY");
+test("capability: Arbitrum HAS traces per docs → trace source READY (the docs are authoritative)", () => {
+  const cfg = { chains: { arb: { id: 42161 } }, contracts: { T: { chain: "arb", address: "0xabc", includeCallTraces: true } } };
+  assert.equal(analyzeConfig(cfg, new Map()).sources[0]!.verdict, "READY");
 });
 
-test("per-chain: a chain where Portal serves no traces flags trace sources", () => {
-  const cfg = { chains: { c: { id: 1 } }, contracts: { T: { chain: "c", address: "0xabc", includeCallTraces: true } } };
-  const features = new Map([[1, { traces: false, receipts: true, stateDiffs: false }]]);
-  const s = analyzeConfig(cfg, new Map(), features as any).sources[0]!;
-  assert.equal(s.verdict, "NEEDS_TRACES");
-  assert.ok(s.blockers.some((b) => b.includes("does not serve traces")));
+test("per-portal existence: a portal that doesn't serve the dataset → NO_DATASET", () => {
+  const catalog = new Map<string, DatasetInfo>([["some-other-chain", { dataset: "some-other-chain", realTime: true, aliases: [] }]]);
+  const cfg = { chains: { eth: { id: 1 } }, contracts: { C: { chain: "eth", address: "0xabc" } } };
+  const s = analyzeConfig(cfg, catalog).sources[0]!;
+  assert.equal(s.verdict, "NO_DATASET");
+  assert.ok(s.blockers.some((b) => b.includes("does not serve")));
+});
+
+test("block-range caveat note surfaced (Optimism Bedrock)", () => {
+  const cfg = { chains: { op: { id: 10 } }, contracts: { T: { chain: "op", address: "0xabc", includeCallTraces: true } } };
+  const s = analyzeConfig(cfg, new Map()).sources[0]!;
+  assert.equal(s.verdict, "READY");
+  assert.ok(s.notes.some((n) => n.includes("Bedrock")));
 });
 
 test("withPortal: extracts portal into registry and strips it from the chain", () => {
   const cfg: any = { chains: { mainnet: { id: 1, rpc: "x", portal: "https://portal.sqd.dev/datasets/ethereum-mainnet" } } };
   withPortal(cfg);
   assert.equal(getPortalDataset(1), "https://portal.sqd.dev/datasets/ethereum-mainnet");
-  assert.equal(cfg.chains.mainnet.portal, undefined); // Ponder never sees it
-  assert.equal(cfg.chains.mainnet.rpc, "x"); // rpc preserved for realtime
+  assert.equal(cfg.chains.mainnet.portal, undefined);
+  assert.equal(cfg.chains.mainnet.rpc, "x");
 });

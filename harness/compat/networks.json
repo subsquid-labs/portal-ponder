@@ -1,0 +1,1240 @@
+{
+  "_source": "https://docs.sqd.dev/en/data/all-networks",
+  "_generated": "run fetch-networks.ts to refresh",
+  "networks": {
+    "1": {
+      "name": "Ethereum",
+      "slug": "ethereum-mainnet",
+      "type": "mainnet",
+      "portal": true,
+      "realtime": true,
+      "traces": true,
+      "stateDiffs": true
+    },
+    "10": {
+      "name": "Optimism",
+      "slug": "optimism-mainnet",
+      "type": "mainnet",
+      "portal": true,
+      "realtime": true,
+      "traces": true,
+      "stateDiffs": true,
+      "note": "Traces and state diffs available from block 105235063 (Bedrock upgrade). Blocks 0 to 105235062 are not covered."
+    },
+    "14": {
+      "name": "Flare",
+      "slug": "flare-mainnet",
+      "type": "mainnet",
+      "portal": true,
+      "realtime": true,
+      "traces": false,
+      "stateDiffs": false
+    },
+    "25": {
+      "name": "Cronos",
+      "slug": "cronos-mainnet",
+      "type": "mainnet",
+      "portal": true,
+      "realtime": true,
+      "traces": false,
+      "stateDiffs": false,
+      "note": "Private network — contact BD for access."
+    },
+    "42": {
+      "name": "LUKSO",
+      "slug": "lukso-mainnet",
+      "type": "mainnet",
+      "portal": true,
+      "realtime": false,
+      "traces": false,
+      "stateDiffs": false
+    },
+    "56": {
+      "name": "BNB Smart Chain",
+      "slug": "binance-mainnet",
+      "type": "mainnet",
+      "portal": true,
+      "realtime": true,
+      "traces": true,
+      "stateDiffs": true
+    },
+    "81": {
+      "name": "Shibuya",
+      "slug": "shibuya-testnet",
+      "type": "testnet",
+      "portal": true,
+      "realtime": false,
+      "traces": false,
+      "stateDiffs": false,
+      "note": "Only for EVM data. For Substrate and ink! data use the corresponding Substrate gateway."
+    },
+    "97": {
+      "name": "Binance Testnet",
+      "slug": "binance-testnet",
+      "type": "testnet",
+      "portal": true,
+      "realtime": false,
+      "traces": false,
+      "stateDiffs": false
+    },
+    "100": {
+      "name": "Gnosis",
+      "slug": "gnosis-mainnet",
+      "type": "mainnet",
+      "portal": true,
+      "realtime": true,
+      "traces": true,
+      "stateDiffs": true
+    },
+    "130": {
+      "name": "Unichain",
+      "slug": "unichain-mainnet",
+      "type": "mainnet",
+      "portal": true,
+      "realtime": true,
+      "traces": true,
+      "stateDiffs": true
+    },
+    "137": {
+      "name": "Polygon",
+      "slug": "polygon-mainnet",
+      "type": "mainnet",
+      "portal": true,
+      "realtime": true,
+      "traces": true,
+      "stateDiffs": false
+    },
+    "143": {
+      "name": "Monad",
+      "slug": "monad-mainnet",
+      "type": "mainnet",
+      "portal": true,
+      "realtime": true,
+      "traces": false,
+      "stateDiffs": false
+    },
+    "146": {
+      "name": "Sonic",
+      "slug": "sonic-mainnet",
+      "type": "mainnet",
+      "portal": true,
+      "realtime": false,
+      "traces": true,
+      "stateDiffs": false
+    },
+    "169": {
+      "name": "Manta Pacific",
+      "slug": "manta-pacific",
+      "type": "mainnet",
+      "portal": true,
+      "realtime": false,
+      "traces": false,
+      "stateDiffs": false
+    },
+    "195": {
+      "name": "X Layer Testnet",
+      "slug": "xlayer-testnet",
+      "type": "testnet",
+      "portal": true,
+      "realtime": false,
+      "traces": false,
+      "stateDiffs": false
+    },
+    "196": {
+      "name": "X Layer",
+      "slug": "xlayer-mainnet",
+      "type": "mainnet",
+      "portal": true,
+      "realtime": false,
+      "traces": false,
+      "stateDiffs": false
+    },
+    "204": {
+      "name": "opBNB",
+      "slug": "opbnb-mainnet",
+      "type": "mainnet",
+      "portal": true,
+      "realtime": false,
+      "traces": false,
+      "stateDiffs": false
+    },
+    "227": {
+      "name": "Prom",
+      "slug": "prom-mainnet",
+      "type": "mainnet",
+      "portal": true,
+      "realtime": false,
+      "traces": true,
+      "stateDiffs": true
+    },
+    "239": {
+      "name": "TAC",
+      "slug": "tac-mainnet",
+      "type": "mainnet",
+      "portal": true,
+      "realtime": true,
+      "traces": false,
+      "stateDiffs": false,
+      "note": "Private network — contact BD for access."
+    },
+    "300": {
+      "name": "zkSync Sepolia",
+      "slug": "zksync-sepolia",
+      "type": "testnet",
+      "portal": true,
+      "realtime": false,
+      "traces": true,
+      "stateDiffs": false
+    },
+    "324": {
+      "name": "zkSync",
+      "slug": "zksync-mainnet",
+      "type": "mainnet",
+      "portal": true,
+      "realtime": true,
+      "traces": true,
+      "stateDiffs": false,
+      "note": "State diffs available from block 15500000."
+    },
+    "336": {
+      "name": "Shiden",
+      "slug": "shiden-mainnet",
+      "type": "mainnet",
+      "portal": true,
+      "realtime": false,
+      "traces": false,
+      "stateDiffs": false,
+      "note": "Only for EVM data. For Substrate and ink! data use the corresponding Substrate gateway."
+    },
+    "480": {
+      "name": "Worldchain",
+      "slug": "worldchain-mainnet",
+      "type": "mainnet",
+      "portal": true,
+      "realtime": true,
+      "traces": true,
+      "stateDiffs": false,
+      "note": "Private network — contact BD for access."
+    },
+    "568": {
+      "name": "Dogechain Testnet",
+      "slug": "dogechain-testnet",
+      "type": "testnet",
+      "portal": true,
+      "realtime": false,
+      "traces": false,
+      "stateDiffs": false
+    },
+    "592": {
+      "name": "Astar",
+      "slug": "astar-mainnet",
+      "type": "mainnet",
+      "portal": true,
+      "realtime": false,
+      "traces": false,
+      "stateDiffs": false,
+      "note": "Only for EVM data. For Substrate and ink! data use the corresponding Substrate gateway."
+    },
+    "945": {
+      "name": "Bittensor Testnet",
+      "slug": "bittensor-testnet-evm",
+      "type": "testnet",
+      "portal": true,
+      "realtime": false,
+      "traces": false,
+      "stateDiffs": false,
+      "note": "First available block for Bittensor Testnet is 3,300,000."
+    },
+    "964": {
+      "name": "Bittensor",
+      "slug": "bittensor-mainnet-evm",
+      "type": "mainnet",
+      "portal": true,
+      "realtime": false,
+      "traces": false,
+      "stateDiffs": false,
+      "note": "First available block for Bittensor Mainnet is 4,400,000."
+    },
+    "998": {
+      "name": "HyperEVM Testnet",
+      "slug": "hyperliquid-testnet",
+      "type": "testnet",
+      "portal": true,
+      "realtime": false,
+      "traces": false,
+      "stateDiffs": false
+    },
+    "999": {
+      "name": "HyperEVM",
+      "slug": "hyperliquid-mainnet",
+      "type": "mainnet",
+      "portal": true,
+      "realtime": true,
+      "traces": true,
+      "stateDiffs": true
+    },
+    "1088": {
+      "name": "Metis Andromeda",
+      "slug": "metis-mainnet",
+      "type": "mainnet",
+      "portal": true,
+      "realtime": false,
+      "traces": true,
+      "stateDiffs": false,
+      "note": "State diffs available except blocks 16861274–16861286."
+    },
+    "1101": {
+      "name": "Polygon zkEVM",
+      "slug": "polygon-zkevm-mainnet",
+      "type": "mainnet",
+      "portal": true,
+      "realtime": false,
+      "traces": false,
+      "stateDiffs": false
+    },
+    "1116": {
+      "name": "Core Blockchain",
+      "slug": "core-mainnet",
+      "type": "mainnet",
+      "portal": true,
+      "realtime": false,
+      "traces": true,
+      "stateDiffs": false
+    },
+    "1284": {
+      "name": "Moonbeam",
+      "slug": "moonbeam-mainnet",
+      "type": "mainnet",
+      "portal": true,
+      "realtime": false,
+      "traces": true,
+      "stateDiffs": false,
+      "note": "Only for EVM data. For Substrate and ink! data use the corresponding Substrate gateway."
+    },
+    "1285": {
+      "name": "Moonriver",
+      "slug": "moonriver-mainnet",
+      "type": "mainnet",
+      "portal": true,
+      "realtime": false,
+      "traces": true,
+      "stateDiffs": false,
+      "note": "Only for EVM data. For Substrate and ink! data use the corresponding Substrate gateway."
+    },
+    "1287": {
+      "name": "Moonbase Alpha",
+      "slug": "moonbase-testnet",
+      "type": "testnet",
+      "portal": true,
+      "realtime": false,
+      "traces": false,
+      "stateDiffs": false,
+      "note": "Only for EVM data. For Substrate and ink! data use the corresponding Substrate gateway."
+    },
+    "1301": {
+      "name": "Unichain Sepolia",
+      "slug": "unichain-sepolia",
+      "type": "testnet",
+      "portal": true,
+      "realtime": false,
+      "traces": false,
+      "stateDiffs": false
+    },
+    "1625": {
+      "name": "Gravity Alpha",
+      "slug": "galxe-gravity",
+      "type": "mainnet",
+      "portal": true,
+      "realtime": false,
+      "traces": true,
+      "stateDiffs": true
+    },
+    "1868": {
+      "name": "Soneium",
+      "slug": "soneium-mainnet",
+      "type": "mainnet",
+      "portal": true,
+      "realtime": true,
+      "traces": true,
+      "stateDiffs": false
+    },
+    "1946": {
+      "name": "Soneium Minato Testnet",
+      "slug": "soneium-minato-testnet",
+      "type": "testnet",
+      "portal": true,
+      "realtime": false,
+      "traces": true,
+      "stateDiffs": true
+    },
+    "1952": {
+      "name": "X Layer Testnet",
+      "slug": "x1-testnet",
+      "type": "testnet",
+      "portal": true,
+      "realtime": false,
+      "traces": false,
+      "stateDiffs": false
+    },
+    "1993": {
+      "name": "B3 Sepolia",
+      "slug": "b3-sepolia",
+      "type": "testnet",
+      "portal": true,
+      "realtime": false,
+      "traces": true,
+      "stateDiffs": true
+    },
+    "1998": {
+      "name": "Kyoto Testnet",
+      "slug": "kyoto-testnet",
+      "type": "testnet",
+      "portal": true,
+      "realtime": false,
+      "traces": false,
+      "stateDiffs": false
+    },
+    "2000": {
+      "name": "Dogechain",
+      "slug": "dogechain-mainnet",
+      "type": "mainnet",
+      "portal": true,
+      "realtime": false,
+      "traces": false,
+      "stateDiffs": false
+    },
+    "2109": {
+      "name": "Exosama Network",
+      "slug": "exosama",
+      "type": "mainnet",
+      "portal": true,
+      "realtime": false,
+      "traces": true,
+      "stateDiffs": true
+    },
+    "2199": {
+      "name": "Moonsama Network",
+      "slug": "moonsama",
+      "type": "mainnet",
+      "portal": true,
+      "realtime": false,
+      "traces": false,
+      "stateDiffs": false
+    },
+    "2442": {
+      "name": "Polygon zkEVM Cardona Testnet",
+      "slug": "polygon-zkevm-cardona-testnet",
+      "type": "testnet",
+      "portal": true,
+      "realtime": false,
+      "traces": false,
+      "stateDiffs": false
+    },
+    "2741": {
+      "name": "Abstract",
+      "slug": "abstract-mainnet",
+      "type": "mainnet",
+      "portal": true,
+      "realtime": false,
+      "traces": false,
+      "stateDiffs": false
+    },
+    "3338": {
+      "name": "Peaq",
+      "slug": "peaq-mainnet",
+      "type": "mainnet",
+      "portal": true,
+      "realtime": false,
+      "traces": false,
+      "stateDiffs": false
+    },
+    "3776": {
+      "name": "Astar zkEVM",
+      "slug": "astar-zkevm-mainnet",
+      "type": "mainnet",
+      "portal": true,
+      "realtime": false,
+      "traces": false,
+      "stateDiffs": false
+    },
+    "4200": {
+      "name": "Merlin",
+      "slug": "merlin-mainnet",
+      "type": "mainnet",
+      "portal": true,
+      "realtime": false,
+      "traces": false,
+      "stateDiffs": false
+    },
+    "4217": {
+      "name": "Tempo",
+      "slug": "tempo-mainnet",
+      "type": "mainnet",
+      "portal": true,
+      "realtime": true,
+      "traces": true,
+      "stateDiffs": false,
+      "note": "Private network — contact BD for access."
+    },
+    "4326": {
+      "name": "MegaETH",
+      "slug": "megaeth-mainnet",
+      "type": "mainnet",
+      "portal": true,
+      "realtime": true,
+      "traces": false,
+      "stateDiffs": false
+    },
+    "4337": {
+      "name": "Beam",
+      "slug": "beam-mainnet",
+      "type": "mainnet",
+      "portal": true,
+      "realtime": false,
+      "traces": true,
+      "stateDiffs": true
+    },
+    "4352": {
+      "name": "MemeCore",
+      "slug": "memecore-mainnet",
+      "type": "mainnet",
+      "portal": true,
+      "realtime": false,
+      "traces": true,
+      "stateDiffs": true
+    },
+    "5000": {
+      "name": "Mantle",
+      "slug": "mantle-mainnet",
+      "type": "mainnet",
+      "portal": true,
+      "realtime": false,
+      "traces": false,
+      "stateDiffs": false
+    },
+    "5003": {
+      "name": "Mantle Sepolia",
+      "slug": "mantle-sepolia",
+      "type": "testnet",
+      "portal": true,
+      "realtime": false,
+      "traces": false,
+      "stateDiffs": false
+    },
+    "5330": {
+      "name": "Superseed",
+      "slug": "superseed-mainnet",
+      "type": "mainnet",
+      "portal": true,
+      "realtime": false,
+      "traces": false,
+      "stateDiffs": false
+    },
+    "5611": {
+      "name": "opBNB Testnet",
+      "slug": "opbnb-testnet",
+      "type": "testnet",
+      "portal": true,
+      "realtime": false,
+      "traces": false,
+      "stateDiffs": false
+    },
+    "5678": {
+      "name": "Tanssi",
+      "slug": "tanssi",
+      "type": "mainnet",
+      "portal": true,
+      "realtime": false,
+      "traces": false,
+      "stateDiffs": false
+    },
+    "6342": {
+      "name": "MegaETH Testnet",
+      "slug": "megaeth-testnet",
+      "type": "testnet",
+      "portal": true,
+      "realtime": false,
+      "traces": false,
+      "stateDiffs": false
+    },
+    "7560": {
+      "name": "Cyber",
+      "slug": "cyber-mainnet",
+      "type": "mainnet",
+      "portal": true,
+      "realtime": false,
+      "traces": false,
+      "stateDiffs": false
+    },
+    "7700": {
+      "name": "Canto",
+      "slug": "canto",
+      "type": "mainnet",
+      "portal": true,
+      "realtime": false,
+      "traces": false,
+      "stateDiffs": false
+    },
+    "7701": {
+      "name": "Canto Testnet",
+      "slug": "canto-testnet",
+      "type": "testnet",
+      "portal": true,
+      "realtime": false,
+      "traces": false,
+      "stateDiffs": false
+    },
+    "8150": {
+      "name": "Alpen Testnet",
+      "slug": "alpen-testnet",
+      "type": "testnet",
+      "portal": true,
+      "realtime": true,
+      "traces": true,
+      "stateDiffs": true
+    },
+    "8333": {
+      "name": "B3",
+      "slug": "b3-mainnet",
+      "type": "mainnet",
+      "portal": true,
+      "realtime": false,
+      "traces": true,
+      "stateDiffs": true
+    },
+    "8453": {
+      "name": "Base",
+      "slug": "base-mainnet",
+      "type": "mainnet",
+      "portal": true,
+      "realtime": true,
+      "traces": true,
+      "stateDiffs": true
+    },
+    "9745": {
+      "name": "Plasma",
+      "slug": "plasma-mainnet",
+      "type": "mainnet",
+      "portal": true,
+      "realtime": true,
+      "traces": true,
+      "stateDiffs": true
+    },
+    "9746": {
+      "name": "Plasma Testnet",
+      "slug": "plasma-testnet",
+      "type": "testnet",
+      "portal": true,
+      "realtime": false,
+      "traces": true,
+      "stateDiffs": true
+    },
+    "9990": {
+      "name": "Agung Testnet",
+      "slug": "agung-evm",
+      "type": "testnet",
+      "portal": true,
+      "realtime": false,
+      "traces": false,
+      "stateDiffs": false
+    },
+    "10143": {
+      "name": "Monad Testnet",
+      "slug": "monad-testnet",
+      "type": "testnet",
+      "portal": true,
+      "realtime": true,
+      "traces": false,
+      "stateDiffs": false
+    },
+    "10242": {
+      "name": "Arthera",
+      "slug": "arthera-mainnet",
+      "type": "mainnet",
+      "portal": true,
+      "realtime": false,
+      "traces": false,
+      "stateDiffs": false
+    },
+    "11124": {
+      "name": "Abstract Testnet",
+      "slug": "abstract-testnet",
+      "type": "testnet",
+      "portal": true,
+      "realtime": false,
+      "traces": false,
+      "stateDiffs": false
+    },
+    "13371": {
+      "name": "Immutable zkEVM",
+      "slug": "immutable-zkevm-mainnet",
+      "type": "mainnet",
+      "portal": true,
+      "realtime": false,
+      "traces": false,
+      "stateDiffs": false
+    },
+    "13473": {
+      "name": "Immutable zkEVM Testnet",
+      "slug": "immutable-zkevm-testnet",
+      "type": "testnet",
+      "portal": true,
+      "realtime": false,
+      "traces": false,
+      "stateDiffs": false
+    },
+    "14601": {
+      "name": "Sonic Testnet",
+      "slug": "sonic-testnet",
+      "type": "testnet",
+      "portal": true,
+      "realtime": false,
+      "traces": true,
+      "stateDiffs": false
+    },
+    "16600": {
+      "name": "0g Testnet",
+      "slug": "0g-testnet",
+      "type": "testnet",
+      "portal": true,
+      "realtime": false,
+      "traces": false,
+      "stateDiffs": false
+    },
+    "17000": {
+      "name": "Ethereum Holesky",
+      "slug": "ethereum-holesky",
+      "type": "testnet",
+      "portal": true,
+      "realtime": false,
+      "traces": true,
+      "stateDiffs": true
+    },
+    "32520": {
+      "name": "Bitgert",
+      "slug": "bitgert-mainnet",
+      "type": "mainnet",
+      "portal": true,
+      "realtime": false,
+      "traces": true,
+      "stateDiffs": false,
+      "note": "State diffs available up to block 4298094."
+    },
+    "34443": {
+      "name": "Mode",
+      "slug": "mode-mainnet",
+      "type": "mainnet",
+      "portal": true,
+      "realtime": false,
+      "traces": false,
+      "stateDiffs": false
+    },
+    "36900": {
+      "name": "ADI Chain",
+      "slug": "adi-mainnet",
+      "type": "mainnet",
+      "portal": true,
+      "realtime": true,
+      "traces": true,
+      "stateDiffs": false
+    },
+    "41455": {
+      "name": "Aleph Zero EVM",
+      "slug": "aleph-zero-evm-mainnet",
+      "type": "mainnet",
+      "portal": true,
+      "realtime": false,
+      "traces": true,
+      "stateDiffs": true
+    },
+    "42161": {
+      "name": "Arbitrum One",
+      "slug": "arbitrum-one",
+      "type": "mainnet",
+      "portal": true,
+      "realtime": true,
+      "traces": true,
+      "stateDiffs": false
+    },
+    "42170": {
+      "name": "Arbitrum Nova",
+      "slug": "arbitrum-nova",
+      "type": "mainnet",
+      "portal": true,
+      "realtime": false,
+      "traces": true,
+      "stateDiffs": false
+    },
+    "42220": {
+      "name": "Celo",
+      "slug": "celo-mainnet",
+      "type": "mainnet",
+      "portal": true,
+      "realtime": true,
+      "traces": false,
+      "stateDiffs": false
+    },
+    "42225": {
+      "name": "Naka Chain",
+      "slug": "nakachain",
+      "type": "mainnet",
+      "portal": true,
+      "realtime": false,
+      "traces": false,
+      "stateDiffs": false
+    },
+    "42793": {
+      "name": "Etherlink",
+      "slug": "etherlink-mainnet",
+      "type": "mainnet",
+      "portal": true,
+      "realtime": false,
+      "traces": false,
+      "stateDiffs": false
+    },
+    "43113": {
+      "name": "Avalanche Testnet",
+      "slug": "avalanche-testnet",
+      "type": "testnet",
+      "portal": true,
+      "realtime": false,
+      "traces": true,
+      "stateDiffs": true
+    },
+    "43114": {
+      "name": "Avalanche",
+      "slug": "avalanche-mainnet",
+      "type": "mainnet",
+      "portal": true,
+      "realtime": true,
+      "traces": true,
+      "stateDiffs": true
+    },
+    "43521": {
+      "name": "MemeCore Testnet (Formicarium)",
+      "slug": "formicarium-testnet",
+      "type": "testnet",
+      "portal": true,
+      "realtime": false,
+      "traces": true,
+      "stateDiffs": true
+    },
+    "43522": {
+      "name": "MemeCore Testnet (Insectarium)",
+      "slug": "memecore-insectarium",
+      "type": "testnet",
+      "portal": true,
+      "realtime": false,
+      "traces": true,
+      "stateDiffs": true
+    },
+    "44787": {
+      "name": "Celo Testnet (Alfajores)",
+      "slug": "celo-alfajores-testnet",
+      "type": "testnet",
+      "portal": true,
+      "realtime": false,
+      "traces": false,
+      "stateDiffs": false
+    },
+    "53302": {
+      "name": "Superseed Sepolia",
+      "slug": "superseed-sepolia",
+      "type": "testnet",
+      "portal": true,
+      "realtime": false,
+      "traces": false,
+      "stateDiffs": false
+    },
+    "53935": {
+      "name": "DFK Chain",
+      "slug": "dfk-chain",
+      "type": "mainnet",
+      "portal": true,
+      "realtime": false,
+      "traces": false,
+      "stateDiffs": false
+    },
+    "57073": {
+      "name": "Ink",
+      "slug": "ink-mainnet",
+      "type": "mainnet",
+      "portal": true,
+      "realtime": true,
+      "traces": true,
+      "stateDiffs": true
+    },
+    "59144": {
+      "name": "Linea",
+      "slug": "linea-mainnet",
+      "type": "mainnet",
+      "portal": true,
+      "realtime": true,
+      "traces": true,
+      "stateDiffs": false
+    },
+    "60808": {
+      "name": "BOB",
+      "slug": "bob-mainnet",
+      "type": "mainnet",
+      "portal": true,
+      "realtime": false,
+      "traces": true,
+      "stateDiffs": true
+    },
+    "64668": {
+      "name": "Bitgert Testnet",
+      "slug": "bitgert-testnet",
+      "type": "testnet",
+      "portal": true,
+      "realtime": false,
+      "traces": true,
+      "stateDiffs": false
+    },
+    "80002": {
+      "name": "Polygon Amoy Testnet",
+      "slug": "polygon-amoy-testnet",
+      "type": "testnet",
+      "portal": true,
+      "realtime": true,
+      "traces": false,
+      "stateDiffs": false
+    },
+    "80084": {
+      "name": "Berachain bArtio",
+      "slug": "berachain-bartio",
+      "type": "testnet",
+      "portal": true,
+      "realtime": false,
+      "traces": true,
+      "stateDiffs": true
+    },
+    "80094": {
+      "name": "Berachain",
+      "slug": "berachain-mainnet",
+      "type": "mainnet",
+      "portal": true,
+      "realtime": true,
+      "traces": true,
+      "stateDiffs": true
+    },
+    "81457": {
+      "name": "Blast",
+      "slug": "blast-l2-mainnet",
+      "type": "mainnet",
+      "portal": true,
+      "realtime": false,
+      "traces": true,
+      "stateDiffs": true
+    },
+    "84532": {
+      "name": "Base Sepolia",
+      "slug": "base-sepolia",
+      "type": "testnet",
+      "portal": true,
+      "realtime": false,
+      "traces": true,
+      "stateDiffs": true
+    },
+    "93747": {
+      "name": "StratoVM Sepolia",
+      "slug": "stratovm-sepolia",
+      "type": "testnet",
+      "portal": true,
+      "realtime": false,
+      "traces": true,
+      "stateDiffs": true
+    },
+    "98866": {
+      "name": "Plume",
+      "slug": "plume-mainnet",
+      "type": "mainnet",
+      "portal": true,
+      "realtime": false,
+      "traces": true,
+      "stateDiffs": true
+    },
+    "98867": {
+      "name": "Plume Testnet",
+      "slug": "plume-testnet",
+      "type": "testnet",
+      "portal": true,
+      "realtime": false,
+      "traces": true,
+      "stateDiffs": true
+    },
+    "127823": {
+      "name": "Etherlink Shadownet",
+      "slug": "etherlink-shadownet",
+      "type": "testnet",
+      "portal": true,
+      "realtime": false,
+      "traces": false,
+      "stateDiffs": false
+    },
+    "128123": {
+      "name": "Etherlink Testnet",
+      "slug": "etherlink-testnet",
+      "type": "testnet",
+      "portal": true,
+      "realtime": false,
+      "traces": false,
+      "stateDiffs": false
+    },
+    "167000": {
+      "name": "Taiko Alethia",
+      "slug": "taiko-mainnet",
+      "type": "mainnet",
+      "portal": true,
+      "realtime": false,
+      "traces": false,
+      "stateDiffs": false
+    },
+    "325000": {
+      "name": "Camp Network Testnet v2",
+      "slug": "camp-network-testnet-v2",
+      "type": "testnet",
+      "portal": true,
+      "realtime": false,
+      "traces": true,
+      "stateDiffs": true
+    },
+    "355110": {
+      "name": "Bitfinity Network",
+      "slug": "bitfinity-mainnet",
+      "type": "mainnet",
+      "portal": true,
+      "realtime": false,
+      "traces": false,
+      "stateDiffs": false
+    },
+    "355113": {
+      "name": "Bitfinity Testnet",
+      "slug": "bitfinity-testnet",
+      "type": "testnet",
+      "portal": true,
+      "realtime": false,
+      "traces": false,
+      "stateDiffs": false,
+      "note": "Genesis block for Bitfinity Testnet is 2,760,000."
+    },
+    "421614": {
+      "name": "Arbitrum Sepolia",
+      "slug": "arbitrum-sepolia",
+      "type": "testnet",
+      "portal": true,
+      "realtime": true,
+      "traces": false,
+      "stateDiffs": false
+    },
+    "534351": {
+      "name": "Scroll Sepolia",
+      "slug": "scroll-sepolia",
+      "type": "testnet",
+      "portal": true,
+      "realtime": false,
+      "traces": true,
+      "stateDiffs": false
+    },
+    "534352": {
+      "name": "Scroll",
+      "slug": "scroll-mainnet",
+      "type": "mainnet",
+      "portal": true,
+      "realtime": false,
+      "traces": true,
+      "stateDiffs": false
+    },
+    "560048": {
+      "name": "Ethereum Hoodi",
+      "slug": "ethereum-hoodi",
+      "type": "testnet",
+      "portal": true,
+      "realtime": false,
+      "traces": false,
+      "stateDiffs": false
+    },
+    "686868": {
+      "name": "Merlin Testnet",
+      "slug": "merlin-testnet",
+      "type": "testnet",
+      "portal": true,
+      "realtime": false,
+      "traces": false,
+      "stateDiffs": false
+    },
+    "747474": {
+      "name": "Katana",
+      "slug": "katana-mainnet",
+      "type": "mainnet",
+      "portal": true,
+      "realtime": true,
+      "traces": true,
+      "stateDiffs": true,
+      "note": "Private network — contact BD for access."
+    },
+    "808813": {
+      "name": "BOB Sepolia",
+      "slug": "bob-sepolia",
+      "type": "testnet",
+      "portal": true,
+      "realtime": false,
+      "traces": false,
+      "stateDiffs": false
+    },
+    "810180": {
+      "name": "zkLink Nova",
+      "slug": "zklink-nova-mainnet",
+      "type": "mainnet",
+      "portal": true,
+      "realtime": false,
+      "traces": true,
+      "stateDiffs": false
+    },
+    "3441006": {
+      "name": "Manta Pacific Sepolia",
+      "slug": "manta-pacific-sepolia",
+      "type": "testnet",
+      "portal": true,
+      "realtime": false,
+      "traces": false,
+      "stateDiffs": false
+    },
+    "6038361": {
+      "name": "Astar zKyoto",
+      "slug": "astar-zkyoto",
+      "type": "testnet",
+      "portal": true,
+      "realtime": false,
+      "traces": false,
+      "stateDiffs": false
+    },
+    "7777777": {
+      "name": "Zora",
+      "slug": "zora-mainnet",
+      "type": "mainnet",
+      "portal": true,
+      "realtime": true,
+      "traces": true,
+      "stateDiffs": true
+    },
+    "7849306": {
+      "name": "Ozean Testnet",
+      "slug": "ozean-testnet",
+      "type": "testnet",
+      "portal": true,
+      "realtime": false,
+      "traces": true,
+      "stateDiffs": true
+    },
+    "11155111": {
+      "name": "Ethereum Sepolia",
+      "slug": "ethereum-sepolia",
+      "type": "testnet",
+      "portal": true,
+      "realtime": true,
+      "traces": true,
+      "stateDiffs": true
+    },
+    "11155420": {
+      "name": "Optimism Sepolia",
+      "slug": "optimism-sepolia",
+      "type": "testnet",
+      "portal": true,
+      "realtime": false,
+      "traces": false,
+      "stateDiffs": false
+    },
+    "12227332": {
+      "name": "Neo X Testnet",
+      "slug": "neox-testnet",
+      "type": "testnet",
+      "portal": true,
+      "realtime": false,
+      "traces": true,
+      "stateDiffs": true
+    },
+    "111557560": {
+      "name": "Cyberconnect L2 Testnet",
+      "slug": "cyberconnect-l2-testnet",
+      "type": "testnet",
+      "portal": true,
+      "realtime": false,
+      "traces": true,
+      "stateDiffs": true
+    },
+    "123420111": {
+      "name": "Gelato OP Celestia Raspberry",
+      "slug": "gelato-opcelestia-raspberry",
+      "type": "testnet",
+      "portal": true,
+      "realtime": false,
+      "traces": false,
+      "stateDiffs": false
+    },
+    "168587773": {
+      "name": "Blast Sepolia",
+      "slug": "blast-sepolia",
+      "type": "testnet",
+      "portal": true,
+      "realtime": false,
+      "traces": false,
+      "stateDiffs": false
+    },
+    "245022926": {
+      "name": "Neon EVM Devnet",
+      "slug": "neon-devnet",
+      "type": "devnet",
+      "portal": true,
+      "realtime": false,
+      "traces": false,
+      "stateDiffs": false,
+      "note": "Genesis block for Neon EVM Devnet is 177,455,580."
+    },
+    "245022934": {
+      "name": "Neon EVM",
+      "slug": "neon-mainnet",
+      "type": "mainnet",
+      "portal": true,
+      "realtime": false,
+      "traces": false,
+      "stateDiffs": false
+    },
+    "666666666": {
+      "name": "Degen Chain",
+      "slug": "degen-chain",
+      "type": "mainnet",
+      "portal": true,
+      "realtime": false,
+      "traces": false,
+      "stateDiffs": false
+    },
+    "999999999": {
+      "name": "Zora Sepolia",
+      "slug": "zora-sepolia",
+      "type": "testnet",
+      "portal": true,
+      "realtime": false,
+      "traces": false,
+      "stateDiffs": false
+    },
+    "1482601649": {
+      "name": "SKALE Nebula Hub",
+      "slug": "skale-nebula",
+      "type": "mainnet",
+      "portal": true,
+      "realtime": false,
+      "traces": false,
+      "stateDiffs": false
+    },
+    "88153591557": {
+      "name": "Arbitrum Blueberry",
+      "slug": "gelato-arbitrum-blueberry",
+      "type": "testnet",
+      "portal": true,
+      "realtime": false,
+      "traces": false,
+      "stateDiffs": false
+    }
+  }
+}

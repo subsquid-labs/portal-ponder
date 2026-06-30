@@ -1,44 +1,31 @@
 /**
- * chainId → SQD Portal dataset slug (a convenience subset; Portal serves 300+ EVM
- * networks). Existence is verified live via the /datasets catalog at runtime.
+ * Two authoritative sources, kept separate on purpose:
  *
- * AUTHORITATIVE per-network capability matrix (traces / stateDiffs / real-time flags
- * + block-range caveats — e.g. Optimism traces+stateDiffs only from the Bedrock block
- * 105235063; zkSync stateDiffs from 15.5M; Arbitrum/Polygon stateDiffs:false):
- *   https://docs.sqd.dev/en/data/all-networks
- * The /datasets catalog only returns {dataset, aliases, real_time} — NOT the trace/
- * stateDiff flags — so we PROBE those live per chain & per block-range (see probe.ts).
+ * 1. CAPABILITIES (which networks have traces / stateDiffs / realtime, + block-range
+ *    caveats) come from the SQD docs matrix, snapshotted in networks.json. The Portal
+ *    API does NOT expose these flags. Refresh with fetch-networks.ts.
+ *
+ * 2. EXISTENCE (which datasets a portal actually serves) is PER-PORTAL — different
+ *    portals serve different subsets — so we query the TARGET portal's /datasets live
+ *    (fetchCatalog) rather than assume the docs list is what this portal has.
  */
-export const ALL_NETWORKS_DOCS = "https://docs.sqd.dev/en/data/all-networks";
-export const CHAIN_TO_DATASET: Record<number, string> = {
-  1: "ethereum-mainnet",
-  10: "optimism-mainnet",
-  56: "binance-mainnet",
-  130: "unichain-mainnet",
-  137: "polygon-mainnet",
-  143: "monad-mainnet",
-  146: "sonic-mainnet",
-  239: "tac-mainnet",
-  250: "fantom-mainnet",
-  480: "worldchain-mainnet",
-  999: "hyperliquid-mainnet",
-  8453: "base-mainnet",
-  9745: "plasma-mainnet",
-  42161: "arbitrum-one",
-  42220: "celo-mainnet",
-  43114: "avalanche-mainnet",
-  59144: "linea-mainnet",
-  60808: "bob-mainnet",
-  80094: "berachain-mainnet",
-  534352: "scroll-mainnet",
-  11155111: "ethereum-sepolia",
-  84532: "base-sepolia",
-  421614: "arbitrum-sepolia",
-};
+import { createRequire } from "node:module";
+
+const snapshot = createRequire(import.meta.url)("./networks.json") as { _source: string; networks: Record<string, NetworkCaps> };
+
+export const ALL_NETWORKS_DOCS = snapshot._source;
+
+export type NetworkCaps = { name: string; slug: string; type: string; portal: boolean; realtime: boolean; traces: boolean; stateDiffs: boolean; note?: string };
+
+/** chainId → docs capabilities (authoritative; from networks.json). */
+export const NETWORKS: Record<number, NetworkCaps> = snapshot.networks as any;
+
+export const datasetForChain = (chainId: number): string | undefined => NETWORKS[chainId]?.slug;
+export const capsForChain = (chainId: number): NetworkCaps | undefined => NETWORKS[chainId];
 
 export type DatasetInfo = { dataset: string; realTime: boolean; aliases: string[] };
 
-/** Fetch the live catalog so we report actual availability (not a stale map). */
+/** Live per-portal catalog — what THIS portal serves (existence is per-portal). */
 export async function fetchCatalog(baseUrl: string, apiKey?: string): Promise<Map<string, DatasetInfo>> {
   const headers: Record<string, string> = {};
   if (apiKey) headers["x-api-key"] = apiKey;
@@ -46,11 +33,10 @@ export async function fetchCatalog(baseUrl: string, apiKey?: string): Promise<Ma
   const map = new Map<string, DatasetInfo>();
   if (res?.ok) {
     for (const d of (await res.json()) as any[]) {
-      map.set(d.dataset, { dataset: d.dataset, realTime: !!d.real_time, aliases: d.aliases ?? [] });
-      for (const a of d.aliases ?? []) map.set(a, { dataset: d.dataset, realTime: !!d.real_time, aliases: d.aliases ?? [] });
+      const info = { dataset: d.dataset, realTime: !!d.real_time, aliases: d.aliases ?? [] };
+      map.set(d.dataset, info);
+      for (const a of d.aliases ?? []) map.set(a, info);
     }
   }
   return map;
 }
-
-export const datasetForChain = (chainId: number): string | undefined => CHAIN_TO_DATASET[chainId];
