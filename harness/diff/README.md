@@ -23,3 +23,12 @@ PORTAL_API_KEY=…  \                                               # for a keye
 `SQD_PONDER_TARBALL=/path/to/subsquid-ponder-X.tgz` installs a local fork build (from `scripts/sync-upstream.sh`) instead of the published `@subsquid/ponder` — useful while iterating before a release.
 
 Exit `0` = byte-identical; non-zero prints the divergent rows (per table) and fails — so it's CI-able and catches any drift in the log/tx/receipt/trace paths.
+
+## Validated at scale (Euler V2 factory suite, private portal + SQD RPC)
+
+| range | logs | txs | receipts | blocks | byte-identical | Portal | RPC | speedup |
+|------:|-----:|----:|---------:|-------:|:---:|------:|----:|--------:|
+| 500k  | 1,904 | 699 | 699 | 695 | ✅ all paths | 40s | 155s | ~3.9× |
+| 1M    | 18,473 | 6,904 | 6,904 | 6,768 | ✅ all paths | 58s | 709s | ~12× |
+
+Portal scales sublinearly (range-scan); per-`getLogs` RPC degrades on the denser later blocks, so the advantage widens with range.

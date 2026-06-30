@@ -53,7 +53,8 @@ run portal "$PORTAL" "$WORK/dbPortal" 42270
 run rpc    ""         "$WORK/dbRpc"    42271
 
 echo ""
-echo "⏱ BACKFILL WALL-CLOCK [$START,$END] — Portal ${WALL_portal}s vs RPC ${WALL_rpc}s  $(awk "BEGIN{p=${WALL_portal:-0};r=${WALL_rpc:-0};if(p>0)printf \"→ %.1fx faster\", r/p}")"
+SPEEDUP=$(awk -v p="${WALL_portal:-0}" -v r="${WALL_rpc:-0}" 'BEGIN{ if (p>0) printf "%.1fx faster", r/p; else print "n/a" }')
+echo "⏱ BACKFILL WALL-CLOCK [$START,$END] — Portal ${WALL_portal}s vs RPC ${WALL_rpc}s  →  $SPEEDUP"
 echo ""
 echo "▶ diffing ponder_sync stores"
 cp "$ROOT/harness/diff/diff.mjs" "$WORK/diff.mjs"   # run from $WORK so @electric-sql/pglite resolves
