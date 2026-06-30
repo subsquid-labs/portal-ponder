@@ -1,3 +1,4 @@
+import { writeFileSync } from "node:fs";
 import type { Common } from "@/internal/common.js";
 import type {
   Chain,
@@ -83,7 +84,7 @@ export const createPortalHistoricalSync = (
   const baseHeaders: Record<string, string> = { "content-type": "application/json", "accept-encoding": "gzip" };
   if (process.env.PORTAL_API_KEY) baseHeaders["x-api-key"] = process.env.PORTAL_API_KEY;
 
-  const stats = { dataChunks: 0, discChunks: 0, http: 0, logs: 0, errors: 0, retries: 0, bytes: 0, cacheHits: 0, inflight: 0, maxInflight: 0 };
+  const stats = { dataChunks: 0, discChunks: 0, http: 0, logs: 0, errors: 0, retries: 0, bytes: 0, cacheHits: 0, inflight: 0, maxInflight: 0, blocks: 0, txs: 0, receipts: 0, traces: 0, rpcFallback: 0 };
   const dataCache = new Map<number, Promise<ChunkData>>(); // keyed by chunk index
   const discCache = new Map<number, Promise<void>>(); // keyed by chunk index
   const stash = new Map<string, { blocks: SyncBlockHeader[]; txs: SyncTransaction[]; receipts: SyncTransactionReceipt[]; traces: { trace: SyncTrace; block: SyncBlock; transaction: SyncTransaction }[]; closest: SyncBlock | undefined }>();
@@ -104,6 +105,21 @@ export const createPortalHistoricalSync = (
     if (process.env.PORTAL_FINALIZED_HEAD) return (portalHead = Number(process.env.PORTAL_FINALIZED_HEAD));
     try { const h = await fetch(`${portalUrl}/finalized-head`, { headers: baseHeaders }).then((r) => r.json()); if (typeof h?.number === "number") portalHead = h.number; } catch { /* keep prior */ }
     return portalHead ?? Number.POSITIVE_INFINITY;
+  };
+  // instrumentation: per-chain backfill metrics → PORTAL_METRICS_FILE.<chainId> (for the bench harness)
+  const METRICS_FILE = process.env.PORTAL_METRICS_FILE;
+  let startTime = 0;
+  const writeMetrics = () => {
+    if (!METRICS_FILE) return;
+    try {
+      writeFileSync(`${METRICS_FILE}.${args.chain.id}`, JSON.stringify({
+        chain: args.chain.name, chainId: args.chain.id, wallMs: startTime ? Date.now() - startTime : 0,
+        chunkBlocks, portalFinalizedHead: portalHead ?? null,
+        fetch: { dataChunks: stats.dataChunks, discChunks: stats.discChunks, http: stats.http, bytes: stats.bytes, errors: stats.errors, retries: stats.retries, cacheHits: stats.cacheHits, maxInflight: stats.maxInflight },
+        inserted: { logs: stats.logs, blocks: stats.blocks, txs: stats.txs, receipts: stats.receipts, traces: stats.traces },
+        rpcFallbackIntervals: stats.rpcFallback,
+      }));
+    } catch { /* best-effort */ }
   };
 
   // Scale chunk size by the chain's block density. High-block-rate chains (Arbitrum
@@ -394,13 +410,14 @@ export const createPortalHistoricalSync = (
   return {
     async syncBlockRangeData(params) {
       const { interval, requiredIntervals, requiredFactoryIntervals, syncStore } = params;
+      if (!startTime) startTime = Date.now();
       // finality gap: if this interval reaches past Portal's finalized head, re-confirm
       // (Portal advances) and, if still beyond, delegate the whole interval to RPC.
       if (portalHead === undefined) await refreshPortalHead();
       if (isFinalityGap(interval[1], portalHead)) {
         await refreshPortalHead(); // Portal advances — re-confirm before falling back
         if (isFinalityGap(interval[1], portalHead)) {
-          delegated.add(ikey(interval));
+          delegated.add(ikey(interval)); stats.rpcFallback++;
           log.debug({ service: "portal", msg: `Portal ${args.chain.name} [${interval[0]},${interval[1]}] past finalized head ${portalHead} → RPC fallback` });
           return rpcFallback().syncBlockRangeData(params);
         }
@@ -514,6 +531,8 @@ export const createPortalHistoricalSync = (
       if (txs.size) await syncStore.insertTransactions({ transactions: [...txs.values()], chainId });
       if (s.receipts.length) await syncStore.insertTransactionReceipts({ transactionReceipts: s.receipts, chainId });
       if (s.traces.length) await syncStore.insertTraces({ traces: s.traces, chainId });
+      stats.blocks += blockArr.length; stats.txs += txs.size; stats.receipts += s.receipts.length; stats.traces += s.traces.length;
+      writeMetrics();
       return s.closest;
     },
   };

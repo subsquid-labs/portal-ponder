@@ -1,0 +1,31 @@
+{
+  "ts": "2026-06-30T10:37Z",
+  "results": [
+    {
+      "name": "uniswap-portal (all-sources)",
+      "ok": true,
+      "wallSec": 22.5,
+      "events": 13635,
+      "eventsPerSec": 605,
+      "peakRssMB": 1003,
+      "portal": {
+        "http": 4,
+        "mb": 372.353,
+        "dataChunks": 7,
+        "errors": 0,
+        "retries": 0,
+        "cacheHits": 91,
+        "maxInflight": 6,
+        "rpcFallback": 0,
+        "chunkBlocks": 25000,
+        "inserted": {
+          "logs": 36203,
+          "blocks": 4309,
+          "txs": 13905,
+          "receipts": 7549,
+          "traces": 6462
+        }
+      }
+    }
+  ]
+}
