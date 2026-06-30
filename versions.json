@@ -1,0 +1,28 @@
+{
+  "fork": "@subsquid/ponder",
+  "upstream": "ponder",
+  "policy": "The fork version mirrors the upstream ponder version EXACTLY: @subsquid/ponder@X.Y.Z is built from ponder@X.Y.Z + the Portal layer (portal/). The bin stays `ponder`, so it's a drop-in. We publish a fork release only for ponder versions a client actually needs; `compat.tested` records which versions the seam is proven against (past + future awareness).",
+  "layer": "portal/",
+  "seam": "HistoricalSync.syncBlockRangeData / syncBlockData (interval-scoped) — identical in shape across the tested range",
+  "versions": [
+    {
+      "ponder": "0.16.6",
+      "wiring": "wiring/0.16.6.patch",
+      "status": "verified",
+      "published": false,
+      "note": "current latest; the layer + wiring were authored against this"
+    },
+    {
+      "ponder": "0.15.17",
+      "wiring": "wiring/0.15.17.patch",
+      "status": "planned",
+      "published": false,
+      "note": "Euler (the company) pins this; seam verified identical 0.15.17→0.16.6. Generate the wiring patch + run sync-upstream to promote to verified."
+    }
+  ],
+  "compat": {
+    "tested": ["0.16.6"],
+    "seamStableRange": "0.15.17 - 0.16.6 (verified identical by inspection; CI matrix promotes to 'tested' as patches land)",
+    "howToAdd": "see PUBLISHING.md — scripts/sync-upstream.sh <ver> --test, then add the row here"
+  }
+}

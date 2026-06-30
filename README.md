@@ -23,9 +23,9 @@ The entire core change is **~310 lines in one new file + 13 lines of wiring**:
 
 | Piece | Where | Notes |
 |---|---|---|
-| `createPortalHistoricalSync` | `integration/core-fork/portal.ts` | Implements Ponder's `HistoricalSync` interface against Portal |
-| Config + runtime wiring | `integration/core-fork/wiring.patch` | adds `portal?` to `ChainConfig`/`Chain`; branches `createHistoricalSync` → `createPortalHistoricalSync` at `runtime/historical.ts` when `chain.portal` is set |
-| Demo indexer | `integration/euler-portal-app/` | real Euler `eVaultFactory`, multi-chain, untouched handler code |
+| `createPortalHistoricalSync` | `portal/portal.ts` | Implements Ponder's `HistoricalSync` interface against Portal |
+| Config + runtime wiring | `portal/wiring/0.16.6.patch` | adds `portal?` to `ChainConfig`/`Chain`; branches `createHistoricalSync` → `createPortalHistoricalSync` at `runtime/historical.ts` when `chain.portal` is set |
+| Demo indexer | `examples/euler-multichain/` | real Euler `eVaultFactory`, multi-chain, untouched handler code |
 | Standalone engine + bench | `packages/portal-sync/`, `harness/` | a self-contained Portal client/transform/metrics used to validate & benchmark Portal directly |
 
 **How `portal.ts` works (the interesting bits):**
@@ -40,7 +40,7 @@ The entire core change is **~310 lines in one new file + 13 lines of wiring**:
 
 ### Trade-offs
 
-- **It's a fork/patch of `@ponder/core`, not a plugin.** The `HistoricalSync` selection is hardcoded in the runtime; there's no DI hook. Distribute via `patch-package` or a thin published `@your-org/ponder-core`. The seam itself (`HistoricalSync`, `SyncStore`, `Sync* = viem` types) is small and stable.
+- **It's a fork/patch of `@ponder/core`, not a plugin.** The `HistoricalSync` selection is hardcoded in the runtime; there's no DI hook. Distribute via `patch-package` or a thin published `@subsquid/ponder`. The seam itself (`HistoricalSync`, `SyncStore`, `Sync* = viem` types) is small and stable.
 - **After the fetch is fast, the bottleneck moves to the indexing layer** (decode + store). The ~5-min single-chain number below is partly pglite write time; use Postgres / parallel indexing for very large resyncs. This is orthogonal to the Portal integration.
 - **Absolute speedups depend on the Portal tier.** Numbers here are on a dedicated Portal; the free public Portal shares a CU pool and is much slower under concurrency.
 - **Portal serves finalized data**; realtime/frontfill stays on `rpc` by design. If Portal's finalized head ever lags Ponder's target, intervals past it are **auto-delegated to the stock RPC historical sync** (so the backfill is still complete; `PORTAL_FINALIZED_HEAD` forces this for testing).
@@ -87,43 +87,52 @@ The headline result is the twist: **Arbitrum — the chain we expected to domina
 
 **Correctness:** Portal-derived logs are byte-identical to JSON-RPC `eth_getLogs` (differential test on Base WETH Transfers, 380/380 logs, all fields).
 
-Reproduce: `integration/euler-portal-app/` is the demo indexer; `harness/` has the stress test + dashboard + differential. Set `PORTAL_API_KEY` and the per-chain `PONDER_RPC_URL_*` env vars (Portal handles backfill; RPC is finality/realtime only).
+Reproduce: `examples/euler-multichain/` is the demo indexer; `harness/` has the stress test + dashboard + differential. Set `PORTAL_API_KEY` and the per-chain `PONDER_RPC_URL_*` env vars (Portal handles backfill; RPC is finality/realtime only).
 
 ---
 
 ## 4. Tests & contributing
 
 **Tests — honest state:**
-- **Transform unit tests** (`integration/core-fork/portal-transform.test.ts`, 12 tests) run over **real Portal NDJSON captured at eth block 21M** (in `__fixtures__/`) and pin every flagged type mismatch: decimal `status`/`type` → hex, gas/value stay hex, trace `callType` read from `action.callType` (→ DELEGATECALL), staticcall `value:null`, CREATE `init`/`code`, suicide → SELFDESTRUCT, stateDiff `prev:null` ⟺ `+`, DFS trace ordering, the trace-chunk memory cap, and the finality-gap decision.
+- **Transform unit tests** (`portal/portal-transform.test.ts`, 12 tests) run over **real Portal NDJSON captured at eth block 21M** (in `__fixtures__/`) and pin every flagged type mismatch: decimal `status`/`type` → hex, gas/value stay hex, trace `callType` read from `action.callType` (→ DELEGATECALL), staticcall `value:null`, CREATE `init`/`code`, suicide → SELFDESTRUCT, stateDiff `prev:null` ⟺ `+`, DFS trace ordering, the trace-chunk memory cap, and the finality-gap decision.
 - **Analyzer tests** (`harness/compat/analyze.test.ts`, 6 tests): docs-capability gate (a chain with `traces:false` flags trace sources; Arbitrum's traces are READY because the docs say so), per-portal existence (a portal that doesn't serve the dataset → `NO_DATASET`), and block-range notes (Optimism Bedrock surfaced).
 - **Integration regression** (`portal.test.ts`): a fixture Portal block → asserts `event.transaction` is populated (runs against a local HTTP server, no chain; isolate via `vite.portal.config.ts`, no Foundry `globalSetup`).
 - **End-to-end**: `integration/uniswap-portal-app/` backfills all five source types from Portal in one run — receipts (V3 pool swaps carry `receiptGasUsed`/`status`), traces (V2 Router calls reconstructed from call-traces), block-interval (a tick every 1000th block: exactly 22.200M, 22.201M …), and account transactions (txs to WETH, all verified `to == WETH`); plus the differential harness + multi-chain Euler runs.
 - **Still wanted:** unit tests for the filter→Portal-query builder, chunk-index math, auto-scaling, and discovery/data ordering. Every bug fix ships with a fixture + regression (the convention).
 
 **Where to pick up (with or without an agent):**
-1. `integration/core-fork/portal.ts` is the whole core — start there. `wiring.patch` shows the 4-file integration into `@ponder/core`.
+1. `portal/portal.ts` is the whole core — start there. `wiring/<ver>.patch` shows the 4-file integration into `@ponder/core`.
 2. Highest-value next work: **chunk-sizing by data volume** (vs block-count) + CU-budget-aware prefetch; then upstreaming the `HistoricalSync` hook.
 3. `packages/portal-sync/` + `harness/` let you exercise Portal directly (no Ponder build) — fastest loop for transform/perf work.
-4. To run the real thing: clone `ponder-sh/ponder`, apply `wiring.patch`, drop in `portal.ts`, build core, point a project's `ponder.config.ts` at a `portal:` dataset.
+4. To run the real thing: clone `ponder-sh/ponder`, apply `wiring/<ver>.patch`, drop in `portal.ts`, build core, point a project's `ponder.config.ts` at a `portal:` dataset.
 
 Contributions welcome — it's a prototype with a clear seam and a clear TODO list. Keep changes honest: measure resync wall-clock (not scan rate), and add a regression for every fix.
 
 ---
 
+## How it ships — `@subsquid/ponder`, a drop-in fork of `ponder`
+
+A client replaces `ponder` with **`@subsquid/ponder`** (same `ponder` bin) and adds one `portal:` line
+per chain; the historical backfill goes through Portal, realtime stays on `rpc`. The fork **version
+mirrors ponder exactly** (`@subsquid/ponder@X.Y.Z` = `ponder@X.Y.Z` + the Portal layer), and it's
+*generated*, not hand-maintained — see [`PUBLISHING.md`](PUBLISHING.md) + [`versions.json`](versions.json).
+
 ## Layout
 
 ```
-MIGRATION.md             how a client adopts this (parity proof → backfill boost → managed)
-integration/core-fork/   portal.ts (the native sync) + portal-transform.ts + __fixtures__/,
-                         wiring.patch, portal.test.ts, portal-transform.test.ts   ← the speedup
-integration/euler-portal-app/      real multi-chain Euler demo indexer
-integration/uniswap-portal-app/    e2e: receipts + traces + block-interval + account-transaction sources
-integration/ponder-core.md         step-by-step integration guide
-packages/portal-sync/
-  config.ts              withPortal() + registry — native-injection glue
-  {portal-client,query,transform,metrics}.ts   standalone Portal engine
-harness/compat/          compat report — analyzer + networks.json (docs snapshot) + fetch-networks.ts + tests
-harness/                 stress test + live dashboard, multichain, differential, gates
+README / MIGRATION / PUBLISHING.md   overview · client adoption · how the fork is built+versioned+published
+versions.json            the @subsquid/ponder ↔ ponder version matrix (source of truth for CI + releases)
+portal/                  THE PORTAL LAYER — the entire diff vs upstream ponder:
+  portal.ts                the Portal-backed HistoricalSync (the speedup)
+  portal-transform.ts      pure NDJSON→Sync* transforms  (+ portal-transform.test.ts, __fixtures__/)
+  config.ts                withPortal() helper · INTEGRATION.md  the seam write-up
+  wiring/<ver>.patch       the 4 touch-points, one patch per ponder version
+scripts/sync-upstream.sh   clone ponder@<ver> + apply the layer + build → @subsquid/ponder@<ver>
+.github/workflows/ci.yml   version matrix: apply the layer + run Portal tests on each supported ponder version
+examples/                  runnable indexers (uniswap-portal · euler-multichain · the Euler subgraph port)
+harness/bench/             benchmark base + instrumentation (BENCHMARKS · CANDIDATES · results)
+harness/compat/            compatibility report (analyzer + networks.json docs snapshot + tests)
+packages/portal-sync/      legacy standalone Portal engine (pre-fork; powers the stress/dashboard harness)
 ```
 
-**Adoption:** start with the [compatibility report](harness/compat/report.ts) — per source it checks that the **target portal** serves the chain's dataset (live `/datasets`, since different portals serve different subsets) and that the network has the needed capabilities (traces) per the [authoritative docs matrix](https://docs.sqd.dev/en/data/all-networks) — then [`MIGRATION.md`](MIGRATION.md). There's a single delivery path (the native `HistoricalSync` seam); we deliberately don't ship a slow JSON-RPC transport shim (see the trade-off note above).
+**Adoption:** start with the [compatibility report](harness/compat/report.ts) — per source it checks that the **target portal** serves the chain's dataset (live `/datasets`, since different portals serve different subsets) and that the network has the needed capabilities (traces) per the [authoritative docs matrix](https://docs.sqd.dev/en/data/all-networks) — then [`MIGRATION.md`](MIGRATION.md). We deliberately don't ship a slow JSON-RPC transport shim (see the trade-off note above).

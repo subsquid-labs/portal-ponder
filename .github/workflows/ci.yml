@@ -1,0 +1,43 @@
+name: ci
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  # derive the ponder-version matrix from versions.json so CI is version-aware:
+  # adding a version there automatically extends the matrix below.
+  versions:
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.set.outputs.matrix }}
+    steps:
+      - uses: actions/checkout@v4
+      - id: set
+        run: echo "matrix=$(node -e "console.log(JSON.stringify(require('./versions.json').compat.tested))")" >> "$GITHUB_OUTPUT"
+
+  # the version matrix: for each supported ponder version, apply the Portal layer + build + run
+  # the Portal-layer unit tests. A ponder upgrade that drifts the seam fails here before release.
+  fork-seam:
+    needs: versions
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        ponder: ${{ fromJson(needs.versions.outputs.matrix) }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with: { node-version: 22 }
+      - run: corepack enable
+      - name: build fork + run Portal tests for ponder@${{ matrix.ponder }}
+        run: bash scripts/sync-upstream.sh ${{ matrix.ponder }} --test
+
+  # the repo's own suites (compat analyzer over the committed networks.json snapshot, etc.)
+  repo-tests:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with: { node-version: 22 }
+      - run: node --experimental-strip-types --test harness/compat/*.test.ts

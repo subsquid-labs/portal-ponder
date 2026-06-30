@@ -25,29 +25,43 @@ Output is a per-source `READY` / `NEEDS_*` verdict. For the common case (event +
 
 ## Step 1 — Turn on the boost
 
-Two lines in `ponder.config.ts`; handlers and schema untouched:
+**Swap the dependency, add one line per chain.** `@subsquid/ponder` is a drop-in fork of `ponder`
+(same `ponder` bin, same API) that just *also* accepts a `portal:` field per chain; handlers and schema
+are untouched.
+
+```jsonc
+// package.json — pin the fork to the ponder version you're on (the versions mirror exactly)
+"dependencies": { "@subsquid/ponder": "0.16.6" }   // == ponder@0.16.6 + Portal layer
+```
 
 ```ts
-import { createConfig } from "ponder";
-import { withPortal } from "@your-org/ponder-portal";
+// ponder.config.ts — import from the fork; add `portal:` per chain. Nothing else changes.
+import { createConfig } from "@subsquid/ponder";
 
-export default createConfig(withPortal({
+export default createConfig({
   chains: {
     mainnet: {
       id: 1,
-      rpc: process.env.PONDER_RPC_URL_1,                 // realtime + state reads stay here
-      portal: "https://portal.sqd.dev/datasets/ethereum-mainnet",  // backfill from Portal
+      rpc: process.env.PONDER_RPC_URL_1,                                // realtime + state reads stay here
+      portal: "https://portal.sqd.dev/datasets/ethereum-mainnet",       // ← backfill from Portal
     },
   },
   contracts: { /* unchanged */ },
-}));
+});
 ```
 
-`withPortal()` records `portal` per chain; the package's runtime injection swaps Ponder's internal `createHistoricalSync` for the Portal-backed one when a chain has `portal` set (delivered as a `module.register` hook or a thin `ponder-portal` CLI — `package.json`: `"start": "ponder-portal start"`). Realtime keeps using `rpc` — and if Portal's finalized head ever lags the target, the backfill auto-falls-back to the `rpc` sync for the gap, so it stays complete.
+When a chain has `portal` set, the fork routes the historical backfill through Portal and keeps realtime
+on `rpc`; and if Portal's finalized head ever lags the target, the gap auto-falls-back to the stock `rpc`
+sync, so it stays complete. (Pin the fork to your exact ponder version — `@subsquid/ponder@X.Y.Z` is built
+from `ponder@X.Y.Z`; see [`versions.json`](versions.json) for the supported set.)
 
-Run it. The first backfill is the wow: the ~5M-block Ethereum Euler history that takes ~38 min on RPC completes in **~5 min**; multi-chain (eth+base+arbitrum) Euler in ~16 min, all concurrent. See `README.md` for the measured numbers.
+Run it. The first backfill is the wow: the ~5M-block Ethereum Euler history that takes ~38 min on RPC
+completes in **~5 min**; multi-chain (eth+base+arbitrum) Euler in ~16 min, all concurrent. See `README.md`
+for the measured numbers.
 
-**Validate & roll back:** watch the first backfill (wall-clock + zero client-facing errors); for deep checks, diff the `ponder_sync` tables of a Portal run vs an RPC run over the same range. Rollback = remove `withPortal(...)` + the `portal:` line.
+**Validate & roll back:** watch the first backfill (wall-clock + zero client-facing errors); for deep
+checks, diff the `ponder_sync` tables of a Portal run vs an RPC run over the same range. Rollback = point
+the dependency back at `ponder` and remove the `portal:` lines.
 
 ---
 

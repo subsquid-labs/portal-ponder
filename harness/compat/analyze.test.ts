@@ -1,6 +1,6 @@
 import assert from "node:assert";
 import { test } from "node:test";
-import { getPortalDataset, withPortal } from "../../packages/portal-sync/src/config.ts";
+import { getPortalDataset, withPortal } from "../../portal/config.ts";
 import { analyzeConfig } from "./analyze.ts";
 import type { DatasetInfo } from "./datasets.ts";
 
