@@ -2,7 +2,7 @@ import { readFileSync } from "node:fs";
 import { join } from "node:path";
 import { hexToBigInt } from "viem";
 import { expect, test } from "vitest";
-import { cmpTraceAddr, parityToCallFrame, toStateDiff, toSyncReceipt, traceSafeChunkBlocks } from "./portal-transform.js";
+import { cmpTraceAddr, isFinalityGap, parityToCallFrame, toStateDiff, toSyncReceipt, traceSafeChunkBlocks } from "./portal-transform.js";
 
 /**
  * Unit tests over REAL Portal NDJSON captured at eth block 21,000,000 (+ base).
@@ -88,6 +88,13 @@ test("trace: suicide → SELFDESTRUCT", () => {
 
 test("trace: traceAddress sorts in DFS pre-order", () => {
   expect([[1], [], [0, 0], [0]].sort(cmpTraceAddr)).toEqual([[], [0], [0, 0], [1]]);
+});
+
+test("isFinalityGap: interval beyond Portal's finalized head triggers RPC fallback", () => {
+  expect(isFinalityGap(1_000, 2_000)).toBe(false); // within Portal's head
+  expect(isFinalityGap(2_001, 2_000)).toBe(true); // past it → fall back
+  expect(isFinalityGap(2_000, 2_000)).toBe(false); // exactly at head is covered
+  expect(isFinalityGap(2_001, undefined)).toBe(false); // head unknown → no gap yet
 });
 
 test("traceSafeChunkBlocks: caps only when traces needed and base exceeds cap", () => {

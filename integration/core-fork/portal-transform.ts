@@ -26,6 +26,11 @@ export type RawHeader = Record<string, any> & { number: number };
 export const traceSafeChunkBlocks = (base: number, needTraces: boolean, cap = Number(process.env.PORTAL_TRACE_CHUNK_BLOCKS ?? 25_000)): number =>
   needTraces && base > cap ? cap : base;
 
+/** An interval reaching past Portal's finalized head must fall back to RPC for the gap.
+ * (undefined head = not yet known → treat as no gap.) Pure so it's unit-testable. */
+export const isFinalityGap = (intervalEnd: number, portalHead: number | undefined): boolean =>
+  portalHead !== undefined && intervalEnd > portalHead;
+
 /** number|decimal-string|hex → 0x-hex; passes existing hex through. */
 export const hx = (v: unknown): Hex => {
   if (typeof v === "string") return (v.startsWith("0x") ? v : toHex(BigInt(v))) as Hex;

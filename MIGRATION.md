@@ -43,7 +43,7 @@ export default createConfig(withPortal({
 }));
 ```
 
-`withPortal()` records `portal` per chain; the package's runtime injection swaps Ponder's internal `createHistoricalSync` for the Portal-backed one when a chain has `portal` set (delivered as a `module.register` hook or a thin `ponder-portal` CLI — `package.json`: `"start": "ponder-portal start"`). Realtime keeps using `rpc`.
+`withPortal()` records `portal` per chain; the package's runtime injection swaps Ponder's internal `createHistoricalSync` for the Portal-backed one when a chain has `portal` set (delivered as a `module.register` hook or a thin `ponder-portal` CLI — `package.json`: `"start": "ponder-portal start"`). Realtime keeps using `rpc` — and if Portal's finalized head ever lags the target, the backfill auto-falls-back to the `rpc` sync for the gap, so it stays complete.
 
 Run it. The first backfill is the wow: the ~5M-block Ethereum Euler history that takes ~38 min on RPC completes in **~5 min**; multi-chain (eth+base+arbitrum) Euler in ~16 min, all concurrent. See `README.md` for the measured numbers.
 

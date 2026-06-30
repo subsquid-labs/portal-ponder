@@ -21,10 +21,11 @@ import {
   isTransactionFilterMatched,
   isTransferFilterMatched,
 } from "@/runtime/filter.js";
+import type { Rpc } from "@/rpc/index.js";
 import type { Interval } from "@/utils/interval.js";
 import { type Address, type Hex } from "viem";
-import type { HistoricalSync } from "./index.js";
-import { type RawHeader, hx, toSyncLog, toSyncBlockHeader, toSyncTransaction, toSyncReceipt, parityToCallFrame, cmpTraceAddr, traceSafeChunkBlocks } from "./portal-transform.js";
+import { type HistoricalSync, createHistoricalSync } from "./index.js";
+import { type RawHeader, hx, isFinalityGap, toSyncLog, toSyncBlockHeader, toSyncTransaction, toSyncReceipt, parityToCallFrame, cmpTraceAddr, traceSafeChunkBlocks } from "./portal-transform.js";
 
 /**
  * Portal-backed historical sync with a PARALLEL read-ahead chunk buffer.
@@ -47,6 +48,7 @@ import { type RawHeader, hx, toSyncLog, toSyncBlockHeader, toSyncTransaction, to
 type CreateHistoricalSyncParameters = {
   common: Common;
   chain: Chain;
+  rpc: Rpc;
   childAddresses: Map<FactoryId, Map<Address, number>>;
 };
 
@@ -90,6 +92,19 @@ export const createPortalHistoricalSync = (
   let chunkSizeP: Promise<void> | undefined;
   const idxOf = (n: number) => Math.floor(n / chunkBlocks);
   let discStartIdx: number | undefined; // factory deploy chunk — discovery floor (fixes from-0 scan)
+
+  // finality-gap fallback: Portal serves only finalized data, and its finalized head can
+  // (rarely) lag Ponder's target. Any interval reaching past Portal's head is delegated
+  // whole to the stock RPC historical sync. PORTAL_FINALIZED_HEAD overrides for tests/ops.
+  let portalHead: number | undefined = process.env.PORTAL_FINALIZED_HEAD ? Number(process.env.PORTAL_FINALIZED_HEAD) : undefined;
+  let rpcFallbackInstance: HistoricalSync | undefined;
+  const rpcFallback = (): HistoricalSync => (rpcFallbackInstance ??= createHistoricalSync(args));
+  const delegated = new Set<string>(); // interval keys routed to RPC
+  const refreshPortalHead = async (): Promise<number> => {
+    if (process.env.PORTAL_FINALIZED_HEAD) return (portalHead = Number(process.env.PORTAL_FINALIZED_HEAD));
+    try { const h = await fetch(`${portalUrl}/finalized-head`, { headers: baseHeaders }).then((r) => r.json()); if (typeof h?.number === "number") portalHead = h.number; } catch { /* keep prior */ }
+    return portalHead ?? Number.POSITIVE_INFINITY;
+  };
 
   // Scale chunk size by the chain's block density. High-block-rate chains (Arbitrum
   // ~478M blocks ≈ 19× Ethereum) otherwise need 19× more 500k-block chunks = 19× more
@@ -377,7 +392,19 @@ export const createPortalHistoricalSync = (
   };
 
   return {
-    async syncBlockRangeData({ interval, requiredIntervals, requiredFactoryIntervals, syncStore }) {
+    async syncBlockRangeData(params) {
+      const { interval, requiredIntervals, requiredFactoryIntervals, syncStore } = params;
+      // finality gap: if this interval reaches past Portal's finalized head, re-confirm
+      // (Portal advances) and, if still beyond, delegate the whole interval to RPC.
+      if (portalHead === undefined) await refreshPortalHead();
+      if (isFinalityGap(interval[1], portalHead)) {
+        await refreshPortalHead(); // Portal advances — re-confirm before falling back
+        if (isFinalityGap(interval[1], portalHead)) {
+          delegated.add(ikey(interval));
+          log.debug({ service: "portal", msg: `Portal ${args.chain.name} [${interval[0]},${interval[1]}] past finalized head ${portalHead} → RPC fallback` });
+          return rpcFallback().syncBlockRangeData(params);
+        }
+      }
       await ensureChunkSize(); // scale chunk to chain block-density before any idxOf()
       const filters = requiredIntervals.map((r) => r.filter).filter((f) => f.type === "log") as LogFilter[];
       const factories = [...new Map(requiredFactoryIntervals.map((r) => [r.factory.id, r.factory])).values()];
@@ -465,7 +492,9 @@ export const createPortalHistoricalSync = (
       return syncLogs;
     },
 
-    async syncBlockData({ interval, syncStore }) {
+    async syncBlockData(params) {
+      const { interval, syncStore } = params;
+      if (delegated.has(ikey(interval))) { delegated.delete(ikey(interval)); return rpcFallback().syncBlockData(params); }
       const s = stash.get(ikey(interval));
       stash.delete(ikey(interval));
       if (!s) return undefined;
