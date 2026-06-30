@@ -2,7 +2,7 @@ import { readFileSync } from "node:fs";
 import { join } from "node:path";
 import { hexToBigInt } from "viem";
 import { expect, test } from "vitest";
-import { cmpTraceAddr, isFinalityGap, parityToCallFrame, toStateDiff, toSyncReceipt, traceSafeChunkBlocks } from "./portal-transform.js";
+import { cmpTraceAddr, isFinalityGap, parityToCallFrame, toStateDiff, toSyncReceipt, toSyncTransaction, traceSafeChunkBlocks } from "./portal-transform.js";
 
 /**
  * Unit tests over REAL Portal NDJSON captured at eth block 21,000,000 (+ base).
@@ -15,6 +15,22 @@ const load = (f: string): any[] => readFileSync(join(FIX, f), "utf8").trim().spl
 const allTx = load("receipts.json").flatMap((b) => (b.transactions ?? []).map((t: any) => ({ t, h: b.header })));
 const allTrace = load("traces.json").flatMap((b) => b.traces ?? []);
 const allDiff = load("statediffs.json").flatMap((b) => b.stateDiffs ?? []);
+
+// Regression for a byte-identity divergence vs the RPC path (harness/diff): Portal returns
+// accessList=[] for every tx, but the RPC sync stores accessList only on TYPED txs (EIP-2930/
+// 1559/4844, type ≥ 1) and null on legacy (type 0). toSyncTransaction must match that exactly.
+test("accessList matches the RPC shape: legacy → none, typed → [] or list", () => {
+  const h = { hash: "0xb10c", number: 100 } as any;
+  const al = [{ address: "0xabc", storageKeys: ["0x1"] }];
+  // legacy (type 0): Portal sends [] but RPC has no accessList → must drop to undefined (→ null col)
+  expect((toSyncTransaction({ type: 0, accessList: [] }, h) as any).accessList).toBeUndefined();
+  // EIP-1559 with empty accessList → []
+  expect((toSyncTransaction({ type: 2, accessList: [] }, h) as any).accessList).toEqual([]);
+  // typed with entries → passthrough
+  expect((toSyncTransaction({ type: 2, accessList: al }, h) as any).accessList).toEqual(al);
+  // typed but Portal omitted the field → default to [] (never null on a typed tx)
+  expect((toSyncTransaction({ type: 1 }, h) as any).accessList).toEqual([]);
+});
 
 test("receipt: decimal status/type → hex; gas fields stay hex (BigInt-able)", () => {
   const ok = allTx.find(({ t }) => t.status === 1)!;

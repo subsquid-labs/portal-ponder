@@ -219,7 +219,7 @@ export const createPortalHistoricalSync = (
   const LOG_FIELDS = { address: true, topics: true, data: true, transactionHash: true, transactionIndex: true, logIndex: true };
   // Ponder's event profiler probes event.transaction.hash, so we pull each matched
   // log's parent transaction (Portal `transaction` relation) and store it.
-  const TX_FIELDS = { transactionIndex: true, hash: true, from: true, to: true, input: true, value: true, nonce: true, gas: true, gasPrice: true, maxFeePerGas: true, maxPriorityFeePerGas: true, type: true, r: true, s: true, v: true, yParity: true };
+  const TX_FIELDS = { transactionIndex: true, hash: true, from: true, to: true, input: true, value: true, nonce: true, gas: true, gasPrice: true, maxFeePerGas: true, maxPriorityFeePerGas: true, type: true, r: true, s: true, v: true, yParity: true, accessList: true };
   // receipt fields ride on Portal's transaction object (no separate receipt entity)
   const RECEIPT_FIELDS = { status: true, cumulativeGasUsed: true, effectiveGasPrice: true, gasUsed: true, contractAddress: true, logsBloom: true };
   let needReceipts = false; // set from filters on first syncBlockRangeData (stable per chain)
@@ -243,7 +243,10 @@ export const createPortalHistoricalSync = (
     for (const f of filters) for (const i of f.include ?? []) if (i.startsWith("block.")) inc.add(i.slice(6));
     const fields: Record<string, boolean> = {};
     for (const k of REQUIRED_BLOCK_FIELDS) fields[k] = true;
-    for (const k of NULLABLE_BLOCK_FIELDS) if (inc.has(k)) fields[k] = true;
+    // always fetch the nullable header fields too — they're cheap and keep stored blocks
+    // byte-identical with the RPC path (which always has nonce/mixHash/sha3Uncles/totalDifficulty).
+    for (const k of NULLABLE_BLOCK_FIELDS) fields[k] = true;
+    void inc;
     return fields;
   };
 
@@ -303,7 +306,7 @@ export const createPortalHistoricalSync = (
         }
       }
       if (needTraces) {
-        const tq = { type: "evm", fields: { block: blockFieldsFor(filters), trace: TRACE_FIELDS, transaction: { transactionIndex: true, hash: true, from: true, to: true, input: true, value: true, nonce: true, gas: true, gasPrice: true, type: true, r: true, s: true, v: true } }, traces: tracePortalRequests() };
+        const tq = { type: "evm", fields: { block: blockFieldsFor(filters), trace: TRACE_FIELDS, transaction: needReceipts ? { ...TX_FIELDS, ...RECEIPT_FIELDS } : TX_FIELDS }, traces: tracePortalRequests() };
         for await (const blocks of stream(tq, from, to)) {
           for (const b of blocks) if (b.traces?.length) {
             const ex = data.traceBlocks.get(b.header.number);

@@ -11,7 +11,7 @@ set -uo pipefail
 
 ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
 APP="$ROOT/harness/diff/app"
-START="${1:-${PONDER_START:-22200000}}"; END="${2:-${PONDER_END:-22200300}}"
+START="${1:-${PONDER_START:-22200000}}"; END="${2:-${PONDER_END:-22200030}}"   # small default; the diff is per-block deterministic, so a wider range only adds coverage
 PORTAL="${PORTAL_URL_1:-https://portal.sqd.dev/datasets/ethereum-mainnet}"
 CHUNK=$(( END - START + 1 ))   # size the Portal chunk to the diff range (no over-fetch)
 : "${PONDER_RPC_URL_1:?set PONDER_RPC_URL_1 to an eth archive RPC that supports debug_traceBlockByNumber}"
@@ -45,4 +45,5 @@ run portal "$PORTAL" "$WORK/dbPortal" 42270
 run rpc    ""         "$WORK/dbRpc"    42271
 
 echo "▶ diffing ponder_sync stores"
-node "$ROOT/harness/diff/diff.mjs" "$WORK/dbPortal" "$WORK/dbRpc"
+cp "$ROOT/harness/diff/diff.mjs" "$WORK/diff.mjs"   # run from $WORK so @electric-sql/pglite resolves
+node "$WORK/diff.mjs" "$WORK/dbPortal" "$WORK/dbRpc"

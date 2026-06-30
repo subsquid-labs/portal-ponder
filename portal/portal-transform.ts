@@ -60,7 +60,10 @@ export const toSyncTransaction = (tx: any, h: RawHeader): SyncTransaction => ({
   gas: hx(tx.gas), hash: tx.hash, input: tx.input ?? "0x", nonce: hx(tx.nonce ?? 0),
   transactionIndex: hx(tx.transactionIndex), value: hx(tx.value ?? 0), type: hx(tx.type ?? 0),
   gasPrice: opt(tx.gasPrice), maxFeePerGas: opt(tx.maxFeePerGas), maxPriorityFeePerGas: opt(tx.maxPriorityFeePerGas),
-  v: opt(tx.v), r: tx.r, s: tx.s, yParity: tx.yParity !== undefined && tx.yParity !== null ? hx(tx.yParity) : undefined, accessList: tx.accessList,
+  v: opt(tx.v), r: tx.r, s: tx.s, yParity: tx.yParity !== undefined && tx.yParity !== null ? hx(tx.yParity) : undefined,
+  // accessList exists only on typed txs (EIP-2930/1559/4844 → type ≥ 1); legacy (type 0) has none.
+  // Portal returns [] regardless, so normalize to match the RPC path: legacy → undefined (null).
+  accessList: Number(tx.type) >= 1 ? (tx.accessList ?? []) : undefined,
 }) as unknown as SyncTransaction;
 
 /** receipt fields ride on Portal's transaction object; status/type are DECIMAL → hex. */
