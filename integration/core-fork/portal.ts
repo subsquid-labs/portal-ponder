@@ -7,16 +7,22 @@ import type {
   SyncBlock,
   SyncBlockHeader,
   SyncLog,
+  SyncTrace,
   SyncTransaction,
+  SyncTransactionReceipt,
 } from "@/internal/types.js";
 import {
   getChildAddress,
   isAddressFactory,
+  isAddressMatched,
   isLogFactoryMatched,
+  isTraceFilterMatched,
+  isTransferFilterMatched,
 } from "@/runtime/filter.js";
 import type { Interval } from "@/utils/interval.js";
-import { type Address, type Hex, numberToHex, toHex } from "viem";
+import { type Address, type Hex } from "viem";
 import type { HistoricalSync } from "./index.js";
+import { type RawHeader, hx, toSyncLog, toSyncBlockHeader, toSyncTransaction, toSyncReceipt, parityToCallFrame, cmpTraceAddr } from "./portal-transform.js";
 
 /**
  * Portal-backed historical sync with a PARALLEL read-ahead chunk buffer.
@@ -43,20 +49,19 @@ type CreateHistoricalSyncParameters = {
 };
 
 type PortalLogRequest = { address?: string[]; topic0?: string[]; topic1?: string[]; topic2?: string[]; topic3?: string[]; transaction?: boolean };
-type RawHeader = Record<string, any> & { number: number };
-type ChunkData = { headers: Map<number, RawHeader>; logs: Map<number, any[]>; txs: Map<number, any[]> };
+type ChunkData = {
+  headers: Map<number, RawHeader>;
+  logs: Map<number, any[]>;
+  txs: Map<number, any[]>;
+  // for trace/transfer sources: full block + all its traces + its txs, by block number
+  traceBlocks: Map<number, { header: RawHeader; traces: any[]; txs: any[] }>;
+};
 
 const PORTAL_MAX_ADDRESSES = 1000;
 const CHUNK_BLOCKS = Number(process.env.PORTAL_CHUNK_BLOCKS ?? 500_000);
 const READAHEAD = Number(process.env.PORTAL_READAHEAD ?? 6);
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
-const hx = (v: unknown): Hex => {
-  if (typeof v === "string") return (v.startsWith("0x") ? v : toHex(BigInt(v))) as Hex;
-  if (typeof v === "number" || typeof v === "bigint") return numberToHex(v);
-  return "0x0";
-};
-const opt = (v: unknown): Hex | undefined => (v === undefined || v === null ? undefined : hx(v));
 const asArr = (t: Hex | readonly Hex[] | null | undefined): string[] | undefined => {
   if (t === null || t === undefined) return undefined;
   return (Array.isArray(t) ? t : [t]).map((x) => (x as string).toLowerCase());
@@ -73,7 +78,7 @@ export const createPortalHistoricalSync = (
   const stats = { dataChunks: 0, discChunks: 0, http: 0, logs: 0, errors: 0, retries: 0, bytes: 0, cacheHits: 0, inflight: 0, maxInflight: 0 };
   const dataCache = new Map<number, Promise<ChunkData>>(); // keyed by chunk index
   const discCache = new Map<number, Promise<void>>(); // keyed by chunk index
-  const stash = new Map<string, { blocks: SyncBlockHeader[]; txs: SyncTransaction[]; closest: SyncBlock | undefined }>();
+  const stash = new Map<string, { blocks: SyncBlockHeader[]; txs: SyncTransaction[]; receipts: SyncTransactionReceipt[]; traces: { trace: SyncTrace; block: SyncBlock; transaction: SyncTransaction }[]; closest: SyncBlock | undefined }>();
   const ikey = (i: Interval) => `${i[0]}-${i[1]}`;
   let chunkBlocks = CHUNK_BLOCKS;
   let chunkSizeP: Promise<void> | undefined;
@@ -103,7 +108,7 @@ export const createPortalHistoricalSync = (
   };
 
   // one POST+drain; returns blocks or "done" (204); throws (with .retryAfterMs on 503-class).
-  async function fetchBatch(body: string, cursor: number): Promise<{ blocks: { header: RawHeader; logs?: any[]; transactions?: any[] }[]; last: number } | "done"> {
+  async function fetchBatch(body: string, cursor: number): Promise<{ blocks: { header: RawHeader; logs?: any[]; transactions?: any[]; traces?: any[] }[]; last: number } | "done"> {
     stats.inflight++; stats.maxInflight = Math.max(stats.maxInflight, stats.inflight);
     try {
       const res = await fetch(`${portalUrl}/finalized-stream`, { method: "POST", headers: baseHeaders, body });
@@ -119,7 +124,7 @@ export const createPortalHistoricalSync = (
       const reader = res.body!.getReader();
       const dec = new TextDecoder();
       let buf = "", last = cursor;
-      const blocks: { header: RawHeader; logs?: any[]; transactions?: any[] }[] = [];
+      const blocks: { header: RawHeader; logs?: any[]; transactions?: any[]; traces?: any[] }[] = [];
       const onLine = (line: string) => { if (!line) return; const b = JSON.parse(line); blocks.push(b); if (b.header?.number > last) last = b.header.number; };
       for (;;) { const { done, value } = await reader.read(); if (done) break; stats.bytes += value.byteLength; buf += dec.decode(value, { stream: true }); let nl: number; while ((nl = buf.indexOf("\n")) >= 0) { onLine(buf.slice(0, nl)); buf = buf.slice(nl + 1); } }
       buf += dec.decode(); if (buf) onLine(buf);
@@ -172,6 +177,20 @@ export const createPortalHistoricalSync = (
   // Ponder's event profiler probes event.transaction.hash, so we pull each matched
   // log's parent transaction (Portal `transaction` relation) and store it.
   const TX_FIELDS = { transactionIndex: true, hash: true, from: true, to: true, input: true, value: true, nonce: true, gas: true, gasPrice: true, maxFeePerGas: true, maxPriorityFeePerGas: true, type: true, r: true, s: true, v: true, yParity: true };
+  // receipt fields ride on Portal's transaction object (no separate receipt entity)
+  const RECEIPT_FIELDS = { status: true, cumulativeGasUsed: true, effectiveGasPrice: true, gasUsed: true, contractAddress: true, logsBloom: true };
+  let needReceipts = false; // set from filters on first syncBlockRangeData (stable per chain)
+  // trace fields: request both flattened selectors (some Portal builds) AND rely on
+  // nested action/result in the response — the transform reads whichever is present.
+  const TRACE_FIELDS = {
+    transactionIndex: true, traceAddress: true, type: true, subtraces: true, error: true, revertReason: true,
+    callFrom: true, callTo: true, callValue: true, callGas: true, callInput: true, callSighash: true, callCallType: true, callResultGasUsed: true, callResultOutput: true,
+    createFrom: true, createValue: true, createGas: true, createInit: true, createResultGasUsed: true, createResultCode: true, createResultAddress: true,
+    suicideAddress: true, suicideRefundAddress: true, suicideBalance: true,
+  };
+  let needTraces = false;
+  let traceFilters: any[] = [];
+  let transferFilters: any[] = [];
   const blockFieldsFor = (filters: Filter[]): Record<string, boolean> => {
     const inc = new Set<string>();
     for (const f of filters) for (const i of f.include ?? []) if (i.startsWith("block.")) inc.add(i.slice(6));
@@ -224,9 +243,9 @@ export const createPortalHistoricalSync = (
       stats.dataChunks++;
       const from = idx * chunkBlocks, to = from + chunkBlocks - 1;
       const logRequests = filters.flatMap((f) => logRequestsFor(f)).map((r) => ({ ...r, transaction: true }));
-      const data: ChunkData = { headers: new Map(), logs: new Map(), txs: new Map() };
+      const data: ChunkData = { headers: new Map(), logs: new Map(), txs: new Map(), traceBlocks: new Map() };
       if (logRequests.length > 0) {
-        const q = { type: "evm", fields: { block: blockFieldsFor(filters), log: LOG_FIELDS, transaction: TX_FIELDS }, logs: logRequests };
+        const q = { type: "evm", fields: { block: blockFieldsFor(filters), log: LOG_FIELDS, transaction: needReceipts ? { ...TX_FIELDS, ...RECEIPT_FIELDS } : TX_FIELDS }, logs: logRequests };
         for await (const blocks of stream(q, from, to)) {
           for (const b of blocks) if (b.logs?.length) {
             data.headers.set(b.header.number, b.header);
@@ -236,22 +255,69 @@ export const createPortalHistoricalSync = (
           }
         }
       }
+      if (needTraces) {
+        const tq = { type: "evm", fields: { block: blockFieldsFor(filters), trace: TRACE_FIELDS, transaction: { transactionIndex: true, hash: true, from: true, to: true, input: true, value: true, nonce: true, gas: true, gasPrice: true, type: true, r: true, s: true, v: true } }, traces: tracePortalRequests() };
+        for await (const blocks of stream(tq, from, to)) {
+          for (const b of blocks) if (b.traces?.length) {
+            const ex = data.traceBlocks.get(b.header.number);
+            if (ex) { ex.traces.push(...b.traces); if (b.transactions) ex.txs.push(...b.transactions); }
+            else data.traceBlocks.set(b.header.number, { header: b.header, traces: b.traces, txs: b.transactions ?? [] });
+          }
+        }
+      }
       return data;
     })();
     dataCache.set(idx, p);
     return p;
   }
 
-  const toSyncLog = (l: any, h: RawHeader): SyncLog => ({ address: (l.address as string).toLowerCase(), topics: l.topics ?? [], data: l.data ?? "0x", blockNumber: hx(h.number), blockHash: h.hash, transactionHash: l.transactionHash, transactionIndex: hx(l.transactionIndex), logIndex: hx(l.logIndex), removed: false }) as SyncLog;
-  const toSyncBlockHeader = (h: RawHeader): SyncBlockHeader => ({ number: hx(h.number), hash: h.hash, parentHash: h.parentHash, timestamp: hx(h.timestamp), logsBloom: h.logsBloom, miner: h.miner, gasUsed: opt(h.gasUsed), gasLimit: opt(h.gasLimit), baseFeePerGas: opt(h.baseFeePerGas), nonce: h.nonce, mixHash: h.mixHash, stateRoot: h.stateRoot, receiptsRoot: h.receiptsRoot, transactionsRoot: h.transactionsRoot, sha3Uncles: h.sha3Uncles, size: opt(h.size), difficulty: opt(h.difficulty), totalDifficulty: opt(h.totalDifficulty), extraData: h.extraData, transactions: undefined }) as unknown as SyncBlockHeader;
-  const toSyncTransaction = (tx: any, h: RawHeader): SyncTransaction => ({
-    blockHash: h.hash, blockNumber: hx(h.number),
-    from: (tx.from as string)?.toLowerCase(), to: tx.to ? (tx.to as string).toLowerCase() : null,
-    gas: hx(tx.gas), hash: tx.hash, input: tx.input ?? "0x", nonce: hx(tx.nonce ?? 0),
-    transactionIndex: hx(tx.transactionIndex), value: hx(tx.value ?? 0), type: hx(tx.type ?? 0),
-    gasPrice: opt(tx.gasPrice), maxFeePerGas: opt(tx.maxFeePerGas), maxPriorityFeePerGas: opt(tx.maxPriorityFeePerGas),
-    v: opt(tx.v), r: tx.r, s: tx.s, yParity: tx.yParity !== undefined ? hx(tx.yParity) : undefined, accessList: tx.accessList,
-  }) as unknown as SyncTransaction;
+
+  const factoryAddrOk = (filterAddr: any, addr: string | undefined, bn: number): boolean =>
+    !isAddressFactory(filterAddr) || isAddressMatched({ address: addr as Address, blockNumber: bn, childAddresses: args.childAddresses.get(filterAddr.id)! });
+  const traceMatched = (frame: any, bn: number): boolean => {
+    const blk = { number: BigInt(bn) } as any;
+    for (const f of transferFilters) if (isTransferFilterMatched({ filter: f, trace: frame, block: blk }) && factoryAddrOk(f.fromAddress, frame.from, bn) && factoryAddrOk(f.toAddress, frame.to, bn)) return true;
+    for (const f of traceFilters) if (isTraceFilterMatched({ filter: f, trace: frame, block: blk }) && factoryAddrOk(f.fromAddress, frame.from, bn) && factoryAddrOk(f.toAddress, frame.to, bn)) return true;
+    return false;
+  };
+  const buildTraces = (cd: ChunkData, lo: number, hi: number): { trace: SyncTrace; block: SyncBlock; transaction: SyncTransaction }[] => {
+    const out: { trace: SyncTrace; block: SyncBlock; transaction: SyncTransaction }[] = [];
+    for (const [bn, tb] of cd.traceBlocks) {
+      if (bn < lo || bn > hi || !tb.traces?.length) continue;
+      const block = toSyncBlockHeader(tb.header) as unknown as SyncBlock; // encodeTrace only reads block.number
+      const txByIdx = new Map<number, any>();
+      for (const tx of tb.txs ?? []) txByIdx.set(tx.transactionIndex, tx);
+      const byTx = new Map<number, any[]>();
+      for (const t of tb.traces) { const k = t.transactionIndex ?? 0; if (!byTx.has(k)) byTx.set(k, []); byTx.get(k)!.push(t); }
+      for (const [txIndex, traces] of byTx) {
+        traces.sort((x, y) => cmpTraceAddr(x.traceAddress ?? [], y.traceAddress ?? []));
+        const rawTx = txByIdx.get(txIndex);
+        traces.forEach((t, i) => {
+          const frame = parityToCallFrame(t, i);
+          if (!frame || !traceMatched(frame, bn)) return;
+          out.push({ trace: { trace: frame, transactionHash: rawTx?.hash } as unknown as SyncTrace, block, transaction: rawTx ? toSyncTransaction(rawTx, tb.header) : ({ transactionIndex: hx(txIndex) } as unknown as SyncTransaction) });
+        });
+      }
+    }
+    return out;
+  };
+  // push the trace/transfer filters' addresses to Portal (resolving factories → children)
+  const tracePortalRequests = (): any[] => {
+    const reqs: any[] = [];
+    const addrsOf = (a: any): string[] | undefined => {
+      if (a === undefined) return undefined;
+      if (isAddressFactory(a)) return Array.from(args.childAddresses.get(a.id)?.keys() ?? []);
+      return (Array.isArray(a) ? a : [a]).map((x: string) => x.toLowerCase());
+    };
+    for (const f of [...traceFilters, ...transferFilters]) {
+      const req: any = {};
+      const to = addrsOf(f.toAddress); if (to?.length) req.callTo = to;
+      const from = addrsOf(f.fromAddress); if (from?.length) req.callFrom = from;
+      if (f.functionSelector) req.callSighash = (Array.isArray(f.functionSelector) ? f.functionSelector : [f.functionSelector]).map((s: string) => s.toLowerCase());
+      req.transaction = true; reqs.push(req);
+    }
+    return reqs.length ? reqs : [{ transaction: true }];
+  };
 
   return {
     async syncBlockRangeData({ interval, requiredIntervals, requiredFactoryIntervals, syncStore }) {
@@ -264,6 +330,13 @@ export const createPortalHistoricalSync = (
         discStartIdx = idxOf(Math.min(...starts));
       }
 
+      needReceipts ||= requiredIntervals.some((r) => (r.filter as any).hasTransactionReceipt === true);
+      if (!needTraces && (requiredIntervals.some((r) => r.filter.type === "trace" || r.filter.type === "transfer"))) {
+        traceFilters = requiredIntervals.filter((r) => r.filter.type === "trace").map((r) => r.filter);
+        transferFilters = requiredIntervals.filter((r) => r.filter.type === "transfer").map((r) => r.filter);
+        needTraces = traceFilters.length + transferFilters.length > 0;
+      }
+
       const startIdx = idxOf(interval[0]), endIdx = idxOf(interval[1]);
       const idxs: number[] = [];
       for (let i = startIdx; i <= endIdx; i++) idxs.push(i);
@@ -274,6 +347,7 @@ export const createPortalHistoricalSync = (
       const syncLogs: SyncLog[] = [];
       const blocksByNumber = new Map<number, SyncBlockHeader>();
       const syncTxs: SyncTransaction[] = [];
+      const syncReceipts: SyncTransactionReceipt[] = [];
       const seenTx = new Set<string>();
       for (const cd of data) for (const [bn, hdr] of cd.headers) {
         if (bn < interval[0] || bn > interval[1]) continue;
@@ -281,15 +355,21 @@ export const createPortalHistoricalSync = (
         if (logs.length) {
           blocksByNumber.set(bn, toSyncBlockHeader(hdr));
           for (const raw of logs) syncLogs.push(toSyncLog(raw, hdr));
-          for (const tx of cd.txs.get(bn) ?? []) if (!seenTx.has(tx.hash)) { seenTx.add(tx.hash); syncTxs.push(toSyncTransaction(tx, hdr)); }
+          for (const tx of cd.txs.get(bn) ?? []) if (!seenTx.has(tx.hash)) {
+            seenTx.add(tx.hash);
+            syncTxs.push(toSyncTransaction(tx, hdr));
+            if (needReceipts) syncReceipts.push(toSyncReceipt(tx, hdr));
+          }
         }
       }
       for (const i of dataCache.keys()) if ((i + 1) * chunkBlocks <= interval[0]) dataCache.delete(i); // evict behind
 
+      const syncTraces = needTraces ? data.flatMap((cd) => buildTraces(cd, interval[0], interval[1])) : [];
+
       let closest: SyncBlock | undefined;
       if (blocksByNumber.size > 0) closest = blocksByNumber.get(Math.max(...blocksByNumber.keys())) as unknown as SyncBlock;
       await syncStore.insertLogs({ logs: syncLogs, chainId: args.chain.id });
-      stash.set(ikey(interval), { blocks: [...blocksByNumber.values()], txs: syncTxs, closest });
+      stash.set(ikey(interval), { blocks: [...blocksByNumber.values()], txs: syncTxs, receipts: syncReceipts, traces: syncTraces, closest });
 
       log.debug({ service: "portal", msg: `Portal ${args.chain.name} [${interval[0]},${interval[1]}]: ${syncLogs.length} logs (dataChunks=${stats.dataChunks} discChunks=${stats.discChunks} http=${stats.http} hits=${stats.cacheHits} inflight=${stats.maxInflight} err=${stats.errors})` });
       return syncLogs;
@@ -298,9 +378,23 @@ export const createPortalHistoricalSync = (
     async syncBlockData({ interval, syncStore }) {
       const s = stash.get(ikey(interval));
       stash.delete(ikey(interval));
-      if (!s || s.blocks.length === 0) return undefined;
-      await syncStore.insertBlocks({ blocks: s.blocks, chainId: args.chain.id });
-      if (s.txs.length) await syncStore.insertTransactions({ transactions: s.txs, chainId: args.chain.id });
+      if (!s) return undefined;
+      const chainId = args.chain.id;
+      // merge log blocks/txs with trace blocks/txs (a trace-only block isn't in the log set)
+      const blocks = new Map<string, SyncBlockHeader>();
+      for (const b of s.blocks) blocks.set(b.number as unknown as string, b);
+      const txs = new Map<string, SyncTransaction>();
+      for (const t of s.txs) txs.set(t.hash as unknown as string, t);
+      for (const { block, transaction } of s.traces) {
+        blocks.set((block as any).number, block as unknown as SyncBlockHeader);
+        if ((transaction as any)?.hash) txs.set((transaction as any).hash, transaction);
+      }
+      const blockArr = [...blocks.values()];
+      if (blockArr.length === 0) return s.closest;
+      await syncStore.insertBlocks({ blocks: blockArr, chainId });
+      if (txs.size) await syncStore.insertTransactions({ transactions: [...txs.values()], chainId });
+      if (s.receipts.length) await syncStore.insertTransactionReceipts({ transactionReceipts: s.receipts, chainId });
+      if (s.traces.length) await syncStore.insertTraces({ traces: s.traces, chainId });
       return s.closest;
     },
   };

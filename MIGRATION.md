@@ -1,125 +1,78 @@
-# Migrating a Ponder indexer onto Portal ("boost Ponder with Portal")
+# Migrating a Ponder indexer onto Portal
 
-Goal: make a Ponder app's **historical backfill** read from SQD Portal (range-scan, ~8× faster on factory/large-contract indexers) while **realtime stays on your existing RPC**. The migration is **additive, reversible, and needs no handler/schema changes** — at most a few lines in `ponder.config.ts`.
+**What you get:** a Ponder app's historical backfill goes **~8× faster** (and finishes on chains where RPC backfill is impractical), the data is **byte-identical to RPC** (proven before you change anything), and **handlers + schema are unchanged**. Realtime/frontfill stays on your existing RPC. It's reversible — remove a line and you're back on RPC.
 
-This doc is the operational playbook. For *what/why/how it works*, see `README.md`.
-
----
-
-## The ladder (each rung is reversible)
-
-| Rung | What | Risk | Delivery |
-|---|---|---|---|
-| 0. **Parity** | Prove Portal data == your RPC data, byte-for-byte | none (read-only) | `harness/compat` |
-| 1. **Backfill-only boost** | Historical sync via Portal; realtime unchanged | low | `portalTransport` (config-only) |
-| 2. **Native** | Full ~8× via the `HistoricalSync` seam | medium | `withPortal` + injection |
-| 3. **Managed** | Dedicated Portal CU + SLA, CI gates, dashboard | — | service |
-
-Rollback at any point = delete the lines you added. Realtime risk never changes (it's always your RPC).
+This is one path, with one de-risking step in front of it.
 
 ---
 
-## Step 0 — Compatibility report (always run first)
+## Step 0 — Prove it (compatibility + parity report)
 
-Tells you which sources Portal can serve **today** (logs, factories, transactions) vs. what's blocked (receipts, traces, block/account sources), and whether each chain has a Portal dataset.
+No production change. Point the report at the client's config:
 
 ```bash
-cd <your-ponder-project>
-PORTAL_API_KEY=<key> node --experimental-strip-types <path>/harness/compat/report.ts ./ponder.config.ts \
-  [--differential <your-rpc-url>]    # optional: proves Portal-vs-RPC log parity on a sample
+cd <client-ponder-project>
+PORTAL_API_KEY=<key> node <path>/harness/compat/report.ts ./ponder.config.ts --differential <client-rpc-url>
 ```
 
-Read the verdict:
-- **READY** — every source is log/factory/transaction-based → safe to boost the whole app.
-- **PARTIAL** — boost the ready chains/sources now; leave the rest (receipts/traces) on RPC until those land.
-- **BLOCKED** — no Portal dataset for your chains, or all sources need unimplemented features.
+It does two things:
+1. **Coverage** — checks every source against (a) what our backfill implements (logs, log-factories, transactions, receipts, traces today; block-interval and account-transaction sources not yet) and (b) what Portal actually **serves for that chain and block-range**. Trace/state-diff coverage is per-network *and* per-range — Portal has [300+ networks](https://docs.sqd.dev/en/data/all-networks) with `traces`/`stateDiffs` flags and caveats (e.g. Optimism traces only from the Bedrock block 105235063; Arbitrum/Polygon lack ancient-block traces). The report **probes this live**, so a trace source whose `startBlock` predates Portal's trace coverage is flagged instead of silently green-lit.
+2. **Parity** — fetches the same `eth_getLogs` from Portal and from the client's RPC and confirms they're byte-identical.
 
-The report is also the onboarding artifact: keep it, and re-run it after any feature lands.
+Output is a per-source `READY` / `NEEDS_*` verdict. For the common case (event + factory indexers like Uniswap/Euler) it's `READY NOW`. This report is the onboarding artifact and the trust gate — a client sees parity proven on *their* indexer before touching anything.
 
 ---
 
-## Step 1 — Backfill-only boost, config-only (`portalTransport`)
+## Step 1 — Turn on the boost
 
-**Works on any Ponder version, including 0.15.x — no fork, no patch, nothing to deploy.** A viem Transport that serves `eth_getLogs`/`eth_getBlockByNumber` from Portal and falls back to your RPC for everything else (receipts, traces, state, realtime).
-
-```ts
-// ponder.config.ts
-import { createConfig } from "ponder";
-import { portalTransport } from "@your-org/ponder-portal";
-
-export default createConfig({
-  chains: {
-    mainnet: {
-      id: 1,
-      rpc: portalTransport({
-        dataset: "https://portal.sqd.dev/datasets/ethereum-mainnet",
-        fallbackRpc: process.env.PONDER_RPC_URL_1!, // realtime + everything Portal doesn't serve
-      }),
-    },
-  },
-  contracts: { /* unchanged */ },
-});
-```
-
-That's the entire change. Trade-off: the orchestrator still drives per-request granularity, so this won't hit the native ~8× — but it kills the `eth_getLogs` fan-out and warms per-block lookups from a range cache, and it's in-process (vs. deploying eRPC + the rust shim). **This is the recommended starting point and the right answer for 0.15.x.**
-
-Validate, then leave it: re-run the differential, watch the first backfill, compare wall-clock.
-
----
-
-## Step 2 — Native seam, full performance (`withPortal` + injection)
-
-For the clean ~8× (read-ahead chunk buffer, parallel prefetch, block-density auto-scaling), the Portal sync must replace Ponder's internal `createHistoricalSync`. Two client-side lines + an injection mechanism.
+Two lines in `ponder.config.ts`; handlers and schema untouched:
 
 ```ts
-// ponder.config.ts
 import { createConfig } from "ponder";
 import { withPortal } from "@your-org/ponder-portal";
 
 export default createConfig(withPortal({
   chains: {
-    mainnet: { id: 1, rpc: process.env.PONDER_RPC_URL_1!, portal: "https://portal.sqd.dev/datasets/ethereum-mainnet" },
+    mainnet: {
+      id: 1,
+      rpc: process.env.PONDER_RPC_URL_1,                 // realtime + state reads stay here
+      portal: "https://portal.sqd.dev/datasets/ethereum-mainnet",  // backfill from Portal
+    },
   },
   contracts: { /* unchanged */ },
 }));
 ```
 
-`withPortal()` records `portal` per chain in a registry (Ponder drops unknown chain fields, so we don't need a core type change). The injection then wraps `createHistoricalSync`:
+`withPortal()` records `portal` per chain; the package's runtime injection swaps Ponder's internal `createHistoricalSync` for the Portal-backed one when a chain has `portal` set (delivered as a `module.register` hook or a thin `ponder-portal` CLI — `package.json`: `"start": "ponder-portal start"`). Realtime keeps using `rpc`.
 
-```ts
-chain-has-portal ? createPortalHistoricalSync(params) : createHistoricalSync(params)
-```
+Run it. The first backfill is the wow: the ~5M-block Ethereum Euler history that takes ~38 min on RPC completes in **~5 min**; multi-chain (eth+base+arbitrum) Euler in ~16 min, all concurrent. See `README.md` for the measured numbers.
 
-Two ways to inject (both centralized in one versioned package — *this* is why a package beats N forks):
-- **patch-package** (postinstall): a ~3-line version-matched patch to `runtime/historical.js` + the `portal.ts` module. Auto-applies on install. The patch is tiny because the seam is stable (see version matrix).
-- **`module.register` load hook** (`ponder` → `ponder-portal` in your `package.json` scripts): wraps the internal `createHistoricalSync` at runtime, no installed files touched.
-
-Use Step 2 for indexers where backfill time is the bottleneck and the ~2× of the Transport isn't enough.
+**Validate & roll back:** watch the first backfill (wall-clock + zero client-facing errors); for deep checks, diff the `ponder_sync` tables of a Portal run vs an RPC run over the same range. Rollback = remove `withPortal(...)` + the `portal:` line.
 
 ---
 
-## Choosing Transport (1) vs Native (2)
+## Why there's no JSON-RPC / transport "shim" option
 
-- On **0.15.x**, or where you can't patch/hook: **Transport**. It's the only config-only option and works everywhere.
-- Where you want max speed and can add an install step: **Native**.
-- Both keep realtime on `rpc` and handlers untouched. You can start on Transport and move to Native later without touching handlers.
+A tempting "config-only" delivery is to present Portal as a custom `rpc:` transport. **We deliberately don't**, because it sits at the per-request EIP-1193 layer — *after* Ponder's orchestrator has shattered each range into thousands of non-contiguous point lookups (`eth_getLogs` per topic, `eth_getBlockByNumber` per block). Point lookups are exactly what Portal is slow/unstable at; a shim would make a client's *first* experience "Portal is slow" — the opposite of the pitch, and the very failure mode the prior eRPC+proxy approach hit.
 
----
-
-## Validation & rollback
-
-- **Parity:** `report.ts --differential <rpc>` compares Portal vs RPC `eth_getLogs` on a sample; for deeper checks, diff the `ponder_sync` tables of a Portal run vs an RPC run over the same range (`harness/compare/differential.ts` is the pattern).
-- **Watch the first backfill:** wall-clock to finalized, and 0 client-facing errors.
-- **Rollback:** Transport → restore `rpc: <url>`. Native → remove `withPortal(...)` + the package/patch. Instant, no data migration (the `ponder_sync` cache is RPC/Portal-agnostic).
+The whole ~8× comes from integrating one level up, at Ponder's **range-oriented `HistoricalSync` seam**, where one interval = one streamed columnar scan. So there's a single path on purpose: the native seam, or nothing.
 
 ---
 
 ## Version coverage
 
-The `HistoricalSync` seam (`syncBlockRangeData`/`syncBlockData`) is **identical in shape from 0.15.17 → 0.16.6**, so one Portal implementation covers them. The package should ship a CI matrix that builds + runs the regression suite against each supported Ponder version, so an upgrade can't silently break a client. The Transport path has **no** version coupling (pure public `rpc: Transport` API).
+The `HistoricalSync` seam (`syncBlockRangeData`/`syncBlockData`) is **identical in shape from 0.15.17 → 0.16.6**, so one Portal implementation covers Euler's 0.15.x and current. The package ships a CI matrix that runs the regression suite against each supported Ponder version, so an upgrade can't silently break a client — this is why a versioned package is far less work than maintaining N forks.
 
----
+## Coverage & gaps
 
-## Honest gaps & roadmap
+| Ponder source | Served by Portal backfill |
+|---|---|
+| logs, log-factories | ✅ |
+| transactions | ✅ |
+| receipts (`includeTransactionReceipts`) | ✅ |
+| traces (`includeCallTraces`) / transfers | ✅ |
+| block-interval sources | ⬜ (next) |
+| account transaction (from/to) sources | ⬜ (transfers work via traces) |
+| state diffs | n/a — Portal has them, but Ponder has no state-diff source (available via the standalone engine only) |
 
-Today the Portal backfill serves **logs, log-factories, transactions**. Not yet: **receipts**, **traces** (Parity→callTracer transform prototyped, not wired), **block-interval** and **account/transfer** sources. The compatibility report flags any source that needs these. Priority order to widen coverage: receipts → traces → block/account sources. Longer term: propose a documented `historicalSync` provider hook upstream so future Ponder versions need no injection at all.
+The compatibility report tells you which bucket each of a client's sources falls in, so you never enable a boost that would miss data.

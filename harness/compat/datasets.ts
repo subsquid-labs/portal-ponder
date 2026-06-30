@@ -1,4 +1,15 @@
-/** chainId → SQD Portal dataset slug. Verified live via the /datasets catalog at runtime. */
+/**
+ * chainId → SQD Portal dataset slug (a convenience subset; Portal serves 300+ EVM
+ * networks). Existence is verified live via the /datasets catalog at runtime.
+ *
+ * AUTHORITATIVE per-network capability matrix (traces / stateDiffs / real-time flags
+ * + block-range caveats — e.g. Optimism traces+stateDiffs only from the Bedrock block
+ * 105235063; zkSync stateDiffs from 15.5M; Arbitrum/Polygon stateDiffs:false):
+ *   https://docs.sqd.dev/en/data/all-networks
+ * The /datasets catalog only returns {dataset, aliases, real_time} — NOT the trace/
+ * stateDiff flags — so we PROBE those live per chain & per block-range (see probe.ts).
+ */
+export const ALL_NETWORKS_DOCS = "https://docs.sqd.dev/en/data/all-networks";
 export const CHAIN_TO_DATASET: Record<number, string> = {
   1: "ethereum-mainnet",
   10: "optimism-mainnet",
