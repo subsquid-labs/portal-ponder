@@ -109,9 +109,16 @@ Contributions welcome — it's a prototype with a clear seam and a clear TODO li
 ## Layout
 
 ```
-integration/core-fork/   portal.ts (the fork), wiring.patch, portal.test.ts   ← the deliverable
+MIGRATION.md             how a client adopts this (parity → backfill-only → native → managed)
+integration/core-fork/   portal.ts (the native fork), wiring.patch, portal.test.ts   ← full perf
 integration/euler-portal-app/   real multi-chain Euler demo indexer
 integration/ponder-core.md      step-by-step integration guide
-packages/portal-sync/    standalone Portal client / transform / metrics (engine mirror)
+packages/portal-sync/
+  transport.ts           portalTransport() — config-only delivery (any version, incl 0.15.x)
+  config.ts              withPortal() + registry — native-injection glue
+  {portal-client,query,transform,metrics}.ts   standalone Portal engine
+harness/compat/          compatibility-report tool (report.ts) + analyzer + tests
 harness/                 stress test + live dashboard, multichain, differential, gates
 ```
+
+**Adoption:** start with the [compatibility report](harness/compat/report.ts) (does Portal serve your indexer's data?), then [`MIGRATION.md`](MIGRATION.md). The config-only `portalTransport` works on any Ponder version including Euler's 0.15.x.
