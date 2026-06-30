@@ -20,10 +20,11 @@ import { type Address, type Hex, numberToHex, toHex } from "viem";
 
 export type RawHeader = Record<string, any> & { number: number };
 
-/** Traces are ~100x denser than logs; buffering a wide chunk's worth over a busy
- * contract OOMs. When a chain has trace sources, cap the chunk to a trace-safe width
- * (PORTAL_TRACE_CHUNK_BLOCKS, default 25k). Pure so it's unit-testable. */
-export const traceSafeChunkBlocks = (base: number, needTraces: boolean, cap = Number(process.env.PORTAL_TRACE_CHUNK_BLOCKS ?? 25_000)): number =>
+/** Traces are ~100x denser than logs; buffering a wide chunk's worth over a busy contract OOMs.
+ * For trace-index parity we fetch the FULL (unfiltered) trace set, which is denser still, so the
+ * default cap is conservative. When a chain has trace sources, cap the chunk to a trace-safe width
+ * (PORTAL_TRACE_CHUNK_BLOCKS, default 2k). Pure so it's unit-testable. */
+export const traceSafeChunkBlocks = (base: number, needTraces: boolean, cap = Number(process.env.PORTAL_TRACE_CHUNK_BLOCKS ?? 2_000)): number =>
   needTraces && base > cap ? cap : base;
 
 /** An interval reaching past Portal's finalized head must fall back to RPC for the gap.

@@ -14,6 +14,7 @@ import type {
 } from "@/internal/types.js";
 import {
   getChildAddress,
+  getFilterFactories,
   isAddressFactory,
   isAddressMatched,
   isBlockFilterMatched,
@@ -51,6 +52,10 @@ type CreateHistoricalSyncParameters = {
   chain: Chain;
   rpc: Rpc;
   childAddresses: Map<FactoryId, Map<Address, number>>;
+  // FULL per-chain filter set (runtime: params.eventCallbacks). The fetch-spec is resolved from
+  // THIS, once, not from per-call requiredIntervals (which is only the subset still needed and
+  // shrinks as fragments cache) — so every idx-keyed chunk is filter-complete. (C1)
+  eventCallbacks: { filter: Filter }[];
 };
 
 type PortalLogRequest = { address?: string[]; topic0?: string[]; topic1?: string[]; topic2?: string[]; topic3?: string[]; transaction?: boolean };
@@ -238,6 +243,27 @@ export const createPortalHistoricalSync = (
   let blockFilters: any[] = [];
   let needTxFilter = false;
   let transactionFilters: any[] = [];
+  let logFilters: LogFilter[] = [];
+  let allFactories: any[] = [];
+  // Resolve the COMPLETE chain-wide fetch-spec ONCE from args.eventCallbacks (the FULL per-chain
+  // filter set), NOT from per-call requiredIntervals (only the subset Ponder still needs, which
+  // shrinks as fragments cache). Chunks are cached by idx ALONE, so every chunk MUST be filter-
+  // complete — else a filter that first needs an already-cached chunk is never streamed, yet its
+  // interval is marked done → permanent silent gap. (C1)
+  let specReady = false;
+  const initSpec = () => {
+    if (specReady) return;
+    specReady = true;
+    const fs = (args.eventCallbacks ?? []).map((e) => e.filter);
+    logFilters = fs.filter((f) => f.type === "log") as LogFilter[];
+    allFactories = [...new Map(fs.flatMap(getFilterFactories).map((f: any) => [f.id, f])).values()];
+    needReceipts = fs.some((f) => (f as any).hasTransactionReceipt === true);
+    blockFilters = fs.filter((f) => f.type === "block"); needBlocks = blockFilters.length > 0;
+    transactionFilters = fs.filter((f) => f.type === "transaction"); needTxFilter = transactionFilters.length > 0;
+    traceFilters = fs.filter((f) => f.type === "trace");
+    transferFilters = fs.filter((f) => f.type === "transfer");
+    needTraces = traceFilters.length + transferFilters.length > 0;
+  };
   const blockFieldsFor = (filters: Filter[]): Record<string, boolean> => {
     const inc = new Set<string>();
     for (const f of filters) for (const i of f.include ?? []) if (i.startsWith("block.")) inc.add(i.slice(6));
@@ -363,7 +389,9 @@ export const createPortalHistoricalSync = (
       const txByIdx = new Map<number, any>();
       for (const tx of tb.txs ?? []) txByIdx.set(tx.transactionIndex, tx);
       const byTx = new Map<number, any[]>();
-      for (const t of tb.traces) { const k = t.transactionIndex ?? 0; if (!byTx.has(k)) byTx.set(k, []); byTx.get(k)!.push(t); }
+      // callTracer has no block-reward frames; skip reward/no-tx traces so `?? 0` can't fold them
+      // into tx 0 and shift its DFS ranks (now that we fetch the full, unfiltered trace set).
+      for (const t of tb.traces) { if (t.transactionIndex == null || t.type === "reward") continue; const k = t.transactionIndex; if (!byTx.has(k)) byTx.set(k, []); byTx.get(k)!.push(t); }
       for (const [txIndex, traces] of byTx) {
         traces.sort((x, y) => cmpTraceAddr(x.traceAddress ?? [], y.traceAddress ?? []));
         const rawTx = txByIdx.get(txIndex);
@@ -376,23 +404,14 @@ export const createPortalHistoricalSync = (
     }
     return out;
   };
-  // push the trace/transfer filters' addresses to Portal (resolving factories → children)
-  const tracePortalRequests = (): any[] => {
-    const reqs: any[] = [];
-    const addrsOf = (a: any): string[] | undefined => {
-      if (a === undefined) return undefined;
-      if (isAddressFactory(a)) return Array.from(args.childAddresses.get(a.id)?.keys() ?? []);
-      return (Array.isArray(a) ? a : [a]).map((x: string) => x.toLowerCase());
-    };
-    for (const f of [...traceFilters, ...transferFilters]) {
-      const req: any = {};
-      const to = addrsOf(f.toAddress); if (to?.length) req.callTo = to;
-      const from = addrsOf(f.fromAddress); if (from?.length) req.callFrom = from;
-      if (f.functionSelector) req.callSighash = (Array.isArray(f.functionSelector) ? f.functionSelector : [f.functionSelector]).map((s: string) => s.toLowerCase());
-      req.transaction = true; reqs.push(req);
-    }
-    return reqs.length ? reqs : [{ transaction: true }];
-  };
+  // Trace-index parity with the RPC path: Ponder assigns `trace_index` as the PRE-ORDER DFS rank
+  // over each tx's FULL call tree (rpc/actions.ts dfs(), which numbers EVERY frame, THEN filters —
+  // so a matched trace keeps its full-tree position). Pushing callTo/callFrom/callSighash would make
+  // Portal return only the matched SUBSET, so buildTraces' per-tx rank would be filter-local (a lone
+  // deep match → 0) instead of its true position (e.g. 7). So fetch EVERY trace and let buildTraces
+  // client-filter (traceMatched) AFTER ranking. Covers trace AND transfer sources. The cost is real
+  // (no server-side trace filter → ~all traces of the chunk); bounded by PORTAL_TRACE_CHUNK_BLOCKS.
+  const tracePortalRequests = (): any[] => [{ transaction: true }];
   // push account TransactionFilters (from/to) to Portal's transactions[] (server-side row filter)
   const txPortalRequests = (): any[] => {
     const reqs: any[] = [];
@@ -412,7 +431,7 @@ export const createPortalHistoricalSync = (
 
   return {
     async syncBlockRangeData(params) {
-      const { interval, requiredIntervals, requiredFactoryIntervals, syncStore } = params;
+      const { interval, requiredFactoryIntervals, syncStore } = params;
       if (!startTime) startTime = Date.now();
       // finality gap: if this interval reaches past Portal's finalized head, re-confirm
       // (Portal advances) and, if still beyond, delegate the whole interval to RPC.
@@ -426,23 +445,9 @@ export const createPortalHistoricalSync = (
         }
       }
       await ensureChunkSize(); // scale chunk to chain block-density before any idxOf()
-      const filters = requiredIntervals.map((r) => r.filter).filter((f) => f.type === "log") as LogFilter[];
-      const factories = [...new Map(requiredFactoryIntervals.map((r) => [r.factory.id, r.factory])).values()];
-
-      needReceipts ||= requiredIntervals.some((r) => (r.filter as any).hasTransactionReceipt === true);
-      if (!needBlocks && requiredIntervals.some((r) => r.filter.type === "block")) {
-        blockFilters = requiredIntervals.filter((r) => r.filter.type === "block").map((r) => r.filter);
-        needBlocks = blockFilters.length > 0;
-      }
-      if (!needTxFilter && requiredIntervals.some((r) => r.filter.type === "transaction")) {
-        transactionFilters = requiredIntervals.filter((r) => r.filter.type === "transaction").map((r) => r.filter);
-        needTxFilter = transactionFilters.length > 0;
-      }
-      if (!needTraces && requiredIntervals.some((r) => r.filter.type === "trace" || r.filter.type === "transfer")) {
-        traceFilters = requiredIntervals.filter((r) => r.filter.type === "trace").map((r) => r.filter);
-        transferFilters = requiredIntervals.filter((r) => r.filter.type === "transfer").map((r) => r.filter);
-        needTraces = traceFilters.length + transferFilters.length > 0;
-      }
+      initSpec(); // freeze the COMPLETE filter/factory set once → every cached chunk is filter-complete (C1)
+      const filters = logFilters;
+      const factories = allFactories;
       // cap the chunk grid BEFORE any idxOf() for DENSE sources (traces fetch every trace;
       // block sources includeAllBlocks-scan the WHOLE chunk range) — bounds memory + overfetch.
       const capped = traceSafeChunkBlocks(chunkBlocks, needTraces || needBlocks);
@@ -451,10 +456,12 @@ export const createPortalHistoricalSync = (
         log.debug({ service: "portal", msg: `Portal ${args.chain.name}: dense sources → chunkBlocks capped to ${chunkBlocks} (grid reset)` });
       }
 
-      // pin the discovery floor at the factory's real start (NOT block 0) — after any chunk cap
-      if (discStartIdx === undefined && factories.length > 0) {
-        const starts = requiredFactoryIntervals.map((r) => r.interval[0]).concat(interval[0]);
-        discStartIdx = idxOf(Math.min(...starts));
+      // pin the discovery floor at the factory's real start (NOT block 0), after any chunk cap.
+      // C4: clamp DOWNWARD only — a later call whose required factory interval starts earlier must
+      // LOWER the floor, never stay latched too high (which would skip early child discovery).
+      if (requiredFactoryIntervals.length > 0) {
+        const floor = idxOf(Math.min(...requiredFactoryIntervals.map((r) => r.interval[0]).concat(interval[0])));
+        discStartIdx = discStartIdx === undefined ? floor : Math.min(discStartIdx, floor);
       }
 
       const startIdx = idxOf(interval[0]), endIdx = idxOf(interval[1]);
