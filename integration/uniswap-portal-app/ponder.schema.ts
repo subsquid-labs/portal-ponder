@@ -17,3 +17,9 @@ export const routerCall = onchainTable("router_call", (t) => ({
   to: t.hex(),
   blockNumber: t.bigint().notNull(),
 }));
+
+// block-interval rows → proves BlockFilter sources are synced
+export const blockTick = onchainTable("block_tick", (t) => ({
+  number: t.bigint().primaryKey(),
+  timestamp: t.bigint().notNull(),
+}));

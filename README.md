@@ -48,11 +48,11 @@ The entire core change is **~310 lines in one new file + 13 lines of wiring**:
 
 ### Implemented
 
-logs, log-factories, transactions, **receipts** (`includeTransactionReceipts`), **traces** (`includeCallTraces` + transfer filters). Transforms handle Portal's split encoding (decimal `status`/`type`, hex gas/value) and Parity→callTracer (callType from `action.callType`; CREATE/CREATE2 indistinguishable, but Ponder ignores trace `type` in matching). Covered by unit tests against real captured fixtures + an end-to-end Uniswap run (receipts on the USDC/WETH V3 pool, traces on the V2 Router). Trace sources **auto-cap the chunk grid** to `PORTAL_TRACE_CHUNK_BLOCKS` (default 25k) — traces are ~100× denser than logs, so a wide chunk over a busy contract would otherwise OOM (verified: the Uniswap e2e completes under a 2 GB heap with the default 500k grid auto-capped).
+logs, log-factories, transactions, **receipts** (`includeTransactionReceipts`), **traces** (`includeCallTraces` + transfer filters), **block-interval** sources (`blocks: { … interval }`). Transforms handle Portal's split encoding (decimal `status`/`type`, hex gas/value) and Parity→callTracer (callType from `action.callType`; CREATE/CREATE2 indistinguishable, but Ponder ignores trace `type` in matching). Covered by unit tests against real captured fixtures + an end-to-end Uniswap run (receipts on the USDC/WETH V3 pool, traces on the V2 Router). Trace sources **auto-cap the chunk grid** to `PORTAL_TRACE_CHUNK_BLOCKS` (default 25k) — traces are ~100× denser than logs, so a wide chunk over a busy contract would otherwise OOM (verified: the Uniswap e2e completes under a 2 GB heap with the default 500k grid auto-capped).
 
 ### Not implemented / TODO
 
-- **Block-interval** and **account transaction (from/to)** sources (transfers already work via traces).
+- **Account transaction (from/to)** sources (transfers already work via traces).
 - **Per-network capability** (traces/stateDiffs + block-range caveats) is checked by the compat report against the [authoritative docs matrix](https://docs.sqd.dev/en/data/all-networks) (snapshotted in `harness/compat/networks.json`); dataset **existence is per-portal** (checked live against the target portal's `/datasets`). A trace source on a chain without traces, or a block-range caveat (e.g. Optimism pre-Bedrock), is surfaced.
 - **Finality-gap RPC fallback** when Portal's finalized head lags Ponder's target.
 - **Chunk sizing by data volume** (vs the block-count heuristic); **CU-budget-aware** prefetch depth.
@@ -97,12 +97,12 @@ Reproduce: `integration/euler-portal-app/` is the demo indexer; `harness/` has t
 - **Transform unit tests** (`integration/core-fork/portal-transform.test.ts`, 11 tests) run over **real Portal NDJSON captured at eth block 21M** (in `__fixtures__/`) and pin every flagged type mismatch: decimal `status`/`type` → hex, gas/value stay hex, trace `callType` read from `action.callType` (→ DELEGATECALL), staticcall `value:null`, CREATE `init`/`code`, suicide → SELFDESTRUCT, stateDiff `prev:null` ⟺ `+`, DFS trace ordering, plus the trace-chunk memory cap.
 - **Analyzer tests** (`harness/compat/analyze.test.ts`, 6 tests): docs-capability gate (a chain with `traces:false` flags trace sources; Arbitrum's traces are READY because the docs say so), per-portal existence (a portal that doesn't serve the dataset → `NO_DATASET`), and block-range notes (Optimism Bedrock surfaced).
 - **Integration regression** (`portal.test.ts`): a fixture Portal block → asserts `event.transaction` is populated (runs against a local HTTP server, no chain; isolate via `vite.portal.config.ts`, no Foundry `globalSetup`).
-- **End-to-end**: `integration/uniswap-portal-app/` backfills from Portal and proves receipts (V3 pool swaps carry `receiptGasUsed`/`status`) + traces (V2 Router calls reconstructed from call-traces); plus the differential harness + multi-chain Euler runs.
+- **End-to-end**: `integration/uniswap-portal-app/` backfills from Portal and proves receipts (V3 pool swaps carry `receiptGasUsed`/`status`), traces (V2 Router calls reconstructed from call-traces), and block-interval sources (a tick every 1000th block: exactly 22.200M, 22.201M … 22.205M); plus the differential harness + multi-chain Euler runs.
 - **Still wanted:** unit tests for the filter→Portal-query builder, chunk-index math, auto-scaling, and discovery/data ordering. Every bug fix ships with a fixture + regression (the convention).
 
 **Where to pick up (with or without an agent):**
 1. `integration/core-fork/portal.ts` is the whole core — start there. `wiring.patch` shows the 4-file integration into `@ponder/core`.
-2. Highest-value next work: **block-interval** + **account-transaction** sources, then the **finality-gap RPC fallback**.
+2. Highest-value next work: **account-transaction** sources, then the **finality-gap RPC fallback**.
 3. `packages/portal-sync/` + `harness/` let you exercise Portal directly (no Ponder build) — fastest loop for transform/perf work.
 4. To run the real thing: clone `ponder-sh/ponder`, apply `wiring.patch`, drop in `portal.ts`, build core, point a project's `ponder.config.ts` at a `portal:` dataset.
 
@@ -117,7 +117,7 @@ MIGRATION.md             how a client adopts this (parity proof → backfill boo
 integration/core-fork/   portal.ts (the native sync) + portal-transform.ts + __fixtures__/,
                          wiring.patch, portal.test.ts, portal-transform.test.ts   ← the speedup
 integration/euler-portal-app/      real multi-chain Euler demo indexer
-integration/uniswap-portal-app/    e2e exercising receipts (V3 pool) + traces (V2 Router)
+integration/uniswap-portal-app/    e2e: receipts (V3 pool) + traces (V2 Router) + block-interval source
 integration/ponder-core.md         step-by-step integration guide
 packages/portal-sync/
   config.ts              withPortal() + registry — native-injection glue

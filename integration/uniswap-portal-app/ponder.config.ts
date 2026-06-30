@@ -24,6 +24,10 @@ export default createConfig({
       portal: process.env.PORTAL_URL ?? "https://sqd.portal.sqd.dev/datasets/ethereum-mainnet",
     },
   },
+  blocks: {
+    // block-interval source: fires every 1000 blocks (exercises BlockFilter)
+    Every1000: { chain: "mainnet", interval: 1000, startBlock: START, endBlock: END },
+  },
   contracts: {
     UsdcWethPool: {
       chain: "mainnet",

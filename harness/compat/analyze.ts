@@ -16,7 +16,7 @@ export const SUPPORT = {
   transactions: "yes",
   receipts: "yes",
   traces: "yes",
-  blockInterval: "todo",
+  blockInterval: "yes",
   accountTx: "todo",
 } as const;
 

@@ -1,5 +1,10 @@
 import { ponder } from "ponder:registry";
-import { routerCall, swap } from "ponder:schema";
+import { blockTick, routerCall, swap } from "ponder:schema";
+
+// BLOCK-INTERVAL: fires on every 1000th block (only possible if block headers are synced)
+ponder.on("Every1000:block", async ({ event, context }) => {
+  await context.db.insert(blockTick).values({ number: event.block.number, timestamp: event.block.timestamp });
+});
 
 // RECEIPTS: the swap handler reads event.transactionReceipt (only present because
 // includeTransactionReceipts pulled + stored the receipt from Portal).

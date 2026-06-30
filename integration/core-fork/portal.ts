@@ -15,6 +15,7 @@ import {
   getChildAddress,
   isAddressFactory,
   isAddressMatched,
+  isBlockFilterMatched,
   isLogFactoryMatched,
   isTraceFilterMatched,
   isTransferFilterMatched,
@@ -55,6 +56,8 @@ type ChunkData = {
   txs: Map<number, any[]>;
   // for trace/transfer sources: full block + all its traces + its txs, by block number
   traceBlocks: Map<number, { header: RawHeader; traces: any[]; txs: any[] }>;
+  // for block-interval sources: headers of blocks matching a BlockFilter (interval/offset)
+  blockHeaders: Map<number, RawHeader>;
 };
 
 const PORTAL_MAX_ADDRESSES = 1000;
@@ -191,6 +194,8 @@ export const createPortalHistoricalSync = (
   let needTraces = false;
   let traceFilters: any[] = [];
   let transferFilters: any[] = [];
+  let needBlocks = false;
+  let blockFilters: any[] = [];
   const blockFieldsFor = (filters: Filter[]): Record<string, boolean> => {
     const inc = new Set<string>();
     for (const f of filters) for (const i of f.include ?? []) if (i.startsWith("block.")) inc.add(i.slice(6));
@@ -243,7 +248,7 @@ export const createPortalHistoricalSync = (
       stats.dataChunks++;
       const from = idx * chunkBlocks, to = from + chunkBlocks - 1;
       const logRequests = filters.flatMap((f) => logRequestsFor(f)).map((r) => ({ ...r, transaction: true }));
-      const data: ChunkData = { headers: new Map(), logs: new Map(), txs: new Map(), traceBlocks: new Map() };
+      const data: ChunkData = { headers: new Map(), logs: new Map(), txs: new Map(), traceBlocks: new Map(), blockHeaders: new Map() };
       if (logRequests.length > 0) {
         const q = { type: "evm", fields: { block: blockFieldsFor(filters), log: LOG_FIELDS, transaction: needReceipts ? { ...TX_FIELDS, ...RECEIPT_FIELDS } : TX_FIELDS }, logs: logRequests };
         for await (const blocks of stream(q, from, to)) {
@@ -262,6 +267,17 @@ export const createPortalHistoricalSync = (
             const ex = data.traceBlocks.get(b.header.number);
             if (ex) { ex.traces.push(...b.traces); if (b.transactions) ex.txs.push(...b.transactions); }
             else data.traceBlocks.set(b.header.number, { header: b.header, traces: b.traces, txs: b.transactions ?? [] });
+          }
+        }
+      }
+      // block-interval sources: includeAllBlocks range-scan (Portal has no modulo filter),
+      // keep only headers matching a BlockFilter's interval/offset.
+      if (needBlocks) {
+        const bq = { type: "evm", includeAllBlocks: true, fields: { block: blockFieldsFor(blockFilters) } };
+        for await (const blocks of stream(bq, from, to)) {
+          for (const b of blocks) {
+            const bn = b.header.number;
+            if (blockFilters.some((f) => isBlockFilterMatched({ filter: f, block: { number: BigInt(bn) } }))) data.blockHeaders.set(bn, b.header);
           }
         }
       }
@@ -326,6 +342,10 @@ export const createPortalHistoricalSync = (
       const factories = [...new Map(requiredFactoryIntervals.map((r) => [r.factory.id, r.factory])).values()];
 
       needReceipts ||= requiredIntervals.some((r) => (r.filter as any).hasTransactionReceipt === true);
+      if (!needBlocks && requiredIntervals.some((r) => r.filter.type === "block")) {
+        blockFilters = requiredIntervals.filter((r) => r.filter.type === "block").map((r) => r.filter);
+        needBlocks = blockFilters.length > 0;
+      }
       // detect trace sources + cap the chunk grid BEFORE any idxOf() (memory safety)
       if (!needTraces && requiredIntervals.some((r) => r.filter.type === "trace" || r.filter.type === "transfer")) {
         traceFilters = requiredIntervals.filter((r) => r.filter.type === "trace").map((r) => r.filter);
@@ -369,6 +389,10 @@ export const createPortalHistoricalSync = (
             if (needReceipts) syncReceipts.push(toSyncReceipt(tx, hdr));
           }
         }
+      }
+      // block-interval sources: ensure each matched block is in the blocks table
+      if (needBlocks) for (const cd of data) for (const [bn, hdr] of cd.blockHeaders) {
+        if (bn >= interval[0] && bn <= interval[1] && !blocksByNumber.has(bn)) blocksByNumber.set(bn, toSyncBlockHeader(hdr));
       }
       for (const i of dataCache.keys()) if ((i + 1) * chunkBlocks <= interval[0]) dataCache.delete(i); // evict behind
 

@@ -24,9 +24,9 @@ test("verdict per source type (empty catalog → trust docs caps)", () => {
   assert.equal(v("WithReceipts"), "READY");
   assert.equal(v("WithTraces"), "READY"); // eth has traces per docs
   assert.equal(v("NoDataset"), "NO_DATASET"); // chain 999999 not in docs matrix
-  assert.equal(v("block:Blk"), "NEEDS_BLOCK_FILTER");
-  assert.equal(r.overall, "PARTIAL");
-  assert.equal(r.ready, 3);
+  assert.equal(v("block:Blk"), "READY"); // block-interval now supported
+  assert.equal(r.overall, "PARTIAL"); // only NoDataset blocked
+  assert.equal(r.ready, 4);
 });
 
 test("capability: a chain with traces:false (per docs) flags trace sources", () => {
