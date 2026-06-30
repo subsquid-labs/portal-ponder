@@ -13,7 +13,9 @@ ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
 APP="${DIFF_APP:-$ROOT/harness/diff/app}"   # DIFF_APP=harness/diff/euler-app for the larger factory run
 START="${1:-${PONDER_START:-22200000}}"; END="${2:-${PONDER_END:-22200030}}"   # small default; the diff is per-block deterministic, so a wider range only adds coverage
 PORTAL="${PORTAL_URL_1:-https://portal.sqd.dev/datasets/ethereum-mainnet}"
-CHUNK=$(( END - START + 1 ))   # size the Portal chunk to the diff range (no over-fetch)
+# Portal chunk: bound to the range (no over-fetch past it) but cap so a large range streams in
+# several chunks with read-ahead instead of one giant chunk that pins progress at 0%.
+CHUNK=$(( END - START + 1 )); [ "$CHUNK" -gt 50000 ] && CHUNK=50000
 : "${PONDER_RPC_URL_1:?set PONDER_RPC_URL_1 to an eth archive RPC that supports debug_traceBlockByNumber}"
 
 pkill -f 'ponder start --schema diff_' 2>/dev/null
@@ -27,7 +29,7 @@ run () { # $1=label  $2=portal-url-or-empty  $3=db  $4=port
   echo "▶ $1 backfill …"
   rm -rf "$3"
   export PONDER_START="$START" PONDER_END="$END" PGLITE_DIR="$3" PONDER_LOG_LEVEL=info CI=true
-  if [ -n "$2" ]; then export PORTAL_URL_1="$2" PORTAL_CHUNK_FIXED=1 PORTAL_CHUNK_BLOCKS="$CHUNK" PORTAL_READAHEAD=1
+  if [ -n "$2" ]; then export PORTAL_URL_1="$2" PORTAL_CHUNK_FIXED=1 PORTAL_CHUNK_BLOCKS="$CHUNK" PORTAL_READAHEAD="${READAHEAD:-2}"
   else unset PORTAL_URL_1 PORTAL_CHUNK_FIXED PORTAL_CHUNK_BLOCKS PORTAL_READAHEAD; fi
   local t0=$SECONDS
   ./node_modules/.bin/ponder start --schema "diff_$1" --port "$4" > "/tmp/diff-$1.log" 2>&1 &
