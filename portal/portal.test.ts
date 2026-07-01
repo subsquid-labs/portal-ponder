@@ -175,9 +175,11 @@ test("regression (C1): a 2nd log filter sharing a chunk on a LATER call is still
 });
 
 test("regression: a dataset-unsupported field (accessList) is dropped, not crashed on", async () => {
-  // Per-dataset schema varies — e.g. Monad's transactions have no accessList; the whole request
-  // 400s ("column 'access_list_size' is not found in 'transactions'"). The fork must drop the
-  // field and retry, not throw an unhandledRejection. Server 400s while accessList is present.
+  // Per-dataset schema varies — e.g. Monad/plasma transactions have no accessList; the whole request
+  // 400s ("column 'access_list_size' is not found in 'transactions'"). accessList is non-load-bearing
+  // and NULLABLE, so the fork must drop it and retry — EVEN THOUGH Ponder's default `include` always
+  // lists transaction.accessList (see `include` below). A static default include must never force a
+  // crash on a droppable field; only NOT-NULL/bloom/core fields do.
   const srv = http.createServer((req, res) => {
     let body = ""; req.on("data", (c) => { body += c; });
     req.on("end", () => {
@@ -196,7 +198,8 @@ test("regression: a dataset-unsupported field (accessList) is dropped, not crash
   try {
     const inserted = { logs: [] as any[] };
     const syncStore: any = { insertLogs: (x: any) => inserted.logs.push(...x.logs), insertBlocks: () => {}, insertTransactions: () => {}, insertTransactionReceipts: () => {}, insertTraces: () => {} };
-    const filter: any = { type: "log", chainId: 1, sourceId: "s", address: VAULT, topic0: DEPOSIT_TOPIC0, topic1: null, topic2: null, topic3: null, fromBlock: 20558652, toBlock: 20558652, hasTransactionReceipt: false, include: [] };
+    // include LISTS accessList (exactly as Ponder's static default does) — the fork must still drop it.
+    const filter: any = { type: "log", chainId: 1, sourceId: "s", address: VAULT, topic0: DEPOSIT_TOPIC0, topic1: null, topic2: null, topic3: null, fromBlock: 20558652, toBlock: 20558652, hasTransactionReceipt: false, include: ["transaction.accessList", "transaction.hash", "log.address"] };
     const sync = createPortalHistoricalSync({
       common: { logger: { debug() {}, info() {}, warn() {}, error() {}, trace() {} } } as any,
       chain: { id: 1, name: "mainnet", portal: `http://localhost:${p}` } as any,
@@ -205,8 +208,43 @@ test("regression: a dataset-unsupported field (accessList) is dropped, not crash
     const interval: [number, number] = [20558652, 20558652];
     const logs = await sync.syncBlockRangeData({ interval, requiredIntervals: [{ interval, filter }], requiredFactoryIntervals: [], syncStore });
     await sync.syncBlockData({ interval, logs, syncStore } as any);
-    expect(inserted.logs).toHaveLength(1); // degraded gracefully — dropped accessList, fetched the block
+    expect(inserted.logs).toHaveLength(1); // degraded gracefully — dropped accessList despite it being in `include`
     expect(inserted.logs[0].transactionHash).toBe(TX_HASH);
+  } finally { srv.close(); }
+});
+
+test("regression: an 'unknown field' 400 (schema doesn't know accessList) is also dropped, not crashed on", async () => {
+  // A second rejection shape: some datasets 400 with a query-PARSE error — "unknown field
+  // `accessList`, expected one of `transactionIndex`, `hash`, ..." — instead of "column not found".
+  // The fork must map it back to transaction.accessList (a droppable field) and retry, not crash.
+  const srv = http.createServer((req, res) => {
+    let body = ""; req.on("data", (c) => { body += c; });
+    req.on("end", () => {
+      if (req.url?.includes("finalized-head")) { res.writeHead(200, { "content-type": "application/json" }); res.end(JSON.stringify({ number: 2_000_000_000 })); return; }
+      const q = body ? JSON.parse(body) : {};
+      if (req.url?.includes("finalized-stream") && q.fields?.transaction?.accessList !== undefined) {
+        res.writeHead(400); res.end("Bad request: couldn't parse request: Couldn't parse query: unknown field `accessList`, expected one of `transactionIndex`, `hash`, `nonce`, `from`"); return;
+      }
+      if (req.url?.includes("finalized-stream") && q.fromBlock <= 20558652 && (q.toBlock ?? 1e12) >= 20558652) {
+        res.writeHead(200, { "content-type": "application/x-ndjson" }); res.end(JSON.stringify(FIXTURE_BLOCK) + "\n"); return;
+      }
+      res.writeHead(204).end();
+    });
+  });
+  const p: number = await new Promise((r) => srv.listen(0, () => r((srv.address() as AddressInfo).port)));
+  try {
+    const inserted = { logs: [] as any[] };
+    const syncStore: any = { insertLogs: (x: any) => inserted.logs.push(...x.logs), insertBlocks: () => {}, insertTransactions: () => {}, insertTransactionReceipts: () => {}, insertTraces: () => {} };
+    const filter: any = { type: "log", chainId: 1, sourceId: "s", address: VAULT, topic0: DEPOSIT_TOPIC0, topic1: null, topic2: null, topic3: null, fromBlock: 20558652, toBlock: 20558652, hasTransactionReceipt: false, include: ["transaction.accessList"] };
+    const sync = createPortalHistoricalSync({
+      common: { logger: { debug() {}, info() {}, warn() {}, error() {}, trace() {} } } as any,
+      chain: { id: 1, name: "plasma", portal: `http://localhost:${p}` } as any,
+      childAddresses: new Map(), eventCallbacks: [{ filter }],
+    } as any);
+    const interval: [number, number] = [20558652, 20558652];
+    const logs = await sync.syncBlockRangeData({ interval, requiredIntervals: [{ interval, filter }], requiredFactoryIntervals: [], syncStore });
+    await sync.syncBlockData({ interval, logs, syncStore } as any);
+    expect(inserted.logs).toHaveLength(1); // dropped accessList via the 'unknown field' path, fetched the block
   } finally { srv.close(); }
 });
 
@@ -253,6 +291,38 @@ test("regression: a NEEDED missing field on an EVENT-LESS range is tolerated (ir
   // before any relevant events) → harmless, must NOT crash. The indexer runs fine.
   const inserted = await runMissingLogsBloom(false);
   expect(inserted.logs).toHaveLength(0);
+});
+
+test("regression: a dataset that starts after genesis (TAC starts at block 1) is clamped forward, not crashed on", async () => {
+  // The Portal 400s "dataset starts from block N" when queried below its first block. The fork must
+  // clamp the cursor to N and continue — NOT throw an unhandledRejection (which killed the whole
+  // multichain app when TAC's dataset started at block 1 and startBlock was 0).
+  const START = 1000; let clampedTo = -1;
+  const srv = http.createServer((req, res) => {
+    let body = ""; req.on("data", (c) => { body += c; });
+    req.on("end", () => {
+      if (req.url?.includes("finalized-head")) { res.writeHead(200, { "content-type": "application/json" }); res.end(JSON.stringify({ number: 2_000_000_000 })); return; }
+      const q = body ? JSON.parse(body) : {};
+      if (req.url?.includes("finalized-stream")) {
+        if ((q.fromBlock ?? 0) < START) { res.writeHead(400); res.end("Bad request: dataset starts from block " + START); return; }
+        clampedTo = q.fromBlock; res.writeHead(204).end(); return; // clamped query → empty, no crash
+      }
+      res.writeHead(204).end();
+    });
+  });
+  const p: number = await new Promise((r) => srv.listen(0, () => r((srv.address() as AddressInfo).port)));
+  try {
+    const syncStore: any = { insertLogs: () => {}, insertBlocks: () => {}, insertTransactions: () => {}, insertTransactionReceipts: () => {}, insertTraces: () => {} };
+    const filter: any = { type: "log", chainId: 1, sourceId: "s", address: VAULT, topic0: DEPOSIT_TOPIC0, topic1: null, topic2: null, topic3: null, fromBlock: 0, toBlock: 5000, include: [] };
+    const sync = createPortalHistoricalSync({
+      common: { logger: { debug() {}, info() {}, warn() {}, error() {}, trace() {} } } as any,
+      chain: { id: 1, name: "tac", portal: `http://localhost:${p}` } as any,
+      childAddresses: new Map(), eventCallbacks: [{ filter }],
+    } as any);
+    const interval: [number, number] = [0, 5000];
+    await sync.syncBlockRangeData({ interval, requiredIntervals: [{ interval, filter }], requiredFactoryIntervals: [], syncStore }); // must not throw
+    expect(clampedTo).toBe(START); // the retry was clamped to the dataset start, not re-issued from 0
+  } finally { srv.close(); }
 });
 
 test("regression (C6): deep matched trace is stored at its FULL-tree pre-order index (7), not filter-local (0)", async () => {

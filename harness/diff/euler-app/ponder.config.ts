@@ -18,7 +18,7 @@ export default createConfig({
       abi: EVaultAbi,
       chain: "mainnet",
       address: factory({ address: (process.env.EULER_FACTORY ?? "0x29a56a1b8214D9Cf7c5561811750D5cBDb45CC8e") as `0x${string}`, event: proxyCreated, parameter: "proxy" }),
-      includeTransactionReceipts: true, // also diff the receipt path at scale
+      includeTransactionReceipts: process.env.INCLUDE_RECEIPTS !== "false", // also diff the receipt path at scale
       startBlock: Number(process.env.PONDER_START ?? 20_529_207),
       endBlock: process.env.PONDER_END ? Number(process.env.PONDER_END) : undefined,
     },

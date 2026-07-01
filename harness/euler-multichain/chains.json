@@ -1,0 +1,290 @@
+[
+  {
+    "id": 1,
+    "name": "ethereum",
+    "ds": "ethereum-mainnet",
+    "factory": "0x29a56a1b8214D9Cf7c5561811750D5cBDb45CC8e",
+    "head": 25436954,
+    "sqdSlug": "eth",
+    "freeRpcs": [
+      "https://rpc.nodeflare.app/eth/public",
+      "https://ethereum-rpc.publicnode.com",
+      "https://1rpc.io/eth",
+      "https://rpc.builder0x69.io",
+      "https://rpc.mevblocker.io",
+      "https://rpc.flashbots.net",
+      "https://virginia.rpc.blxrbdn.com",
+      "https://uk.rpc.blxrbdn.com",
+      "https://singapore.rpc.blxrbdn.com"
+    ]
+  },
+  {
+    "id": 56,
+    "name": "binance",
+    "ds": "binance-mainnet",
+    "factory": "0x7F53E2755eB3c43824E162F7F6F087832B9C9Df6",
+    "head": 107428243,
+    "sqdSlug": "bsc",
+    "freeRpcs": [
+      "https://rpc.nodeflare.app/bnb/public",
+      "https://bsc-dataseed.bnbchain.org",
+      "https://bsc.campioneinfrastructure.com",
+      "https://bsc-dataseed1.defibit.io",
+      "https://bsc-dataseed1.ninicoin.io",
+      "https://bsc-dataseed2.defibit.io",
+      "https://bsc-dataseed3.defibit.io",
+      "https://bsc-dataseed4.defibit.io",
+      "https://bsc-dataseed2.ninicoin.io",
+      "https://bsc-dataseed3.ninicoin.io",
+      "https://bsc-dataseed4.ninicoin.io",
+      "https://bsc-dataseed1.bnbchain.org"
+    ]
+  },
+  {
+    "id": 130,
+    "name": "unichain",
+    "ds": "unichain-mainnet",
+    "factory": "0xbAd8b5BDFB2bcbcd78Cc9f1573D3Aad6E865e752",
+    "head": 52151647,
+    "sqdSlug": "unichain",
+    "freeRpcs": [
+      "https://mainnet.unichain.org",
+      "https://unichain.api.onfinality.io/public",
+      "https://unichain-rpc.publicnode.com",
+      "https://unichain.drpc.org",
+      "https://unichain.therpc.io",
+      "https://unichain-mainnet.gateway.tatum.io",
+      "https://rpc.poolz.finance/unichain",
+      "https://unichain-mainnet.rpc.sentio.xyz",
+      "https://rpc.swiftnodes.io/rpc/unichain"
+    ]
+  },
+  {
+    "id": 137,
+    "name": "polygon",
+    "ds": "polygon-mainnet",
+    "factory": "0xB1771a13e2a13fCafA89B00335915E732B9466b7",
+    "head": 89464275,
+    "sqdSlug": "polygon",
+    "freeRpcs": [
+      "https://rpc.ankr.com/polygon",
+      "https://polygon-rpc.com",
+      "https://rpc-mainnet.matic.quiknode.pro",
+      "https://polygon-public.nodies.app",
+      "https://polygon-mainnet.public.blastapi.io",
+      "https://1rpc.io/matic",
+      "https://polygon-bor-rpc.publicnode.com",
+      "https://polygon.api.onfinality.io/public",
+      "https://polygon.rpc.blxrbdn.com",
+      "https://polygon.drpc.org",
+      "https://polygon.gateway.tenderly.co"
+    ]
+  },
+  {
+    "id": 143,
+    "name": "monad",
+    "ds": "monad-mainnet",
+    "factory": "0xba4Dd672062dE8FeeDb665DD4410658864483f1E",
+    "head": 84877876,
+    "sqdSlug": null,
+    "freeRpcs": [
+      "https://monad-mainnet.api.onfinality.io/public",
+      "https://monad-mainnet.drpc.org",
+      "https://monad-mainnet-rpc.spidernode.net",
+      "https://infra.originstake.com/monad/evm",
+      "https://monad-mainnet.gateway.tatum.io",
+      "https://monad-mainnet.rpc.sentio.xyz",
+      "https://monad-rpc.huginn.tech",
+      "https://gm.monad.at.htw.tech",
+      "https://rpc.swiftnodes.io/rpc/monad",
+      "https://rpc.monad.xyz",
+      "https://rpc1.monad.xyz",
+      "https://rpc2.monad.xyz"
+    ]
+  },
+  {
+    "id": 146,
+    "name": "sonic",
+    "ds": "sonic-mainnet",
+    "factory": "0xF075cC8660B51D0b8a4474e3f47eDAC5fA034cFB",
+    "head": 75115740,
+    "sqdSlug": "sonic-mainnet",
+    "freeRpcs": [
+      "https://rpc.soniclabs.com",
+      "https://sonic.drpc.org",
+      "https://rpc.ankr.com/sonic_mainnet",
+      "https://sonic.api.onfinality.io/public",
+      "https://sonic.therpc.io",
+      "https://sonic-json-rpc.stakely.io",
+      "https://sonic.api.pocket.network",
+      "https://sonic-mainnet.rpc.sentio.xyz",
+      "https://rpc.swiftnodes.io/rpc/sonic",
+      "https://sonic-mainnet.gateway.tatum.io",
+      "https://sonic-rpc.publicnode.com"
+    ]
+  },
+  {
+    "id": 239,
+    "name": "tac",
+    "ds": "tac-mainnet",
+    "factory": "0x2b21621b8Ef1406699a99071ce04ec14cCd50677",
+    "head": 21828489,
+    "sqdSlug": null,
+    "freeRpcs": [
+      "https://rpc.ankr.com/tac",
+      "https://tac.therpc.io",
+      "https://rpc.tac.build",
+      "https://ws.rpc.tac.build"
+    ]
+  },
+  {
+    "id": 999,
+    "name": "hyperliquid",
+    "ds": "hyperliquid-mainnet",
+    "factory": "0xcF5552580fD364cdBBFcB5Ae345f75674c59273A",
+    "head": 39289933,
+    "sqdSlug": null,
+    "freeRpcs": [
+      "https://rpc.nodeflare.app/hl/public",
+      "https://hyperevm.rpc.sentio.xyz",
+      "https://rpc.hyperliquid.xyz/evm",
+      "https://rpc.hypurrscan.io",
+      "https://hyperliquid-json-rpc.stakely.io",
+      "https://hyperliquid.drpc.org",
+      "https://rpc.hyperlend.finance",
+      "https://hyperliquid.api.onfinality.io/evm/public",
+      "https://hyperliquid.rpc.blxrbdn.com"
+    ]
+  },
+  {
+    "id": 8453,
+    "name": "base",
+    "ds": "base-mainnet",
+    "factory": "0x7F321498A801A191a93C840750ed637149dDf8D0",
+    "head": 48055440,
+    "sqdSlug": "base",
+    "freeRpcs": [
+      "https://rpc.nodeflare.app/base/public",
+      "https://mainnet.base.org",
+      "https://developer-access-mainnet.base.org",
+      "https://li-fi-base.intustechno.workers.dev/rpc",
+      "https://base-mainnet.diamondswap.org/rpc",
+      "https://1rpc.io/base",
+      "https://base-public.nodies.app",
+      "https://base.meowrpc.com",
+      "https://base-mainnet.public.blastapi.io",
+      "https://base.gateway.tenderly.co",
+      "https://gateway.tenderly.co/public/base"
+    ]
+  },
+  {
+    "id": 9745,
+    "name": "plasma",
+    "ds": "plasma-mainnet",
+    "factory": "0x42388213C6F56D7E1477632b58Ae6Bba9adeEeA3",
+    "head": 25961073,
+    "sqdSlug": null,
+    "freeRpcs": [
+      "https://plasma.drpc.org",
+      "https://plasma.api.onfinality.io/public",
+      "https://rpc.swiftnodes.io/rpc/plasma",
+      "https://plasma-mainnet.gateway.tatum.io",
+      "https://rpc.plasma.to"
+    ]
+  },
+  {
+    "id": 42161,
+    "name": "arbitrum",
+    "ds": "arbitrum-one",
+    "factory": "0x78Df1CF5bf06a7f27f2ACc580B934238C1b80D50",
+    "head": 479230602,
+    "sqdSlug": "arbitrum-one",
+    "freeRpcs": [
+      "https://rpc.nodeflare.app/arb/public",
+      "https://arb1.arbitrum.io/rpc",
+      "https://1rpc.io/arb",
+      "https://arbitrum-one-public.nodies.app",
+      "https://arbitrum-one.public.blastapi.io",
+      "https://arb-mainnet-public.unifra.io",
+      "https://rpc.arb1.arbitrum.gateway.fm",
+      "https://arbitrum-one-rpc.publicnode.com",
+      "https://arbitrum.meowrpc.com",
+      "https://api.zan.top/arb-one"
+    ]
+  },
+  {
+    "id": 43114,
+    "name": "avalanche",
+    "ds": "avalanche-mainnet",
+    "factory": "0xaf4B4c18B17F6a2B32F6c398a3910bdCD7f26181",
+    "head": 89201801,
+    "sqdSlug": "ava",
+    "freeRpcs": [
+      "https://rpc.nodeflare.app/avax/public",
+      "https://api.avax.network/ext/bc/C/rpc",
+      "https://avalanche.public-rpc.com",
+      "https://ava-mainnet.public.blastapi.io/ext/bc/C/rpc",
+      "https://avalancheapi.terminet.io/ext/bc/C/rpc",
+      "https://avalanche-c-chain-rpc.publicnode.com",
+      "https://1rpc.io/avax/c",
+      "https://avalanche-public.nodies.app/ext/bc/C/rpc",
+      "https://avalanche.api.onfinality.io/public/ext/bc/C/rpc",
+      "https://avax.meowrpc.com",
+      "https://api.zan.top/avax-mainnet/ext/bc/C/rpc"
+    ]
+  },
+  {
+    "id": 59144,
+    "name": "linea",
+    "ds": "linea-mainnet",
+    "factory": "0x84711986Fd3BF0bFe4a8e6d7f4E22E67f7f27F04",
+    "head": 31222776,
+    "sqdSlug": "linea",
+    "freeRpcs": [
+      "https://rpc.linea.build",
+      "https://1rpc.io/linea",
+      "https://linea.drpc.org",
+      "https://linea.decubate.com",
+      "https://linea.therpc.io",
+      "https://linea.api.pocket.network",
+      "https://rpc.poolz.finance/linea",
+      "https://linea-rpc.publicnode.com",
+      "https://linea.rpc.sentio.xyz",
+      "https://rpc.swiftnodes.io/rpc/linea"
+    ]
+  },
+  {
+    "id": 60808,
+    "name": "bob",
+    "ds": "bob-mainnet",
+    "factory": "0x046a9837A61d6b6263f54F4E27EE072bA4bdC7e4",
+    "head": 23581020,
+    "sqdSlug": null,
+    "freeRpcs": [
+      "https://rpc.gobob.xyz",
+      "https://bob.drpc.org",
+      "https://bob.gateway.tenderly.co",
+      "https://bob.rpc.sentio.xyz",
+      "https://bob-mainnet.public.blastapi.io"
+    ]
+  },
+  {
+    "id": 80094,
+    "name": "berachain",
+    "ds": "berachain-mainnet",
+    "factory": "0x5C13fb43ae9BAe8470f646ea647784534E9543AF",
+    "head": 22943345,
+    "sqdSlug": "berachain",
+    "freeRpcs": [
+      "https://rpc.berachain.com",
+      "https://berachain-rpc.publicnode.com",
+      "https://berachain.drpc.org",
+      "https://rpc.berachain-apis.com",
+      "https://berachain.therpc.io",
+      "https://berachain-mainnet.gateway.tatum.io",
+      "https://berachain.api.pocket.network",
+      "https://berachain.rpc.sentio.xyz",
+      "https://rpc.swiftnodes.io/rpc/berachain"
+    ]
+  }
+]

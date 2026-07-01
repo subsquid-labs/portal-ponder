@@ -174,6 +174,19 @@ export const createPortalHistoricalSync = (
         // request 400s. Surface the column so stream() can drop the field and retry.
         const m = res.status === 400 && text.match(/column '([a-z0-9_]+)' is not found in '([a-z_]+)'/i);
         if (m) { const e: any = new Error(`Portal 400: unsupported column ${m[1]} in ${m[2]}`); e.unsupportedColumn = m[1]; e.unsupportedTable = m[2]; throw e; }
+        // OTHER schema shape: a dataset whose schema doesn't know the field at all → query PARSE
+        // error ("unknown field `accessList`, expected one of ..."). Find which fields-block we put
+        // it in (block/transaction/log/trace) so stream() can drop that field key and retry.
+        const u = res.status === 400 && text.match(/unknown field `([a-zA-Z0-9_]+)`/);
+        if (u && u[1]) {
+          const fn = u[1]; let table = "transaction";
+          try { const q = JSON.parse(body); for (const t of ["transaction", "block", "log", "trace"]) if (q?.fields?.[t] && q.fields[t][fn] !== undefined) { table = t; break; } } catch { /* default transaction */ }
+          const e: any = new Error(`Portal 400: unknown field ${fn} in ${table}`); e.unsupportedField = fn; e.unsupportedFieldTable = table; throw e;
+        }
+        // a dataset that doesn't begin at genesis (e.g. TAC starts at block 1) 400s when queried
+        // below its first block. Surface the start so stream() can clamp the cursor forward.
+        const s = res.status === 400 && text.match(/dataset starts (?:from|at) block (\d+)/i);
+        if (s) { const e: any = new Error(`Portal 400: dataset starts at block ${s[1]}`); e.datasetStartsAt = Number(s[1]); throw e; }
         throw new Error(`Portal ${res.status} @ ${cursor}: ${text}`);
       }
       const reader = res.body!.getReader();
@@ -220,14 +233,25 @@ export const createPortalHistoricalSync = (
         const body = JSON.stringify({ ...stripFields(query, dropped), fromBlock: cursor, toBlock: to });
         try { batch = await fetchBatch(body, cursor); }
         catch (err: any) {
-          if (err?.unsupportedColumn) {
-            if (triedCols.has(err.unsupportedColumn)) throw err; // dropping its field didn't help → real error
-            triedCols.add(err.unsupportedColumn);
-            const field = colToFieldKey(err.unsupportedColumn, err.unsupportedTable);
+          if (err?.datasetStartsAt !== undefined) {
+            // dataset begins after this chunk's start (doesn't reach genesis) → skip the missing
+            // prefix. If the whole chunk precedes the dataset, there's nothing to fetch here.
+            if (err.datasetStartsAt > to) return;
+            if (err.datasetStartsAt > cursor) { cursor = err.datasetStartsAt; continue; }
+            throw err; // start ≤ cursor yet still 400 ⇒ not a below-start issue; surface it
+          }
+          // a dataset that can't serve a requested field — either the column is absent from the
+          // parquet ("column not found") or the schema doesn't know the field ("unknown field").
+          // Both are handled the same way: drop that field for this chunk and retry.
+          if (err?.unsupportedColumn || err?.unsupportedField) {
+            const tag = (err.unsupportedColumn ?? err.unsupportedField) as string; // unique id → bounds retries
+            if (triedCols.has(tag)) throw err; // dropping its field didn't help → real error
+            triedCols.add(tag);
+            const field = err.unsupportedColumn ? colToFieldKey(err.unsupportedColumn, err.unsupportedTable) : `${err.unsupportedFieldTable}.${err.unsupportedField}`;
             dropped.add(field); // drop for THIS chunk's retries only (chunks that have it keep it)
-            // needed = in the indexer's `include`, or a NOT-NULL/bloom field (not a skippable nullable).
-            if (!DROPPABLE_IF_UNUSED.has(field) || includedFields.has(field)) neededMissing?.add(`${field} (col '${err.unsupportedColumn}')`);
-            else log.debug({ service: "portal", msg: `Portal ${args.chain.name} [${from},${to}]: dataset lacks '${err.unsupportedColumn}' → skipping UNUSED nullable field ${field}` });
+            // non-load-bearing nullable field → drop silently; anything else → crash IF matched (dataChunk).
+            if (!DROPPABLE_FIELDS.has(field)) neededMissing?.add(`${field} (${tag})`);
+            else log.debug({ service: "portal", msg: `Portal ${args.chain.name} [${from},${to}]: dataset can't serve '${tag}' → skipping non-load-bearing field ${field}` });
             continue;
           }
           const retryable = err?.retryAfterMs !== undefined || isNetworkError(err);
@@ -294,11 +318,14 @@ export const createPortalHistoricalSync = (
   let allFactories: any[] = [];
   let backfillStartBlock = 0;
   let backfillEndBlock: number | undefined; // undefined ⇒ unbounded (backfill to the finalized head)
-  let includedFields = new Set<string>(); // the fields the indexer actually reads (Ponder `include`)
-  // NULLABLE sync-store columns that are safe to store as null when a dataset lacks them AND the
-  // indexer doesn't read them. Everything else missing ⇒ crash (never silently substitute data a
-  // handler might read, or a NOT-NULL / bloom-load-bearing field).
-  const DROPPABLE_IF_UNUSED = new Set(["transaction.accessList", "block.baseFeePerGas", "block.nonce", "block.mixHash", "block.sha3Uncles", "block.totalDifficulty"]);
+  // Fields that are NULLABLE in Ponder's sync-store AND non-load-bearing — Ponder never uses them
+  // internally and they're legitimately absent on some chains (accessList on non-typed txs; nonce/
+  // mixHash on PoS; baseFeePerGas pre-1559; totalDifficulty post-merge). Safe to store as null when a
+  // dataset lacks them. NOTE: Ponder's per-filter `include` is a STATIC default that always lists
+  // EVERY standard field incl. accessList (runtime/filter.ts defaultTransactionInclude), so it can't
+  // tell us what a handler actually reads — we classify by field. Anything NOT here, missing ⇒ crash
+  // (a NOT-NULL / bloom-load-bearing / core column whose absence would corrupt or silently gut data).
+  const DROPPABLE_FIELDS = new Set(["transaction.accessList", "block.baseFeePerGas", "block.nonce", "block.mixHash", "block.sha3Uncles", "block.totalDifficulty"]);
   // Resolve the COMPLETE chain-wide fetch-spec ONCE from args.eventCallbacks (the FULL per-chain
   // filter set), NOT from per-call requiredIntervals (only the subset Ponder still needs, which
   // shrinks as fragments cache). Chunks are cached by idx ALONE, so every chunk MUST be filter-
@@ -323,8 +350,6 @@ export const createPortalHistoricalSync = (
     backfillStartBlock = froms.length ? Math.min(...froms) : 0;
     const tos = fs.map((f) => (f as any).toBlock);
     backfillEndBlock = tos.length && tos.every((t) => t != null) ? Math.max(...tos) : undefined;
-    // exact fields the indexer reads — the crash-vs-skip discriminator when a dataset lacks a column.
-    includedFields = new Set(fs.flatMap((f) => ((f as any).include ?? []) as string[]));
   };
   // a chunk's grid-aligned [from,to] clamped to the real backfill window (end ⇒ explicit toBlock,
   // else the finalized head). Bounds fetch on BOTH sides so a small/bounded range isn't widened to
