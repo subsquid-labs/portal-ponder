@@ -74,6 +74,19 @@ Resync **wall-clock** is the metric (events indexed end-to-end), not raw scan ra
 
 ---
 
+## 🚩 Flagship: every Euler V2 chain in one indexer
+
+[**`harness/euler-multichain/`**](harness/euler-multichain/) is the reference deployment — **all 15 Portal-supported Euler V2 chains in a single Ponder app**, full history `[deploy → finalized head]` per chain, the **complete 24-event EVault superset**, Portal backfill → **Postgres**. It's the production shape of an Euler indexer (Euler runs *both* Ponder and subgraphs) *and* the fork's hardest stress test: one Portal endpoint, one database, fifteen chains backfilling concurrently.
+
+- **Authoritative, not guessed** — per-chain start blocks come straight from Euler's own [`euler-subgraph`](https://github.com/euler-xyz/euler-subgraph) config; every `eVaultFactory` is cross-verified against [`euler-interfaces`](https://github.com/euler-xyz/euler-interfaces).
+- **Superset, not a subset** — all 24 EVault events (Euler's public subgraph indexes only `Transfer/Borrow/Repay`), so the output serves any downstream consumer.
+- **Cross-checked against Euler's own live subgraph** — discovered vault counts match *exactly* on finished chains (polygon 25/25, tac 36/36, bob 27/27…), and it indexes chains the subgraph reports as **empty** (e.g. hyperliquid). The high-block / high-TPS chains where subgraphs are slow-to-unviable are exactly where the Portal backfill wins.
+- **Zero-config at scale** — adaptive Portal concurrency (AIMD) + memory backpressure + a proactive 256 KB query-size guard, all exercised by the 15-chain load.
+
+**Full results — _TBD_.** The captured end-to-end run (wall-time, per-chain blk/s + ev/s, the complete vault-count cross-check across all 15 chains, and the saturation breakdown — Portal I/O vs decode vs DB) lands in [`harness/euler-multichain/REPORT.md`](harness/euler-multichain/REPORT.md). Reproduce with `docker compose up -d postgres && ./run.sh` — see the [flagship README](harness/euler-multichain/README.md).
+
+---
+
 ## How it works
 
 The whole change is one module (`portal/portal.ts`, the `HistoricalSync` implementation) plus a 4-line wiring patch that adds `portal?` to the chain config and routes to it when set.
@@ -127,7 +140,7 @@ Each is a real indexer that runs end-to-end on `@subsquid/ponder` (backfill from
 
 - [`examples/euler-subgraph/`](examples/euler-subgraph/) — **the Euler V2 subgraph ported to Ponder + Portal** (factory templates → `factory()`, subgraph eth_calls → `readContract` with the once-per-vault cache, Counter aggregation, APY derivation). A reusable *subgraph → Ponder* migration guide.
 - [`examples/uniswap-portal/`](examples/uniswap-portal/) — exercises **all five source types** in one app (logs + receipts + traces + block-interval + accounts).
-- [`examples/euler-multichain/`](examples/euler-multichain/) — multi-chain Euler factory indexer (the benchmark app).
+- [`examples/euler-multichain/`](examples/euler-multichain/) — compact 3-chain Euler factory indexer (the benchmark app). The full **15-chain flagship** (24-event superset, Postgres, live subgraph cross-check) is [`harness/euler-multichain/`](harness/euler-multichain/) — see 🚩 **Flagship** above.
 
 ---
 
