@@ -17,7 +17,7 @@
       "https://uk.rpc.blxrbdn.com",
       "https://singapore.rpc.blxrbdn.com"
     ],
-    "deploy": 20529225
+    "deploy": 20529207
   },
   {
     "id": 56,
@@ -40,7 +40,7 @@
       "https://bsc-dataseed4.ninicoin.io",
       "https://bsc-dataseed1.bnbchain.org"
     ],
-    "deploy": 0
+    "deploy": 46370000
   },
   {
     "id": 130,
@@ -60,7 +60,7 @@
       "https://unichain-mainnet.rpc.sentio.xyz",
       "https://rpc.swiftnodes.io/rpc/unichain"
     ],
-    "deploy": 8541544
+    "deploy": 8541547
   },
   {
     "id": 137,
@@ -105,7 +105,7 @@
       "https://rpc1.monad.xyz",
       "https://rpc2.monad.xyz"
     ],
-    "deploy": 84877876
+    "deploy": 30858000
   },
   {
     "id": 146,
@@ -127,7 +127,7 @@
       "https://sonic-mainnet.gateway.tatum.io",
       "https://sonic-rpc.publicnode.com"
     ],
-    "deploy": 5324454
+    "deploy": 5324457
   },
   {
     "id": 239,
@@ -142,7 +142,7 @@
       "https://rpc.tac.build",
       "https://ws.rpc.tac.build"
     ],
-    "deploy": 555116
+    "deploy": 860000
   },
   {
     "id": 999,
@@ -162,7 +162,7 @@
       "https://hyperliquid.api.onfinality.io/evm/public",
       "https://hyperliquid.rpc.blxrbdn.com"
     ],
-    "deploy": 19635337
+    "deploy": 1980586
   },
   {
     "id": 8453,
@@ -184,7 +184,7 @@
       "https://base.gateway.tenderly.co",
       "https://gateway.tenderly.co/public/base"
     ],
-    "deploy": 22282408
+    "deploy": 22282411
   },
   {
     "id": 9745,
@@ -200,7 +200,7 @@
       "https://plasma-mainnet.gateway.tatum.io",
       "https://rpc.plasma.to"
     ],
-    "deploy": 511040
+    "deploy": 510000
   },
   {
     "id": 42161,
@@ -221,7 +221,7 @@
       "https://arbitrum.meowrpc.com",
       "https://api.zan.top/arb-one"
     ],
-    "deploy": 300690953
+    "deploy": 238643655
   },
   {
     "id": 43114,
@@ -243,7 +243,7 @@
       "https://avax.meowrpc.com",
       "https://api.zan.top/avax-mainnet/ext/bc/C/rpc"
     ],
-    "deploy": 56805794
+    "deploy": 56805796
   },
   {
     "id": 59144,
@@ -264,7 +264,7 @@
       "https://linea.rpc.sentio.xyz",
       "https://rpc.swiftnodes.io/rpc/linea"
     ],
-    "deploy": 17915340
+    "deploy": 17900000
   },
   {
     "id": 60808,
@@ -280,7 +280,7 @@
       "https://bob.rpc.sentio.xyz",
       "https://bob-mainnet.public.blastapi.io"
     ],
-    "deploy": 12266832
+    "deploy": 13157157
   },
   {
     "id": 80094,
@@ -300,6 +300,6 @@
       "https://berachain.rpc.sentio.xyz",
       "https://rpc.swiftnodes.io/rpc/berachain"
     ],
-    "deploy": 786314
+    "deploy": 1095611
   }
 ]
