@@ -48,5 +48,16 @@ concurrency + buffered rows). `PORTAL_GATE_LOG=1` logs the AIMD concurrency + me
 live. Pair with Postgres `pg_stat_activity` wait-events to see whether the DB is I/O-bound,
 CPU-bound, or *waiting on the client* (i.e. upstream decode is the limit).
 
-See **[REPORT.md](./REPORT.md)** for a captured full run — throughput, per-chain reach, and the
-saturation analysis.
+### Hardware & wall-time (read this before comparing numbers)
+The Portal is **not** the bottleneck here — local decode + DB write + the in-memory fetch buffer are,
+and that envelope scales with **RAM**. On a memory-constrained box (the captured run: 16 GB) the
+24-event superset must use conservative, uniform chunks (`PORTAL_CHUNK_FIXED=1`,
+`PORTAL_CHUNK_BLOCKS=300000`) to bound the buffer, which trades **more HTTP round-trips** for a fit —
+*same Portal CU* (CU is billed per data-chunk, not per request), just added latency on high-block
+chains. On a larger-RAM machine you instead keep the default **density-scaled chunks** (arbitrum →
+multi-million-block chunks) and a bigger heap, cutting round-trips dramatically → **materially better
+wall-time**. So the reported wall-time is a **conservative floor on modest hardware, not the fork's
+ceiling** — more RAM gives strictly better numbers.
+
+See **[REPORT.md](./REPORT.md)** for a captured full run — throughput, per-chain reach, the
+saturation analysis, and the hardware caveat above applied to the actual wall-time.
