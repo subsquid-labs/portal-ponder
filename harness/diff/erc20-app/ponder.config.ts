@@ -7,7 +7,7 @@ const transfer = parseAbiItem("event Transfer(address indexed from, address inde
 
 export default createConfig({
   database: { kind: "pglite", directory: process.env.PGLITE_DIR ?? "./.ponder/pglite" },
-  chains: { mainnet: { id: 1, rpc: process.env.PONDER_RPC_URL_1, portal: process.env.PORTAL_URL_1 || undefined } },
+  chains: { mainnet: { id: 1, rpc: (process.env.PONDER_RPC_URL_1 ?? "").includes(",") ? process.env.PONDER_RPC_URL_1.split(",").map((x)=>x.trim()).filter(Boolean) : process.env.PONDER_RPC_URL_1, portal: process.env.PORTAL_URL_1 || undefined } },
   contracts: {
     USDC: {
       abi: [transfer] as const, chain: "mainnet",

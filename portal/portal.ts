@@ -194,7 +194,7 @@ export const createPortalHistoricalSync = (
   // Portal reports a missing COLUMN in a plural TABLE; map back to the field key we requested.
   const TABLE_TO_KEY: Record<string, string> = { transactions: "transaction", blocks: "block", logs: "log", traces: "trace" };
   const COL_SPECIAL: Record<string, string> = { access_list_size: "accessList", access_list: "accessList" }; // portal's derived column ≠ snake(field)
-  const colToFieldKey = (col: string, table: string): string | undefined => {
+  const colToFieldKey = (col: string, table: string): string => {
     const key = TABLE_TO_KEY[table] ?? table;
     const field = COL_SPECIAL[col] ?? col.replace(/_([a-z0-9])/g, (_, c) => c.toUpperCase()); // snake_case → camelCase
     return `${key}.${field}`;
@@ -208,6 +208,7 @@ export const createPortalHistoricalSync = (
 
   async function* stream(query: object, from: number, to: number) {
     let cursor = from;
+    const droppedCols = new Set<string>(); // per-stream: bounds retries (same column twice ⇒ real error)
     while (cursor <= to) {
       let attempt = 0;
       let batch: Awaited<ReturnType<typeof fetchBatch>> | undefined;
@@ -216,9 +217,14 @@ export const createPortalHistoricalSync = (
         try { batch = await fetchBatch(body, cursor); }
         catch (err: any) {
           if (err?.unsupportedColumn) {
+            // dataset lacks a requested column → drop the mapped field and retry (the shared strip
+            // removes it). ALWAYS retry (never throw on a concurrent double-hit from a sibling chunk);
+            // only give up if the SAME column 400s again after we already dropped its field.
+            if (droppedCols.has(err.unsupportedColumn)) throw err;
+            droppedCols.add(err.unsupportedColumn);
             const field = colToFieldKey(err.unsupportedColumn, err.unsupportedTable);
-            if (field && !unsupportedFields.has(field)) { unsupportedFields.add(field); log.debug({ service: "portal", msg: `Portal ${args.chain.name}: dataset lacks '${err.unsupportedColumn}' in ${err.unsupportedTable} → dropping field ${field}` }); continue; }
-            throw err; // already dropped (loop) → real error
+            if (!unsupportedFields.has(field)) { unsupportedFields.add(field); log.debug({ service: "portal", msg: `Portal ${args.chain.name}: dataset lacks '${err.unsupportedColumn}' in ${err.unsupportedTable} → dropping field ${field}` }); }
+            continue;
           }
           const retryable = err?.retryAfterMs !== undefined || isNetworkError(err);
           if (!retryable || attempt++ >= 10) throw err;
