@@ -26,7 +26,11 @@ const only = (process.env.EULER_CHAINS ?? "").split(",").map((s) => s.trim()).fi
 const active = only.length ? rows.filter((c) => only.includes(c.name)) : rows;
 
 export default createConfig({
-  database: { kind: "pglite", directory: process.env.PGLITE_DIR ?? "./.ponder/pglite" },
+  // Postgres (production shape, separate process → own memory) when DATABASE_URL is set; else pglite
+  // (in-process dev DB — its write backlog shares the Node heap, so a fast 15-chain backfill can OOM it).
+  database: process.env.DATABASE_URL
+    ? { kind: "postgres", connectionString: process.env.DATABASE_URL }
+    : { kind: "pglite", directory: process.env.PGLITE_DIR ?? "./.ponder/pglite" },
   chains: Object.fromEntries(active.map((c) => [c.name, { id: c.id, rpc: rpcFor(c), portal: `https://sqd.portal.sqd.dev/datasets/${c.ds}` }])),
   contracts: {
     EVault: {

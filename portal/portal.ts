@@ -128,7 +128,7 @@ export const createPortalHistoricalSync = (
   const baseHeaders: Record<string, string> = { "content-type": "application/json", "accept-encoding": "gzip" };
   if (process.env.PORTAL_API_KEY) baseHeaders["x-api-key"] = process.env.PORTAL_API_KEY;
 
-  const stats = { dataChunks: 0, discChunks: 0, http: 0, logs: 0, errors: 0, retries: 0, bytes: 0, cacheHits: 0, inflight: 0, maxInflight: 0, blocks: 0, txs: 0, receipts: 0, traces: 0, rpcFallback: 0 };
+  const stats = { dataChunks: 0, discChunks: 0, http: 0, logs: 0, errors: 0, retries: 0, bytes: 0, cacheHits: 0, inflight: 0, maxInflight: 0, blocks: 0, txs: 0, receipts: 0, traces: 0, rpcFallback: 0, gateWaitMs: 0, fetchMs: 0, transformMs: 0 };
   const dataCache = new Map<number, Promise<ChunkData>>(); // keyed by chunk index
   const chunkRows = new Map<number, number>(); // idx → buffered row count, for the global memory budget
   let discoveredThrough = -1; // high-water block covered by the single wide factory-discovery scan
@@ -167,6 +167,11 @@ export const createPortalHistoricalSync = (
         chain: args.chain.name, chainId: args.chain.id, wallMs: startTime ? Date.now() - startTime : 0,
         chunkBlocks, portalFinalizedHead: portalHead ?? null,
         fetch: { dataChunks: stats.dataChunks, discChunks: stats.discChunks, http: stats.http, bytes: stats.bytes, errors: stats.errors, retries: stats.retries, cacheHits: stats.cacheHits, maxInflight: stats.maxInflight },
+        // saturation breakdown (cumulative ms across all requests of this chain): gate-wait = time
+        // blocked on the global concurrency budget; fetch = Portal I/O (POST+stream drain); transform
+        // = NDJSON→Sync* decode. DB-write time lives in Ponder (per-range log timing), not here.
+        timing: { gateWaitMs: Math.round(stats.gateWaitMs), fetchMs: Math.round(stats.fetchMs), transformMs: Math.round(stats.transformMs) },
+        portalGate: portalGate.snapshot(),
         inserted: { logs: stats.logs, blocks: stats.blocks, txs: stats.txs, receipts: stats.receipts, traces: stats.traces },
         rpcFallbackIntervals: stats.rpcFallback,
       }));
@@ -198,7 +203,8 @@ export const createPortalHistoricalSync = (
 
   // one POST+drain; returns blocks or "done" (204); throws (with .retryAfterMs on 503-class).
   async function fetchBatch(body: string, cursor: number): Promise<{ blocks: { header: RawHeader; logs?: any[]; transactions?: any[]; traces?: any[] }[]; last: number } | "done"> {
-    await portalGate.acquire(); // one global (cross-chain) concurrency slot; AIMD-tuned to the endpoint
+    const tAcq = Date.now(); await portalGate.acquire(); stats.gateWaitMs += Date.now() - tAcq; // gate-wait = concurrency back-pressure
+    const tFetch = Date.now();
     stats.inflight++; stats.maxInflight = Math.max(stats.maxInflight, stats.inflight);
     try {
       const res = await fetch(`${portalUrl}/finalized-stream`, { method: "POST", headers: baseHeaders, body });
@@ -244,7 +250,7 @@ export const createPortalHistoricalSync = (
     } catch (err: any) {
       if (isNetworkError(err)) portalGate.onThrottle(); // dropped/timed-out connections under load = congestion
       throw err;
-    } finally { portalGate.release(); stats.inflight--; }
+    } finally { stats.fetchMs += Date.now() - tFetch; portalGate.release(); stats.inflight--; }
   }
 
   // Fields the TARGET dataset doesn't have (per-dataset schema varies — e.g. Monad's transactions
@@ -635,6 +641,7 @@ export const createPortalHistoricalSync = (
       const raEnd = backfillEndBlock ?? portalHead ?? Number.POSITIVE_INFINITY;
       for (let d = 1; d <= READAHEAD; d++) { if ((endIdx + d) * chunkBlocks > raEnd) break; if (d > 1 && portalGate.saturated()) break; void dataChunk(endIdx + d, factories, filters).catch(() => {}); }
 
+      const tXform = Date.now(); // decode/transform time: Portal NDJSON → Ponder Sync* shapes
       const syncLogs: SyncLog[] = [];
       const blocksByNumber = new Map<number, SyncBlockHeader>();
       const syncTxs: SyncTransaction[] = [];
@@ -673,6 +680,7 @@ export const createPortalHistoricalSync = (
       for (const i of dataCache.keys()) if ((i + 1) * chunkBlocks <= interval[0]) { dataCache.delete(i); portalGate.freeRows(chunkRows.get(i) ?? 0); chunkRows.delete(i); } // evict behind + free its memory budget
 
       const syncTraces = needTraces ? data.flatMap((cd) => buildTraces(cd, interval[0], interval[1])) : [];
+      stats.transformMs += Date.now() - tXform;
 
       // C9: highest block with data — a loop, NOT Math.max(...spread) which RangeErrors on ~100k+
       // keys — and INCLUDING trace-only blocks (a block with only matched traces isn't in
