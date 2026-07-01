@@ -72,6 +72,11 @@ type ChunkData = {
 };
 
 const PORTAL_MAX_ADDRESSES = 1000;
+// Portal rejects any request whose raw body exceeds this (sqd-network transport/src/protocol.rs:
+// `MAX_RAW_QUERY_SIZE = 256 * 1024`) with 400 "Query is too large". The body is dominated by filter
+// address lists (factory children in log/tx filters). We keep under it by merging per-event log
+// filters + batching addresses; a body that still overflows fails loud (see fetchBatch).
+const MAX_RAW_QUERY_SIZE = 256 * 1024;
 const CHUNK_BLOCKS = Number(process.env.PORTAL_CHUNK_BLOCKS ?? 500_000);
 const READAHEAD = Number(process.env.PORTAL_READAHEAD ?? 6);
 // The Portal fans ONE stream request out across up to `buffer_size` chunk-workers concurrently
@@ -217,6 +222,20 @@ export const createPortalHistoricalSync = (
 
   // one POST+drain; returns blocks or "done" (204); throws (with .retryAfterMs on 503-class).
   async function fetchBatch(body: string, cursor: number): Promise<{ blocks: { header: RawHeader; logs?: any[]; transactions?: any[]; traces?: any[] }[]; last: number } | "done"> {
+    // Proactive, uniform size guard — covers EVERY request type (logs/traces/txs/discovery) at the one
+    // POST choke point. A body over MAX_RAW_QUERY_SIZE would 400; surface it explicitly with the real
+    // driver instead. Euler's worst (eth: 897 children × 24 topics) is ~41KB, so this never fires here;
+    // it protects indexers with pathological filtered-address counts (esp. unbatched tx from/to sets).
+    if (body.length > MAX_RAW_QUERY_SIZE) {
+      const q = (() => { try { return JSON.parse(body); } catch { return {}; } })();
+      const nLog = (q.logs ?? []).reduce((s: number, r: any) => s + (r.address?.length ?? 0), 0);
+      const nTx = (q.transactions ?? []).reduce((s: number, r: any) => s + (r.from?.length ?? 0) + (r.to?.length ?? 0), 0);
+      throw new Error(
+        `Portal request body ${(body.length / 1024).toFixed(1)}KB exceeds MAX_RAW_QUERY_SIZE ${MAX_RAW_QUERY_SIZE / 1024}KB @ ${cursor}. ` +
+        `Filter addresses in this request: ${nLog} log + ${nTx} tx(from/to). ` +
+        `Log filters are already merged+batched (PORTAL_MAX_ADDRESSES=${PORTAL_MAX_ADDRESSES}); if this is a tx filter, its from/to set is too large to fit one request and cannot be safely split — narrow the filter.`,
+      );
+    }
     const tAcq = Date.now(); await portalGate.acquire(); stats.gateWaitMs += Date.now() - tAcq; // gate-wait = concurrency back-pressure
     const tFetch = Date.now();
     stats.inflight++; stats.maxInflight = Math.max(stats.maxInflight, stats.inflight);
@@ -304,17 +323,15 @@ export const createPortalHistoricalSync = (
     while (cursor <= to) {
       let attempt = 0;
       let batch: Awaited<ReturnType<typeof fetchBatch>> | undefined;
-      let hi = to; // per-cursor upper bound; bisected down on "query too large", reset each advance
       while (batch === undefined) {
-        const body = JSON.stringify({ ...stripFields(query, dropped), fromBlock: cursor, toBlock: hi });
+        const body = JSON.stringify({ ...stripFields(query, dropped), fromBlock: cursor, toBlock: to });
         try { batch = await fetchBatch(body, cursor); }
         catch (err: any) {
           if (err?.tooLarge) {
-            // dense window exceeded the Portal's query estimate → halve it and retry. Continuation
-            // then covers [hi+1, to] as usual, so no data is skipped.
-            if (hi <= cursor) throw err; // a single block still too large ⇒ a real limit, surface it
-            hi = cursor + Math.floor((hi - cursor) / 2);
-            continue;
+            // Portal caps request BYTES (MAX_RAW_QUERY_SIZE), not range — so bisecting blocks can't
+            // help. mergeLogRequests already de-dups addresses across event filters; if a body still
+            // exceeds the cap the address batch itself is too big → fail loud with the actual lever.
+            throw new Error(`Portal query body exceeds MAX_RAW_QUERY_SIZE even after merging event filters — lower PORTAL_MAX_ADDRESSES (currently ${PORTAL_MAX_ADDRESSES}) to shrink the address batch. @ ${cursor}`);
           }
           if (err?.datasetStartsAt !== undefined) {
             // dataset begins after this chunk's start (doesn't reach genesis) → skip the missing
@@ -365,6 +382,23 @@ export const createPortalHistoricalSync = (
     const out: PortalLogRequest[] = [];
     for (let i = 0; i < addresses.length; i += PORTAL_MAX_ADDRESSES) out.push({ ...base, address: addresses.slice(i, i + PORTAL_MAX_ADDRESSES) });
     return out;
+  }
+
+  // Ponder emits ONE filter per event, so an N-event contract (e.g. the 24-event EVault) produces N
+  // log requests that each repeat the SAME (possibly large) child-address list with a different
+  // topic0. Concatenated into one query body they can exceed the Portal's raw query-size limit
+  // (400 "Query is too large" — it caps request BYTES, not range). Collapse requests that share the
+  // same address set + topic1..3 into one, unioning topic0 — identical result set, ~N× smaller body.
+  function mergeLogRequests(reqs: PortalLogRequest[]): PortalLogRequest[] {
+    const groups = new Map<string, PortalLogRequest>();
+    for (const r of reqs) {
+      const key = JSON.stringify([r.address ? [...r.address].sort() : null, r.topic1 ?? null, r.topic2 ?? null, r.topic3 ?? null]);
+      const g = groups.get(key);
+      if (!g) { groups.set(key, { ...r, topic0: r.topic0 ? [...new Set(r.topic0)] : undefined }); continue; }
+      if (g.topic0 === undefined || r.topic0 === undefined) g.topic0 = undefined; // one wants ALL topic0 → keep the broadest
+      else { const s = new Set(g.topic0); for (const t of r.topic0) s.add(t); g.topic0 = [...s]; }
+    }
+    return [...groups.values()];
   }
 
   // FILTER/PROJECTION STRATEGY (max Portal leverage): every row filter is pushed to
@@ -504,7 +538,7 @@ export const createPortalHistoricalSync = (
       await ensureDiscoveredThrough(idx, factories); // correctness: children ≤ this chunk are known
       stats.dataChunks++;
       const [from, to] = chunkRange(idx);
-      const logRequests = filters.flatMap((f) => logRequestsFor(f)).map((r) => ({ ...r, transaction: true }));
+      const logRequests = mergeLogRequests(filters.flatMap((f) => logRequestsFor(f))).map((r) => ({ ...r, transaction: true }));
       const data: ChunkData = { headers: new Map(), logs: new Map(), txs: new Map(), traceBlocks: new Map(), blockHeaders: new Map(), txBlocks: new Map() };
       const neededMissing = new Set<string>(); // needed fields the dataset lacked on THIS chunk
       if (logRequests.length > 0) {

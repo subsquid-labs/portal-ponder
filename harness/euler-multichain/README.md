@@ -6,9 +6,15 @@ is the production shape of an Euler indexer and a stress test of the `@subsquid/
 shared Portal endpoint, one database, fifteen chains backfilling concurrently.
 
 ## What it indexes
-- The `eVaultFactory` (`GenericFactory` — `ProxyCreated` → child EVaults) per chain.
-- The 6 EVault events — `Deposit, Withdraw, Borrow, Repay, Liquidate, VaultStatus` — log-based,
-  exactly how the real euler-subgraph indexes (no receipts; `event.transaction.hash` for IDs).
+- The `eVaultFactory` (`GenericFactory` — `ProxyCreated` → child EVaults) per chain, with start blocks
+  taken from **Euler's own subgraph config** (`euler-xyz/euler-subgraph`) and every factory address
+  cross-verified against `euler-xyz/euler-interfaces` `CoreAddresses.json`.
+- The **full 24-event EVault superset** (`Deposit/Withdraw/Borrow/Repay/Liquidate/Transfer/Approval/
+  VaultStatus/InterestAccrued/DebtSocialized/PullDebt/ConvertFees/BalanceForwarderStatus/EVaultCreated`
+  + all `GovSet*`), from the euler-interfaces ABI. Euler runs **both** ponder and subgraphs in prod and
+  the public subgraph indexes only a subset (`Transfer/Borrow/Repay`), so a superset is the faithful
+  apples-to-apples target. Log-based, no receipts; `event.transaction.hash` for IDs.
+  Vault discovery is cross-checked against Euler's live Goldsky subgraph per chain (see REPORT.md).
 
 ## Chains (15)
 `ethereum · binance · unichain · polygon · monad · sonic · tac · hyperliquid · base · plasma ·

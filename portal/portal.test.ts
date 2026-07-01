@@ -376,3 +376,55 @@ test("regression (C6): deep matched trace is stored at its FULL-tree pre-order i
     expect((inserted[0].trace.trace.to as string)?.toLowerCase()).toBe(TARGET);
   } finally { srv.close(); delete process.env.PORTAL_FINALIZED_HEAD; }
 });
+
+test("merge: N same-address event filters collapse to ONE log request (unioned topic0) — keeps body small", async () => {
+  // Ponder emits one filter per event; a 24-event EVault would otherwise repeat the child-address
+  // list 24× in one body and blow past MAX_RAW_QUERY_SIZE. mergeLogRequests must fold them into one.
+  const ADDR = "0x" + "cc".repeat(20);
+  const topic0s = Array.from({ length: 6 }, (_, i) => "0x" + (i + 1).toString(16).padStart(64, "0"));
+  const dataQueries: any[] = [];
+  const srv = http.createServer((req, res) => {
+    let body = ""; req.on("data", (c) => { body += c; });
+    req.on("end", () => { const q = body ? JSON.parse(body) : {}; if (q.logs) dataQueries.push(q); res.writeHead(204).end(); });
+  });
+  const p = await new Promise<number>((r) => srv.listen(0, () => r((srv.address() as AddressInfo).port)));
+  try {
+    const filters = topic0s.map((t, i) => ({
+      type: "log", chainId: 1, sourceId: `evault:e${i}`, address: ADDR, topic0: t,
+      topic1: null, topic2: null, topic3: null, fromBlock: 0, toBlock: 100, hasTransactionReceipt: false, include: [],
+    }));
+    const sync = createPortalHistoricalSync({
+      common: { logger: { debug() {}, info() {}, warn() {}, error() {}, trace() {} } },
+      chain: { id: 1, name: "mainnet", portal: `http://localhost:${p}` },
+      childAddresses: new Map(), eventCallbacks: filters.map((f) => ({ filter: f })),
+    } as any);
+    await sync.syncBlockRangeData({
+      interval: [0, 100], requiredIntervals: filters.map((f) => ({ interval: [0, 100], filter: f })),
+      requiredFactoryIntervals: [], syncStore: { insertLogs() {}, insertBlocks() {}, insertTransactions() {}, insertTransactionReceipts() {}, insertTraces() {} },
+    } as any);
+    const merged = dataQueries.find((q) => (q.logs?.[0]?.topic0?.length ?? 0) > 1);
+    expect(merged).toBeDefined();
+    expect(merged.logs).toHaveLength(1); // ONE request, not 6
+    expect(new Set(merged.logs[0].topic0.map((x: string) => x.toLowerCase())).size).toBe(6); // all selectors unioned
+  } finally { srv.close(); }
+});
+
+test("guard: an over-limit request body fails loud with the explicit size driver (never a silent Portal 400)", async () => {
+  // 12k filter addresses → batched bodies sum > 256KB MAX_RAW_QUERY_SIZE. The proactive guard must
+  // throw a clear, actionable error BEFORE the POST, not let the Portal reject it opaquely.
+  const addrs = Array.from({ length: 12000 }, (_, i) => "0x" + i.toString(16).padStart(40, "0"));
+  const srv = http.createServer((req, res) => { let b = ""; req.on("data", (c) => { b += c; }); req.on("end", () => res.writeHead(204).end()); });
+  const p = await new Promise<number>((r) => srv.listen(0, () => r((srv.address() as AddressInfo).port)));
+  try {
+    const filter = { type: "log", chainId: 1, sourceId: "big", address: addrs, topic0: "0x" + "11".repeat(32), topic1: null, topic2: null, topic3: null, fromBlock: 0, toBlock: 100, hasTransactionReceipt: false, include: [] };
+    const sync = createPortalHistoricalSync({
+      common: { logger: { debug() {}, info() {}, warn() {}, error() {}, trace() {} } },
+      chain: { id: 1, name: "mainnet", portal: `http://localhost:${p}` },
+      childAddresses: new Map(), eventCallbacks: [{ filter }],
+    } as any);
+    await expect(sync.syncBlockRangeData({
+      interval: [0, 100], requiredIntervals: [{ interval: [0, 100], filter }], requiredFactoryIntervals: [],
+      syncStore: { insertLogs() {}, insertBlocks() {}, insertTransactions() {}, insertTransactionReceipts() {}, insertTraces() {} },
+    } as any)).rejects.toThrow(/exceeds MAX_RAW_QUERY_SIZE/);
+  } finally { srv.close(); }
+});
