@@ -1,0 +1,6 @@
+{
+  "name": "portal-rpc-diff-univ3",
+  "private": true,
+  "type": "module",
+  "dependencies": { "@subsquid/ponder": "0.16.6-sqd.1", "abitype": "^0.10.2", "viem": "^2.21.3", "hono": "^4.5.0" }
+}

@@ -106,10 +106,15 @@ export const createPortalHistoricalSync = (
   let rpcFallbackInstance: HistoricalSync | undefined;
   const rpcFallback = (): HistoricalSync => (rpcFallbackInstance ??= createHistoricalSync(args));
   const delegated = new Set<string>(); // interval keys routed to RPC
-  const refreshPortalHead = async (): Promise<number> => {
+  const refreshPortalHead = async (): Promise<number | undefined> => {
     if (process.env.PORTAL_FINALIZED_HEAD) return (portalHead = Number(process.env.PORTAL_FINALIZED_HEAD));
-    try { const h = await fetch(`${portalUrl}/finalized-head`, { headers: baseHeaders }).then((r) => r.json()); if (typeof h?.number === "number") portalHead = h.number; } catch { /* keep prior */ }
-    return portalHead ?? Number.POSITIVE_INFINITY;
+    // retry: the head probe is cheap, and a valid head is load-bearing for the finality-gap decision.
+    // On persistent failure portalHead stays undefined → the caller treats "head unknown" conservatively.
+    for (let attempt = 0; attempt < 3; attempt++) {
+      try { const h = await fetch(`${portalUrl}/finalized-head`, { headers: baseHeaders }).then((r) => r.json()); if (typeof h?.number === "number") return (portalHead = h.number); } catch { /* retry */ }
+      await new Promise((r) => setTimeout(r, 200 * (attempt + 1)));
+    }
+    return portalHead; // may be a kept-prior value, or undefined if never probed successfully
   };
   // instrumentation: per-chain backfill metrics → PORTAL_METRICS_FILE.<chainId> (for the bench harness)
   const METRICS_FILE = process.env.PORTAL_METRICS_FILE;
@@ -136,6 +141,7 @@ export const createPortalHistoricalSync = (
       if (process.env.PORTAL_CHUNK_FIXED) return;
       try {
         const h = await fetch(`${portalUrl}/finalized-head`, { headers: baseHeaders }).then((r) => r.json());
+        if (typeof h?.number === "number") portalHead = h.number; // dedupe the probe: seed the finality head (C3)
         const density = Math.max(1, Math.round((h.number as number) / 25_000_000));
         chunkBlocks = Math.min(CHUNK_BLOCKS * density, 25_000_000);
         log.debug({ service: "portal", msg: `Portal ${args.chain.name}: head=${h.number} → chunkBlocks=${chunkBlocks} (${density}× density)` });
@@ -451,11 +457,14 @@ export const createPortalHistoricalSync = (
       // finality gap: if this interval reaches past Portal's finalized head, re-confirm
       // (Portal advances) and, if still beyond, delegate the whole interval to RPC.
       if (portalHead === undefined) await refreshPortalHead();
-      if (isFinalityGap(interval[1], portalHead)) {
-        await refreshPortalHead(); // Portal advances — re-confirm before falling back
-        if (isFinalityGap(interval[1], portalHead)) {
+      // C3: head UNKNOWN (probe persistently failing) OR interval past the head → don't risk silently
+      // under-serving the tip from Portal (it would 204 the missing tail and mark it synced).
+      // Re-confirm (Portal advances), then delegate the whole interval to the authoritative RPC.
+      if (portalHead === undefined || isFinalityGap(interval[1], portalHead)) {
+        await refreshPortalHead();
+        if (portalHead === undefined || isFinalityGap(interval[1], portalHead)) {
           delegated.add(ikey(interval)); stats.rpcFallback++;
-          log.debug({ service: "portal", msg: `Portal ${args.chain.name} [${interval[0]},${interval[1]}] past finalized head ${portalHead} → RPC fallback` });
+          log.debug({ service: "portal", msg: `Portal ${args.chain.name} [${interval[0]},${interval[1]}] ${portalHead === undefined ? "head unknown" : `past finalized head ${portalHead}`} → RPC fallback` });
           return rpcFallback().syncBlockRangeData(params);
         }
       }
@@ -527,8 +536,13 @@ export const createPortalHistoricalSync = (
 
       const syncTraces = needTraces ? data.flatMap((cd) => buildTraces(cd, interval[0], interval[1])) : [];
 
+      // C9: highest block with data — a loop, NOT Math.max(...spread) which RangeErrors on ~100k+
+      // keys — and INCLUDING trace-only blocks (a block with only matched traces isn't in
+      // blocksByNumber) so `closest` doesn't understate the synced tip.
       let closest: SyncBlock | undefined;
-      if (blocksByNumber.size > 0) closest = blocksByNumber.get(Math.max(...blocksByNumber.keys())) as unknown as SyncBlock;
+      let maxBn = -1;
+      for (const [bn, hdr] of blocksByNumber) if (bn > maxBn) { maxBn = bn; closest = hdr as unknown as SyncBlock; }
+      for (const t of syncTraces) { const bn = Number((t.block as any).number); if (bn > maxBn) { maxBn = bn; closest = t.block; } }
       await syncStore.insertLogs({ logs: syncLogs, chainId: args.chain.id });
       stash.set(ikey(interval), { blocks: [...blocksByNumber.values()], txs: syncTxs, receipts: syncReceipts, traces: syncTraces, closest });
 

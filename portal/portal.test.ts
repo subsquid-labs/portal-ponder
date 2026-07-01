@@ -50,6 +50,7 @@ let port: number;
 
 beforeEach(async () => {
   process.env.PORTAL_CHUNK_FIXED = "1"; // skip head-based chunk scaling (no /finalized-head call)
+  process.env.PORTAL_FINALIZED_HEAD = "2000000000"; // valid finality head — real usage always has one (C3: unknown head → RPC fallback)
   server = http.createServer((req, res) => {
     let body = "";
     req.on("data", (c) => { body += c; });
@@ -67,7 +68,7 @@ beforeEach(async () => {
   port = await new Promise<number>((resolve) => server.listen(0, () => resolve((server.address() as AddressInfo).port)));
 });
 
-afterEach(() => { server.close(); delete process.env.PORTAL_CHUNK_FIXED; });
+afterEach(() => { server.close(); delete process.env.PORTAL_CHUNK_FIXED; delete process.env.PORTAL_FINALIZED_HEAD; });
 
 test("regression: matched log's transaction is fetched, transformed, and inserted (event.transaction defined)", async () => {
   const inserted = { logs: [] as any[], blocks: [] as any[], txs: [] as any[] };
