@@ -20,7 +20,9 @@ WORK="$(mktemp -d)"; trap 'pkill -f "ponder start --schema diff_" 2>/dev/null' E
 cp -r "$APP/." "$WORK/"; cd "$WORK"
 echo "▶ workspace $WORK  range [$START,$END]"
 [ -n "${SQD_PONDER_TARBALL:-}" ] && node -e "const p=require('./package.json');p.dependencies['@subsquid/ponder']='file:$SQD_PONDER_TARBALL';require('fs').writeFileSync('package.json',JSON.stringify(p,null,2))"
-echo "▶ npm install"; npm install --no-audit --no-fund --silent || { echo "✗ install failed"; exit 1; }
+# fresh cache when installing a LOCAL fork build: a re-packed tarball keeps the same version
+# (0.16.6-sqd.1), so npm's by-version cache would serve stale content across rebuilds.
+echo "▶ npm install"; npm install --no-audit --no-fund --silent ${SQD_PONDER_TARBALL:+--cache "$(mktemp -d)"} || { echo "✗ install failed"; exit 1; }
 
 run () { # $1=label  $2=portal-url-or-empty  $3=db  $4=port
   echo "▶ $1 backfill …"
