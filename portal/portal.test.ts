@@ -174,6 +174,42 @@ test("regression (C1): a 2nd log filter sharing a chunk on a LATER call is still
   } finally { srv.close(); }
 });
 
+test("regression: a dataset-unsupported field (accessList) is dropped, not crashed on", async () => {
+  // Per-dataset schema varies — e.g. Monad's transactions have no accessList; the whole request
+  // 400s ("column 'access_list_size' is not found in 'transactions'"). The fork must drop the
+  // field and retry, not throw an unhandledRejection. Server 400s while accessList is present.
+  const srv = http.createServer((req, res) => {
+    let body = ""; req.on("data", (c) => { body += c; });
+    req.on("end", () => {
+      if (req.url?.includes("finalized-head")) { res.writeHead(200, { "content-type": "application/json" }); res.end(JSON.stringify({ number: 2_000_000_000 })); return; }
+      const q = body ? JSON.parse(body) : {};
+      if (req.url?.includes("finalized-stream") && q.fields?.transaction?.accessList !== undefined) {
+        res.writeHead(400); res.end("Bad request: couldn't parse request: column 'access_list_size' is not found in 'transactions'"); return;
+      }
+      if (req.url?.includes("finalized-stream") && q.fromBlock <= 20558652 && (q.toBlock ?? 1e12) >= 20558652) {
+        res.writeHead(200, { "content-type": "application/x-ndjson" }); res.end(JSON.stringify(FIXTURE_BLOCK) + "\n"); return;
+      }
+      res.writeHead(204).end();
+    });
+  });
+  const p: number = await new Promise((r) => srv.listen(0, () => r((srv.address() as AddressInfo).port)));
+  try {
+    const inserted = { logs: [] as any[] };
+    const syncStore: any = { insertLogs: (x: any) => inserted.logs.push(...x.logs), insertBlocks: () => {}, insertTransactions: () => {}, insertTransactionReceipts: () => {}, insertTraces: () => {} };
+    const filter: any = { type: "log", chainId: 1, sourceId: "s", address: VAULT, topic0: DEPOSIT_TOPIC0, topic1: null, topic2: null, topic3: null, fromBlock: 20558652, toBlock: 20558652, hasTransactionReceipt: false, include: [] };
+    const sync = createPortalHistoricalSync({
+      common: { logger: { debug() {}, info() {}, warn() {}, error() {}, trace() {} } } as any,
+      chain: { id: 1, name: "mainnet", portal: `http://localhost:${p}` } as any,
+      childAddresses: new Map(), eventCallbacks: [{ filter }],
+    } as any);
+    const interval: [number, number] = [20558652, 20558652];
+    const logs = await sync.syncBlockRangeData({ interval, requiredIntervals: [{ interval, filter }], requiredFactoryIntervals: [], syncStore });
+    await sync.syncBlockData({ interval, logs, syncStore } as any);
+    expect(inserted.logs).toHaveLength(1); // degraded gracefully — dropped accessList, fetched the block
+    expect(inserted.logs[0].transactionHash).toBe(TX_HASH);
+  } finally { srv.close(); }
+});
+
 test("regression (C6): deep matched trace is stored at its FULL-tree pre-order index (7), not filter-local (0)", async () => {
   // Ponder's RPC sync numbers trace_index as the pre-order DFS rank over each tx's FULL call tree,
   // THEN filters — so a lone deep match keeps its true position. Portal used to push the trace

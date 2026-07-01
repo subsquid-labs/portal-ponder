@@ -168,7 +168,14 @@ export const createPortalHistoricalSync = (
         const e: any = new Error(`Portal ${res.status}`); e.retryAfterMs = Number.isFinite(ra) ? ra * 1000 : undefined;
         throw e;
       }
-      if (!res.ok) throw new Error(`Portal ${res.status} @ ${cursor}: ${(await res.text()).slice(0, 200)}`);
+      if (!res.ok) {
+        const text = (await res.text()).slice(0, 300);
+        // a dataset that lacks a requested column (e.g. Monad has no accessList) → the whole
+        // request 400s. Surface the column so stream() can drop the field and retry.
+        const m = res.status === 400 && text.match(/column '([a-z0-9_]+)' is not found/i);
+        if (m) { const e: any = new Error(`Portal 400: unsupported column ${m[1]}`); e.unsupportedColumn = m[1]; throw e; }
+        throw new Error(`Portal ${res.status} @ ${cursor}: ${text}`);
+      }
       const reader = res.body!.getReader();
       const dec = new TextDecoder();
       let buf = "", last = cursor;
@@ -180,15 +187,32 @@ export const createPortalHistoricalSync = (
     } finally { stats.inflight--; }
   }
 
+  // Fields the TARGET dataset doesn't have (per-dataset schema varies — e.g. Monad's transactions
+  // have no accessList). Discovered from a "column not found" 400, then stripped from every request
+  // so the fork degrades gracefully instead of crashing. Keyed "<fieldsKey>.<field>".
+  const unsupportedFields = new Set<string>();
+  const COLUMN_TO_FIELD: Record<string, string> = { access_list: "transaction.accessList", access_list_size: "transaction.accessList" };
+  const stripUnsupported = (q: any): any => {
+    if (unsupportedFields.size === 0 || !q.fields) return q;
+    const fields = JSON.parse(JSON.stringify(q.fields));
+    for (const tf of unsupportedFields) { const i = tf.indexOf("."); const t = tf.slice(0, i), f = tf.slice(i + 1); if (fields[t]) delete fields[t][f]; }
+    return { ...q, fields };
+  };
+
   async function* stream(query: object, from: number, to: number) {
     let cursor = from;
     while (cursor <= to) {
-      const body = JSON.stringify({ ...query, fromBlock: cursor, toBlock: to });
       let attempt = 0;
       let batch: Awaited<ReturnType<typeof fetchBatch>> | undefined;
       while (batch === undefined) {
+        const body = JSON.stringify({ ...stripUnsupported(query), fromBlock: cursor, toBlock: to });
         try { batch = await fetchBatch(body, cursor); }
         catch (err: any) {
+          if (err?.unsupportedColumn) {
+            const field = COLUMN_TO_FIELD[err.unsupportedColumn];
+            if (field && !unsupportedFields.has(field)) { unsupportedFields.add(field); log.debug({ service: "portal", msg: `Portal ${args.chain.name}: dataset lacks '${err.unsupportedColumn}' → dropping field ${field}` }); continue; }
+            throw err; // unmappable missing column → real error
+          }
           const retryable = err?.retryAfterMs !== undefined || isNetworkError(err);
           if (!retryable || attempt++ >= 10) throw err;
           stats.errors++; stats.retries++;
