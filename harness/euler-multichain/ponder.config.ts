@@ -14,7 +14,7 @@ const proxyCreated = parseAbiItem(
   "event ProxyCreated(address indexed proxy, bool upgradeable, address implementation, bytes trailingData)",
 );
 
-type ChainRow = { id: number; name: string; ds: string; factory: string; head: number; sqdSlug: string | null; freeRpcs: string[] };
+type ChainRow = { id: number; name: string; ds: string; factory: string; head: number; deploy: number; sqdSlug: string | null; freeRpcs: string[] };
 const rows = chainsData as ChainRow[];
 const SQD_KEY = process.env.SQD_RPC_KEY;
 
@@ -39,7 +39,7 @@ export default createConfig({
       chain: Object.fromEntries(
         active.map((c) => [
           c.name,
-          { address: factory({ address: c.factory as `0x${string}`, event: proxyCreated, parameter: "proxy" }), startBlock: 0, endBlock: c.head },
+          { address: factory({ address: c.factory as `0x${string}`, event: proxyCreated, parameter: "proxy" }), startBlock: c.deploy, endBlock: c.head },
         ]),
       ),
     },

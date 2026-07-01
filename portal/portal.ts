@@ -74,6 +74,16 @@ type ChunkData = {
 const PORTAL_MAX_ADDRESSES = 1000;
 const CHUNK_BLOCKS = Number(process.env.PORTAL_CHUNK_BLOCKS ?? 500_000);
 const READAHEAD = Number(process.env.PORTAL_READAHEAD ?? 6);
+// The Portal fans ONE stream request out across up to `buffer_size` chunk-workers concurrently
+// (default 10, clamped to 1000) at ZERO extra CU. Without it a wide/sparse scan runs ~10-wide and
+// the head-of-line front chunk stalls → the stream truncates (verified: an empty [0,5M] factory scan
+// terminates at 60s with the default vs completes in 17.5s at 100). Set high; the Portal's own
+// download window (~500) is the real ceiling, and CU is charged per chunk touched regardless.
+const BUFFER_SIZE = Number(process.env.PORTAL_BUFFER_SIZE ?? 100);
+// Discovery splits [deploy, head] into this many DISJOINT windows fetched CONCURRENTLY (separate
+// streams — the Portal serializes one stream in block order, so parallelism comes from disjoint
+// requests). Bounded so tiny ranges aren't over-split.
+const DISCOVERY_WINDOWS = Number(process.env.PORTAL_DISCOVERY_WINDOWS ?? 8);
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
 // ── Global adaptive Portal controller — module scope, SHARED across every per-chain sync ──────────
@@ -207,7 +217,7 @@ export const createPortalHistoricalSync = (
     const tFetch = Date.now();
     stats.inflight++; stats.maxInflight = Math.max(stats.maxInflight, stats.inflight);
     try {
-      const res = await fetch(`${portalUrl}/finalized-stream`, { method: "POST", headers: baseHeaders, body });
+      const res = await fetch(`${portalUrl}/finalized-stream?buffer_size=${BUFFER_SIZE}`, { method: "POST", headers: baseHeaders, body });
       stats.http++;
       if (res.status === 204) { portalGate.onOk(); return "done"; }
       // 503/529/429 = explicit throttle; 409 on the FINALIZED stream = a gateway/proxy hiccup (an
@@ -426,10 +436,12 @@ export const createPortalHistoricalSync = (
     return fields;
   };
 
-  // ---- discovery: ONE wide columnar scan per chain, extended lazily — NOT one request per chunk ----
-  // The Portal filters logs by address across huge ranges in seconds and returns instantly for empty
-  // spans, so scanning [factoryStart, head] in a single pass finds every child far faster than probing
-  // each 500k-block chunk (which was ~170 mostly-empty requests on an 84M-block chain — the slow start).
+  // ---- discovery: wide factory scan over [factoryStart, head], split into PARALLEL disjoint windows ----
+  // A factory scan can't be pruned (logs are block-ordered, the address is scattered), so its cost is
+  // ~the log volume of the range and irreducible — but fully parallelizable. The Portal serializes ONE
+  // stream in block order (a slow front chunk truncates it), so parallelism comes from issuing DISJOINT
+  // windows concurrently; each stream additionally fans out `buffer_size` chunk-workers. A single
+  // sequential [0,head] scan was the slow start; N concurrent windows divide the wall-clock by N.
   function ensureDiscoveredThrough(idx: number, factories: any[]): Promise<unknown> {
     if (factories.length === 0 || discStartIdx === undefined) return Promise.resolve();
     const need = chunkRange(idx)[1];
@@ -440,22 +452,29 @@ export const createPortalHistoricalSync = (
     const earlier = discoveryP;
     discoveryP = (async () => {
       await earlier; // serialize extensions so children accumulate deterministically
-      stats.discChunks++;
-      for (const factory of factories) {
-        const needsData = factory.childAddressLocation.startsWith("offset");
-        const q = { type: "evm", fields: { block: { number: true }, log: { address: true, topics: true, data: needsData } }, logs: [{ address: factory.address ? (Array.isArray(factory.address) ? factory.address : [factory.address]).map((a: string) => a.toLowerCase()) : undefined, topic0: [factory.eventSelector.toLowerCase()] }] };
-        const rec = args.childAddresses.get(factory.id)!;
-        for await (const blocks of stream(q, from, to)) {
-          for (const b of blocks) for (const raw of b.logs ?? []) {
-            const sl = { address: (raw.address as string)?.toLowerCase(), topics: raw.topics ?? [], data: raw.data ?? "0x", blockNumber: hx(b.header.number) } as unknown as SyncLog;
-            if (isLogFactoryMatched({ factory, log: sl })) {
-              const child = getChildAddress({ log: sl, factory }).toLowerCase() as Address;
-              const bn = b.header.number; const prevBn = rec.get(child);
-              if (prevBn === undefined || prevBn > bn) rec.set(child, bn);
+      const span = to - from + 1;
+      const P = Math.max(1, Math.min(DISCOVERY_WINDOWS, Math.ceil(span / chunkBlocks)));
+      const w = Math.ceil(span / P);
+      const windows: [number, number][] = [];
+      for (let i = 0; i < P; i++) { const lo = from + i * w; if (lo > to) break; windows.push([lo, Math.min(to, lo + w - 1)]); }
+      stats.discChunks += windows.length;
+      await Promise.all(windows.map(async ([lo, hi]) => {
+        for (const factory of factories) {
+          const needsData = factory.childAddressLocation.startsWith("offset");
+          const q = { type: "evm", fields: { block: { number: true }, log: { address: true, topics: true, data: needsData } }, logs: [{ address: factory.address ? (Array.isArray(factory.address) ? factory.address : [factory.address]).map((addr: string) => addr.toLowerCase()) : undefined, topic0: [factory.eventSelector.toLowerCase()] }] };
+          const rec = args.childAddresses.get(factory.id)!;
+          for await (const blocks of stream(q, lo, hi)) {
+            for (const bl of blocks) for (const raw of bl.logs ?? []) {
+              const sl = { address: (raw.address as string)?.toLowerCase(), topics: raw.topics ?? [], data: raw.data ?? "0x", blockNumber: hx(bl.header.number) } as unknown as SyncLog;
+              if (isLogFactoryMatched({ factory, log: sl })) {
+                const child = getChildAddress({ log: sl, factory }).toLowerCase() as Address;
+                const bn = bl.header.number; const prevBn = rec.get(child);
+                if (prevBn === undefined || prevBn > bn) rec.set(child, bn);
+              }
             }
           }
         }
-      }
+      }));
     })();
     return discoveryP;
   }
