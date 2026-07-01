@@ -172,8 +172,8 @@ export const createPortalHistoricalSync = (
         const text = (await res.text()).slice(0, 300);
         // a dataset that lacks a requested column (e.g. Monad has no accessList) → the whole
         // request 400s. Surface the column so stream() can drop the field and retry.
-        const m = res.status === 400 && text.match(/column '([a-z0-9_]+)' is not found/i);
-        if (m) { const e: any = new Error(`Portal 400: unsupported column ${m[1]}`); e.unsupportedColumn = m[1]; throw e; }
+        const m = res.status === 400 && text.match(/column '([a-z0-9_]+)' is not found in '([a-z_]+)'/i);
+        if (m) { const e: any = new Error(`Portal 400: unsupported column ${m[1]} in ${m[2]}`); e.unsupportedColumn = m[1]; e.unsupportedTable = m[2]; throw e; }
         throw new Error(`Portal ${res.status} @ ${cursor}: ${text}`);
       }
       const reader = res.body!.getReader();
@@ -191,7 +191,14 @@ export const createPortalHistoricalSync = (
   // have no accessList). Discovered from a "column not found" 400, then stripped from every request
   // so the fork degrades gracefully instead of crashing. Keyed "<fieldsKey>.<field>".
   const unsupportedFields = new Set<string>();
-  const COLUMN_TO_FIELD: Record<string, string> = { access_list: "transaction.accessList", access_list_size: "transaction.accessList" };
+  // Portal reports a missing COLUMN in a plural TABLE; map back to the field key we requested.
+  const TABLE_TO_KEY: Record<string, string> = { transactions: "transaction", blocks: "block", logs: "log", traces: "trace" };
+  const COL_SPECIAL: Record<string, string> = { access_list_size: "accessList", access_list: "accessList" }; // portal's derived column ≠ snake(field)
+  const colToFieldKey = (col: string, table: string): string | undefined => {
+    const key = TABLE_TO_KEY[table] ?? table;
+    const field = COL_SPECIAL[col] ?? col.replace(/_([a-z0-9])/g, (_, c) => c.toUpperCase()); // snake_case → camelCase
+    return `${key}.${field}`;
+  };
   const stripUnsupported = (q: any): any => {
     if (unsupportedFields.size === 0 || !q.fields) return q;
     const fields = JSON.parse(JSON.stringify(q.fields));
@@ -209,9 +216,9 @@ export const createPortalHistoricalSync = (
         try { batch = await fetchBatch(body, cursor); }
         catch (err: any) {
           if (err?.unsupportedColumn) {
-            const field = COLUMN_TO_FIELD[err.unsupportedColumn];
-            if (field && !unsupportedFields.has(field)) { unsupportedFields.add(field); log.debug({ service: "portal", msg: `Portal ${args.chain.name}: dataset lacks '${err.unsupportedColumn}' → dropping field ${field}` }); continue; }
-            throw err; // unmappable missing column → real error
+            const field = colToFieldKey(err.unsupportedColumn, err.unsupportedTable);
+            if (field && !unsupportedFields.has(field)) { unsupportedFields.add(field); log.debug({ service: "portal", msg: `Portal ${args.chain.name}: dataset lacks '${err.unsupportedColumn}' in ${err.unsupportedTable} → dropping field ${field}` }); continue; }
+            throw err; // already dropped (loop) → real error
           }
           const retryable = err?.retryAfterMs !== undefined || isNetworkError(err);
           if (!retryable || attempt++ >= 10) throw err;
