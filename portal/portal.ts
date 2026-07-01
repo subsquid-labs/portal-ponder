@@ -224,10 +224,11 @@ export const createPortalHistoricalSync = (
       const res = await fetch(`${portalUrl}/finalized-stream?buffer_size=${BUFFER_SIZE}`, { method: "POST", headers: baseHeaders, body });
       stats.http++;
       if (res.status === 204) { portalGate.onOk(); return "done"; }
-      // 503/529/429 = explicit throttle; 409 on the FINALIZED stream = a gateway/proxy hiccup (an
-      // HTML "conflict" page, not the reorg JSON — finalized data doesn't reorg) → both are transient,
-      // retry with back-off rather than crash the whole app on one bad response.
-      if (res.status === 503 || res.status === 529 || res.status === 429 || res.status === 409) {
+      // Transient, retry with back-off (never crash the app on one bad response): 429/529 = explicit
+      // throttle; ALL 5xx (500/502/503/504…) = gateway/proxy/server hiccups that return an HTML error
+      // page mid-backfill; 409 on the FINALIZED stream = a gateway "conflict" (finalized data doesn't
+      // reorg, so it's not the reorg JSON). Backing off on any of these keeps the AIMD honest.
+      if (res.status >= 500 || res.status === 429 || res.status === 409) {
         await res.body?.cancel().catch(() => {});
         const ra = Number(res.headers.get("retry-after"));
         const e: any = new Error(`Portal ${res.status}`); e.retryAfterMs = Number.isFinite(ra) ? ra * 1000 : undefined;
