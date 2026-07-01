@@ -254,6 +254,10 @@ export const createPortalHistoricalSync = (
         // below its first block. Surface the start so stream() can clamp the cursor forward.
         const s = res.status === 400 && text.match(/dataset starts (?:from|at) block (\d+)/i);
         if (s) { const e: any = new Error(`Portal 400: dataset starts at block ${s[1]}`); e.datasetStartsAt = Number(s[1]); throw e; }
+        // a dense range (many child addresses × many event topics × wide chunk) can exceed the
+        // Portal's per-query size/work estimate → 400 "Query is too large". Signal stream() to
+        // bisect the block range and retry (adaptive; no client tuning).
+        if (res.status === 400 && /query is too large/i.test(text)) { const e: any = new Error(`Portal 400: query too large @ ${cursor}`); e.tooLarge = true; throw e; }
         throw new Error(`Portal ${res.status} @ ${cursor}: ${text}`);
       }
       const reader = res.body!.getReader();
@@ -300,10 +304,18 @@ export const createPortalHistoricalSync = (
     while (cursor <= to) {
       let attempt = 0;
       let batch: Awaited<ReturnType<typeof fetchBatch>> | undefined;
+      let hi = to; // per-cursor upper bound; bisected down on "query too large", reset each advance
       while (batch === undefined) {
-        const body = JSON.stringify({ ...stripFields(query, dropped), fromBlock: cursor, toBlock: to });
+        const body = JSON.stringify({ ...stripFields(query, dropped), fromBlock: cursor, toBlock: hi });
         try { batch = await fetchBatch(body, cursor); }
         catch (err: any) {
+          if (err?.tooLarge) {
+            // dense window exceeded the Portal's query estimate → halve it and retry. Continuation
+            // then covers [hi+1, to] as usual, so no data is skipped.
+            if (hi <= cursor) throw err; // a single block still too large ⇒ a real limit, surface it
+            hi = cursor + Math.floor((hi - cursor) / 2);
+            continue;
+          }
           if (err?.datasetStartsAt !== undefined) {
             // dataset begins after this chunk's start (doesn't reach genesis) → skip the missing
             // prefix. If the whole chunk precedes the dataset, there's nothing to fetch here.
