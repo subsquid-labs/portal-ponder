@@ -1,6 +1,5 @@
 import { ponder } from "ponder:registry";
-// no-op: we only diff the ponder_sync store (factory child logs + txs + receipts), which the
-// backfill populates regardless of the handlers. 6 event filters → exercises the C1 multi-source path.
-for (const ev of ["Deposit", "Withdraw", "Borrow", "Repay", "Liquidate", "VaultStatus"]) {
-  ponder.on(`EVault:${ev}` as any, async () => {});
-}
+// SUPERSET: index every EVault event (Euler runs both ponder + subgraphs; the subgraph is only a
+// subset). No-op handlers — the backfill populates the ponder_sync store regardless.
+const EVENTS = ["Approval","BalanceForwarderStatus","Borrow","ConvertFees","DebtSocialized","Deposit","EVaultCreated","GovSetCaps","GovSetConfigFlags","GovSetFeeReceiver","GovSetGovernorAdmin","GovSetHookConfig","GovSetInterestFee","GovSetInterestRateModel","GovSetLTV","GovSetLiquidationCoolOffTime","GovSetMaxLiquidationDiscount","InterestAccrued","Liquidate","PullDebt","Repay","Transfer","VaultStatus","Withdraw"];
+for (const ev of EVENTS) ponder.on(`EVault:${ev}` as any, async () => {});
