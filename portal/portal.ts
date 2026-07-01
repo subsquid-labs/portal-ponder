@@ -190,7 +190,6 @@ export const createPortalHistoricalSync = (
   // Fields the TARGET dataset doesn't have (per-dataset schema varies — e.g. Monad's transactions
   // have no accessList). Discovered from a "column not found" 400, then stripped from every request
   // so the fork degrades gracefully instead of crashing. Keyed "<fieldsKey>.<field>".
-  const unsupportedFields = new Set<string>();
   // Portal reports a missing COLUMN in a plural TABLE; map back to the field key we requested.
   const TABLE_TO_KEY: Record<string, string> = { transactions: "transaction", blocks: "block", logs: "log", traces: "trace" };
   const COL_SPECIAL: Record<string, string> = { access_list_size: "accessList", access_list: "accessList" }; // portal's derived column ≠ snake(field)
@@ -199,31 +198,36 @@ export const createPortalHistoricalSync = (
     const field = COL_SPECIAL[col] ?? col.replace(/_([a-z0-9])/g, (_, c) => c.toUpperCase()); // snake_case → camelCase
     return `${key}.${field}`;
   };
-  const stripUnsupported = (q: any): any => {
-    if (unsupportedFields.size === 0 || !q.fields) return q;
+  const stripFields = (q: any, dropped: Set<string>): any => {
+    if (dropped.size === 0 || !q.fields) return q;
     const fields = JSON.parse(JSON.stringify(q.fields));
-    for (const tf of unsupportedFields) { const i = tf.indexOf("."); const t = tf.slice(0, i), f = tf.slice(i + 1); if (fields[t]) delete fields[t][f]; }
+    for (const tf of dropped) { const i = tf.indexOf("."); const t = tf.slice(0, i), f = tf.slice(i + 1); if (fields[t]) delete fields[t][f]; }
     return { ...q, fields };
   };
 
-  async function* stream(query: object, from: number, to: number) {
+  // PER-STREAM (per block-range) field degradation. A dataset can lack a column on only SOME
+  // (e.g. old) chunks, so drops are LOCAL — a chunk that has the column keeps it. When a NEEDED
+  // field is missing we DON'T crash here (this range might be event-less/irrelevant); we drop it to
+  // fetch, and record it in `neededMissing` so the caller can crash ONLY IF the range yields matched
+  // data (see dataChunk). Unused nullable fields are dropped silently.
+  async function* stream(query: object, from: number, to: number, neededMissing?: Set<string>) {
     let cursor = from;
-    const droppedCols = new Set<string>(); // per-stream: bounds retries (same column twice ⇒ real error)
+    const dropped = new Set<string>(), triedCols = new Set<string>();
     while (cursor <= to) {
       let attempt = 0;
       let batch: Awaited<ReturnType<typeof fetchBatch>> | undefined;
       while (batch === undefined) {
-        const body = JSON.stringify({ ...stripUnsupported(query), fromBlock: cursor, toBlock: to });
+        const body = JSON.stringify({ ...stripFields(query, dropped), fromBlock: cursor, toBlock: to });
         try { batch = await fetchBatch(body, cursor); }
         catch (err: any) {
           if (err?.unsupportedColumn) {
-            // dataset lacks a requested column → drop the mapped field and retry (the shared strip
-            // removes it). ALWAYS retry (never throw on a concurrent double-hit from a sibling chunk);
-            // only give up if the SAME column 400s again after we already dropped its field.
-            if (droppedCols.has(err.unsupportedColumn)) throw err;
-            droppedCols.add(err.unsupportedColumn);
+            if (triedCols.has(err.unsupportedColumn)) throw err; // dropping its field didn't help → real error
+            triedCols.add(err.unsupportedColumn);
             const field = colToFieldKey(err.unsupportedColumn, err.unsupportedTable);
-            if (!unsupportedFields.has(field)) { unsupportedFields.add(field); log.debug({ service: "portal", msg: `Portal ${args.chain.name}: dataset lacks '${err.unsupportedColumn}' in ${err.unsupportedTable} → dropping field ${field}` }); }
+            dropped.add(field); // drop for THIS chunk's retries only (chunks that have it keep it)
+            // needed = in the indexer's `include`, or a NOT-NULL/bloom field (not a skippable nullable).
+            if (!DROPPABLE_IF_UNUSED.has(field) || includedFields.has(field)) neededMissing?.add(`${field} (col '${err.unsupportedColumn}')`);
+            else log.debug({ service: "portal", msg: `Portal ${args.chain.name} [${from},${to}]: dataset lacks '${err.unsupportedColumn}' → skipping UNUSED nullable field ${field}` });
             continue;
           }
           const retryable = err?.retryAfterMs !== undefined || isNetworkError(err);
@@ -290,6 +294,11 @@ export const createPortalHistoricalSync = (
   let allFactories: any[] = [];
   let backfillStartBlock = 0;
   let backfillEndBlock: number | undefined; // undefined ⇒ unbounded (backfill to the finalized head)
+  let includedFields = new Set<string>(); // the fields the indexer actually reads (Ponder `include`)
+  // NULLABLE sync-store columns that are safe to store as null when a dataset lacks them AND the
+  // indexer doesn't read them. Everything else missing ⇒ crash (never silently substitute data a
+  // handler might read, or a NOT-NULL / bloom-load-bearing field).
+  const DROPPABLE_IF_UNUSED = new Set(["transaction.accessList", "block.baseFeePerGas", "block.nonce", "block.mixHash", "block.sha3Uncles", "block.totalDifficulty"]);
   // Resolve the COMPLETE chain-wide fetch-spec ONCE from args.eventCallbacks (the FULL per-chain
   // filter set), NOT from per-call requiredIntervals (only the subset Ponder still needs, which
   // shrinks as fragments cache). Chunks are cached by idx ALONE, so every chunk MUST be filter-
@@ -314,6 +323,8 @@ export const createPortalHistoricalSync = (
     backfillStartBlock = froms.length ? Math.min(...froms) : 0;
     const tos = fs.map((f) => (f as any).toBlock);
     backfillEndBlock = tos.length && tos.every((t) => t != null) ? Math.max(...tos) : undefined;
+    // exact fields the indexer reads — the crash-vs-skip discriminator when a dataset lacks a column.
+    includedFields = new Set(fs.flatMap((f) => ((f as any).include ?? []) as string[]));
   };
   // a chunk's grid-aligned [from,to] clamped to the real backfill window (end ⇒ explicit toBlock,
   // else the finalized head). Bounds fetch on BOTH sides so a small/bounded range isn't widened to
@@ -378,9 +389,10 @@ export const createPortalHistoricalSync = (
       const [from, to] = chunkRange(idx);
       const logRequests = filters.flatMap((f) => logRequestsFor(f)).map((r) => ({ ...r, transaction: true }));
       const data: ChunkData = { headers: new Map(), logs: new Map(), txs: new Map(), traceBlocks: new Map(), blockHeaders: new Map(), txBlocks: new Map() };
+      const neededMissing = new Set<string>(); // needed fields the dataset lacked on THIS chunk
       if (logRequests.length > 0) {
         const q = { type: "evm", fields: { block: blockFieldsFor(filters), log: LOG_FIELDS, transaction: needReceipts ? { ...TX_FIELDS, ...RECEIPT_FIELDS } : TX_FIELDS }, logs: logRequests };
-        for await (const blocks of stream(q, from, to)) {
+        for await (const blocks of stream(q, from, to, neededMissing)) {
           for (const b of blocks) if (b.logs?.length) {
             data.headers.set(b.header.number, b.header);
             data.logs.set(b.header.number, (data.logs.get(b.header.number) ?? []).concat(b.logs));
@@ -391,7 +403,7 @@ export const createPortalHistoricalSync = (
       }
       if (needTraces) {
         const tq = { type: "evm", fields: { block: blockFieldsFor(filters), trace: TRACE_FIELDS, transaction: needReceipts ? { ...TX_FIELDS, ...RECEIPT_FIELDS } : TX_FIELDS }, traces: tracePortalRequests() };
-        for await (const blocks of stream(tq, from, to)) {
+        for await (const blocks of stream(tq, from, to, neededMissing)) {
           for (const b of blocks) if (b.traces?.length) {
             const ex = data.traceBlocks.get(b.header.number);
             if (ex) { ex.traces.push(...b.traces); if (b.transactions) ex.txs.push(...b.transactions); }
@@ -403,7 +415,7 @@ export const createPortalHistoricalSync = (
       // keep only headers matching a BlockFilter's interval/offset.
       if (needBlocks) {
         const bq = { type: "evm", includeAllBlocks: true, fields: { block: blockFieldsFor(blockFilters) } };
-        for await (const blocks of stream(bq, from, to)) {
+        for await (const blocks of stream(bq, from, to, neededMissing)) {
           for (const b of blocks) {
             const bn = b.header.number;
             if (blockFilters.some((f) => isBlockFilterMatched({ filter: f, block: { number: BigInt(bn) } }))) data.blockHeaders.set(bn, b.header);
@@ -415,7 +427,7 @@ export const createPortalHistoricalSync = (
         const txReqs = txPortalRequests();
         if (txReqs.length) {
           const tq = { type: "evm", fields: { block: blockFieldsFor(transactionFilters), transaction: needReceipts ? { ...TX_FIELDS, ...RECEIPT_FIELDS } : TX_FIELDS }, transactions: txReqs };
-          for await (const blocks of stream(tq, from, to)) {
+          for await (const blocks of stream(tq, from, to, neededMissing)) {
             for (const b of blocks) if (b.transactions?.length) {
               const ex = data.txBlocks.get(b.header.number);
               if (ex) ex.txs.push(...b.transactions);
@@ -423,6 +435,13 @@ export const createPortalHistoricalSync = (
             }
           }
         }
+      }
+      // The dataset lacked a NEEDED field on THIS chunk. Crash ONLY IF the chunk yielded MATCHED
+      // data — an event the indexer processes would be incomplete. If the chunk is event-less
+      // (old/irrelevant range), the gap is harmless, so proceed. (silent bug ≫ crash, but only
+      // when it actually affects the indexer's data.)
+      if (neededMissing.size && (data.logs.size || data.traceBlocks.size || data.txBlocks.size || data.blockHeaders.size)) {
+        throw new Error(`Portal dataset for ${args.chain.name} is missing [${[...neededMissing].join(", ")}] on blocks [${from},${to}], which contain matched data your indexer needs — a Portal dataset-completeness gap. Failing fast rather than serving incomplete data; report the gap to SQD, or start your indexer past the affected range.`);
       }
       return data;
     })();

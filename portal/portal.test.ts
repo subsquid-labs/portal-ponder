@@ -210,6 +210,51 @@ test("regression: a dataset-unsupported field (accessList) is dropped, not crash
   } finally { srv.close(); }
 });
 
+// Server that 400s while `logsBloom` is requested, then serves `serveData ? the fixture : nothing`
+// once it's dropped — models a dataset (e.g. Monad old chunks) that lacks the receipt logsBloom.
+const missingLogsBloomServer = (serveData: boolean) => http.createServer((req, res) => {
+  let body = ""; req.on("data", (c) => { body += c; });
+  req.on("end", () => {
+    if (req.url?.includes("finalized-head")) { res.writeHead(200, { "content-type": "application/json" }); res.end(JSON.stringify({ number: 2_000_000_000 })); return; }
+    const q = body ? JSON.parse(body) : {};
+    if (req.url?.includes("finalized-stream") && q.fields?.transaction?.logsBloom !== undefined) {
+      res.writeHead(400); res.end("Bad request: couldn't parse request: column 'logs_bloom' is not found in 'transactions'"); return;
+    }
+    if (serveData && req.url?.includes("finalized-stream") && q.fromBlock <= 20558652 && (q.toBlock ?? 1e12) >= 20558652) {
+      res.writeHead(200, { "content-type": "application/x-ndjson" }); res.end(JSON.stringify(FIXTURE_BLOCK) + "\n"); return;
+    }
+    res.writeHead(204).end();
+  });
+});
+const runMissingLogsBloom = async (serveData: boolean) => {
+  const srv = missingLogsBloomServer(serveData);
+  const p: number = await new Promise((r) => srv.listen(0, () => r((srv.address() as AddressInfo).port)));
+  const inserted = { logs: [] as any[] };
+  const syncStore: any = { insertLogs: (x: any) => inserted.logs.push(...x.logs), insertBlocks: () => {}, insertTransactions: () => {}, insertTransactionReceipts: () => {}, insertTraces: () => {} };
+  const filter: any = { type: "log", chainId: 1, sourceId: "s", address: VAULT, topic0: DEPOSIT_TOPIC0, topic1: null, topic2: null, topic3: null, fromBlock: 20558652, toBlock: 20558652, hasTransactionReceipt: true, include: [] };
+  const sync = createPortalHistoricalSync({
+    common: { logger: { debug() {}, info() {}, warn() {}, error() {}, trace() {} } } as any,
+    chain: { id: 1, name: "mainnet", portal: `http://localhost:${p}` } as any,
+    childAddresses: new Map(), eventCallbacks: [{ filter }],
+  } as any);
+  const interval: [number, number] = [20558652, 20558652];
+  try { const logs = await sync.syncBlockRangeData({ interval, requiredIntervals: [{ interval, filter }], requiredFactoryIntervals: [], syncStore }); await sync.syncBlockData({ interval, logs, syncStore } as any); return inserted; }
+  finally { srv.close(); }
+};
+
+test("regression: a NEEDED missing field fails LOUDLY when the range has MATCHED data (no silent substitution)", async () => {
+  // logsBloom is NOT-NULL + bloom-load-bearing; a chunk that lacks it AND has matched events must
+  // CRASH, not default (a wrong bloom silently drops logs in realtime).
+  await expect(runMissingLogsBloom(true)).rejects.toThrow(/logs_bloom.*matched data|matched data.*logs_bloom/);
+});
+
+test("regression: a NEEDED missing field on an EVENT-LESS range is tolerated (irrelevant old chunks)", async () => {
+  // Same missing logsBloom, but the range yields NO matched data (e.g. Monad's pre-schema chunks
+  // before any relevant events) → harmless, must NOT crash. The indexer runs fine.
+  const inserted = await runMissingLogsBloom(false);
+  expect(inserted.logs).toHaveLength(0);
+});
+
 test("regression (C6): deep matched trace is stored at its FULL-tree pre-order index (7), not filter-local (0)", async () => {
   // Ponder's RPC sync numbers trace_index as the pre-order DFS rank over each tx's FULL call tree,
   // THEN filters — so a lone deep match keeps its true position. Portal used to push the trace

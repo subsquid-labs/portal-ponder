@@ -75,9 +75,9 @@ export const toSyncReceipt = (tx: any, h: RawHeader): SyncTransactionReceipt => 
   blockNumber: hx(h.number), blockHash: h.hash, transactionIndex: hx(tx.transactionIndex), transactionHash: tx.hash,
   from: (tx.from as string)?.toLowerCase(), to: tx.to ? (tx.to as string).toLowerCase() : null,
   contractAddress: tx.contractAddress ? (tx.contractAddress as string).toLowerCase() : null,
-  // ponder's receipt logsBloom is NOT NULL; reduced-schema datasets (e.g. Monad) don't serve it →
-  // default to the empty bloom so the receipt still stores (a dataset-completeness gap, not a crash).
-  logsBloom: tx.logsBloom ?? `0x${"0".repeat(512)}`, gasUsed: hx(tx.gasUsed), cumulativeGasUsed: hx(tx.cumulativeGasUsed),
+  // logsBloom is NOT NULL + bloom-load-bearing; never substitute. A dataset that lacks it fails
+  // loudly at fetch (stream() field-degradation), so this is a straight passthrough.
+  logsBloom: tx.logsBloom, gasUsed: hx(tx.gasUsed), cumulativeGasUsed: hx(tx.cumulativeGasUsed),
   effectiveGasPrice: hx(tx.effectiveGasPrice),
   status: tx.status === 1 || tx.status === "0x1" || tx.status === true ? "0x1" : "0x0",
   type: hx(tx.type ?? 0),
