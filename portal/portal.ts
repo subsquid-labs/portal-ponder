@@ -107,7 +107,11 @@ const portalGate = (() => {
   const MIN = Number(process.env.PORTAL_MIN_CONCURRENCY ?? 8);
   const MAX = Number(process.env.PORTAL_MAX_CONCURRENCY ?? 48);
   const START = Number(process.env.PORTAL_START_CONCURRENCY ?? 16);
-  const MAX_ROWS = Number(process.env.PORTAL_MAX_ROWS_IN_MEM ?? 1_200_000);
+  // Backpressure threshold on buffered rows (log/tx/trace/block records held across all chains'
+  // read-ahead). A buffered record costs ~5-10 KB live in V8 once ponder's derived copies are
+  // counted, so 250k ≈ 1.5-2.5 GB — it must engage BEFORE the heap dies. The prior 1.2M was dead
+  // code: a 4 GB heap OOMs at ~450k rows, so the cap never fired. Scale up with --max-old-space-size.
+  const MAX_ROWS = Number(process.env.PORTAL_MAX_ROWS_IN_MEM ?? 250_000);
   let limit = START, active = 0, ok = 0, rows = 0;
   const waiters: (() => void)[] = [];
   const pump = () => { while (active < limit && waiters.length > 0) { active++; waiters.shift()!(); } };
