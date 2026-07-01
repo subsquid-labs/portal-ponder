@@ -76,6 +76,45 @@ const CHUNK_BLOCKS = Number(process.env.PORTAL_CHUNK_BLOCKS ?? 500_000);
 const READAHEAD = Number(process.env.PORTAL_READAHEAD ?? 6);
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
+// ── Global adaptive Portal controller — module scope, SHARED across every per-chain sync ──────────
+// All chains stream from the SAME Portal endpoint, so request concurrency, CU/throttle headroom and
+// buffered memory are ONE shared budget, not per-chain (15 chains each running a private read-ahead
+// is what OOMs and gets CU-throttled). Portal mode ≠ RPC: it prefers a FEW long, data-heavy requests
+// over RPC's aggressive low-latency fan-out, so the objective is not max RPS but to keep every chain's
+// read-ahead buffer FULL while bounding total memory — so indexing is bottlenecked by local
+// decode/write and NEVER by awaiting a fetch (the whole promise of the Portal). Two controls, both
+// zero-config + self-tuning (the client can't know the endpoint's limits, which drift over time):
+//   • AIMD concurrency — start low, ramp one slot per clean generation, halve on 429/503/timeout.
+//     Discovers the endpoint's LIVE capacity and re-adapts (mirrors Ponder's native RPC AIMD,
+//     rpc/index.ts), but GLOBAL because the endpoint is shared.
+//   • Rows-in-memory budget — read-ahead prefetches until the shared buffer reaches it, then
+//     backpressures. Caps memory regardless of chain count; consumption drains + evicts → refills.
+const portalGate = (() => {
+  // Concurrency must feed however many chains share the endpoint, so the floor is generous (a
+  // multichain app parks one in-flight request per chain plus read-ahead). Memory — not concurrency —
+  // is the OOM guard (the rows budget below), so a higher concurrency ceiling is safe. AIMD still
+  // discovers the true ceiling: ramp while clean, halve on throttle. All zero-config.
+  const MIN = Number(process.env.PORTAL_MIN_CONCURRENCY ?? 8);
+  const MAX = Number(process.env.PORTAL_MAX_CONCURRENCY ?? 48);
+  const START = Number(process.env.PORTAL_START_CONCURRENCY ?? 16);
+  const MAX_ROWS = Number(process.env.PORTAL_MAX_ROWS_IN_MEM ?? 1_200_000);
+  let limit = START, active = 0, ok = 0, rows = 0;
+  const waiters: (() => void)[] = [];
+  const pump = () => { while (active < limit && waiters.length > 0) { active++; waiters.shift()!(); } };
+  return {
+    acquire: (): Promise<void> => new Promise<void>((r) => { waiters.push(r); pump(); }),
+    release: () => { active = Math.max(0, active - 1); pump(); },
+    onOk: () => { if (++ok >= 8 && limit < MAX) { limit = Math.min(MAX, limit + 2); ok = 0; pump(); } }, // additive ramp (+2 / 8 clean)
+    onThrottle: () => { limit = Math.max(MIN, Math.floor(limit / 2)); ok = 0; }, // multiplicative back-off
+    addRows: (n: number) => { rows += n; },
+    freeRows: (n: number) => { rows = Math.max(0, rows - n); },
+    saturated: () => rows >= MAX_ROWS, // memory backpressure for read-ahead (never gates the needed chunk)
+    snapshot: () => ({ limit, active, rows }),
+  };
+})();
+// opt-in observability: watch the AIMD concurrency + memory backpressure adapt live.
+if (process.env.PORTAL_GATE_LOG) setInterval(() => { const s = portalGate.snapshot(); console.log(`[portalGate] concurrency_limit=${s.limit} active=${s.active} buffered_rows=${s.rows}`); }, 20_000).unref();
+
 const asArr = (t: Hex | readonly Hex[] | null | undefined): string[] | undefined => {
   if (t === null || t === undefined) return undefined;
   return (Array.isArray(t) ? t : [t]).map((x) => (x as string).toLowerCase());
@@ -91,7 +130,9 @@ export const createPortalHistoricalSync = (
 
   const stats = { dataChunks: 0, discChunks: 0, http: 0, logs: 0, errors: 0, retries: 0, bytes: 0, cacheHits: 0, inflight: 0, maxInflight: 0, blocks: 0, txs: 0, receipts: 0, traces: 0, rpcFallback: 0 };
   const dataCache = new Map<number, Promise<ChunkData>>(); // keyed by chunk index
-  const discCache = new Map<number, Promise<void>>(); // keyed by chunk index
+  const chunkRows = new Map<number, number>(); // idx → buffered row count, for the global memory budget
+  let discoveredThrough = -1; // high-water block covered by the single wide factory-discovery scan
+  let discoveryP: Promise<void> = Promise.resolve(); // the (lazily extended) discovery scan promise
   const stash = new Map<string, { blocks: SyncBlockHeader[]; txs: SyncTransaction[]; receipts: SyncTransactionReceipt[]; traces: { trace: SyncTrace; block: SyncBlock; transaction: SyncTransaction }[]; closest: SyncBlock | undefined }>();
   const ikey = (i: Interval) => `${i[0]}-${i[1]}`;
   let chunkBlocks = CHUNK_BLOCKS;
@@ -157,15 +198,17 @@ export const createPortalHistoricalSync = (
 
   // one POST+drain; returns blocks or "done" (204); throws (with .retryAfterMs on 503-class).
   async function fetchBatch(body: string, cursor: number): Promise<{ blocks: { header: RawHeader; logs?: any[]; transactions?: any[]; traces?: any[] }[]; last: number } | "done"> {
+    await portalGate.acquire(); // one global (cross-chain) concurrency slot; AIMD-tuned to the endpoint
     stats.inflight++; stats.maxInflight = Math.max(stats.maxInflight, stats.inflight);
     try {
       const res = await fetch(`${portalUrl}/finalized-stream`, { method: "POST", headers: baseHeaders, body });
       stats.http++;
-      if (res.status === 204) return "done";
+      if (res.status === 204) { portalGate.onOk(); return "done"; }
       if (res.status === 503 || res.status === 529 || res.status === 429) {
         await res.body?.cancel().catch(() => {});
         const ra = Number(res.headers.get("retry-after"));
         const e: any = new Error(`Portal ${res.status}`); e.retryAfterMs = Number.isFinite(ra) ? ra * 1000 : undefined;
+        portalGate.onThrottle(); // explicit throttle → halve global concurrency
         throw e;
       }
       if (!res.ok) {
@@ -196,8 +239,12 @@ export const createPortalHistoricalSync = (
       const onLine = (line: string) => { if (!line) return; const b = JSON.parse(line); blocks.push(b); if (b.header?.number > last) last = b.header.number; };
       for (;;) { const { done, value } = await reader.read(); if (done) break; stats.bytes += value.byteLength; buf += dec.decode(value, { stream: true }); let nl: number; while ((nl = buf.indexOf("\n")) >= 0) { onLine(buf.slice(0, nl)); buf = buf.slice(nl + 1); } }
       buf += dec.decode(); if (buf) onLine(buf);
+      portalGate.onOk(); // clean full response → a generation of these ramps concurrency up
       return { blocks, last };
-    } finally { stats.inflight--; }
+    } catch (err: any) {
+      if (isNetworkError(err)) portalGate.onThrottle(); // dropped/timed-out connections under load = congestion
+      throw err;
+    } finally { portalGate.release(); stats.inflight--; }
   }
 
   // Fields the TARGET dataset doesn't have (per-dataset schema varies — e.g. Monad's transactions
@@ -370,13 +417,21 @@ export const createPortalHistoricalSync = (
     return fields;
   };
 
-  // ---- discovery: one sparse stream per chunk, accumulating children (memoized) ----
-  function discoverChunk(idx: number, factories: any[]): Promise<void> {
-    let p = discCache.get(idx);
-    if (p) return p;
-    p = (async () => {
+  // ---- discovery: ONE wide columnar scan per chain, extended lazily — NOT one request per chunk ----
+  // The Portal filters logs by address across huge ranges in seconds and returns instantly for empty
+  // spans, so scanning [factoryStart, head] in a single pass finds every child far faster than probing
+  // each 500k-block chunk (which was ~170 mostly-empty requests on an 84M-block chain — the slow start).
+  function ensureDiscoveredThrough(idx: number, factories: any[]): Promise<unknown> {
+    if (factories.length === 0 || discStartIdx === undefined) return Promise.resolve();
+    const need = chunkRange(idx)[1];
+    if (need <= discoveredThrough) return discoveryP; // already scanned this far
+    const from = discoveredThrough < 0 ? discStartIdx * chunkBlocks : discoveredThrough + 1;
+    const to = Math.max(need, backfillEndBlock ?? portalHead ?? need); // reach as far as the backfill will need — usually the whole span at once
+    discoveredThrough = to;
+    const earlier = discoveryP;
+    discoveryP = (async () => {
+      await earlier; // serialize extensions so children accumulate deterministically
       stats.discChunks++;
-      const [from, to] = chunkRange(idx);
       for (const factory of factories) {
         const needsData = factory.childAddressLocation.startsWith("offset");
         const q = { type: "evm", fields: { block: { number: true }, log: { address: true, topics: true, data: needsData } }, logs: [{ address: factory.address ? (Array.isArray(factory.address) ? factory.address : [factory.address]).map((a: string) => a.toLowerCase()) : undefined, topic0: [factory.eventSelector.toLowerCase()] }] };
@@ -386,22 +441,14 @@ export const createPortalHistoricalSync = (
             const sl = { address: (raw.address as string)?.toLowerCase(), topics: raw.topics ?? [], data: raw.data ?? "0x", blockNumber: hx(b.header.number) } as unknown as SyncLog;
             if (isLogFactoryMatched({ factory, log: sl })) {
               const child = getChildAddress({ log: sl, factory }).toLowerCase() as Address;
-              const bn = b.header.number; const prev = rec.get(child);
-              if (prev === undefined || prev > bn) rec.set(child, bn);
+              const bn = b.header.number; const prevBn = rec.get(child);
+              if (prevBn === undefined || prevBn > bn) rec.set(child, bn);
             }
           }
         }
       }
     })();
-    discCache.set(idx, p);
-    return p;
-  }
-  // discovery complete THROUGH chunk idx (children of all chunks ≤ idx are known)
-  function ensureDiscoveredThrough(idx: number, factories: any[]): Promise<unknown> {
-    if (factories.length === 0 || discStartIdx === undefined) return Promise.resolve();
-    const ps: Promise<void>[] = [];
-    for (let i = discStartIdx; i <= idx; i++) ps.push(discoverChunk(i, factories));
-    return Promise.all(ps);
+    return discoveryP;
   }
 
   // ---- data chunk: gated on discovery-through-this-chunk, then ONE big data stream ----
@@ -468,6 +515,13 @@ export const createPortalHistoricalSync = (
       if (neededMissing.size && (data.logs.size || data.traceBlocks.size || data.txBlocks.size || data.blockHeaders.size)) {
         throw new Error(`Portal dataset for ${args.chain.name} is missing [${[...neededMissing].join(", ")}] on blocks [${from},${to}], which contain matched data your indexer needs — a Portal dataset-completeness gap. Failing fast rather than serving incomplete data; report the gap to SQD, or start your indexer past the affected range.`);
       }
+      // register this chunk's buffered size with the GLOBAL memory budget (freed when evicted).
+      let rc = data.blockHeaders.size;
+      for (const a of data.logs.values()) rc += a.length;
+      for (const a of data.txs.values()) rc += a.length;
+      for (const b of data.traceBlocks.values()) rc += b.traces.length + b.txs.length;
+      for (const b of data.txBlocks.values()) rc += b.txs.length;
+      chunkRows.set(idx, rc); portalGate.addRows(rc);
       return data;
     })();
     dataCache.set(idx, p);
@@ -557,7 +611,7 @@ export const createPortalHistoricalSync = (
       // block sources includeAllBlocks-scan the WHOLE chunk range) — bounds memory + overfetch.
       const capped = traceSafeChunkBlocks(chunkBlocks, needTraces || needBlocks);
       if (capped !== chunkBlocks) {
-        chunkBlocks = capped; dataCache.clear(); discCache.clear(); discStartIdx = undefined;
+        chunkBlocks = capped; dataCache.clear(); for (const r of chunkRows.values()) portalGate.freeRows(r); chunkRows.clear(); discStartIdx = undefined; discoveredThrough = -1; discoveryP = Promise.resolve();
         log.debug({ service: "portal", msg: `Portal ${args.chain.name}: dense sources → chunkBlocks capped to ${chunkBlocks} (grid reset)` });
       }
 
@@ -573,10 +627,13 @@ export const createPortalHistoricalSync = (
       const idxs: number[] = [];
       for (let i = startIdx; i <= endIdx; i++) idxs.push(i);
       const data = await Promise.all(idxs.map((i) => dataChunk(i, factories, filters)));
-      // PARALLEL read-ahead: prefetch the next READAHEAD chunks concurrently — but never past the
-      // backfill end (bounded toBlock or finalized head), so the tail doesn't waste CU / hit 204s.
+      // PARALLEL read-ahead: prefetch the next chunks concurrently — but never past the backfill end
+      // (bounded toBlock or finalized head), so the tail doesn't waste CU / hit 204s. Depth is bounded
+      // by the GLOBAL memory budget, not a fixed count: always prefetch lead-1 (so this chain's next
+      // chunk is ready and indexing never awaits a fetch), and go deeper only while the shared buffer
+      // isn't saturated — so a fast Portal keeps every chain fed while total memory stays capped.
       const raEnd = backfillEndBlock ?? portalHead ?? Number.POSITIVE_INFINITY;
-      for (let d = 1; d <= READAHEAD; d++) { if ((endIdx + d) * chunkBlocks > raEnd) break; void dataChunk(endIdx + d, factories, filters).catch(() => {}); }
+      for (let d = 1; d <= READAHEAD; d++) { if ((endIdx + d) * chunkBlocks > raEnd) break; if (d > 1 && portalGate.saturated()) break; void dataChunk(endIdx + d, factories, filters).catch(() => {}); }
 
       const syncLogs: SyncLog[] = [];
       const blocksByNumber = new Map<number, SyncBlockHeader>();
@@ -613,7 +670,7 @@ export const createPortalHistoricalSync = (
           if (needReceipts) syncReceipts.push(toSyncReceipt(raw, tb.header));
         }
       }
-      for (const i of dataCache.keys()) if ((i + 1) * chunkBlocks <= interval[0]) dataCache.delete(i); // evict behind
+      for (const i of dataCache.keys()) if ((i + 1) * chunkBlocks <= interval[0]) { dataCache.delete(i); portalGate.freeRows(chunkRows.get(i) ?? 0); chunkRows.delete(i); } // evict behind + free its memory budget
 
       const syncTraces = needTraces ? data.flatMap((cd) => buildTraces(cd, interval[0], interval[1])) : [];
 
