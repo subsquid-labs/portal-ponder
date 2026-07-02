@@ -20,7 +20,7 @@ import { loadEulerChain, extractChild } from "./euler/load-sources.ts";
 import { DASHBOARD_HTML } from "./dashboard.ts";
 
 const API_KEY = process.env.PORTAL_API_KEY ?? "";
-const BASE = process.env.PORTAL_BASE ?? "https://sqd.portal.sqd.dev/datasets";
+const BASE = process.env.PORTAL_BASE ?? "https://portal.sqd.dev/datasets";
 const CHAINS = (process.env.CHAINS ?? "1,8453,42161").split(",").map(Number);
 const DURATION_MS = Number(process.env.DURATION_MIN ?? 30) * 60_000;
 const WINDOW = Number(process.env.WINDOW ?? 1_000_000);

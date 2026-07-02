@@ -21,7 +21,7 @@ export default createConfig({
     mainnet: {
       id: 1,
       rpc: process.env.PONDER_RPC_URL_1,
-      portal: process.env.PORTAL_URL ?? "https://sqd.portal.sqd.dev/datasets/ethereum-mainnet",
+      portal: process.env.PORTAL_URL ?? "https://portal.sqd.dev/datasets/ethereum-mainnet",
     },
   },
   blocks: {

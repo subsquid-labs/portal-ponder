@@ -24,13 +24,12 @@
 import { http, fallback, type Transport } from "viem";
 
 /**
- * Portal-backed EVM RPC transport (auth via `x-api-key`). The base URL is provisioned PER CLIENT
- * (e.g. `https://<client>.portal.sqd.dev/rpc/v1/evm`), so pass `opts.baseUrl` or set `PORTAL_RPC_URL` —
- * never hardcode a client domain.
+ * Portal-backed EVM RPC transport (auth via `x-api-key`). The base URL is provisioned per client, so
+ * pass `opts.baseUrl` or set `PORTAL_RPC_URL` — never hardcode a client domain.
  */
 export function portalRpc(chainId: number, apiKey: string, opts?: { baseUrl?: string; timeout?: number; retryCount?: number }): Transport {
   const base = opts?.baseUrl ?? process.env.PORTAL_RPC_URL;
-  if (!base) throw new Error("portalRpc: pass opts.baseUrl or set PORTAL_RPC_URL (the Portal-backed RPC base, provisioned per client, e.g. https://<client>.portal.sqd.dev/rpc/v1/evm)");
+  if (!base) throw new Error("portalRpc: pass opts.baseUrl or set PORTAL_RPC_URL (the Portal-backed RPC base, provisioned per client)");
   return http(`${base}/${chainId}`, {
     fetchOptions: { headers: { "x-api-key": apiKey } },
     timeout: opts?.timeout ?? 10_000,

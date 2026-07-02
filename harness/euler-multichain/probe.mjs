@@ -11,7 +11,7 @@ import { fileURLToPath } from "node:url";
 const dir = path.dirname(fileURLToPath(import.meta.url));
 const chains = JSON.parse(fs.readFileSync(path.join(dir, "chains.json"), "utf8"));
 const KEY = process.env.PORTAL_RPC_KEY;
-const RPC_URL = process.env.PORTAL_RPC_URL; // client-specific base, e.g. https://euler.portal.sqd.dev/rpc/v1/evm
+const RPC_URL = process.env.PORTAL_RPC_URL; // Portal-backed RPC base (from env; provisioned per client)
 const PORTAL_RPC_CHAINS = new Set([1, 42161, 8453, 43114, 137, 56, 9745, 143]);
 const METRICS = process.env.PROBE_METRICS_FILE || path.join(dir, "probe-metrics.json");
 const INTERVAL = Number(process.env.PROBE_INTERVAL_MS || 15000);

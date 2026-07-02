@@ -12,7 +12,7 @@ const eVaultAbi = [
   parseAbiItem("event Liquidate(address indexed liquidator, address indexed violator, address collateral, uint256 repayAssets, uint256 yieldBalance)"),
 ] as const;
 
-const PORTAL = (slug: string) => `https://sqd.portal.sqd.dev/datasets/${slug}`;
+const PORTAL = (slug: string) => `https://portal.sqd.dev/datasets/${slug}`;
 
 export default createConfig({
   chains: {

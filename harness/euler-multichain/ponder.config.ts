@@ -12,12 +12,13 @@ import chainsData from "./chains.json";
 //   • EULER_REALTIME=true:  unbounded → live, realtime served by the Portal-backed RPC — the service
 //     offered to clients (Portal-backed under the hood, designed for the recent tip).
 //
-// SQD Portal domains are tenancy-specific (dedicated per client), so BOTH URLs are env-driven, never
-// hardcoded:  PORTAL_URL      = dataset base   (default https://sqd.portal.sqd.dev — SQD-internal)
-//             PORTAL_RPC_URL  = Portal-backed RPC base (e.g. https://euler.portal.sqd.dev/rpc/v1/evm)
-// One config then serves any client by swapping env. `rpc.subsquid.io` is a generic proxied RPC (like
-// Alchemy) — NOT the Portal-backed product — and is deliberately not used; keyless public RPCs
-// (chains.json `freeRpcs`) are only for setup / finality tail.
+// Portal base URLs are deployment config (from env); relative to a base the documented Portal API paths
+// apply — /datasets/<>, /metadata, … (see docs.sqd.dev). Public examples default to the public Portal.
+//   PORTAL_URL      = Portal base (default https://portal.sqd.dev — the public, rate-limited Portal)
+//   PORTAL_RPC_URL  = Portal-backed RPC base (from env; provisioned per client)
+// One config serves any client by swapping env. `rpc.subsquid.io` is a generic proxied RPC (like Alchemy)
+// — NOT the Portal-backed product — and is deliberately not used; keyless public RPCs (chains.json
+// `freeRpcs`) are only for setup / finality tail.
 //
 // No secrets/tenancy in the repo: PORTAL_API_KEY, PORTAL_URL, PORTAL_RPC_KEY, PORTAL_RPC_URL come from env.
 const proxyCreated = parseAbiItem(
@@ -26,9 +27,9 @@ const proxyCreated = parseAbiItem(
 
 type ChainRow = { id: number; name: string; ds: string; factory: string; head: number; deploy: number; sqdSlug: string | null; freeRpcs: string[] };
 const rows = chainsData as ChainRow[];
-const PORTAL_URL = process.env.PORTAL_URL ?? "https://sqd.portal.sqd.dev";
+const PORTAL_URL = process.env.PORTAL_URL ?? "https://portal.sqd.dev";
 const PORTAL_RPC_KEY = process.env.PORTAL_RPC_KEY;
-const PORTAL_RPC_URL = process.env.PORTAL_RPC_URL; // e.g. https://euler.portal.sqd.dev/rpc/v1/evm
+const PORTAL_RPC_URL = process.env.PORTAL_RPC_URL; // Portal-backed RPC base (from env; provisioned per client)
 const REALTIME = process.env.EULER_REALTIME === "true";
 
 // Chains served by the Portal-backed RPC. Realtime uses it (alone) on these.

@@ -2,11 +2,11 @@ import { expect, test } from "vitest";
 import { portalRpc, portalRealtime, rpcRealtime, freshnessLag, summarize, probeOnce, type ProbeSample } from "./realtime.js";
 
 test("portalRpc: appends chainId to the client-specific base + x-api-key header", () => {
-  const t = portalRpc(42161, "prt_test", { baseUrl: "https://euler.portal.sqd.dev/rpc/v1/evm" });
+  const t = portalRpc(42161, "prt_test", { baseUrl: "https://portal.example/rpc" });
   expect(typeof t).toBe("function");
   // viem http transport exposes its url on the instantiated value
   const inst: any = t({} as any);
-  expect(inst.value?.url).toBe("https://euler.portal.sqd.dev/rpc/v1/evm/42161");
+  expect(inst.value?.url).toBe("https://portal.example/rpc/42161");
   const t2: any = portalRpc(1, "k", { baseUrl: "http://local/rpc" })({} as any);
   expect(t2.value?.url).toBe("http://local/rpc/1");
 });
@@ -19,7 +19,7 @@ test("portalRpc: throws without a base (never hardcodes a client domain)", () =>
 });
 
 test("portalRealtime / rpcRealtime return composed viem transports", () => {
-  expect(typeof portalRealtime(1, "k", ["http://a", "http://b"], { baseUrl: "https://x/rpc/v1/evm" })).toBe("function");
+  expect(typeof portalRealtime(1, "k", ["http://a", "http://b"], { baseUrl: "https://portal.example/rpc" })).toBe("function");
   expect(typeof rpcRealtime(["http://a", "http://b"])).toBe("function");
 });
 

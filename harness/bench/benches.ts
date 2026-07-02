@@ -12,8 +12,8 @@ import { join } from "node:path";
 import type { BenchSpec } from "./run-bench.ts";
 
 const EX = process.env.PONDER_EXAMPLES ?? "/private/tmp/claude-501/-Users-dz-Projects/13199370-953e-47b4-8270-46346fb77a26/scratchpad/ponder/examples";
-const ETH = "https://sqd.portal.sqd.dev/datasets/ethereum-mainnet";
-const BASE = "https://sqd.portal.sqd.dev/datasets/base-mainnet";
+const ETH = "https://portal.sqd.dev/datasets/ethereum-mainnet";
+const BASE = "https://portal.sqd.dev/datasets/base-mainnet";
 
 export const BENCHES: BenchSpec[] = [
   // synthetic all-in-one: the only bench exercising all five source types (logs + receipts
