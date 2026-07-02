@@ -16,13 +16,14 @@
     {
       "ponder": "0.15.17",
       "wiring": "wiring/0.15.17.patch",
-      "status": "planned",
+      "rev": 1,
+      "status": "verified",
       "published": false,
-      "note": "Euler (the company) pins this; seam verified identical 0.15.17→0.16.6. Generate the wiring patch + run sync-upstream to promote to verified."
+      "note": "Seam identical to 0.16.6 — the 0.16.6 wiring patch applies cleanly, builds, and passes all 53 tests on ponder@0.15.17."
     }
   ],
   "compat": {
-    "tested": ["0.16.6"],
+    "tested": ["0.16.6", "0.15.17"],
     "seamStableRange": "0.15.17 - 0.16.6 (verified identical by inspection; CI matrix promotes to 'tested' as patches land)",
     "howToAdd": "see PUBLISHING.md — scripts/sync-upstream.sh <ver> --test, then add the row here"
   }

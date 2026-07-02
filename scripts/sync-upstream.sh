@@ -34,7 +34,7 @@ cp "$ROOT/portal/vite.portal.config.ts" "$CORE/"
 # The ponder version stays visible; SYNC_REV bumps the fork revision (default 1).
 REV="${SYNC_REV:-1}"
 echo "▶ renaming → @subsquid/ponder@$VER-sqd.$REV (bin stays 'ponder' so it's drop-in)"
-node -e "const f='$CORE/package.json',p=require(f);p.name='@subsquid/ponder';p.version='$VER-sqd.$REV';require('fs').writeFileSync(f,JSON.stringify(p,null,2)+'\n')"
+node -e "const f='$CORE/package.json',p=require(f);p.name='@subsquid/ponder';p.version='$VER-sqd.$REV';p.repository={type:'git',url:'git+https://github.com/subsquid-labs/portal-ponder.git'};p.bugs={url:'https://github.com/subsquid-labs/portal-ponder/issues'};p.homepage='https://sqd.dev/portal/';require('fs').writeFileSync(f,JSON.stringify(p,null,2)+'\n')"
 
 echo "▶ building"
 ( cd "$WORK" && $PNPM install --silent && $PNPM --filter @ponder/utils build && $PNPM --filter @subsquid/ponder build )
