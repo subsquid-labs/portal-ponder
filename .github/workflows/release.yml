@@ -57,6 +57,12 @@ jobs:
 
       - name: Publish to npm (Trusted Publishing via OIDC — no token)
         working-directory: ${{ runner.temp }}/fork/${{ steps.v.outputs.version }}/packages/core
-        # --tag latest so this <version>-sqd.<rev> prerelease is the default `npm install`.
-        # When this repo is PUBLIC, append `--provenance` for a signed provenance attestation.
-        run: npm publish --access public --tag latest
+        # `latest` ONLY for the newest ponder version in versions.json, so publishing an older version
+        # (e.g. 0.15.17 after 0.16.6) does not clobber the default `npm install`. Older versions get a
+        # `ponder-<version>` tag; users still pin the exact `<version>-sqd.<rev>`. Provenance is automatic.
+        run: |
+          V='${{ steps.v.outputs.version }}'
+          MAX=$(node -e "const j=require('$GITHUB_WORKSPACE/versions.json');console.log(j.versions.map(r=>r.ponder).sort((a,b)=>a.localeCompare(b,undefined,{numeric:true})).pop())")
+          if [ "$V" = "$MAX" ]; then TAG=latest; else TAG="ponder-$V"; fi
+          echo "→ npm publish --tag $TAG (newest ponder in versions.json = $MAX)"
+          npm publish --access public --tag "$TAG"

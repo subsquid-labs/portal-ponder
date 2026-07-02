@@ -4,3 +4,7 @@ harness/euler/vaults.*.json
 *.log
 .DS_Store
 .claude/
+examples/*/package-lock.json
+examples/*/ponder-env.d.ts
+examples/*/.ponder/
+examples/*/generated/
