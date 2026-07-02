@@ -91,9 +91,9 @@ So more RAM/cores don't buy wall-time here — they're already idle. The lever f
 
 ---
 
-## What's managed vs what you tune
+## What runs where
 
-- **Portal capacity is managed by Subsquid Labs** as part of the enterprise subscription — a flat plan, scalable transparently. Clients never touch compute-units or infra; throughput is a dial we turn, not a client concern.
+- **The Portal serves the historical data** over HTTP. Backfill throughput scales with the Portal's provisioning and is independent of the indexer's footprint.
 - **The indexer** (this fork of Ponder) is what you run — modest footprint, your handlers and schema unchanged, one `portal:` line per chain.
 
 The numbers here are a **floor** at the current provisioning and a single-process indexer — not a ceiling.
