@@ -77,8 +77,8 @@ Full adoption path — check, swap, run, validate, roll back — in [`MIGRATION.
 
 | Ponder | `@subsquid/ponder` | Status |
 |---|---|---|
-| 0.16.6 | `0.16.6-sqd.1` | current |
-| 0.15.17 | `0.15.17-sqd.1` | planned |
+| 0.16.6 | `0.16.6-sqd.1` | **latest** |
+| 0.15.17 | `0.15.17-sqd.1` | published |
 
 `npm install @subsquid/ponder` installs the latest; pin `@X.Y.Z-sqd.<rev>` to match your Ponder version. How versions work: [`PUBLISHING.md`](PUBLISHING.md).
 
