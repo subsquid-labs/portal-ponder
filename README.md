@@ -2,6 +2,8 @@
 
 [![npm](https://img.shields.io/npm/v/@subsquid/ponder?color=cb0000&logo=npm)](https://www.npmjs.com/package/@subsquid/ponder)
 [![CI](https://github.com/subsquid-labs/portal-ponder/actions/workflows/ci.yml/badge.svg)](https://github.com/subsquid-labs/portal-ponder/actions/workflows/ci.yml)
+[![license](https://img.shields.io/badge/license-MIT-blue)](LICENSE)
+[![status](https://img.shields.io/badge/status-beta-orange)](#going-to-production)
 [![Telegram](https://img.shields.io/badge/chat-SquidDevs-2CA5E0?logo=telegram)](https://t.me/HydraDevs)
 
 A drop-in fork of [Ponder](https://github.com/ponder-sh/ponder) that runs the historical backfill through the [SQD Portal](https://sqd.dev/portal/) instead of per-chain JSON-RPC — **several times faster**, across 130+ EVM networks. Realtime stays on your RPC, your handlers and schema don't change, and the switch is one line of config per chain.
@@ -70,6 +72,8 @@ node --experimental-strip-types harness/compat/report.ts ./ponder.config.ts   # 
 Full adoption path — check, swap, run, validate, roll back — in [`MIGRATION.md`](MIGRATION.md).
 
 ## Going to production
+
+**The fork is in beta.** We've tested it extensively in-house — the 15-chain, 28M-event run above is one such test — and we'd value your testing and bug reports ([GitHub issues](https://github.com/subsquid-labs/portal-ponder/issues) · [SquidDevs on Telegram](https://t.me/HydraDevs)). The Portal underneath is not new: it's the enterprise-grade data layer behind **$20B+ in TVL**, used in production by teams like GMX, Morpho, and PancakeSwap.
 
 The free public Portal is ideal for trying the fork and for development, but shares capacity across all users and is rate-limited under load. For production throughput and reliability, use a **dedicated Portal** — your own capacity, no shared limits. Dedicated Portals are set up with the SQD team today: [talk to us](https://sqd.dev/portal/). Self-served tiers (free, starter, growth) are coming soon.
 
