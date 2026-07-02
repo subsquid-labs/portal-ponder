@@ -42,7 +42,7 @@ cd portal-ponder/examples/euler-subgraph
 npm install && npm run dev
 ```
 
-This runs a real indexer and backfills Ethereum history from the Portal — watch the events/second in the Ponder dev UI. The example uses `portal.sqd.dev`, the free public Portal: ideal for trying the fork and for development, but shared and rate-limited under load. For production, see [Going to production](#going-to-production).
+This runs a real indexer — a subgraph ported to Ponder — and backfills its full history on Ethereum (~5M blocks, from the protocol's deploy at block 20,529,207) from the Portal. Watch the events/second in the Ponder dev UI. The example uses `portal.sqd.dev`, the free public Portal: ideal for trying the fork and for development, but shared and rate-limited under load. For production, see [Going to production](#going-to-production).
 
 ## Why it's faster, and why a fork
 
