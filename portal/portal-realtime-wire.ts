@@ -18,6 +18,8 @@
  * (no gap, the RPC fallback never triggers) and (b) realtime streams `[portal-head+1 → tip]` — every block
  * strictly ABOVE `finalized`, and every `finalize` monotonically at/above it.
  */
+
+import { type Address, hexToNumber, numberToHex } from "viem";
 import type { Common } from "@/internal/common.js";
 import type {
   Chain,
@@ -29,16 +31,15 @@ import type {
   LogFilter,
   SyncLog,
 } from "@/internal/types.js";
+import { eth_getBlockByNumber } from "@/rpc/actions.js";
+import type { Rpc } from "@/rpc/index.js";
 import {
   getChildAddress,
   getFilterFactories,
   isAddressFactory,
   isLogFactoryMatched,
 } from "@/runtime/filter.js";
-import { eth_getBlockByNumber } from "@/rpc/actions.js";
-import type { Rpc } from "@/rpc/index.js";
 import type { RealtimeSyncEvent } from "@/sync-realtime/index.js";
-import { type Address, hexToNumber, numberToHex } from "viem";
 import {
   type Light,
   type PortalRealtimeEvent,
@@ -49,11 +50,16 @@ import { hx } from "./portal-transform.js";
 // ─────────────────────────────── flag / detection ───────────────────────────────
 
 /** True when this chain should use the Portal `/stream` for realtime instead of ponder's RPC path. */
-export const isPortalRealtime = (chain: { portal?: string | undefined }): boolean =>
+export const isPortalRealtime = (chain: {
+  portal?: string | undefined;
+}): boolean =>
   typeof chain.portal === "string" && process.env.PORTAL_REALTIME === "stream";
 
 const portalHeaders = (): Record<string, string> => {
-  const h: Record<string, string> = { "content-type": "application/json", "accept-encoding": "gzip" };
+  const h: Record<string, string> = {
+    "content-type": "application/json",
+    "accept-encoding": "gzip",
+  };
   if (process.env.PORTAL_API_KEY) h["x-api-key"] = process.env.PORTAL_API_KEY;
   return h;
 };
@@ -69,7 +75,9 @@ export async function portalFinalizedHead(
   fetchImpl: typeof fetch = fetch,
 ): Promise<number | undefined> {
   try {
-    const h = await fetchImpl(`${cleanUrl(portalUrl)}/finalized-head`, { headers }).then((r) => r.json());
+    const h = await fetchImpl(`${cleanUrl(portalUrl)}/finalized-head`, {
+      headers,
+    }).then((r) => r.json());
     if (typeof h?.number === "number") return h.number;
   } catch {
     /* head unknown → caller stays conservative */
@@ -94,10 +102,15 @@ export async function clampFinalizedToPortalHead(params: {
   if (isPortalRealtime(chain) === false) return finalizedBlock;
 
   const portalUrl = cleanUrl(chain.portal!);
-  const head = await portalFinalizedHead(portalUrl, portalHeaders(), params.fetchImpl);
+  const head = await portalFinalizedHead(
+    portalUrl,
+    portalHeaders(),
+    params.fetchImpl,
+  );
   // Head unknown → stay conservative and keep the RPC finalized block (historical's own RPC finality-gap
   // fallback remains the safety net). Portal at/ahead of RPC finalized → nothing to clamp.
-  if (head === undefined || head >= hexToNumber(finalizedBlock.number)) return finalizedBlock;
+  if (head === undefined || head >= hexToNumber(finalizedBlock.number))
+    return finalizedBlock;
 
   const clamped = (await eth_getBlockByNumber(rpc, [numberToHex(head), false], {
     retryNullBlockRequest: true,
@@ -121,16 +134,19 @@ export type PortalLogRequest = {
 };
 
 const PORTAL_MAX_ADDRESSES = 1000;
-const asArr = <T,>(v: T | T[]): T[] => (Array.isArray(v) ? v : [v]);
+const asArr = <T>(v: T | T[]): T[] => (Array.isArray(v) ? v : [v]);
 const lc = (a: string): string => a.toLowerCase();
 
 /** The unique factories referenced by any filter (deduped by id). */
-export const uniqueFactories = (eventCallbacks: { filter: Filter }[]): Factory[] =>
-  [
-    ...new Map(
-      eventCallbacks.flatMap((e) => getFilterFactories(e.filter)).map((f) => [f.id, f]),
-    ).values(),
-  ];
+export const uniqueFactories = (
+  eventCallbacks: { filter: Filter }[],
+): Factory[] => [
+  ...new Map(
+    eventCallbacks
+      .flatMap((e) => getFilterFactories(e.filter))
+      .map((f) => [f.id, f]),
+  ).values(),
+];
 
 /** Log-filter → Portal log requests. Factory-address filters expand to the currently-known children. */
 function logRequestsFor(
@@ -153,7 +169,10 @@ function logRequestsFor(
   }
   const out: PortalLogRequest[] = [];
   for (let i = 0; i < addresses.length; i += PORTAL_MAX_ADDRESSES)
-    out.push({ ...base, address: addresses.slice(i, i + PORTAL_MAX_ADDRESSES) });
+    out.push({
+      ...base,
+      address: addresses.slice(i, i + PORTAL_MAX_ADDRESSES),
+    });
   return out;
 }
 
@@ -161,11 +180,26 @@ function logRequestsFor(
 function mergeLogRequests(reqs: PortalLogRequest[]): PortalLogRequest[] {
   const groups = new Map<string, PortalLogRequest>();
   for (const r of reqs) {
-    const key = JSON.stringify([r.address ? [...r.address].sort() : null, r.topic1 ?? null, r.topic2 ?? null, r.topic3 ?? null]);
+    const key = JSON.stringify([
+      r.address ? [...r.address].sort() : null,
+      r.topic1 ?? null,
+      r.topic2 ?? null,
+      r.topic3 ?? null,
+    ]);
     const g = groups.get(key);
-    if (!g) { groups.set(key, { ...r, topic0: r.topic0 ? [...new Set(r.topic0)] : undefined }); continue; }
+    if (!g) {
+      groups.set(key, {
+        ...r,
+        topic0: r.topic0 ? [...new Set(r.topic0)] : undefined,
+      });
+      continue;
+    }
     if (g.topic0 === undefined || r.topic0 === undefined) g.topic0 = undefined;
-    else { const s = new Set(g.topic0); for (const t of r.topic0) s.add(t); g.topic0 = [...s]; }
+    else {
+      const s = new Set(g.topic0);
+      for (const t of r.topic0) s.add(t);
+      g.topic0 = [...s];
+    }
   }
   return [...groups.values()];
 }
@@ -182,9 +216,13 @@ export function buildPortalLogRequests(
 ): PortalLogRequest[] {
   const filters = eventCallbacks.map((e) => e.filter);
   const reqs: PortalLogRequest[] = [];
-  for (const f of filters) if (f.type === "log") reqs.push(...logRequestsFor(f as LogFilter, childAddresses));
+  for (const f of filters)
+    if (f.type === "log")
+      reqs.push(...logRequestsFor(f as LogFilter, childAddresses));
   for (const factory of uniqueFactories(eventCallbacks)) {
-    const address = factory.address ? asArr(factory.address).map(lc) : undefined;
+    const address = factory.address
+      ? asArr(factory.address).map(lc)
+      : undefined;
     reqs.push({ address, topic0: [factory.eventSelector.toLowerCase()] });
   }
   return mergeLogRequests(reqs);
@@ -232,9 +270,15 @@ function applyDiscovered(
   let added = false;
   for (const [factory, addresses] of discovered) {
     let rec = childAddresses.get(factory.id);
-    if (rec === undefined) { rec = new Map<Address, number>(); childAddresses.set(factory.id, rec); }
+    if (rec === undefined) {
+      rec = new Map<Address, number>();
+      childAddresses.set(factory.id, rec);
+    }
     for (const address of addresses) {
-      if (rec.has(address) === false) { rec.set(address, blockNumber); added = true; }
+      if (rec.has(address) === false) {
+        rec.set(address, blockNumber);
+        added = true;
+      }
     }
   }
   return added;
@@ -272,7 +316,11 @@ export function toRealtimeSyncEvent(
         blockCallback: undefined, // no rpc.subscribe backpressure hook in the stream path (optional-chained downstream)
       };
     case "reorg":
-      return { type: "reorg", block: lightToLightBlock(ev.block), reorgedBlocks: ev.reorgedBlocks.map(lightToLightBlock) };
+      return {
+        type: "reorg",
+        block: lightToLightBlock(ev.block),
+        reorgedBlocks: ev.reorgedBlocks.map(lightToLightBlock),
+      };
     case "finalize":
       return { type: "finalize", block: lightToLightBlock(ev.block) };
   }
@@ -295,14 +343,17 @@ export async function* getPortalRealtimeEventGenerator(params: {
   fetchImpl?: typeof fetch; // injected for tests
   finalizePollMs?: number; // injected for tests (prod: portal-realtime.ts default cadence)
 }) {
-  const { common, chain, eventCallbacks, syncProgress, childAddresses } = params;
+  const { common, chain, eventCallbacks, syncProgress, childAddresses } =
+    params;
   const portalUrl = cleanUrl(chain.portal!);
   const headers = portalHeaders();
   const factories = uniqueFactories(eventCallbacks);
 
   const startupFinalized = hexToNumber(syncProgress.finalized.number);
   const fromBlock = startupFinalized + 1; // finalized == Portal head (clamped) → stream (portal-head, tip]
-  const endBlock = syncProgress.end ? hexToNumber(syncProgress.end.number) : undefined;
+  const endBlock = syncProgress.end
+    ? hexToNumber(syncProgress.end.number)
+    : undefined;
 
   // Mutable: rebuilt (in place) whenever a new child is discovered so the next stream reconnection filters
   // the new child's logs too (portal-realtime.ts re-reads this array when it re-opens the stream).
@@ -329,7 +380,8 @@ export async function* getPortalRealtimeEventGenerator(params: {
       logs,
       blockFields: BLOCK_FIELDS,
       logFields: LOG_FIELDS,
-      finalizedHead: () => portalFinalizedHead(portalUrl, headers, params.fetchImpl),
+      finalizedHead: () =>
+        portalFinalizedHead(portalUrl, headers, params.fetchImpl),
       finalizePollMs: params.finalizePollMs,
       signal: controller.signal,
       fetchImpl: params.fetchImpl,
@@ -379,11 +431,31 @@ export async function* getPortalRealtimeEventGenerator(params: {
 // Block header fields — the RPC-path-equivalent set (kept in sync with portal.ts) so stored realtime
 // blocks are byte-consistent with the historical Portal backfill.
 const BLOCK_FIELDS: Record<string, boolean> = {
-  number: true, hash: true, parentHash: true, timestamp: true, logsBloom: true, miner: true,
-  gasUsed: true, gasLimit: true, stateRoot: true, receiptsRoot: true, transactionsRoot: true,
-  size: true, difficulty: true, extraData: true, baseFeePerGas: true, nonce: true, mixHash: true,
-  sha3Uncles: true, totalDifficulty: true,
+  number: true,
+  hash: true,
+  parentHash: true,
+  timestamp: true,
+  logsBloom: true,
+  miner: true,
+  gasUsed: true,
+  gasLimit: true,
+  stateRoot: true,
+  receiptsRoot: true,
+  transactionsRoot: true,
+  size: true,
+  difficulty: true,
+  extraData: true,
+  baseFeePerGas: true,
+  nonce: true,
+  mixHash: true,
+  sha3Uncles: true,
+  totalDifficulty: true,
 };
 const LOG_FIELDS: Record<string, boolean> = {
-  address: true, topics: true, data: true, transactionHash: true, transactionIndex: true, logIndex: true,
+  address: true,
+  topics: true,
+  data: true,
+  transactionHash: true,
+  transactionIndex: true,
+  logIndex: true,
 };

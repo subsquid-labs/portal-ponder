@@ -2,7 +2,9 @@
 import { readFileSync } from "node:fs";
 import { toEventSelector } from "viem";
 
-export type ChildRule = { kind: "topic"; index: number } | { kind: "data"; word: number };
+export type ChildRule =
+  | { kind: "topic"; index: number }
+  | { kind: "data"; word: number };
 
 export type FactorySource = {
   name: string;
@@ -12,7 +14,12 @@ export type FactorySource = {
   childTopic0s: string[]; // topic0 of every child event
   childEventNames: string[];
 };
-export type SingletonSource = { name: string; address: string; topic0s: string[]; eventNames: string[] };
+export type SingletonSource = {
+  name: string;
+  address: string;
+  topic0s: string[];
+  eventNames: string[];
+};
 
 export type EulerChain = {
   chainId: number;
@@ -29,9 +36,13 @@ const CHILD_RULE: Record<string, ChildRule> = {
   EulerSwapPool: { kind: "data", word: 0 }, // PoolDeployed(..., address pool, ...) — pool not indexed
 };
 
-const topic0 = (sig: string): string => toEventSelector(sig as `event ${string}`);
+const topic0 = (sig: string): string =>
+  toEventSelector(sig as `event ${string}`);
 
-export const loadEulerChain = (chainId: number, file = "/Users/dz/Projects/portal-ponder/harness/euler/sources.generated.json"): EulerChain => {
+export const loadEulerChain = (
+  chainId: number,
+  file = "/Users/dz/Projects/portal-ponder/harness/euler/sources.generated.json",
+): EulerChain => {
   const all = JSON.parse(readFileSync(file, "utf8"));
   const c = all.chains.find((x: any) => x.chainId === chainId);
   if (!c) throw new Error(`chain ${chainId} not in sources.generated.json`);
@@ -40,7 +51,10 @@ export const loadEulerChain = (chainId: number, file = "/Users/dz/Projects/porta
   const singletons: SingletonSource[] = [];
   for (const s of c.sources) {
     if (s.kind === "factory") {
-      const childEvents = (s.childEvents ?? []) as { name: string; signature: string }[];
+      const childEvents = (s.childEvents ?? []) as {
+        name: string;
+        signature: string;
+      }[];
       factories.push({
         name: s.name,
         factory: s.address.toLowerCase(),
@@ -59,11 +73,20 @@ export const loadEulerChain = (chainId: number, file = "/Users/dz/Projects/porta
       });
     }
   }
-  return { chainId: c.chainId, dataset: c.portalDataset, realTime: c.realTime, factories, singletons };
+  return {
+    chainId: c.chainId,
+    dataset: c.portalDataset,
+    realTime: c.realTime,
+    factories,
+    singletons,
+  };
 };
 
 /** extract a deployed child address from a discovery log per the source's rule */
-export const extractChild = (rule: ChildRule, log: { topics?: string[]; data?: string }): string | undefined => {
+export const extractChild = (
+  rule: ChildRule,
+  log: { topics?: string[]; data?: string },
+): string | undefined => {
   if (rule.kind === "topic") {
     const t = log.topics?.[rule.index];
     return t ? "0x" + t.slice(26) : undefined;

@@ -2,7 +2,16 @@ import { readFileSync } from "node:fs";
 import { join } from "node:path";
 import { hexToBigInt } from "viem";
 import { expect, test } from "vitest";
-import { cmpTraceAddr, hx, isFinalityGap, parityToCallFrame, toStateDiff, toSyncReceipt, toSyncTransaction, traceSafeChunkBlocks } from "./portal-transform.js";
+import {
+  cmpTraceAddr,
+  hx,
+  isFinalityGap,
+  parityToCallFrame,
+  toStateDiff,
+  toSyncReceipt,
+  toSyncTransaction,
+  traceSafeChunkBlocks,
+} from "./portal-transform.js";
 
 // C7: hx("0x") used to return the invalid quantity "0x" (throws downstream in BigInt); empty
 // strings must normalize to "0x0". Decimal numbers/strings and existing hex pass through.
@@ -23,8 +32,14 @@ test("hx: empty quantity → 0x0 (never invalid 0x); decimal/hex normalize", () 
  * staticcall value:null, CREATE init/code, stateDiff prev:null⟺"+".
  */
 const FIX = join(__dirname, "__fixtures__");
-const load = (f: string): any[] => readFileSync(join(FIX, f), "utf8").trim().split("\n").map((l) => JSON.parse(l));
-const allTx = load("receipts.json").flatMap((b) => (b.transactions ?? []).map((t: any) => ({ t, h: b.header })));
+const load = (f: string): any[] =>
+  readFileSync(join(FIX, f), "utf8")
+    .trim()
+    .split("\n")
+    .map((l) => JSON.parse(l));
+const allTx = load("receipts.json").flatMap((b) =>
+  (b.transactions ?? []).map((t: any) => ({ t, h: b.header })),
+);
 const allTrace = load("traces.json").flatMap((b) => b.traces ?? []);
 const allDiff = load("statediffs.json").flatMap((b) => b.stateDiffs ?? []);
 
@@ -35,11 +50,17 @@ test("accessList matches the RPC shape: legacy → none, typed → [] or list", 
   const h = { hash: "0xb10c", number: 100 } as any;
   const al = [{ address: "0xabc", storageKeys: ["0x1"] }];
   // legacy (type 0): Portal sends [] but RPC has no accessList → must drop to undefined (→ null col)
-  expect((toSyncTransaction({ type: 0, accessList: [] }, h) as any).accessList).toBeUndefined();
+  expect(
+    (toSyncTransaction({ type: 0, accessList: [] }, h) as any).accessList,
+  ).toBeUndefined();
   // EIP-1559 with empty accessList → []
-  expect((toSyncTransaction({ type: 2, accessList: [] }, h) as any).accessList).toEqual([]);
+  expect(
+    (toSyncTransaction({ type: 2, accessList: [] }, h) as any).accessList,
+  ).toEqual([]);
   // typed with entries → passthrough
-  expect((toSyncTransaction({ type: 2, accessList: al }, h) as any).accessList).toEqual(al);
+  expect(
+    (toSyncTransaction({ type: 2, accessList: al }, h) as any).accessList,
+  ).toEqual(al);
   // typed but Portal omitted the field → default to [] (never null on a typed tx)
   expect((toSyncTransaction({ type: 1 }, h) as any).accessList).toEqual([]);
 });
@@ -65,10 +86,14 @@ test("receipt: failed tx (status 0) → 0x0", () => {
 test("receipt: contract-creation contractAddress lowercased; non-creation null", () => {
   const creation = allTx.find(({ t }) => t.contractAddress);
   const transfer = allTx.find(({ t }) => t.contractAddress === null)!;
-  expect((toSyncReceipt(transfer.t, transfer.h) as any).contractAddress).toBeNull();
+  expect(
+    (toSyncReceipt(transfer.t, transfer.h) as any).contractAddress,
+  ).toBeNull();
   if (creation) {
     const r = toSyncReceipt(creation.t, creation.h) as any;
-    expect(r.contractAddress).toBe((creation.t.contractAddress as string).toLowerCase());
+    expect(r.contractAddress).toBe(
+      (creation.t.contractAddress as string).toLowerCase(),
+    );
   }
 });
 
@@ -90,7 +115,9 @@ test("trace: staticcall value:null → frame.value undefined (not 0x0)", () => {
 });
 
 test("trace: call/create mapping (CREATE uses init→input, code→output, result.address→to)", () => {
-  const call = allTrace.find((t) => t.type === "call" && t.action?.callType === "call");
+  const call = allTrace.find(
+    (t) => t.type === "call" && t.action?.callType === "call",
+  );
   if (call) expect(parityToCallFrame(call, 0).type).toBe("CALL");
   const create = allTrace.find((t) => t.type === "create")!;
   const f = parityToCallFrame(create, 0);
@@ -115,7 +142,12 @@ test("trace: suicide → SELFDESTRUCT", () => {
 });
 
 test("trace: traceAddress sorts in DFS pre-order", () => {
-  expect([[1], [], [0, 0], [0]].sort(cmpTraceAddr)).toEqual([[], [0], [0, 0], [1]]);
+  expect([[1], [], [0, 0], [0]].sort(cmpTraceAddr)).toEqual([
+    [],
+    [0],
+    [0, 0],
+    [1],
+  ]);
 });
 
 test("isFinalityGap: interval beyond Portal's finalized head triggers RPC fallback", () => {

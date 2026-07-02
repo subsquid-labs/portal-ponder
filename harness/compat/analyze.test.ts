@@ -10,7 +10,11 @@ const FIXTURE = {
   chains: { eth: { id: 1 }, weird: { id: 999_999 } },
   contracts: {
     Factory: { chain: "eth", address: { event: {}, parameter: "proxy" } },
-    WithReceipts: { chain: "eth", address: "0xabc", includeTransactionReceipts: true },
+    WithReceipts: {
+      chain: "eth",
+      address: "0xabc",
+      includeTransactionReceipts: true,
+    },
     WithTraces: { chain: "eth", address: "0xabc", includeCallTraces: true },
     NoDataset: { chain: "weird", address: "0xabc" },
   },
@@ -30,19 +34,32 @@ test("verdict per source type (empty catalog → trust docs caps)", () => {
 });
 
 test("capability: a chain with traces:false (per docs) flags trace sources", () => {
-  const cfg = { chains: { flare: { id: 14 } }, contracts: { T: { chain: "flare", address: "0xabc", includeCallTraces: true } } };
+  const cfg = {
+    chains: { flare: { id: 14 } },
+    contracts: {
+      T: { chain: "flare", address: "0xabc", includeCallTraces: true },
+    },
+  };
   const s = analyzeConfig(cfg, new Map()).sources[0]!;
   assert.equal(s.verdict, "NEEDS_TRACES");
   assert.ok(s.blockers.some((b) => b.includes("no traces")));
 });
 
 test("capability: Arbitrum HAS traces per docs → trace source READY (the docs are authoritative)", () => {
-  const cfg = { chains: { arb: { id: 42161 } }, contracts: { T: { chain: "arb", address: "0xabc", includeCallTraces: true } } };
+  const cfg = {
+    chains: { arb: { id: 42161 } },
+    contracts: {
+      T: { chain: "arb", address: "0xabc", includeCallTraces: true },
+    },
+  };
   assert.equal(analyzeConfig(cfg, new Map()).sources[0]!.verdict, "READY");
 });
 
 test("account source (transactions from/to) → READY where the dataset is served", () => {
-  const cfg = { chains: { eth: { id: 1 } }, accounts: { Wallet: { chain: "eth", address: "0xabc" } } };
+  const cfg = {
+    chains: { eth: { id: 1 } },
+    accounts: { Wallet: { chain: "eth", address: "0xabc" } },
+  };
   const s = analyzeConfig(cfg, new Map()).sources[0]!;
   assert.equal(s.source, "account:Wallet");
   assert.ok(s.needs.includes("accountTx"));
@@ -50,24 +67,48 @@ test("account source (transactions from/to) → READY where the dataset is serve
 });
 
 test("per-portal existence: a portal that doesn't serve the dataset → NO_DATASET", () => {
-  const catalog = new Map<string, DatasetInfo>([["some-other-chain", { dataset: "some-other-chain", realTime: true, aliases: [] }]]);
-  const cfg = { chains: { eth: { id: 1 } }, contracts: { C: { chain: "eth", address: "0xabc" } } };
+  const catalog = new Map<string, DatasetInfo>([
+    [
+      "some-other-chain",
+      { dataset: "some-other-chain", realTime: true, aliases: [] },
+    ],
+  ]);
+  const cfg = {
+    chains: { eth: { id: 1 } },
+    contracts: { C: { chain: "eth", address: "0xabc" } },
+  };
   const s = analyzeConfig(cfg, catalog).sources[0]!;
   assert.equal(s.verdict, "NO_DATASET");
   assert.ok(s.blockers.some((b) => b.includes("does not serve")));
 });
 
 test("block-range caveat note surfaced (Optimism Bedrock)", () => {
-  const cfg = { chains: { op: { id: 10 } }, contracts: { T: { chain: "op", address: "0xabc", includeCallTraces: true } } };
+  const cfg = {
+    chains: { op: { id: 10 } },
+    contracts: {
+      T: { chain: "op", address: "0xabc", includeCallTraces: true },
+    },
+  };
   const s = analyzeConfig(cfg, new Map()).sources[0]!;
   assert.equal(s.verdict, "READY");
   assert.ok(s.notes.some((n) => n.includes("Bedrock")));
 });
 
 test("withPortal: extracts portal into registry and strips it from the chain", () => {
-  const cfg: any = { chains: { mainnet: { id: 1, rpc: "x", portal: "https://portal.sqd.dev/datasets/ethereum-mainnet" } } };
+  const cfg: any = {
+    chains: {
+      mainnet: {
+        id: 1,
+        rpc: "x",
+        portal: "https://portal.sqd.dev/datasets/ethereum-mainnet",
+      },
+    },
+  };
   withPortal(cfg);
-  assert.equal(getPortalDataset(1), "https://portal.sqd.dev/datasets/ethereum-mainnet");
+  assert.equal(
+    getPortalDataset(1),
+    "https://portal.sqd.dev/datasets/ethereum-mainnet",
+  );
   assert.equal(cfg.chains.mainnet.portal, undefined);
   assert.equal(cfg.chains.mainnet.rpc, "x");
 });

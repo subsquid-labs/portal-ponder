@@ -29,11 +29,39 @@ const logCols = (t: any) => ({
   blockNumber: t.bigint().notNull(),
   txHash: t.hex().notNull(),
 });
-export const deposit = onchainTable("deposit", (t) => ({ ...logCols(t), sender: t.hex().notNull(), owner: t.hex().notNull(), assets: t.bigint().notNull(), shares: t.bigint().notNull() }));
-export const withdraw = onchainTable("withdraw", (t) => ({ ...logCols(t), sender: t.hex().notNull(), receiver: t.hex().notNull(), owner: t.hex().notNull(), assets: t.bigint().notNull(), shares: t.bigint().notNull() }));
-export const borrow = onchainTable("borrow", (t) => ({ ...logCols(t), account: t.hex().notNull(), assets: t.bigint().notNull() }));
-export const repay = onchainTable("repay", (t) => ({ ...logCols(t), account: t.hex().notNull(), assets: t.bigint().notNull() }));
-export const liquidate = onchainTable("liquidate", (t) => ({ ...logCols(t), liquidator: t.hex().notNull(), violator: t.hex().notNull(), collateral: t.hex().notNull(), repayAssets: t.bigint().notNull(), yieldBalance: t.bigint().notNull() }));
+export const deposit = onchainTable("deposit", (t) => ({
+  ...logCols(t),
+  sender: t.hex().notNull(),
+  owner: t.hex().notNull(),
+  assets: t.bigint().notNull(),
+  shares: t.bigint().notNull(),
+}));
+export const withdraw = onchainTable("withdraw", (t) => ({
+  ...logCols(t),
+  sender: t.hex().notNull(),
+  receiver: t.hex().notNull(),
+  owner: t.hex().notNull(),
+  assets: t.bigint().notNull(),
+  shares: t.bigint().notNull(),
+}));
+export const borrow = onchainTable("borrow", (t) => ({
+  ...logCols(t),
+  account: t.hex().notNull(),
+  assets: t.bigint().notNull(),
+}));
+export const repay = onchainTable("repay", (t) => ({
+  ...logCols(t),
+  account: t.hex().notNull(),
+  assets: t.bigint().notNull(),
+}));
+export const liquidate = onchainTable("liquidate", (t) => ({
+  ...logCols(t),
+  liquidator: t.hex().notNull(),
+  violator: t.hex().notNull(),
+  collateral: t.hex().notNull(),
+  repayAssets: t.bigint().notNull(),
+  yieldBalance: t.bigint().notNull(),
+}));
 
 // VaultStatus carries the derived supply/borrow APY (computeAPYs, ported from src/utils/math.ts)
 export const vaultStatus = onchainTable("vault_status", (t) => ({
@@ -62,5 +90,9 @@ export const account = onchainTable("account", (t) => ({
 
 // one matched relation pair (vault ↔ deposits) — how the subgraph's @derivedFrom reverse
 // lookups port to Ponder: define both sides explicitly.
-export const vaultRelations = relations(vault, ({ many }) => ({ deposits: many(deposit) }));
-export const depositRelations = relations(deposit, ({ one }) => ({ vaultRef: one(vault, { fields: [deposit.vault], references: [vault.id] }) }));
+export const vaultRelations = relations(vault, ({ many }) => ({
+  deposits: many(deposit),
+}));
+export const depositRelations = relations(deposit, ({ one }) => ({
+  vaultRef: one(vault, { fields: [deposit.vault], references: [vault.id] }),
+}));

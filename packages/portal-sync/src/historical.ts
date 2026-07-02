@@ -11,18 +11,45 @@
  * machinery. The runtime's adaptive estimator grows intervals toward 100k
  * blocks, which only makes Portal faster.
  */
-import { PortalClient } from "./portal-client.ts";
+
 import type { PortalMetrics } from "./metrics.ts";
-import { buildPortalQuery, type LogFilter, type TraceFilter, type Interval } from "./query.ts";
-import { toSyncLog, toSyncBlock, toSyncTransaction, toSyncReceipt, toSyncTraces, type SyncLog, type SyncBlock, type SyncTrace } from "./transform.ts";
+import { PortalClient } from "./portal-client.ts";
+import {
+  buildPortalQuery,
+  type Interval,
+  type LogFilter,
+  type TraceFilter,
+} from "./query.ts";
+import {
+  type SyncBlock,
+  type SyncLog,
+  type SyncTrace,
+  toSyncBlock,
+  toSyncLog,
+  toSyncReceipt,
+  toSyncTraces,
+  toSyncTransaction,
+} from "./transform.ts";
 
 /** Subset of Ponder's SyncStore the Portal path writes (same method names/shapes). */
 export interface SyncStore {
   insertLogs(p: { logs: SyncLog[]; chainId: number }): Promise<void> | void;
-  insertBlocks(p: { blocks: SyncBlock[]; chainId: number }): Promise<void> | void;
-  insertTransactions(p: { transactions: unknown[]; chainId: number }): Promise<void> | void;
-  insertTransactionReceipts(p: { transactionReceipts: unknown[]; chainId: number }): Promise<void> | void;
-  insertTraces(p: { traces: SyncTrace[]; chainId: number }): Promise<void> | void;
+  insertBlocks(p: {
+    blocks: SyncBlock[];
+    chainId: number;
+  }): Promise<void> | void;
+  insertTransactions(p: {
+    transactions: unknown[];
+    chainId: number;
+  }): Promise<void> | void;
+  insertTransactionReceipts(p: {
+    transactionReceipts: unknown[];
+    chainId: number;
+  }): Promise<void> | void;
+  insertTraces(p: {
+    traces: SyncTrace[];
+    chainId: number;
+  }): Promise<void> | void;
 }
 
 /** A factory whose children are discovered from a log and reused on later intervals. */
@@ -57,11 +84,21 @@ export type CreatePortalHistoricalSyncParams = {
 };
 
 export type HistoricalSync = {
-  syncBlockRangeData(p: { interval: Interval; syncStore: SyncStore }): Promise<SyncLog[]>;
-  syncBlockData(p: { interval: Interval; logs: SyncLog[]; syncStore: SyncStore }): Promise<SyncBlock | undefined>;
+  syncBlockRangeData(p: {
+    interval: Interval;
+    syncStore: SyncStore;
+  }): Promise<SyncLog[]>;
+  syncBlockData(p: {
+    interval: Interval;
+    logs: SyncLog[];
+    syncStore: SyncStore;
+  }): Promise<SyncBlock | undefined>;
 };
 
-const extractChild = (rule: FactoryDiscovery["child"], log: any): string | undefined => {
+const extractChild = (
+  rule: FactoryDiscovery["child"],
+  log: any,
+): string | undefined => {
   if (rule.kind === "topic") {
     const t = log.topics?.[rule.index];
     return t ? ("0x" + t.slice(26)).toLowerCase() : undefined;
@@ -71,10 +108,18 @@ const extractChild = (rule: FactoryDiscovery["child"], log: any): string | undef
   return w.length === 64 ? ("0x" + w.slice(24)).toLowerCase() : undefined;
 };
 
-export const createPortalHistoricalSync = (params: CreatePortalHistoricalSyncParams): HistoricalSync => {
-  const client = new PortalClient({ dataset: params.dataset, baseUrl: params.baseUrl, metrics: params.metrics });
-  const childAddresses = params.childAddresses ?? new Map<string, Set<string>>();
-  for (const f of params.sources.factories) if (!childAddresses.has(f.name)) childAddresses.set(f.name, new Set());
+export const createPortalHistoricalSync = (
+  params: CreatePortalHistoricalSyncParams,
+): HistoricalSync => {
+  const client = new PortalClient({
+    dataset: params.dataset,
+    baseUrl: params.baseUrl,
+    metrics: params.metrics,
+  });
+  const childAddresses =
+    params.childAddresses ?? new Map<string, Set<string>>();
+  for (const f of params.sources.factories)
+    if (!childAddresses.has(f.name)) childAddresses.set(f.name, new Set());
 
   /** Resolve the chain's full filter set for an interval, with current children. */
   const logFiltersFor = (): LogFilter[] => {
@@ -84,7 +129,12 @@ export const createPortalHistoricalSync = (params: CreatePortalHistoricalSyncPar
       filters.push({ address: [f.factory], topic0: [f.discoveryTopic0] });
       // child-data filter over children discovered so far
       const addrs = [...childAddresses.get(f.name)!];
-      if (addrs.length && f.childTopic0s.length) filters.push({ address: addrs, topic0: f.childTopic0s, includeTransaction: params.sources.includeReceipts });
+      if (addrs.length && f.childTopic0s.length)
+        filters.push({
+          address: addrs,
+          topic0: f.childTopic0s,
+          includeTransaction: params.sources.includeReceipts,
+        });
     }
     return filters;
   };
@@ -93,7 +143,9 @@ export const createPortalHistoricalSync = (params: CreatePortalHistoricalSyncPar
     async syncBlockRangeData({ interval, syncStore }) {
       const query = buildPortalQuery(interval, logFiltersFor(), {
         receipts: params.sources.includeReceipts,
-        traces: params.sources.traceFilters.length ? params.sources.traceFilters : undefined,
+        traces: params.sources.traceFilters.length
+          ? params.sources.traceFilters
+          : undefined,
       });
 
       const syncLogs: SyncLog[] = [];
@@ -104,12 +156,16 @@ export const createPortalHistoricalSync = (params: CreatePortalHistoricalSyncPar
 
       for await (const batch of client.streamFinalized(query)) {
         for (const b of batch.blocks) {
-          if (b.logs?.length || b.transactions?.length || b.traces?.length) blocks.push(toSyncBlock(b));
+          if (b.logs?.length || b.transactions?.length || b.traces?.length)
+            blocks.push(toSyncBlock(b));
           for (const log of b.logs ?? []) {
             syncLogs.push(toSyncLog(log, b.header));
             // factory child discovery
             for (const f of params.sources.factories) {
-              if ((log.address as string).toLowerCase() === f.factory && log.topics?.[0] === f.discoveryTopic0) {
+              if (
+                (log.address as string).toLowerCase() === f.factory &&
+                log.topics?.[0] === f.discoveryTopic0
+              ) {
                 const c = extractChild(f.child, log);
                 if (c) childAddresses.get(f.name)!.add(c);
               }
@@ -117,17 +173,28 @@ export const createPortalHistoricalSync = (params: CreatePortalHistoricalSyncPar
           }
           for (const tx of b.transactions ?? []) {
             transactions.push(toSyncTransaction(tx, b.header));
-            if (params.sources.includeReceipts) receipts.push(toSyncReceipt(tx, b.header));
+            if (params.sources.includeReceipts)
+              receipts.push(toSyncReceipt(tx, b.header));
           }
           traces.push(...toSyncTraces(b));
         }
       }
 
       await syncStore.insertLogs({ logs: syncLogs, chainId: params.chainId });
-      if (blocks.length) await syncStore.insertBlocks({ blocks, chainId: params.chainId });
-      if (transactions.length) await syncStore.insertTransactions({ transactions, chainId: params.chainId });
-      if (receipts.length) await syncStore.insertTransactionReceipts({ transactionReceipts: receipts, chainId: params.chainId });
-      if (traces.length) await syncStore.insertTraces({ traces, chainId: params.chainId });
+      if (blocks.length)
+        await syncStore.insertBlocks({ blocks, chainId: params.chainId });
+      if (transactions.length)
+        await syncStore.insertTransactions({
+          transactions,
+          chainId: params.chainId,
+        });
+      if (receipts.length)
+        await syncStore.insertTransactionReceipts({
+          transactionReceipts: receipts,
+          chainId: params.chainId,
+        });
+      if (traces.length)
+        await syncStore.insertTraces({ traces, chainId: params.chainId });
 
       return syncLogs;
     },
@@ -139,7 +206,11 @@ export const createPortalHistoricalSync = (params: CreatePortalHistoricalSyncPar
     async syncBlockData({ logs }) {
       if (logs.length === 0) return undefined;
       const last = logs[logs.length - 1]!;
-      return { number: last.blockNumber, hash: last.blockHash, transactions: [] };
+      return {
+        number: last.blockNumber,
+        hash: last.blockHash,
+        transactions: [],
+      };
     },
   };
 };

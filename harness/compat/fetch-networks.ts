@@ -14,7 +14,12 @@ import { join } from "node:path";
 const DOCS = "https://docs.sqd.dev/en/data/all-networks";
 
 const html = await fetch(DOCS).then((r) => r.text());
-const unescaped = html.replace(/\\n/g, "\n").replace(/\\"/g, '"').replace(/\\u003e/g, ">").replace(/\\u003c/g, "<").replace(/\\\\/g, "\\");
+const unescaped = html
+  .replace(/\\n/g, "\n")
+  .replace(/\\"/g, '"')
+  .replace(/\\u003e/g, ">")
+  .replace(/\\u003c/g, "<")
+  .replace(/\\\\/g, "\\");
 
 const re = /\{[^{}]*?"slug"\s*:\s*"[^"]+"[^{}]*?\}/g;
 const out: Record<string, any> = {};
@@ -24,13 +29,39 @@ while ((m = re.exec(unescaped))) {
   const t = m[0];
   if (!/"traces"/.test(t) || !/"stateDiffs"/.test(t)) continue;
   let o: any;
-  try { o = JSON.parse(t); } catch { continue; }
+  try {
+    o = JSON.parse(t);
+  } catch {
+    continue;
+  }
   rows++;
   const cid = Number(o.chainId);
   if (!Number.isFinite(cid) || cid === 0) continue; // skip non-numeric / missing chainId
-  out[cid] = { name: o.name, slug: o.slug, type: o.type, portal: !!o.portal, realtime: !!o.realtime, traces: !!o.traces, stateDiffs: !!o.stateDiffs, ...(o.tooltip ? { note: o.tooltip } : {}) };
+  out[cid] = {
+    name: o.name,
+    slug: o.slug,
+    type: o.type,
+    portal: !!o.portal,
+    realtime: !!o.realtime,
+    traces: !!o.traces,
+    stateDiffs: !!o.stateDiffs,
+    ...(o.tooltip ? { note: o.tooltip } : {}),
+  };
 }
 
 const path = join(import.meta.dirname, "networks.json");
-writeFileSync(path, JSON.stringify({ _source: DOCS, _generated: "run fetch-networks.ts to refresh", networks: out }, null, 2) + "\n");
-console.log(`parsed ${rows} rows → wrote ${Object.keys(out).length} networks (with numeric chainId) to ${path}`);
+writeFileSync(
+  path,
+  JSON.stringify(
+    {
+      _source: DOCS,
+      _generated: "run fetch-networks.ts to refresh",
+      networks: out,
+    },
+    null,
+    2,
+  ) + "\n",
+);
+console.log(
+  `parsed ${rows} rows → wrote ${Object.keys(out).length} networks (with numeric chainId) to ${path}`,
+);

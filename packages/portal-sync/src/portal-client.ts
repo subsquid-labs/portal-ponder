@@ -10,8 +10,9 @@
  * datasets/intervals is bounded by the caller, per Portal's CU/worker economics
  * ("a small number of concurrent streams, each over a large contiguous range").
  */
-import type { PortalEvmQuery, PortalBlock, BlockRef } from "./portal-types.ts";
+
 import type { PortalMetrics } from "./metrics.ts";
+import type { BlockRef, PortalBlock, PortalEvmQuery } from "./portal-types.ts";
 
 export type PortalClientOptions = {
   baseUrl?: string;
@@ -46,7 +47,10 @@ export class PortalClient {
   headers: Record<string, string>;
 
   constructor(opts: PortalClientOptions) {
-    this.baseUrl = (opts.baseUrl ?? "https://portal.sqd.dev/datasets").replace(/\/$/, "");
+    this.baseUrl = (opts.baseUrl ?? "https://portal.sqd.dev/datasets").replace(
+      /\/$/,
+      "",
+    );
     this.dataset = opts.dataset;
     this.metrics = opts.metrics;
     this.requestTimeoutMs = opts.requestTimeoutMs ?? 60_000;
@@ -69,11 +73,14 @@ export class PortalClient {
   private async getRef(path: string): Promise<BlockRef | undefined> {
     const res = await fetch(this.url(path), { headers: this.headers });
     if (res.status === 204 || res.status === 404) return undefined;
-    if (!res.ok) throw new Error(`Portal ${path} ${res.status}: ${await res.text()}`);
+    if (!res.ok)
+      throw new Error(`Portal ${path} ${res.status}: ${await res.text()}`);
     return (await res.json()) as BlockRef;
   }
   async getMetadata(): Promise<any> {
-    const res = await fetch(this.url("metadata"), { headers: { "accept-encoding": "gzip" } });
+    const res = await fetch(this.url("metadata"), {
+      headers: { "accept-encoding": "gzip" },
+    });
     if (!res.ok) throw new Error(`Portal metadata ${res.status}`);
     return res.json();
   }
@@ -85,7 +92,8 @@ export class PortalClient {
    */
   async *streamFinalized(query: PortalEvmQuery): AsyncGenerator<StreamBatch> {
     const target = query.toBlock;
-    if (target === undefined) throw new Error("backfill stream requires toBlock");
+    if (target === undefined)
+      throw new Error("backfill stream requires toBlock");
     this.metrics?.onLogicalStream(this.dataset, query.fromBlock, target);
 
     let cursor = query.fromBlock;
@@ -96,14 +104,20 @@ export class PortalClient {
       yield batch;
       if (batch.toBlock < cursor) {
         // server made no progress — guard against an infinite loop
-        throw new Error(`Portal made no forward progress at block ${cursor} (got ${batch.toBlock})`);
+        throw new Error(
+          `Portal made no forward progress at block ${cursor} (got ${batch.toBlock})`,
+        );
       }
       cursor = batch.toBlock + 1;
     }
   }
 
   /** One HTTP POST + NDJSON drain, with Retry-After-aware retries. */
-  private async postOnce(body: string, fromBlock: number, target: number): Promise<StreamBatch | "above-head"> {
+  private async postOnce(
+    body: string,
+    fromBlock: number,
+    target: number,
+  ): Promise<StreamBatch | "above-head"> {
     let attempt = 0;
     while (true) {
       const started = Date.now();
@@ -118,16 +132,26 @@ export class PortalClient {
         });
 
         if (res.status === 204) {
-          this.metrics?.onHttpResponse(this.dataset, { status: 204, bytes: 0, durationMs: Date.now() - started });
+          this.metrics?.onHttpResponse(this.dataset, {
+            status: 204,
+            bytes: 0,
+            durationMs: Date.now() - started,
+          });
           return "above-head";
         }
 
         if (res.status === 503 || res.status === 529 || res.status === 429) {
           await res.body?.cancel().catch(() => {});
           const waitMs = this.retryAfterMs(res, attempt);
-          this.metrics?.onHttpResponse(this.dataset, { status: res.status, bytes: 0, durationMs: Date.now() - started });
+          this.metrics?.onHttpResponse(this.dataset, {
+            status: res.status,
+            bytes: 0,
+            durationMs: Date.now() - started,
+          });
           if (attempt++ >= this.maxRetries) {
-            throw new Error(`Portal overloaded (${res.status}) at block ${fromBlock} after ${attempt} attempts`);
+            throw new Error(
+              `Portal overloaded (${res.status}) at block ${fromBlock} after ${attempt} attempts`,
+            );
           }
           this.metrics?.onRetry(this.dataset, waitMs);
           await sleep(waitMs);
@@ -136,28 +160,45 @@ export class PortalClient {
 
         if (!res.ok) {
           const text = await res.text().catch(() => "");
-          this.metrics?.onHttpResponse(this.dataset, { status: res.status, bytes: text.length, durationMs: Date.now() - started });
-          throw new Error(`Portal stream ${res.status} at block ${fromBlock}: ${text.slice(0, 200)}`);
+          this.metrics?.onHttpResponse(this.dataset, {
+            status: res.status,
+            bytes: text.length,
+            durationMs: Date.now() - started,
+          });
+          throw new Error(
+            `Portal stream ${res.status} at block ${fromBlock}: ${text.slice(0, 200)}`,
+          );
         }
 
         // 200 — drain NDJSON
         const drained = await this.drainNdjson(res, fromBlock);
         this.metrics?.onHttpResponse(this.dataset, {
-          status: 200, bytes: drained.bytes, durationMs: Date.now() - started,
-          blocks: drained.blocks.length, logs: drained.logs, transactions: drained.transactions,
-          traces: drained.traces, lastBlock: drained.lastBlock,
+          status: 200,
+          bytes: drained.bytes,
+          durationMs: Date.now() - started,
+          blocks: drained.blocks.length,
+          logs: drained.logs,
+          transactions: drained.transactions,
+          traces: drained.traces,
+          lastBlock: drained.lastBlock,
         });
         return {
           blocks: drained.blocks,
           fromBlock,
           toBlock: Math.min(drained.lastBlock ?? target, target),
-          logs: drained.logs, transactions: drained.transactions, traces: drained.traces,
+          logs: drained.logs,
+          transactions: drained.transactions,
+          traces: drained.traces,
         };
       } catch (err) {
         const aborted = (err as Error)?.name === "AbortError";
         if (aborted && attempt++ < this.maxRetries) {
           // a timeout is a transient, not a poison pill — back off and retry the cursor
-          this.metrics?.onHttpResponse(this.dataset, { status: 500, bytes: 0, durationMs: Date.now() - started });
+          this.metrics?.onHttpResponse(this.dataset, {
+            status: 500,
+            bytes: 0,
+            durationMs: Date.now() - started,
+          });
           const waitMs = Math.min(500 * 2 ** attempt, this.maxRetryAfterMs);
           this.metrics?.onRetry(this.dataset, waitMs);
           await sleep(waitMs);
@@ -174,14 +215,18 @@ export class PortalClient {
     const h = res.headers.get("retry-after");
     if (h) {
       const secs = Number(h);
-      if (Number.isFinite(secs)) return Math.min(secs * 1000, this.maxRetryAfterMs);
+      if (Number.isFinite(secs))
+        return Math.min(secs * 1000, this.maxRetryAfterMs);
     }
     return Math.min(500 * 2 ** attempt, this.maxRetryAfterMs);
   }
 
   private async drainNdjson(res: Response, fromBlock: number) {
     const blocks: PortalBlock[] = [];
-    let bytes = 0, logs = 0, transactions = 0, traces = 0;
+    let bytes = 0,
+      logs = 0,
+      transactions = 0,
+      traces = 0;
     let lastBlock: number | undefined;
 
     const reader = res.body!.getReader();
@@ -192,7 +237,8 @@ export class PortalClient {
       const b = JSON.parse(line) as PortalBlock;
       blocks.push(b);
       const n = b.header?.number;
-      if (typeof n === "number" && (lastBlock === undefined || n > lastBlock)) lastBlock = n;
+      if (typeof n === "number" && (lastBlock === undefined || n > lastBlock))
+        lastBlock = n;
       if (b.logs) logs += b.logs.length;
       if (b.transactions) transactions += b.transactions.length;
       if (b.traces) traces += b.traces.length;

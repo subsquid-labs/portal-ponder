@@ -57,7 +57,13 @@ export type PortalEvmQuery = {
 
 /** One NDJSON line. Only `header.number` is guaranteed present. */
 export type PortalBlock = {
-  header: { number: number; hash?: string; parentHash?: string; timestamp?: number; [k: string]: unknown };
+  header: {
+    number: number;
+    hash?: string;
+    parentHash?: string;
+    timestamp?: number;
+    [k: string]: unknown;
+  };
   logs?: any[];
   transactions?: any[];
   traces?: any[];

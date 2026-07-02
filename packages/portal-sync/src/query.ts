@@ -9,7 +9,12 @@
  * OR'd `logs[]` entries (still one stream). Fields are projected to exactly what
  * the sync-store needs.
  */
-import type { PortalEvmQuery, PortalLogRequest, PortalTraceRequest, PortalFieldSelection } from "./portal-types.ts";
+import type {
+  PortalEvmQuery,
+  PortalFieldSelection,
+  PortalLogRequest,
+  PortalTraceRequest,
+} from "./portal-types.ts";
 
 export type Topic = string | string[] | null | undefined;
 
@@ -53,37 +58,100 @@ const lower = (s: string) => s.toLowerCase();
 /** Full field projections matching Ponder's sync-store columns. */
 export const FIELDS = {
   block: {
-    number: true, hash: true, parentHash: true, timestamp: true, logsBloom: true,
-    miner: true, gasUsed: true, gasLimit: true, baseFeePerGas: true, nonce: true,
-    mixHash: true, stateRoot: true, receiptsRoot: true, transactionsRoot: true,
-    sha3Uncles: true, size: true, difficulty: true, totalDifficulty: true, extraData: true,
+    number: true,
+    hash: true,
+    parentHash: true,
+    timestamp: true,
+    logsBloom: true,
+    miner: true,
+    gasUsed: true,
+    gasLimit: true,
+    baseFeePerGas: true,
+    nonce: true,
+    mixHash: true,
+    stateRoot: true,
+    receiptsRoot: true,
+    transactionsRoot: true,
+    sha3Uncles: true,
+    size: true,
+    difficulty: true,
+    totalDifficulty: true,
+    extraData: true,
   } as Record<string, boolean>,
-  log: { address: true, topics: true, data: true, transactionHash: true, transactionIndex: true, logIndex: true } as Record<string, boolean>,
+  log: {
+    address: true,
+    topics: true,
+    data: true,
+    transactionHash: true,
+    transactionIndex: true,
+    logIndex: true,
+  } as Record<string, boolean>,
   transactionBase: {
-    transactionIndex: true, hash: true, from: true, to: true, input: true, value: true,
-    nonce: true, gas: true, gasPrice: true, maxFeePerGas: true, maxPriorityFeePerGas: true,
-    type: true, r: true, s: true, v: true, yParity: true,
+    transactionIndex: true,
+    hash: true,
+    from: true,
+    to: true,
+    input: true,
+    value: true,
+    nonce: true,
+    gas: true,
+    gasPrice: true,
+    maxFeePerGas: true,
+    maxPriorityFeePerGas: true,
+    type: true,
+    r: true,
+    s: true,
+    v: true,
+    yParity: true,
   } as Record<string, boolean>,
   receipt: {
-    status: true, gasUsed: true, cumulativeGasUsed: true, effectiveGasPrice: true,
-    contractAddress: true, logsBloom: true,
+    status: true,
+    gasUsed: true,
+    cumulativeGasUsed: true,
+    effectiveGasPrice: true,
+    contractAddress: true,
+    logsBloom: true,
   } as Record<string, boolean>,
   trace: {
-    transactionIndex: true, traceAddress: true, subtraces: true, type: true, error: true, revertReason: true,
-    callFrom: true, callTo: true, callValue: true, callGas: true, callInput: true, callSighash: true, callType: true,
-    callResultGasUsed: true, callResultOutput: true,
-    createFrom: true, createValue: true, createGas: true, createInit: true,
-    createResultGasUsed: true, createResultCode: true, createResultAddress: true,
+    transactionIndex: true,
+    traceAddress: true,
+    subtraces: true,
+    type: true,
+    error: true,
+    revertReason: true,
+    callFrom: true,
+    callTo: true,
+    callValue: true,
+    callGas: true,
+    callInput: true,
+    callSighash: true,
+    callType: true,
+    callResultGasUsed: true,
+    callResultOutput: true,
+    createFrom: true,
+    createValue: true,
+    createGas: true,
+    createInit: true,
+    createResultGasUsed: true,
+    createResultCode: true,
+    createResultAddress: true,
   } as Record<string, boolean>,
 };
 
 /** Split one log filter into >=1 Portal logs[] entries respecting the address cap. */
-const expandLogFilter = (f: LogFilter, maxAddresses: number): PortalLogRequest[] => {
+const expandLogFilter = (
+  f: LogFilter,
+  maxAddresses: number,
+): PortalLogRequest[] => {
   const base: PortalLogRequest = {};
-  const t0 = asArray(f.topic0); if (t0) base.topic0 = t0.map(lower);
-  const t1 = asArray(f.topic1); if (t1) base.topic1 = t1.map(lower);
-  const t2 = asArray(f.topic2); if (t2) base.topic2 = t2.map(lower);
-  const t3 = asArray(f.topic3); if (t3) base.topic3 = t3.map(lower);
+  const t0 = asArray(f.topic0);
+  if (t0) base.topic0 = t0.map(lower);
+  const t1 = asArray(f.topic1);
+  if (t1) base.topic1 = t1.map(lower);
+  const t2 = asArray(f.topic2);
+  if (t2) base.topic2 = t2.map(lower);
+  const t3 = asArray(f.topic3);
+  if (t3) base.topic3 = t3.map(lower);
   if (f.includeTransaction) base.transaction = true;
 
   if (f.address === undefined) return [base];
@@ -117,13 +185,19 @@ export const buildPortalQuery = (
 ): PortalEvmQuery => {
   const maxAddresses = opts.maxAddresses ?? PORTAL_MAX_ADDRESSES;
 
-  const logs: PortalLogRequest[] = logFilters.flatMap((f) => expandLogFilter(f, maxAddresses));
+  const logs: PortalLogRequest[] = logFilters.flatMap((f) =>
+    expandLogFilter(f, maxAddresses),
+  );
 
-  const needTx = logFilters.some((f) => f.includeTransaction) || (opts.traces?.length ?? 0) > 0;
+  const needTx =
+    logFilters.some((f) => f.includeTransaction) ||
+    (opts.traces?.length ?? 0) > 0;
 
   const fields: PortalFieldSelection = { block: FIELDS.block, log: FIELDS.log };
   if (needTx) {
-    fields.transaction = opts.receipts ? { ...FIELDS.transactionBase, ...FIELDS.receipt } : { ...FIELDS.transactionBase };
+    fields.transaction = opts.receipts
+      ? { ...FIELDS.transactionBase, ...FIELDS.receipt }
+      : { ...FIELDS.transactionBase };
   }
 
   const query: PortalEvmQuery = {

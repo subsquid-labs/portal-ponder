@@ -20,10 +20,16 @@
 /** chainId → Portal dataset URL, populated by withPortal(), read by the injection. */
 export const portalRegistry = new Map<number, string>();
 
-export type PortalChainConfig = { id: number; portal?: string; [k: string]: unknown };
+export type PortalChainConfig = {
+  id: number;
+  portal?: string;
+  [k: string]: unknown;
+};
 
 /** Pre-process a Ponder config: record `portal` per chain and strip it before Ponder sees it. */
-export function withPortal<T extends { chains?: Record<string, PortalChainConfig> }>(config: T): T {
+export function withPortal<
+  T extends { chains?: Record<string, PortalChainConfig> },
+>(config: T): T {
   for (const chain of Object.values(config.chains ?? {})) {
     if (chain && typeof chain.portal === "string") {
       portalRegistry.set(chain.id, chain.portal);
@@ -33,4 +39,5 @@ export function withPortal<T extends { chains?: Record<string, PortalChainConfig
   return config;
 }
 
-export const getPortalDataset = (chainId: number): string | undefined => portalRegistry.get(chainId);
+export const getPortalDataset = (chainId: number): string | undefined =>
+  portalRegistry.get(chainId);

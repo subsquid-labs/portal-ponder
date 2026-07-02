@@ -6,7 +6,8 @@
     "useIgnoreFile": true
   },
   "files": {
-    "ignoreUnknown": false
+    "ignoreUnknown": false,
+    "includes": ["**", "!portal/__fixtures__/*.json"]
   },
   "formatter": {
     "enabled": true,

@@ -1,5 +1,5 @@
-import { parseAbiItem } from "abitype";
 import { createConfig, factory } from "@subsquid/ponder";
+import { parseAbiItem } from "abitype";
 import { EVaultAbi } from "./abis/EVault";
 
 // Euler V2 subgraph → Ponder. The subgraph's GenericFactory template (ProxyCreated → EVault)
@@ -27,7 +27,9 @@ export default createConfig({
         parameter: "proxy", // child EVault address (subgraph: event.params.proxy)
       }),
       startBlock: Number(process.env.PONDER_START ?? 20_529_207), // subgraph mainnet startBlock
-      endBlock: process.env.PONDER_END ? Number(process.env.PONDER_END) : undefined,
+      endBlock: process.env.PONDER_END
+        ? Number(process.env.PONDER_END)
+        : undefined,
     },
   },
 });
