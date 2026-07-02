@@ -1,0 +1,16 @@
+{
+  "name": "uniswap-portal",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "ponder dev",
+    "start": "ponder start",
+    "codegen": "ponder codegen"
+  },
+  "dependencies": {
+    "abitype": "^0.10.2",
+    "hono": "^4.5.0",
+    "viem": "^2.21.3",
+    "@subsquid/ponder": "0.16.6-sqd.1"
+  }
+}

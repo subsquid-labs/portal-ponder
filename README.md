@@ -71,6 +71,17 @@ node --experimental-strip-types harness/compat/report.ts ./ponder.config.ts   # 
 
 Full adoption path — check, swap, run, validate, roll back — in [`MIGRATION.md`](MIGRATION.md).
 
+## Ponder versions
+
+`@subsquid/ponder@X.Y.Z-sqd.<rev>` is `ponder@X.Y.Z` plus the Portal layer, pinned to a known Ponder version; `-sqd.<rev>` ships a fork-side fix on the same Ponder version. The seam is stable across 0.15.17–0.16.6.
+
+| Ponder | `@subsquid/ponder` | Status |
+|---|---|---|
+| 0.16.6 | `0.16.6-sqd.1` | current |
+| 0.15.17 | `0.15.17-sqd.1` | planned |
+
+`npm install @subsquid/ponder` installs the latest; pin `@X.Y.Z-sqd.<rev>` to match your Ponder version. How versions work: [`PUBLISHING.md`](PUBLISHING.md).
+
 ## Going to production
 
 **The fork is in beta.** We've tested it extensively in-house — the 15-chain, 28M-event run above is one such test — and we'd value your testing and bug reports ([GitHub issues](https://github.com/subsquid-labs/portal-ponder/issues) · [SquidDevs on Telegram](https://t.me/HydraDevs)). The Portal underneath is not new: it's the enterprise-grade data layer behind **$20B+ in TVL**, used in production by teams like GMX, Morpho, and PancakeSwap.
