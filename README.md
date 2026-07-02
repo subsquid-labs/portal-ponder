@@ -66,7 +66,7 @@ At scale, one app indexing a real protocol (Euler V2) across all **15 chains** i
 All of Ponder's source types are supported — logs, factories, transactions, receipts, traces, block intervals, accounts; `readContract` uses your RPC. The Portal serves [130+ EVM networks](https://docs.sqd.dev/en/data/all-networks); per-network capabilities and per-portal availability vary. Check an indexer before migrating:
 
 ```bash
-node --experimental-strip-types harness/compat/report.ts ./ponder.config.ts   # → READY / NEEDS_TRACES / NO_DATASET per source
+npx tsx harness/compat/report.ts ./ponder.config.ts   # → READY / NEEDS_TRACES / NO_DATASET per source
 ```
 
 Full adoption path — check, swap, run, validate, roll back — in [`MIGRATION.md`](MIGRATION.md).

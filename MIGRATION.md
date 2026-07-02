@@ -6,20 +6,18 @@
 
 ---
 
-## Step 0 — Prove it (compatibility + parity, no production change)
+## Step 0 — Check compatibility (optional)
 
-Run the compatibility report against your config, pointing `PORTAL_BASE` at the portal you'll actually use (dataset availability is per-portal):
+A read-only pre-flight, in seconds and with no RPC: does the target portal serve your chains and source types? It changes nothing. Point `PORTAL_BASE` at the portal you'll actually use (dataset availability is per-portal):
 
 ```bash
 cd <your-ponder-project>
-PORTAL_API_KEY=<key> PORTAL_BASE=<portal> \
-  node <path>/harness/compat/report.ts ./ponder.config.ts --differential <your-rpc-url>
+PORTAL_BASE=<portal> npx tsx <path>/harness/compat/report.ts ./ponder.config.ts
 ```
 
-- **Coverage** — per source: is the type supported, does the target portal serve that chain's dataset, and does the network have the needed capability (traces/state-diffs, with block-range caveats). Output is a per-source `READY` / `NEEDS_*` verdict; for event + factory indexers (Uniswap, Euler, …) it's `READY NOW`.
-- **Parity** (`--differential`) — fetches the same `eth_getLogs` from Portal and your RPC and confirms they're byte-identical.
+It prints a per-source `READY` / `NEEDS_*` verdict — for event and factory indexers (Uniswap, Euler, …) it's `READY NOW`. Coverage checks whether the source type is supported, whether the portal serves that chain's dataset, and whether the network has the needed capability (traces / state-diffs, with block-range caveats).
 
-The report proves parity on *your* indexer before you change anything in production.
+**Optional — prove byte-parity.** Add `--differential <your-rpc-url>` to fetch the same `eth_getLogs` from the Portal and your RPC and confirm they're byte-identical. This one calls your RPC, so it is slower and depends on the RPC being responsive — run it when you want the proof, or skip it and go straight to the backfill.
 
 ---
 
