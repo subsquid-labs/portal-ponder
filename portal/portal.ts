@@ -166,6 +166,11 @@ export const createPortalHistoricalSync = (
   let rpcFallbackInstance: HistoricalSync | undefined;
   const rpcFallback = (): HistoricalSync => (rpcFallbackInstance ??= createHistoricalSync(args));
   const delegated = new Set<string>(); // interval keys routed to RPC
+  // Portal-native realtime (PORTAL_REALTIME="stream"): the recent region [portal-head → tip] is served by
+  // the Portal `/stream` in runtime/realtime.ts, and `clampFinalizedToPortalHead` lowers ponder's finalized
+  // block to the Portal head — so historical never targets past the head and this RPC finality-gap fallback
+  // is neither needed nor wanted (it's the single-thread stall this mode removes). Skip it here.
+  const STREAM_REALTIME = Boolean(args.chain.portal) && process.env.PORTAL_REALTIME === "stream";
   const refreshPortalHead = async (): Promise<number | undefined> => {
     if (process.env.PORTAL_FINALIZED_HEAD) return (portalHead = Number(process.env.PORTAL_FINALIZED_HEAD));
     // retry: the head probe is cheap, and a valid head is load-bearing for the finality-gap decision.
@@ -677,6 +682,13 @@ export const createPortalHistoricalSync = (
       if (portalHead === undefined || isFinalityGap(interval[1], portalHead)) {
         await refreshPortalHead();
         if (portalHead === undefined || isFinalityGap(interval[1], portalHead)) {
+          // Stream-realtime mode: do NOT delegate to RPC — the Portal `/stream` covers [portal-head → tip].
+          // With clampFinalizedToPortalHead this branch is unreachable (finalized ≤ portal-head), so it only
+          // fires if the head probe is failing (portalHead === undefined) — a loud degradation, not silent.
+          if (STREAM_REALTIME) {
+            log.warn({ service: "portal", msg: `Portal ${args.chain.name} [${interval[0]},${interval[1]}] past/unknown finalized head in stream mode → RPC fallback suppressed (realtime /stream covers the gap)` });
+            return [];
+          }
           delegated.add(ikey(interval)); stats.rpcFallback++;
           log.debug({ service: "portal", msg: `Portal ${args.chain.name} [${interval[0]},${interval[1]}] ${portalHead === undefined ? "head unknown" : `past finalized head ${portalHead}`} → RPC fallback` });
           return rpcFallback().syncBlockRangeData(params);
