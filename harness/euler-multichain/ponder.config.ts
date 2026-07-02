@@ -1,6 +1,6 @@
 import { parseAbiItem } from "abitype";
 import { createConfig, factory } from "@subsquid/ponder";
-import { http, fallback } from "viem";
+import { http } from "viem";
 import { EVaultAbi } from "./abis/EVault";
 import chainsData from "./chains.json";
 
@@ -9,40 +9,37 @@ import chainsData from "./chains.json";
 //
 // Historical backfill is ALWAYS the Portal. The realtime source is a config choice:
 //   • bench mode (default): bounded [deploy, head] — a clean fixed-range benchmark; RPC only for setup.
-//   • EULER_REALTIME=true:  unbounded → live. The Portal-backed RPC (euler.portal.sqd.dev/rpc/v1/evm —
-//     the realtime service offered to Euler alongside Portal + Ponder, Portal-backed under the hood)
-//     LEADS realtime, with public RPCs as fallback for downtime / tip-lag. Ponder owns reorg handling
-//     either way (RealtimeSync: parent-hash tracking + rollback to the finalized common ancestor).
+//   • EULER_REALTIME=true:  unbounded → live, realtime served by the Portal-backed RPC — the service
+//     offered to clients (Portal-backed under the hood, designed for the recent tip).
 //
-// The plain `rpc` list is GENERIC — rpc.subsquid.io/<slug> is just a fast keyed RPC (like Alchemy),
-// nothing special. The Portal-backed RPC is the distinct, Portal-served product.
+// SQD Portal domains are tenancy-specific (dedicated per client), so BOTH URLs are env-driven, never
+// hardcoded:  PORTAL_URL      = dataset base   (default https://sqd.portal.sqd.dev — SQD-internal)
+//             PORTAL_RPC_URL  = Portal-backed RPC base (e.g. https://euler.portal.sqd.dev/rpc/v1/evm)
+// One config then serves any client by swapping env. `rpc.subsquid.io` is a generic proxied RPC (like
+// Alchemy) — NOT the Portal-backed product — and is deliberately not used; keyless public RPCs
+// (chains.json `freeRpcs`) are only for setup / finality tail.
 //
-// No secrets in the repo: PORTAL_API_KEY (backfill), PORTAL_RPC_KEY (realtime), SQD_RPC_KEY come from env.
+// No secrets/tenancy in the repo: PORTAL_API_KEY, PORTAL_URL, PORTAL_RPC_KEY, PORTAL_RPC_URL come from env.
 const proxyCreated = parseAbiItem(
   "event ProxyCreated(address indexed proxy, bool upgradeable, address implementation, bytes trailingData)",
 );
 
 type ChainRow = { id: number; name: string; ds: string; factory: string; head: number; deploy: number; sqdSlug: string | null; freeRpcs: string[] };
 const rows = chainsData as ChainRow[];
-const SQD_KEY = process.env.SQD_RPC_KEY;
+const PORTAL_URL = process.env.PORTAL_URL ?? "https://sqd.portal.sqd.dev";
 const PORTAL_RPC_KEY = process.env.PORTAL_RPC_KEY;
+const PORTAL_RPC_URL = process.env.PORTAL_RPC_URL; // e.g. https://euler.portal.sqd.dev/rpc/v1/evm
 const REALTIME = process.env.EULER_REALTIME === "true";
 
-// Chains served by the Portal-backed RPC (euler.portal.sqd.dev/rpc/v1/evm). Realtime leads with it here.
+// Chains served by the Portal-backed RPC. Realtime uses it (alone) on these.
 const PORTAL_RPC_CHAINS = new Set([1, 42161, 8453, 43114, 137, 56, 9745, 143]);
 const portalRpc = (chainId: number) =>
-  http(`https://euler.portal.sqd.dev/rpc/v1/evm/${chainId}`, { fetchOptions: { headers: { "x-api-key": PORTAL_RPC_KEY ?? "" } } });
+  http(`${PORTAL_RPC_URL}/${chainId}`, { fetchOptions: { headers: { "x-api-key": PORTAL_RPC_KEY ?? "" } } });
 
-// generic RPC list: a fast keyed proxy (if configured) + keyless public RPCs — for setup / finality tail,
-// and as the realtime fallback behind the Portal-backed RPC.
-const genericRpcs = (c: ChainRow): string[] =>
-  [c.sqdSlug && SQD_KEY ? `https://rpc.subsquid.io/${c.sqdSlug}/${SQD_KEY}` : null, ...c.freeRpcs].filter(Boolean) as string[];
-
-// realtime → Portal-backed RPC preferred + generic fallback; bench → the plain generic list.
+// realtime → the Portal-backed RPC ALONE (the endpoint under evaluation): no generic proxy, no flaky
+// keyless public fallback (their 403/timeout cascades stall the single-thread). bench → public RPCs only.
 const rpcFor = (c: ChainRow) =>
-  REALTIME && PORTAL_RPC_KEY && PORTAL_RPC_CHAINS.has(c.id)
-    ? fallback([portalRpc(c.id), ...genericRpcs(c).map((u) => http(u))])
-    : genericRpcs(c);
+  REALTIME && PORTAL_RPC_KEY && PORTAL_RPC_URL && PORTAL_RPC_CHAINS.has(c.id) ? portalRpc(c.id) : c.freeRpcs;
 
 // optional subset: EULER_CHAINS=ethereum,base limits the run. In realtime mode with no explicit subset,
 // default to the Portal-backed-RPC chains (the 8 that have a realtime source).
@@ -55,7 +52,7 @@ export default createConfig({
   database: process.env.DATABASE_URL
     ? { kind: "postgres", connectionString: process.env.DATABASE_URL }
     : { kind: "pglite", directory: process.env.PGLITE_DIR ?? "./.ponder/pglite" },
-  chains: Object.fromEntries(active.map((c) => [c.name, { id: c.id, rpc: rpcFor(c), portal: `https://sqd.portal.sqd.dev/datasets/${c.ds}` }])),
+  chains: Object.fromEntries(active.map((c) => [c.name, { id: c.id, rpc: rpcFor(c), portal: `${PORTAL_URL}/datasets/${c.ds}` }])),
   contracts: {
     EVault: {
       abi: EVaultAbi,
@@ -63,7 +60,7 @@ export default createConfig({
       chain: Object.fromEntries(
         active.map((c) => [
           c.name,
-          // realtime: no endBlock → backfill to finalized head, then go live on the realtime source.
+          // realtime: no endBlock → backfill to finalized head, then go live on the Portal-backed RPC.
           { address: factory({ address: c.factory as `0x${string}`, event: proxyCreated, parameter: "proxy" }), startBlock: c.deploy, ...(REALTIME ? {} : { endBlock: c.head }) },
         ]),
       ),

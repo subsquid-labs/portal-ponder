@@ -11,20 +11,20 @@ import { fileURLToPath } from "node:url";
 const dir = path.dirname(fileURLToPath(import.meta.url));
 const chains = JSON.parse(fs.readFileSync(path.join(dir, "chains.json"), "utf8"));
 const KEY = process.env.PORTAL_RPC_KEY;
-const SQD_KEY = process.env.SQD_RPC_KEY;
+const RPC_URL = process.env.PORTAL_RPC_URL; // client-specific base, e.g. https://euler.portal.sqd.dev/rpc/v1/evm
 const PORTAL_RPC_CHAINS = new Set([1, 42161, 8453, 43114, 137, 56, 9745, 143]);
 const METRICS = process.env.PROBE_METRICS_FILE || path.join(dir, "probe-metrics.json");
 const INTERVAL = Number(process.env.PROBE_INTERVAL_MS || 15000);
 const WINDOW = Number(process.env.PROBE_WINDOW || 40); // rolling ticks
 
-if (!KEY) { console.error("PORTAL_RPC_KEY required (the Portal-backed RPC x-api-key)"); process.exit(1); }
+if (!KEY || !RPC_URL) { console.error("PORTAL_RPC_KEY + PORTAL_RPC_URL required (the Portal-backed RPC base + x-api-key)"); process.exit(1); }
 
-// per chain, probe the Portal-backed RPC (the product) alongside generic RPCs (for a fair comparison)
+// per chain, probe the Portal-backed RPC (the product) alongside a keyless public RPC (freshness baseline).
+// rpc.subsquid.io is a generic proxy, not the Portal-backed product — deliberately excluded.
 const targets = chains.filter((c) => PORTAL_RPC_CHAINS.has(c.id)).map((c) => ({
   chainId: c.id, chain: c.name,
   endpoints: [
-    { name: "portal-rpc", url: `https://euler.portal.sqd.dev/rpc/v1/evm/${c.id}`, headers: { "x-api-key": KEY } },
-    ...(c.sqdSlug && SQD_KEY ? [{ name: "sqd-proxy", url: `https://rpc.subsquid.io/${c.sqdSlug}/${SQD_KEY}` }] : []),
+    { name: "portal-rpc", url: `${RPC_URL}/${c.id}`, headers: { "x-api-key": KEY } },
     ...(c.freeRpcs || []).slice(0, 1).map((u, i) => ({ name: `public${i}`, url: u })),
   ],
 }));

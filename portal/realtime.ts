@@ -10,8 +10,9 @@
  *   import { http, fallback } from "viem";
  *   import { portalRpc } from "@subsquid/ponder/realtime";
  *
- *   // (A) Portal realtime, RPC fallback — SQD portal-backed RPC leads; public RPCs cover downtime/lag.
- *   rpc: fallback([ portalRpc(1, process.env.SQD_KEY!), http(process.env.RPC_1), http(process.env.RPC_1B) ]),
+ *   // (A) Portal realtime, RPC fallback — Portal-backed RPC leads; public RPCs cover downtime/lag.
+ *   //     base URL is provisioned per client → set PORTAL_RPC_URL (or pass { baseUrl }).
+ *   rpc: fallback([ portalRpc(1, process.env.PORTAL_RPC_KEY!), http(process.env.RPC_1), http(process.env.RPC_1B) ]),
  *
  *   // (B) RPC(s) realtime — a plain Ponder-style list, or latency-ranked for fastest-tip.
  *   rpc: [process.env.RPC_1!, process.env.RPC_1B!],
@@ -22,21 +23,24 @@
  */
 import { http, fallback, type Transport } from "viem";
 
-const PORTAL_RPC_BASE = "https://euler.portal.sqd.dev/rpc/v1/evm";
-
-/** SQD portal-backed EVM RPC transport (auth via `x-api-key` header). Usable anywhere a viem Transport is. */
-export function portalRpc(chainId: number, apiKey: string, opts?: { url?: string; timeout?: number; retryCount?: number }): Transport {
-  const url = `${opts?.url ?? PORTAL_RPC_BASE}/${chainId}`;
-  return http(url, {
+/**
+ * Portal-backed EVM RPC transport (auth via `x-api-key`). The base URL is provisioned PER CLIENT
+ * (e.g. `https://<client>.portal.sqd.dev/rpc/v1/evm`), so pass `opts.baseUrl` or set `PORTAL_RPC_URL` —
+ * never hardcode a client domain.
+ */
+export function portalRpc(chainId: number, apiKey: string, opts?: { baseUrl?: string; timeout?: number; retryCount?: number }): Transport {
+  const base = opts?.baseUrl ?? process.env.PORTAL_RPC_URL;
+  if (!base) throw new Error("portalRpc: pass opts.baseUrl or set PORTAL_RPC_URL (the Portal-backed RPC base, provisioned per client, e.g. https://<client>.portal.sqd.dev/rpc/v1/evm)");
+  return http(`${base}/${chainId}`, {
     fetchOptions: { headers: { "x-api-key": apiKey } },
     timeout: opts?.timeout ?? 10_000,
     retryCount: opts?.retryCount ?? 2,
   });
 }
 
-/** Portal realtime with RPC fallback(s): SQD portal-backed RPC preferred, public RPCs as fallback. */
-export function portalRealtime(chainId: number, apiKey: string, fallbackRpcs: string[] = [], opts?: { rank?: boolean }): Transport {
-  return fallback([portalRpc(chainId, apiKey), ...fallbackRpcs.map((u) => http(u))], { rank: opts?.rank ?? false });
+/** Portal realtime with RPC fallback(s): Portal-backed RPC preferred, public RPCs as fallback. */
+export function portalRealtime(chainId: number, apiKey: string, fallbackRpcs: string[] = [], opts?: { baseUrl?: string; rank?: boolean }): Transport {
+  return fallback([portalRpc(chainId, apiKey, { baseUrl: opts?.baseUrl }), ...fallbackRpcs.map((u) => http(u))], { rank: opts?.rank ?? false });
 }
 
 /** RPC(s)-only realtime: a list of RPC URLs, latency-ranked so the fastest tip lands. */
