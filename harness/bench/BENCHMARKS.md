@@ -72,7 +72,7 @@ amortize too (7.7 → 6 KB/event). `feature-blocks` is the outlier — 85 s for 
 
 - **Stability is solid:** 0 errors / 0 retries across every bench; the dense-source chunk cap keeps
   RSS bounded (≤~1 GB) where an uncapped run hit **3.7 GB / near-OOM** on a block source.
-- **`uniswap-portal` (all five source types) is the headline:** dense real Uniswap activity, hundreds
+- **`uniswap-portal` (all five source types) is the standout:** dense real Uniswap activity, hundreds
   of events/sec, ~100 MB fetched for a 5k-block window — clean and fast.
 - **Block-interval sources are the slowest path.** `includeAllBlocks` has no server-side stride
   filter, so a `blocks:{interval:N}` source scans **every** block in range to keep every Nth — bytes
@@ -88,8 +88,8 @@ amortize too (7.7 → 6 KB/event). `feature-blocks` is the outlier — 85 s for 
 ## Optimization backlog (next steps — prioritized)
 
 1. **Block-source fetch.** Avoid `includeAllBlocks` whole-range scans for sparse intervals: fetch the
-   matched block numbers directly (batched), or adopt a server-side stride if Portal adds one. Biggest
-   backfill-speed win for `blocks:{interval}` sources.
+   matched block numbers directly (batched), or adopt a server-side stride if Portal adds one. Largest
+   backfill-speed gain for `blocks:{interval}` sources.
 2. **Clamp chunk + read-ahead to the sync target.** Don't fetch/prefetch past the historical end block;
    size the chunk to remaining work near the tail. (Done in-bench via env; should be intrinsic.)
 3. **Trace memory/throughput at hot contracts.** Stream-insert traces per sub-range instead of buffering

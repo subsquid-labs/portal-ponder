@@ -1,6 +1,6 @@
 # Production Ponder indexers — discovery catalog
 
-A sweep (5 parallel agents, by protocol) of real open-source Ponder indexers, ranked for porting onto the Portal-backed backfill. Excludes Envio/HyperIndex (`config.yaml`), subgraphs, and tutorials.
+A sweep of real open-source Ponder indexers, grouped by protocol and ranked for porting onto the Portal-backed backfill. Excludes Envio/HyperIndex (`config.yaml`), subgraphs, and tutorials.
 
 **Cross-cutting findings**
 - **No `awesome-ponder` list / showcase exists** (Ponder is now by Marble). The base must be assembled from `ponder-sh/ponder` `examples/` + GitHub code-search.
@@ -26,7 +26,7 @@ A sweep (5 parallel agents, by protocol) of real open-source Ponder indexers, ra
 | nounsDAO/nouns-monorepo | 685 | 0.12 | mainnet | logs + `factory()` (Streams) + governor | needs `@nouns/sdk` build; deep history |
 | Uniswap/the-compact-indexer | 48 | 0.10 | mainnet/base/op | logs + `blocks:{interval:1}` | old API; live at marble.live |
 | Uniswap/hybrid-allocator / tribunal-indexer | 0–1 | 0.10 | mainnet/base/**arb**/op | logs + `blocks:{interval:1}` | cleanest blocks+arbitrum exemplar; old API |
-| centrifuge/api-v3 | 4 | 0.16 | eth/base/arb/op + | many `factory()` + `blocks:{interval}` + bridge adapters | RWA flagship; **Postgres** + registry fetch |
+| centrifuge/api-v3 | 4 | 0.16 | eth/base/arb/op + | many `factory()` + `blocks:{interval}` + bridge adapters | RWA anchor; **Postgres** + registry fetch |
 | relayprotocol/relay-vaults | 0 | 0.16 | multi-L2 | `factory()` ×3 + `blocks:{interval:100}` + multichain | AGPL; Postgres hardcoded |
 | ecp-eth/comments-monorepo | 23 | 0.12 | base | logs + **`includeTransactionReceipts`** | social + receipts; monorepo |
 | mripani/stablecoin-apy-indexer | 1 | 0.8 | mainnet | `filter` + discovery + dynamic + `blocks:{interval:50}` | Aave+Morpho+Maple; old 0.8 API |

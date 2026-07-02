@@ -1,6 +1,6 @@
 # Euler subgraph → Ponder → Portal
 
-A faithful port of the official **Euler V2 subgraph** ([`euler-xyz/euler-subgraph`](https://github.com/euler-xyz/euler-subgraph)) to Ponder, with the historical backfill routed through **SQD Portal** — i.e. the full *subgraph → Ponder → ponder-portal* path. It exercises every migration concern in one example.
+A faithful port of the official **Euler V2 subgraph** ([`euler-xyz/euler-subgraph`](https://github.com/euler-xyz/euler-subgraph)) to Ponder, with the historical backfill routed through **SQD Portal** — i.e. the full *subgraph → Ponder → Portal* path. It exercises every migration concern in one example.
 
 Run (drop-in `@subsquid/ponder`; backfill from Portal, `readContract` + realtime on `rpc`):
 
@@ -18,7 +18,7 @@ APY-derived `VaultStatus` — backfilled in ~1m over 91k blocks.
 
 | subgraph (`euler-xyz/euler-subgraph`) | Ponder | notes |
 |---|---|---|
-| **GenericFactory template** — `EulerVaultFactory` data source emits `ProxyCreated(proxy,…)`, handler calls `EulerVault.create(proxy)` | **`factory({ address, event, parameter: "proxy" })`** in `ponder.config.ts` | the headline. child EVault discovery, 1:1. |
+| **GenericFactory template** — `EulerVaultFactory` data source emits `ProxyCreated(proxy,…)`, handler calls `EulerVault.create(proxy)` | **`factory({ address, event, parameter: "proxy" })`** in `ponder.config.ts` | the key mapping; child EVault discovery, 1:1. |
 | EVault `Deposit/Withdraw/Borrow/Repay/Liquidate` events | `ponder.on("EVault:<Event>", …)` → immutable log tables | `id = `${txHash}-${logIndex}``, same as the subgraph. |
 | **eth_calls** in `loadOrCreateEulerVault` (`asset/name/symbol/decimals/oracle/creator/EVC`, …) | **`context.client.readContract`**, gated by a `db.find(vault)` existence check | the subgraph's `.bind()`/`.try_*` → `readContract`. The existence check = the subgraph's once-per-vault cache; without it `readContract` hammers RPC. **Portal serves the logs; these state reads still hit `rpc`.** |
 | `Counter` (load-or-create per action + a `"global"` singleton) | `db.insert(counter).onConflictDoUpdate(r => ({ value: r.value+1n }))` | no special singleton concept needed. |
