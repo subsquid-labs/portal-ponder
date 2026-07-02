@@ -4,5 +4,5 @@ import { defineConfig } from "vitest/config";
 // packages/core/ by scripts/sync-upstream.sh, where ./src points at the patched core.
 export default defineConfig({
   resolve: { alias: { "@": path.resolve(__dirname, "./src"), "@ponder/utils": path.resolve(__dirname, "../utils/src") } },
-  test: { include: ["src/sync-historical/portal*.test.ts"], testTimeout: 15000 },
+  test: { include: ["src/sync-historical/portal*.test.ts", "src/sync-historical/realtime*.test.ts"], testTimeout: 15000 },
 });
