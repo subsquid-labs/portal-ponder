@@ -10,7 +10,7 @@ field per chain that routes the historical backfill through SQD Portal (realtime
   fork **re-cut a fix on the same ponder version** — npm permanently retires an unpublished version
   number, so a plain mirror (`0.16.6`) can't be re-published after a bad build. Each release is
   published with `--tag latest`, so `npm i @subsquid/ponder` resolves it (npm doesn't auto-pick a
-  prerelease otherwise); clients can pin `@subsquid/ponder@0.16.6-sqd.1`.
+  prerelease otherwise); an exact build can be pinned as `@subsquid/ponder@0.16.6-sqd.1`.
 - **We don't hand-maintain a fork.** This repo holds only the **Portal layer** (`portal/`): two modules
   (`portal.ts`, `portal-transform.ts`) + a per-version `wiring/<ver>.patch` (the 4 one-line touch-points)
   + `config.ts` (`withPortal`). That's the entire diff against upstream.
@@ -19,8 +19,8 @@ field per chain that routes the historical backfill through SQD Portal (realtime
   "author one small patch + run the script", not "merge a fork".
 - **Version-aware by construction.** `versions.json` is the source of truth: which ponder versions we
   support, each with its wiring patch + status (`verified` / `planned` / `published`), and the
-  `compat.tested` list the CI matrix proves the seam against. We publish a fork release **only for ponder
-  versions a client needs** (the economy), but we *know* which past/future versions hold (the awareness).
+  `compat.tested` list the CI matrix proves the seam against. We publish a fork release **only for the
+  ponder versions that are needed**, while tracking which past and future versions still hold.
 
 ## Releasing — automated (npm Trusted Publishing via OIDC, no token)
 
@@ -58,7 +58,7 @@ cd "$SYNC_WORKDIR/0.16.6/packages/core" && npm publish --access public --tag lat
 2. `scripts/sync-upstream.sh <ver> --test` — confirm it applies + builds + the Portal unit tests pass.
 3. Add a `{ "ponder": "<ver>", "wiring": "wiring/<ver>.patch", "status": "verified" }` row to
    `versions.json` and add `<ver>` to `compat.tested`.
-4. Commit; publish when a client needs it.
+4. Commit; publish when a version is needed.
 
 CI (`.github/workflows/ci.yml`) runs step 2 for every version in `versions.json` on each push, so a
 ponder upgrade that breaks the seam is caught before release.

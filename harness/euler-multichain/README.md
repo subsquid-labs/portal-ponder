@@ -1,4 +1,4 @@
-# Euler multichain — flagship e2e
+# Euler multichain — full-history e2e
 
 Index **every Portal-supported Euler V2 chain (15) in a single Ponder app**, full history
 `[0 → finalized head]` per chain, streaming from the **SQD Portal** backfill into **Postgres**. This
@@ -31,7 +31,7 @@ Postgres is the production DB path (separate process, own memory). Without `DATA
 back to in-process **pglite** — fine for a few chains, but a fast 15-chain backfill can OOM pglite
 because its writer shares the Node heap. Use Postgres for the full run.
 
-## How it works (no secrets in the repo)
+## How it works
 - **`chains.json`** — public data only: dataset name, factory address, finalized head, SQD RPC slug,
   and keyless public RPCs. Secret-scanned clean.
 - **`ponder.config.ts`** — reads `chains.json`, injects `SQD_RPC_KEY` + `PORTAL_API_KEY` from the
@@ -48,7 +48,7 @@ concurrency + buffered rows). `PORTAL_GATE_LOG=1` logs the AIMD concurrency + me
 live. Pair with Postgres `pg_stat_activity` wait-events to see whether the DB is I/O-bound,
 CPU-bound, or *waiting on the client* (i.e. upstream decode is the limit).
 
-### Hardware & wall-time (read this before comparing numbers)
+### Hardware & wall-time
 The Portal is **not** the bottleneck here — local decode + DB write + the in-memory fetch buffer are,
 and that envelope scales with **RAM**. On a memory-constrained box (the captured run: 16 GB) the
 24-event superset must use conservative, uniform chunks (`PORTAL_CHUNK_FIXED=1`,

@@ -40,7 +40,7 @@ Thread it through `Chain` in `internal/types.ts` (~line 299) and the config buil
 - `TraceFilter`/`TransferFilter` → `traceFilters[]`
 - `includeTransactionReceipts` → `includeReceipts`
 
-The runtime's adaptive `estimate()` (`runtime/historical.ts:1340`, range `[25, 100_000]`) feeds the Portal sync ever-larger intervals automatically — its speed compounds.
+The runtime's adaptive `estimate()` (`runtime/historical.ts:1340`, range `[25, 100_000]`) feeds the Portal sync ever-larger intervals automatically, so throughput ramps as the backfill proceeds.
 
 ## 3. Observability — register Portal metrics
 
@@ -56,4 +56,4 @@ Historical owns `[start, finalized]`, realtime owns `(finalized, tip]`. Portal's
 
 ## Distribution
 
-Publish as `@your-org/ponder-core` (the chosen path). Clients swap one dependency + add `portal:` per chain in `ponder.config.ts`; **handlers and schema are unchanged.**
+Publish as `@your-org/ponder-core`. Consumers swap one dependency and add `portal:` per chain in `ponder.config.ts`; **handlers and schema are unchanged.**

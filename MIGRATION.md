@@ -8,18 +8,18 @@
 
 ## Step 0 — Prove it (compatibility + parity, no production change)
 
-Run the compatibility report against the client's config, pointing `PORTAL_BASE` at the portal they'll actually use (dataset availability is per-portal):
+Run the compatibility report against your config, pointing `PORTAL_BASE` at the portal you'll actually use (dataset availability is per-portal):
 
 ```bash
-cd <client-ponder-project>
+cd <your-ponder-project>
 PORTAL_API_KEY=<key> PORTAL_BASE=<portal> \
-  node <path>/harness/compat/report.ts ./ponder.config.ts --differential <client-rpc-url>
+  node <path>/harness/compat/report.ts ./ponder.config.ts --differential <your-rpc-url>
 ```
 
 - **Coverage** — per source: is the type supported, does the target portal serve that chain's dataset, and does the network have the needed capability (traces/state-diffs, with block-range caveats). Output is a per-source `READY` / `NEEDS_*` verdict; for event + factory indexers (Uniswap, Euler, …) it's `READY NOW`.
-- **Parity** (`--differential`) — fetches the same `eth_getLogs` from Portal and the client's RPC and confirms they're byte-identical.
+- **Parity** (`--differential`) — fetches the same `eth_getLogs` from Portal and your RPC and confirms they're byte-identical.
 
-This report is the onboarding artifact: a client sees parity proven on *their* indexer before touching anything.
+The report proves parity on *your* indexer before you change anything in production.
 
 ---
 
@@ -54,6 +54,6 @@ Same `ponder` bin, so `ponder dev` / `ponder start` are unchanged. When a chain 
 
 ## Step 2 — Validate & roll back
 
-- Watch the first backfill: wall-clock vs the previous RPC run, and **zero client-facing errors**.
+- Watch the first backfill: wall-clock vs the previous RPC run, and **zero errors**.
 - For a deep check, diff the `ponder_sync` tables of a Portal run vs an RPC run over the same range — they should match (logs are byte-identical; see the differential test).
 - **Rollback** is a one-liner: point the dependency back at `ponder` and remove the `portal:` lines.
