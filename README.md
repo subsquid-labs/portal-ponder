@@ -50,6 +50,8 @@ RPC was built for transactions, not for reading data. A backfill over RPC is a s
 
 The speed comes from integrating at Ponder's range-oriented historical-sync seam, where one interval maps to one Portal range scan. That seam isn't part of Ponder's public API, so this is a small fork rather than a plugin — generated from upstream Ponder plus a short patch, so it tracks Ponder closely.
 
+That's only half of it. A fast endpoint alone doesn't make a fast indexer — the fork's own engineering (read-ahead that keeps indexing, not fetch, the bottleneck; a shared controller that saturates the Portal at a fixed memory ceiling across every chain; factory discovery over ranges) is what extracts the speed. The full mechanics, and the honest single-thread ceiling, are in [**HOW-IT-WORKS.md**](HOW-IT-WORKS.md).
+
 ## Benchmarks
 
 Full Ethereum history, deploy → head (~5M blocks, 457,931 events), on a dedicated Portal:
@@ -96,7 +98,7 @@ The free public Portal is ideal for trying the fork and for development, but sha
 
 ## Learn more
 
-- [**How it works**](portal/INTEGRATION.md) — the historical-sync seam, read-ahead chunk buffer, factory discovery, adaptive concurrency, and memory backpressure.
+- [**How it works**](HOW-IT-WORKS.md) — the design story: why a streamed range beats per-topic RPC lookups, the historical-sync seam, the shared read-ahead controller, factory discovery over ranges, and where the single-thread ceiling honestly is. Operational reference: [`portal/INTEGRATION.md`](portal/INTEGRATION.md).
 - [**Observability**](portal/INTEGRATION.md) — `PORTAL_METRICS_FILE` writes a per-chain JSON metrics file (throughput, bytes, errors, RPC-fallback); `PORTAL_GATE_LOG=1` logs the adaptive controller.
 - **Portal-native realtime** (experimental) — realtime runs on your RPC by default; set `PORTAL_REALTIME=stream` to serve the tip from the Portal's fork-aware `/stream` instead of RPC.
 - [**Versioning & releases**](PUBLISHING.md) — `@subsquid/ponder@<ponder-version>-sqd.<rev>`, generated from upstream Ponder + a per-version patch.
