@@ -83,7 +83,7 @@ Resync **wall-clock** is the metric (events indexed end-to-end), not raw scan ra
 - **Cross-checked against Euler's own live subgraph** — discovered vault counts match *exactly* on finished chains (polygon 25/25, tac 36/36, bob 27/27…), and it indexes chains the subgraph reports as **empty** (e.g. hyperliquid). The high-block / high-TPS chains where subgraphs are slow-to-unviable are exactly where the Portal backfill wins.
 - **Zero-config at scale** — adaptive Portal concurrency (AIMD) + memory backpressure + a proactive 256 KB query-size guard, all exercised by the 15-chain load.
 
-**Full results — _TBD_.** The captured end-to-end run (wall-time, per-chain blk/s + ev/s, the complete vault-count cross-check across all 15 chains, and the saturation breakdown — Portal I/O vs decode vs DB) lands in [`harness/euler-multichain/REPORT.md`](harness/euler-multichain/REPORT.md). Reproduce with `docker compose up -d postgres && ./run.sh` — see the [flagship README](harness/euler-multichain/README.md).
+**Results:** **28,405,932 events across all 15 chains, full history, in 45 min** — on a **~1-core / 16 GB indexer** (plus a separate tuned Postgres), **byte-verified complete against the Portal ground truth** (60/60 sampled windows exact across all chains) and **reproducible** (two independent runs → identical total). Full per-chain breakdown, the A/B (a right-sized indexer + tuned DB beats over-provisioning), and the measured single-thread ceiling: **[`harness/euler-multichain/REPORT.md`](harness/euler-multichain/REPORT.md)**. Reproduce with `docker compose up -d postgres && ./run.sh` — see the [flagship README](harness/euler-multichain/README.md).
 
 ---
 
