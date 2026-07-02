@@ -3,3 +3,4 @@ harness/results.*.json
 harness/euler/vaults.*.json
 *.log
 .DS_Store
+.claude/

@@ -87,6 +87,7 @@ The free public Portal is ideal for trying the fork and for development, but sha
 
 - [**How it works**](portal/INTEGRATION.md) — the historical-sync seam, read-ahead chunk buffer, factory discovery, adaptive concurrency, and memory backpressure.
 - [**Observability**](portal/INTEGRATION.md) — `PORTAL_METRICS_FILE` writes a per-chain JSON metrics file (throughput, bytes, errors, RPC-fallback); `PORTAL_GATE_LOG=1` logs the adaptive controller.
+- **Portal-native realtime** (experimental) — realtime runs on your RPC by default; set `PORTAL_REALTIME=stream` to serve the tip from the Portal's fork-aware `/stream` instead of RPC.
 - [**Versioning & releases**](PUBLISHING.md) — `@subsquid/ponder@<ponder-version>-sqd.<rev>`, generated from upstream Ponder + a per-version patch.
 
 ## Contributing & support
