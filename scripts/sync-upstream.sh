@@ -23,8 +23,8 @@ rm -rf "$WORK"; git clone --quiet --depth 1 --branch "ponder@$VER" https://githu
 CORE="$WORK/packages/core"
 SYNC="$CORE/src/sync-historical"
 echo "▶ applying Portal layer"
-cp "$ROOT/portal/portal.ts" "$ROOT/portal/portal-transform.ts" "$ROOT/portal/realtime.ts" "$ROOT/portal/portal-realtime.ts" "$SYNC/"
-cp "$ROOT/portal/portal-transform.test.ts" "$ROOT/portal/portal.test.ts" "$ROOT/portal/realtime.test.ts" "$ROOT/portal/portal-realtime.test.ts" "$SYNC/" 2>/dev/null || true
+cp "$ROOT/portal/portal.ts" "$ROOT/portal/portal-transform.ts" "$ROOT/portal/realtime.ts" "$ROOT/portal/portal-realtime.ts" "$ROOT/portal/portal-realtime-wire.ts" "$SYNC/"
+cp "$ROOT/portal/portal-transform.test.ts" "$ROOT/portal/portal.test.ts" "$ROOT/portal/realtime.test.ts" "$ROOT/portal/portal-realtime.test.ts" "$ROOT/portal/portal-realtime-wire.test.ts" "$SYNC/" 2>/dev/null || true
 mkdir -p "$SYNC/__fixtures__"; cp "$ROOT/portal/__fixtures__/"*.json "$SYNC/__fixtures__/"
 cp "$ROOT/portal/vite.portal.config.ts" "$CORE/"
 ( cd "$WORK" && git apply --verbose "$WIRING" )
