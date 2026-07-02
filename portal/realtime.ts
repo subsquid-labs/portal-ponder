@@ -1,50 +1,30 @@
 /**
  * Realtime source helpers + endpoint instrumentation.
  *
- * Ponder owns realtime and reorg handling natively (RealtimeSync: parent-hash tracking + rollback to
- * the common ancestor, bounded by the finalized block). The fork only swaps the HISTORICAL sync to
- * the Portal. So "which realtime source" is purely a `rpc` config choice — ponder polls whatever
- * transport(s) you give it and reorg-handles the result identically:
+ * Ponder owns realtime and reorg handling natively (RealtimeSync: parent-hash tracking + rollback to the
+ * common ancestor, bounded by the finalized block). The fork only swaps the HISTORICAL sync to the Portal.
+ * So the realtime source is purely a `rpc` config choice — ponder polls whatever transport(s) you give it
+ * and reorg-handles the result identically. The lib is RPC-agnostic: an authenticated RPC (an x-api-key
+ * header, a keyed proxy, …) is just `http(url, { fetchOptions: { headers } })` — nothing special.
  *
- *   import { createConfig } from "@subsquid/ponder";
  *   import { http, fallback } from "viem";
- *   import { portalRpc } from "@subsquid/ponder/realtime";
- *
- *   // (A) Portal realtime, RPC fallback — Portal-backed RPC leads; public RPCs cover downtime/lag.
- *   //     base URL is provisioned per client → set PORTAL_RPC_URL (or pass { baseUrl }).
- *   rpc: fallback([ portalRpc(1, process.env.PORTAL_RPC_KEY!), http(process.env.RPC_1), http(process.env.RPC_1B) ]),
- *
- *   // (B) RPC(s) realtime — a plain Ponder-style list, or latency-ranked for fastest-tip.
+ *   // a plain list (Ponder-style), or latency-ranked for fastest-tip:
  *   rpc: [process.env.RPC_1!, process.env.RPC_1B!],
  *   rpc: fallback([http(process.env.RPC_1!), http(process.env.RPC_1B!)], { rank: true }),
+ *   // an authenticated RPC + fallback:
+ *   rpc: fallback([ http(process.env.RPC_URL!, { fetchOptions: { headers: { "x-api-key": process.env.RPC_KEY! } } }), http(process.env.RPC_1!) ]),
  *
- * `fallback` gives smooth failover; `{ rank: true }` probes latency and routes to the fastest, so the
- * freshest tip lands. Both (A) and (B) get ponder's reorg safety for free.
+ * `fallback` gives smooth failover; `{ rank: true }` probes latency and routes to the fastest tip. Either
+ * way ponder's reorg safety comes for free.
  */
 import { http, fallback, type Transport } from "viem";
 
 /**
- * Portal-backed EVM RPC transport (auth via `x-api-key`). The base URL is provisioned per client, so
- * pass `opts.baseUrl` or set `PORTAL_RPC_URL` — never hardcode a client domain.
+ * Compose realtime RPC(s) into a latency-ranked fallback so the fastest tip lands. Accepts URL strings or
+ * viem Transports — pass a Transport for an authenticated RPC: `http(url, { fetchOptions: { headers } })`.
  */
-export function portalRpc(chainId: number, apiKey: string, opts?: { baseUrl?: string; timeout?: number; retryCount?: number }): Transport {
-  const base = opts?.baseUrl ?? process.env.PORTAL_RPC_URL;
-  if (!base) throw new Error("portalRpc: pass opts.baseUrl or set PORTAL_RPC_URL (the Portal-backed RPC base, provisioned per client)");
-  return http(`${base}/${chainId}`, {
-    fetchOptions: { headers: { "x-api-key": apiKey } },
-    timeout: opts?.timeout ?? 10_000,
-    retryCount: opts?.retryCount ?? 2,
-  });
-}
-
-/** Portal realtime with RPC fallback(s): Portal-backed RPC preferred, public RPCs as fallback. */
-export function portalRealtime(chainId: number, apiKey: string, fallbackRpcs: string[] = [], opts?: { baseUrl?: string; rank?: boolean }): Transport {
-  return fallback([portalRpc(chainId, apiKey, { baseUrl: opts?.baseUrl }), ...fallbackRpcs.map((u) => http(u))], { rank: opts?.rank ?? false });
-}
-
-/** RPC(s)-only realtime: a list of RPC URLs, latency-ranked so the fastest tip lands. */
-export function rpcRealtime(rpcs: string[], opts?: { rank?: boolean }): Transport {
-  return fallback(rpcs.map((u) => http(u)), { rank: opts?.rank ?? true });
+export function rpcRealtime(rpcs: Array<string | Transport>, opts?: { rank?: boolean }): Transport {
+  return fallback(rpcs.map((r) => (typeof r === "string" ? http(r) : r)), { rank: opts?.rank ?? true });
 }
 
 // ─────────────────────────────── endpoint instrumentation ───────────────────────────────

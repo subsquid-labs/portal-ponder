@@ -3,28 +3,28 @@
 // responsiveness. Standalone (no imports beyond node) so it survives an overnight run alongside ponder.
 // Mirrors portal/realtime.ts (unit-tested). Writes PROBE_METRICS_FILE (rolling JSON) + a .log trail.
 //
-//   PORTAL_RPC_KEY=... [SQD_RPC_KEY=...] [PROBE_INTERVAL_MS=15000] node probe.mjs
+//   REALTIME_RPC_KEY=... [SQD_RPC_KEY=...] [PROBE_INTERVAL_MS=15000] node probe.mjs
 import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 
 const dir = path.dirname(fileURLToPath(import.meta.url));
 const chains = JSON.parse(fs.readFileSync(path.join(dir, "chains.json"), "utf8"));
-const KEY = process.env.PORTAL_RPC_KEY;
-const RPC_URL = process.env.PORTAL_RPC_URL; // Portal-backed RPC base (from env; provisioned per client)
-const PORTAL_RPC_CHAINS = new Set([1, 42161, 8453, 43114, 137, 56, 9745, 143]);
+const KEY = process.env.REALTIME_RPC_KEY;
+const RPC_URL = process.env.REALTIME_RPC_URL; // realtime RPC base (from env; provisioned per client)
+const REALTIME_CHAINS = new Set([1, 42161, 8453, 43114, 137, 56, 9745, 143]);
 const METRICS = process.env.PROBE_METRICS_FILE || path.join(dir, "probe-metrics.json");
 const INTERVAL = Number(process.env.PROBE_INTERVAL_MS || 15000);
 const WINDOW = Number(process.env.PROBE_WINDOW || 40); // rolling ticks
 
-if (!KEY || !RPC_URL) { console.error("PORTAL_RPC_KEY + PORTAL_RPC_URL required (the Portal-backed RPC base + x-api-key)"); process.exit(1); }
+if (!KEY || !RPC_URL) { console.error("REALTIME_RPC_KEY + REALTIME_RPC_URL required (the realtime RPC base + x-api-key)"); process.exit(1); }
 
-// per chain, probe the Portal-backed RPC (the product) alongside a keyless public RPC (freshness baseline).
-// rpc.subsquid.io is a generic proxy, not the Portal-backed product — deliberately excluded.
-const targets = chains.filter((c) => PORTAL_RPC_CHAINS.has(c.id)).map((c) => ({
+// per chain, probe the realtime RPC alongside a keyless public RPC (freshness baseline).
+// rpc.subsquid.io is a generic proxy — deliberately excluded.
+const targets = chains.filter((c) => REALTIME_CHAINS.has(c.id)).map((c) => ({
   chainId: c.id, chain: c.name,
   endpoints: [
-    { name: "portal-rpc", url: `${RPC_URL}/${c.id}`, headers: { "x-api-key": KEY } },
+    { name: "realtime-rpc", url: `${RPC_URL}/${c.id}`, headers: { "x-api-key": KEY } },
     ...(c.freeRpcs || []).slice(0, 1).map((u, i) => ({ name: `public${i}`, url: u })),
   ],
 }));
@@ -67,8 +67,8 @@ async function tick() {
       avgLagBlk: lags.length ? Math.round(lags.reduce((a, b) => a + b, 0) / lags.length) : null, lastError: [...ss].reverse().find((s) => s.error)?.error };
   }
   try { fs.writeFileSync(METRICS, JSON.stringify({ ts: new Date().toISOString(), intervalMs: INTERVAL, endpoints: summary }, null, 2)); } catch { /* best-effort */ }
-  const line = Object.values(summary).filter((v) => v.endpoint === "portal-rpc").map((v) => `${v.chain} p50=${v.latP50} p95=${v.latP95} ok=${(v.okRate * 100).toFixed(0)}% lag=${v.avgLagBlk ?? "?"}`).join(" | ");
-  try { fs.appendFileSync(METRICS + ".log", `${new Date().toISOString()} [portal-rpc] ${line}\n`); } catch { /* best-effort */ }
+  const line = Object.values(summary).filter((v) => v.endpoint === "realtime-rpc").map((v) => `${v.chain} p50=${v.latP50} p95=${v.latP95} ok=${(v.okRate * 100).toFixed(0)}% lag=${v.avgLagBlk ?? "?"}`).join(" | ");
+  try { fs.appendFileSync(METRICS + ".log", `${new Date().toISOString()} [realtime-rpc] ${line}\n`); } catch { /* best-effort */ }
 }
 
 console.log(`probe: ${targets.length} chains × endpoints, interval ${INTERVAL}ms -> ${METRICS}`);

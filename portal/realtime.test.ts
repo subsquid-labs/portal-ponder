@@ -1,26 +1,12 @@
 import { expect, test } from "vitest";
-import { portalRpc, portalRealtime, rpcRealtime, freshnessLag, summarize, probeOnce, type ProbeSample } from "./realtime.js";
+import { http } from "viem";
+import { rpcRealtime, freshnessLag, summarize, probeOnce, type ProbeSample } from "./realtime.js";
 
-test("portalRpc: appends chainId to the client-specific base + x-api-key header", () => {
-  const t = portalRpc(42161, "prt_test", { baseUrl: "https://portal.example/rpc" });
-  expect(typeof t).toBe("function");
-  // viem http transport exposes its url on the instantiated value
-  const inst: any = t({} as any);
-  expect(inst.value?.url).toBe("https://portal.example/rpc/42161");
-  const t2: any = portalRpc(1, "k", { baseUrl: "http://local/rpc" })({} as any);
-  expect(t2.value?.url).toBe("http://local/rpc/1");
-});
-
-test("portalRpc: throws without a base (never hardcodes a client domain)", () => {
-  const saved = process.env.PORTAL_RPC_URL;
-  delete process.env.PORTAL_RPC_URL;
-  expect(() => portalRpc(1, "k")).toThrow(/baseUrl|PORTAL_RPC_URL/);
-  if (saved !== undefined) process.env.PORTAL_RPC_URL = saved;
-});
-
-test("portalRealtime / rpcRealtime return composed viem transports", () => {
-  expect(typeof portalRealtime(1, "k", ["http://a", "http://b"], { baseUrl: "https://portal.example/rpc" })).toBe("function");
-  expect(typeof rpcRealtime(["http://a", "http://b"])).toBe("function");
+test("rpcRealtime: composes URL strings and authed transports into a latency-ranked fallback", () => {
+  // an authenticated RPC is just a viem transport — the lib is agnostic to what backs it
+  const authed = http("http://b", { fetchOptions: { headers: { "x-api-key": "k" } } });
+  expect(typeof rpcRealtime(["http://a", authed])).toBe("function");
+  expect(typeof rpcRealtime(["http://a", "http://b"], { rank: false })).toBe("function");
 });
 
 test("freshnessLag: blocks behind the freshest endpoint, per chain", () => {
