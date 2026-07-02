@@ -1,15 +1,30 @@
 # @subsquid/ponder
 
-A **drop-in fork of [Ponder](https://github.com/ponder-sh/ponder)** whose historical backfill streams from **[SQD Portal](https://docs.sqd.dev)** — a columnar, range-scan data lake — instead of JSON-RPC. Backfills run **~8× faster** (and finish on chains where RPC backfill is impractical); realtime/frontfill stays on your RPC. The switch is **one config line per chain**, and **your handlers and schema are unchanged**.
+A drop-in fork of [Ponder](https://github.com/ponder-sh/ponder) that runs the historical backfill through the [SQD Portal](https://sqd.dev/portal/) instead of per-chain JSON-RPC. Backfills run several times faster, and complete on chains where an RPC backfill is impractical. Realtime stays on your RPC, your handlers and schema don't change, and the switch is one line of config per chain.
+
+**In numbers:** ~8× faster on a full Ethereum backfill · 15 chains and 28M events in one app in 45 minutes · Portal logs byte-identical to `eth_getLogs`. See [Benchmarks](#benchmarks).
+
+## Quickstart
+
+Try it in a couple of minutes against the free public Portal — no key required:
 
 ```bash
-npm install @subsquid/ponder          # latest; or pin a build: @subsquid/ponder@0.16.6-sqd.1
+git clone https://github.com/subsquid-labs/portal-ponder
+cd portal-ponder/examples/euler-subgraph
+npm install
+npm run dev
 ```
 
-> Versions are `<ponder-version>-sqd.<rev>` — e.g. `0.16.6-sqd.1` **is** `ponder@0.16.6` + the Portal layer (fork revision 1). The ponder version stays visible; pin it for reproducibility.
+This runs a real indexer — the Euler V2 subgraph ported to Ponder — and backfills Ethereum history from the Portal. Watch the events/second in the Ponder dev UI; that throughput is the point. Add an Ethereum RPC for realtime as usual (the Portal backfill itself needs no key); see the [example README](examples/euler-subgraph/).
+
+The example points at `https://portal.sqd.dev`, the **free public Portal**. It needs no key and is ideal for trying the fork and for development. It shares capacity across all users, so it is rate-limited and slower under load — for production throughput, see [Going to production](#going-to-production).
+
+## Add it to an existing app
+
+Point the config at the fork and add a `portal` URL per chain. Nothing else changes:
 
 ```ts
-// ponder.config.ts — import from the fork, add `portal:` per chain. Nothing else changes.
+// ponder.config.ts
 import { createConfig } from "@subsquid/ponder";
 
 export default createConfig({
@@ -17,161 +32,132 @@ export default createConfig({
     mainnet: {
       id: 1,
       rpc: process.env.PONDER_RPC_URL_1,                          // realtime + state reads
-      portal: "https://portal.sqd.dev/datasets/ethereum-mainnet", // ← historical backfill
+      portal: "https://portal.sqd.dev/datasets/ethereum-mainnet", // historical backfill
     },
   },
   contracts: { /* unchanged */ },
 });
 ```
 
-`@subsquid/ponder` provides the same `ponder` bin, so `ponder dev` / `ponder start` work as before. Remove the `portal:` line (or point the dependency back at `ponder`) and you're on stock Ponder again.
+```bash
+npm install @subsquid/ponder   # provides the same `ponder` bin — `ponder dev` / `ponder start` work as before
+```
 
----
+Versions are `<ponder-version>-sqd.<rev>`: `0.16.6-sqd.1` is `ponder@0.16.6` plus the Portal layer. Remove the `portal` line (or point the dependency back at `ponder`) to return to stock Ponder. Before migrating a larger app, run the [compatibility check](#compatibility).
 
-## Why
+## Why it's faster, and why a fork
 
-Ponder's RPC backfill fans out **one `eth_getLogs` per event-topic per contract group**, then **one `eth_getBlockByNumber` (+receipts/traces) per matched block** — a point-lookup workload on a range-scan-shaped problem. Factory contracts (e.g. Euler — thousands of vaults discovered at runtime) explode the fan-out into hundreds of thousands of tiny, non-contiguous requests. And Ponder's adaptive RPC client *demotes* slow backends, so pointing `rpc:` at Portal-as-JSON-RPC reads Portal's range-scan latency as a "failing node" and spirals into stalls — which is why prior RPC-emulation shims underperform.
+RPC was built for transactions, not for reading data. A backfill over RPC is a stream of point lookups — one `eth_getLogs` per topic, one `eth_getBlockByNumber` per matched block — and a factory that discovers thousands of contracts at runtime turns that into hundreds of thousands of small, serial requests. The Portal is built for the opposite: it answers an arbitrary `[from, to]` block range as a single HTTP stream, reorg-safe and at constant memory. A backfill that RPC serves as hundreds of thousands of round-trips becomes a handful of large streamed reads — which is where the [8×](#benchmarks) comes from.
 
-This fork integrates one level up, at Ponder's range-oriented **`HistoricalSync` seam** (`syncBlockRangeData` / `syncBlockData`, interval-scoped). One interval becomes one streamed columnar scan; nothing touches the RPC penalty machinery; realtime keeps using `rpc`. SQD Portal answers a whole `[from, to]` range in a single pass.
+Reaching that means integrating at Ponder's range-oriented historical-sync seam, where one interval maps directly to one Portal range scan. That seam isn't part of Ponder's public API, so the integration is a small fork rather than a plugin. The fork is generated from upstream Ponder plus a short patch and tracks it closely — a thin plugin can follow once Ponder exposes the hook.
 
----
+## How it works
+
+The change is one module (`portal/portal.ts`, a `HistoricalSync` implementation) plus a short wiring patch that adds `portal?` to the chain config and routes to it when set.
+
+- **Read-ahead chunk buffer.** Ponder requests small intervals; the Portal is latency-bound per request but has large parallel bandwidth. The fork fetches large aligned chunks, serves every interval from that cache, and prefetches the next *N* chunks concurrently so latency overlaps instead of serializing. This is the largest single gain.
+- **Correctness-safe factory discovery.** Child addresses are discovered per chunk into a shared set; a data chunk fetches only once discovery has completed through its own block range, so out-of-order parallel fetches never miss a child event. Discovery is clamped to the factory's real start block.
+- **Block-density auto-scaling.** Chunk size scales with the chain's head, keeping round-trips roughly constant across chains (Arbitrum's 478M blocks don't mean 19× the requests).
+- **Server-side filtering.** Every row filter is pushed to the Portal's native filters (logs by address and topics, traces by call target and sighash, account transactions by from/to); field projection requests only the columns the sync store persists. The exception is block-interval sources, which the Portal cannot express as a modulo filter (range-scan + client filter).
+- **Memory safety on dense sources.** Trace and block sources cap the chunk grid (`PORTAL_TRACE_CHUNK_BLOCKS`, default 25k) so a busy contract cannot exhaust memory.
+- **Finality-gap fallback.** The Portal serves finalized data; if its head lags Ponder's target, intervals past it are delegated to the RPC sync, so the backfill stays complete.
+- **Resilience.** Socket errors and HTTP 503/529/429 (honoring `Retry-After`) are retried with backoff.
+
+Tunables: `PORTAL_CHUNK_BLOCKS`, `PORTAL_READAHEAD`, `PORTAL_TRACE_CHUNK_BLOCKS`, `PORTAL_API_KEY`. Full write-up: [`portal/INTEGRATION.md`](portal/INTEGRATION.md).
 
 ## Compatibility
 
-**Source types — all of Ponder's are supported:** `logs`, log-`factory()`, `transactions`, `receipts` (`includeTransactionReceipts`), `traces` (`includeCallTraces` + transfer filters), `blocks: { interval }`, and `accounts: {}` (transaction from/to). `readContract` calls in handlers go to your `rpc` as usual.
+**Source types** — all of Ponder's are supported: `logs`, log-`factory()`, `transactions`, `receipts` (`includeTransactionReceipts`), `traces` (`includeCallTraces` + transfer filters), `blocks: { interval }`, and `accounts: {}`. `readContract` calls in handlers use your `rpc` as usual.
 
-**Chains:** Portal serves [300+ EVM networks](https://docs.sqd.dev/en/data/all-networks) (ethereum, base, arbitrum, optimism, polygon, …). Per-network **capabilities differ** — traces and state-diffs aren't on every chain, and some have block-range caveats (e.g. Optimism traces from the Bedrock block; Arbitrum has traces but no state-diffs). Dataset **availability is also per-portal** (different portals serve different subsets).
+**Chains** — the Portal serves [130+ EVM networks](https://docs.sqd.dev/en/data/all-networks) (ethereum, base, arbitrum, optimism, polygon, …). Per-network capabilities differ (traces and state-diffs aren't on every chain; some have block-range caveats), and dataset availability is per-portal.
 
-**Check your indexer before migrating** with the compatibility report — it inspects a `ponder.config.ts` and, per source, verifies (a) the type is supported, (b) the **target portal** serves that chain's dataset (live `/datasets`), and (c) the network has the needed capability, against the [authoritative docs matrix](https://docs.sqd.dev/en/data/all-networks) (snapshotted in [`harness/compat/networks.json`](harness/compat/networks.json)):
+**Check your indexer before migrating** with the compatibility report. It inspects a `ponder.config.ts` and, per source, confirms the type is supported, the target portal serves the chain's dataset, and the network has the needed capability:
 
 ```bash
 PORTAL_API_KEY=… PORTAL_BASE=<your portal> \
   node --experimental-strip-types harness/compat/report.ts ./ponder.config.ts
-# → per-source READY / NEEDS_TRACES / NO_DATASET, with the per-chain capability + block-range notes
 ```
 
-For a clean event + factory indexer (Uniswap, Euler, …) it reports `READY NOW`. See [`MIGRATION.md`](MIGRATION.md) for the full adoption path (compat check → swap dependency → run → validate → roll back).
-
----
+For a clean event or factory indexer (Uniswap, Euler, …) it reports `READY NOW`. The full adoption path — compat check, swap the dependency, run, validate, roll back — is in [`MIGRATION.md`](MIGRATION.md).
 
 ## Benchmarks
 
-Resync **wall-clock** is the metric (events indexed end-to-end), not raw scan rate. Numbers are on a dedicated SQD Portal; the free public Portal shares a CU pool and is slower under concurrency. Deep analysis + the reproducible harness: [`harness/bench/BENCHMARKS.md`](harness/bench/BENCHMARKS.md).
+Resync wall-clock (events indexed end to end) is the metric. These numbers are on a dedicated Portal; the free public Portal shares capacity and is slower under concurrency. Full analysis and the reproducible harness: [`harness/bench/BENCHMARKS.md`](harness/bench/BENCHMARKS.md).
 
-**Single-chain — full Ethereum Euler history** (deploy → head, ~5M blocks, 466 vaults, 457,931 real economic events → pglite):
+**Single chain — full Ethereum Euler history** (deploy → head, ~5M blocks, 466 vaults, 457,931 events → pglite):
 
-| Integration | Resync wall-clock | speedup |
+| Integration | Resync wall-clock | Speedup |
 |---|---|---|
-| Stock RPC (1 stream / Ponder interval) | ~38 min | 1× |
+| Stock RPC (one stream per Ponder interval) | ~38 min | 1× |
 | Read-ahead chunk buffer | ~17 min | ~2× |
-| **+ parallel prefetch (the fork)** | **4m 45s** | **~8×** |
+| **Parallel prefetch (the fork)** | **4m 45s** | **~8×** |
 
-**Multi-chain — ethereum + base + arbitrum** concurrently, one `ponder start`: **~1.05M events in ~16 min, 0 errors.** The twist: Arbitrum (478M blocks, ~19× Ethereum) finished *first* — block-density auto-scaling collapses its ~436 fixed-size chunks to ~23, so it backfills faster than Base.
+**Multi-chain** — Ethereum, Base, and Arbitrum in one `ponder start`: ~1.05M events in ~16 min, 0 errors.
 
-**Indexer bench base** (`harness/bench/`, real/representative indexers, instrumented): a synthetic all-five-source-types Uniswap app scales **834 → 1,812 events/s** as the range grows 10× (179k events in 99s), stable at 1.6 GB RSS / 0 errors.
+**Correctness** — Portal logs are byte-identical to `eth_getLogs` (differential test, Base WETH transfers, 380/380 logs, all fields); the transforms are unit-tested against captured Portal data.
 
-**Correctness:** Portal-derived logs are **byte-identical** to JSON-RPC `eth_getLogs` (differential test, Base WETH Transfers, 380/380 logs, all fields); transforms are unit-tested against real captured Portal NDJSON.
+## Flagship: every Euler V2 chain in one indexer
 
----
+[`harness/euler-multichain/`](harness/euler-multichain/) is the reference deployment: all 15 Portal-supported Euler V2 chains in a single Ponder app, full history per chain, the complete 24-event EVault set, Portal backfill into Postgres. It is the production shape of an Euler indexer and the fork's hardest stress test — one Portal endpoint, one database, fifteen chains backfilling at once.
 
-## 🚩 Flagship: every Euler V2 chain in one indexer
+**28,405,932 events across all 15 chains, full history, in 45 minutes** on roughly one core and 16 GB (plus a separate Postgres), byte-verified complete against the Portal (60/60 sampled windows exact) and reproducible across two runs. Per-chain breakdown and analysis: [`harness/euler-multichain/REPORT.md`](harness/euler-multichain/REPORT.md).
 
-[**`harness/euler-multichain/`**](harness/euler-multichain/) is the reference deployment — **all 15 Portal-supported Euler V2 chains in a single Ponder app**, full history `[deploy → finalized head]` per chain, the **complete 24-event EVault superset**, Portal backfill → **Postgres**. It's the production shape of an Euler indexer (Euler runs *both* Ponder and subgraphs) *and* the fork's hardest stress test: one Portal endpoint, one database, fifteen chains backfilling concurrently.
+## Going to production
 
-- **Authoritative, not guessed** — per-chain start blocks come straight from Euler's own [`euler-subgraph`](https://github.com/euler-xyz/euler-subgraph) config; every `eVaultFactory` is cross-verified against [`euler-interfaces`](https://github.com/euler-xyz/euler-interfaces).
-- **Superset, not a subset** — all 24 EVault events (Euler's public subgraph indexes only `Transfer/Borrow/Repay`), so the output serves any downstream consumer.
-- **Cross-checked against Euler's own live subgraph** — discovered vault counts match *exactly* on finished chains (polygon 25/25, tac 36/36, bob 27/27…), and it indexes chains the subgraph reports as **empty** (e.g. hyperliquid). The high-block / high-TPS chains where subgraphs are slow-to-unviable are exactly where the Portal backfill wins.
-- **Zero-config at scale** — adaptive Portal concurrency (AIMD) + memory backpressure + a proactive 256 KB query-size guard, all exercised by the 15-chain load.
+The free public Portal needs no key and is ideal for trying the fork and for development. Because it shares capacity across everyone, it is rate-limited and slows down under concurrency — a large production backfill will feel that.
 
-**Results:** **28,405,932 events across all 15 chains, full history, in 45 min** — on a **~1-core / 16 GB indexer** (plus a separate tuned Postgres), **byte-verified complete against the Portal ground truth** (60/60 sampled windows exact across all chains) and **reproducible** (two independent runs → identical total). Full per-chain breakdown, the A/B (a right-sized indexer + tuned DB beats over-provisioning), and the measured single-thread ceiling: **[`harness/euler-multichain/REPORT.md`](harness/euler-multichain/REPORT.md)**. Reproduce with `docker compose up -d postgres && ./run.sh` — see the [flagship README](harness/euler-multichain/README.md).
-
----
-
-## How it works
-
-The whole change is one module (`portal/portal.ts`, the `HistoricalSync` implementation) plus a 4-line wiring patch that adds `portal?` to the chain config and routes to it when set.
-
-- **Read-ahead chunk buffer.** Ponder feeds small intervals; Portal is latency-bound per request but has huge parallel bandwidth. So we fetch large aligned **chunks** and serve every interval from cache, prefetching the next *N* chunks concurrently so per-request latency overlaps instead of serializing. This decoupling is the biggest win.
-- **Decoupled, correctness-safe factory discovery.** Child addresses are discovered per-chunk into a shared set; a data chunk fetches only once discovery is complete *through its own block range*, so out-of-order parallel fetches never miss a child event. Discovery is clamped to the factory's real start block.
-- **Block-density auto-scaling.** Chunk size scales with the chain's head, keeping round-trips ~constant across chains (Arbitrum's 478M blocks don't mean 19× the requests).
-- **Max field/row leverage.** Every row filter is pushed to Portal's native server-side filters (logs by address+topics, traces by callTo/callFrom/sighash, account txs by from/to); field projection requests exactly the columns the sync store persists — strictly tighter than Ponder's whole-block RPC fetch. The one exception is block-interval (Portal has no modulo filter → range-scan + client filter).
-- **Dense-source memory safety.** Trace/block sources auto-cap the chunk grid (`PORTAL_TRACE_CHUNK_BLOCKS`, default 25k) so a busy contract can't OOM.
-- **Finality-gap fallback.** Portal serves finalized data; if its head ever lags Ponder's target, intervals past it are auto-delegated to the stock RPC sync, so the backfill stays complete.
-- **Resilience.** Socket errors and HTTP 503/529/429 (with `Retry-After`) are retried with backoff.
-
-Tunables: `PORTAL_CHUNK_BLOCKS`, `PORTAL_READAHEAD`, `PORTAL_TRACE_CHUNK_BLOCKS`, `PORTAL_API_KEY`. Full seam write-up: [`portal/INTEGRATION.md`](portal/INTEGRATION.md).
-
----
-
-## Metrics & observability
-
-The Portal backfill emits its own metrics alongside Ponder's normal logging/UI (the indexing side — progress, the dev UI, Ponder's `/metrics` — is unchanged).
-
-**Per-chain backfill metrics file.** Set `PORTAL_METRICS_FILE=<path>` and the sync writes `<path>.<chainId>` (JSON, refreshed each interval) — read it live or after the run:
-
-```bash
-PORTAL_METRICS_FILE=/tmp/portal-metrics ponder start
-cat /tmp/portal-metrics.1 | jq      # chainId 1
-```
-```jsonc
-{
-  "chain": "mainnet", "chainId": 1,
-  "wallMs": 285000,                  // backfill wall-clock so far
-  "chunkBlocks": 25000,              // effective chunk width (after density-scaling / dense-cap)
-  "portalFinalizedHead": 25429590,
-  "fetch":    { "dataChunks": 9, "discChunks": 2, "http": 12, "bytes": 1102500000,
-                "errors": 0, "retries": 0, "cacheHits": 31, "maxInflight": 6 },
-  "inserted": { "logs": 179245, "blocks": 50000, "txs": 48210, "receipts": 0, "traces": 6064 },
-  "rpcFallbackIntervals": 0          // intervals delegated to RPC past Portal's finalized head
-}
-```
-
-Read it as: **stability** = `fetch.errors` / `fetch.retries` / `rpcFallbackIntervals` (all 0 in a healthy run); **efficiency** = `fetch.http` + `fetch.bytes` vs `inserted.*` (bytes-per-event); **what the chunker chose** = `chunkBlocks` + `dataChunks` + `cacheHits`.
-
-**Per-interval debug logs.** `PONDER_LOG_LEVEL=debug` logs a `service=portal` line per interval (chunk counts, http, inflight, errors) plus the chunk-cap / finality-fallback decisions.
-
-**The bench harness** (`harness/bench/`) consumes `PORTAL_METRICS_FILE` and adds wall-clock, events/sec, and peak RSS into a comparable table — see [`harness/bench/BENCHMARKS.md`](harness/bench/BENCHMARKS.md).
-
----
+For production throughput and reliability, use a **dedicated Portal**: your own capacity, no shared rate limits. Dedicated Portals are set up with the SQD team today — [talk to us](https://sqd.dev/portal/). Self-served shared tiers (free, starter, and growth) are coming soon.
 
 ## Examples
 
-Each is a real indexer that runs end-to-end on `@subsquid/ponder` (backfill from Portal, realtime + `readContract` on `rpc`):
+Each is a real indexer that runs end to end on `@subsquid/ponder` (Portal backfill, realtime and `readContract` on `rpc`):
 
-- [`examples/euler-subgraph/`](examples/euler-subgraph/) — **the Euler V2 subgraph ported to Ponder + Portal** (factory templates → `factory()`, subgraph eth_calls → `readContract` with the once-per-vault cache, Counter aggregation, APY derivation). A reusable *subgraph → Ponder* migration guide.
-- [`examples/uniswap-portal/`](examples/uniswap-portal/) — exercises **all five source types** in one app (logs + receipts + traces + block-interval + accounts).
-- [`examples/euler-multichain/`](examples/euler-multichain/) — compact 3-chain Euler factory indexer (the benchmark app). The full **15-chain flagship** (24-event superset, Postgres, live subgraph cross-check) is [`harness/euler-multichain/`](harness/euler-multichain/) — see 🚩 **Flagship** above.
+- [`examples/euler-subgraph/`](examples/euler-subgraph/) — the Euler V2 subgraph ported to Ponder and the Portal (factory templates, `readContract` state reads, aggregation). A worked *subgraph → Ponder* migration, and the Quickstart above.
+- [`examples/uniswap-portal/`](examples/uniswap-portal/) — all five source types in one app (logs, receipts, traces, block-interval, accounts).
+- [`examples/euler-multichain/`](examples/euler-multichain/) — a compact three-chain factory indexer (the benchmark app).
 
----
+## Metrics & observability
 
-## Versioning & releases
+The backfill emits its own metrics alongside Ponder's normal logging and UI. Set `PORTAL_METRICS_FILE=<path>` and the sync writes `<path>.<chainId>` (JSON, refreshed each interval):
 
-`@subsquid/ponder@X.Y.Z-sqd.<rev>` **is** `ponder@X.Y.Z` + the Portal layer — the ponder version is visible in the number, and `-sqd.<rev>` lets the fork re-cut a fix on the same ponder version (npm retires unpublished version numbers, so a plain mirror can't be re-cut). Each is published with `--tag latest`, so `npm i @subsquid/ponder` resolves it. The fork is *generated*, not hand-maintained: this repo holds only the Portal layer (`portal/`) + a per-version `wiring/<ver>.patch`; [`scripts/sync-upstream.sh`](scripts/sync-upstream.sh) clones `ponder@<ver>`, applies it, and builds. [`versions.json`](versions.json) is the supported-version matrix, and CI proves the seam against each. Releases publish via GitHub Actions + npm Trusted Publishing (OIDC, no token). Details: [`PUBLISHING.md`](PUBLISHING.md).
+```bash
+PORTAL_METRICS_FILE=/tmp/portal-metrics ponder start
+cat /tmp/portal-metrics.1 | jq     # chainId 1: wall-clock, chunk width, fetch counts, inserted rows, RPC-fallback intervals
+```
 
----
+Read stability from `fetch.errors` / `fetch.retries` / `rpcFallbackIntervals` (all 0 in a healthy run) and efficiency from bytes-per-event. `PONDER_LOG_LEVEL=debug` adds a per-interval `service=portal` line. The bench harness (`harness/bench/`) turns the metrics file into a comparable wall-clock / events-per-second / RSS table.
 
 ## Limitations
 
-- **The fetch bottleneck moves to the indexing layer.** Once Portal makes the backfill fast, decode + store (pglite) dominates; use Postgres / parallel indexing for very large resyncs. Orthogonal to Portal.
-- **Block-interval sources range-scan the whole window** (Portal has no modulo filter) — heavier than their matched-block count; pick a tight interval/range or expect more bytes.
-- **`readContract`-heavy indexers stay RPC-bound** on those calls — Portal accelerates logs/state, not your handler's contract reads.
-- **It's a fork, not a plugin** (ponder's internals aren't publicly exported; a thin plugin awaits an upstream `HistoricalSync` hook). The seam is small and stable, so the fork tracks ponder with a tiny patch — see [`PUBLISHING.md`](PUBLISHING.md#why-a-fork-not-a-thin-plugin).
+- **The bottleneck moves to indexing.** Once the Portal makes the backfill fast, decode and store dominate; use Postgres and parallel indexing for very large resyncs. This is orthogonal to the Portal.
+- **Block-interval sources range-scan the window** (the Portal has no modulo filter), so they read more than their matched-block count. Use a tight interval or range.
+- **`readContract`-heavy indexers stay RPC-bound** on those calls — the Portal accelerates logs and state, not handler contract reads.
+- **It's a fork, not a plugin.** Ponder's internals aren't publicly exported, so a thin plugin awaits an upstream `HistoricalSync` hook. The seam is small and stable, so the fork tracks Ponder with a short patch — see [`PUBLISHING.md`](PUBLISHING.md#why-a-fork-not-a-thin-plugin).
 
----
+## Versioning & releases
+
+`@subsquid/ponder@X.Y.Z-sqd.<rev>` is `ponder@X.Y.Z` plus the Portal layer — the Ponder version is visible in the number, and `-sqd.<rev>` lets the fork ship a fix on the same Ponder version. The fork is generated, not hand-maintained: this repo holds only the Portal layer (`portal/`) and a per-version `wiring/<ver>.patch`; [`scripts/sync-upstream.sh`](scripts/sync-upstream.sh) clones `ponder@<ver>`, applies the layer, and builds. [`versions.json`](versions.json) is the supported-version matrix, and CI proves the seam against each. Details: [`PUBLISHING.md`](PUBLISHING.md).
+
+## Contributing, feedback & bug reports
+
+Questions, bugs, feedback, and contributions are all welcome:
+
+- **Bugs & feature requests** — [open a GitHub issue](https://github.com/subsquid-labs/portal-ponder/issues).
+- **Questions & help** — [SquidDevs on Telegram](https://t.me/HydraDevs).
+- **Contributions** — pull requests are welcome. The repo holds only the Portal layer (`portal/`) and the per-version wiring patch; the published package is generated from upstream Ponder — see [`PUBLISHING.md`](PUBLISHING.md) for how the fork is built and how to add a Ponder version.
 
 ## Repo layout
 
 ```
-portal/                  the Portal layer (the entire diff vs upstream ponder)
+portal/                  the Portal layer (the entire diff vs upstream Ponder)
   portal.ts                the Portal-backed HistoricalSync
-  portal-transform.ts      pure NDJSON→Sync* transforms (+ tests, __fixtures__/)
+  portal-transform.ts      pure NDJSON → Sync* transforms (+ tests)
   config.ts · INTEGRATION.md · wiring/<ver>.patch
 scripts/sync-upstream.sh   generate @subsquid/ponder@<ver> from ponder@<ver> + the layer
 versions.json              the @subsquid/ponder ↔ ponder version matrix
 examples/                  runnable indexers (euler-subgraph · uniswap-portal · euler-multichain)
-harness/bench/             benchmark base + instrumentation (BENCHMARKS · CANDIDATES · results)
-harness/compat/            compatibility report (analyzer + docs-matrix snapshot + tests)
-.github/workflows/         ci (version matrix) + release (OIDC publish)
+harness/bench/             benchmark base + instrumentation
+harness/compat/            compatibility report (analyzer + docs-matrix snapshot)
+harness/euler-multichain/  the 15-chain flagship + REPORT.md
 MIGRATION.md · PUBLISHING.md
-packages/portal-sync/      legacy standalone Portal engine (pre-fork; powers the stress/dashboard harness)
 ```
