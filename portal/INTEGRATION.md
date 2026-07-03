@@ -122,7 +122,7 @@ The defaults run well without configuration. These environment variables overrid
 | `PORTAL_CHUNK_FIXED` | unset | Set to any value to disable density-based chunk scaling. |
 | `PORTAL_TRACE_CHUNK_BLOCKS` | `2000` | Chunk width when a chain has trace or block-interval sources (denser data). |
 | `PORTAL_REQUEST_TIMEOUT` | `30000` | Per-request connect/headers deadline (ms) for a Portal stream POST. A request that stalls before its headers arrive is aborted and retried, so a hung gateway can't leak its shared-controller slot. |
-| `PORTAL_IDLE_TIMEOUT` | `60000` | Max gap (ms) between NDJSON chunks before a stalled response body is aborted and retried. Reset on every chunk, so a slow-but-progressing stream is never cut. |
+| `PORTAL_IDLE_TIMEOUT` | `60000` | Max gap (ms) between NDJSON chunks before a stalled response body is cancelled (a graceful `reader.cancel()`, never `abort()` — issue #14: an abort landing on an in-flight gzip body can silently kill Node) and the request retried. Reset on every chunk, so a slow-but-progressing stream is never cut. |
 | `PORTAL_BUFFER_SIZE` | `100` | Chunk workers the Portal fans a single request across. |
 | `PORTAL_DISCOVERY_WINDOWS` | `8` | Disjoint windows a factory scan is split into and fetched concurrently. |
 | `PORTAL_REALTIME` | unset | Set to `stream` to serve realtime from the Portal `/stream` instead of RPC. |

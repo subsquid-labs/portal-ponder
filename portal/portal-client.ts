@@ -113,6 +113,40 @@ async function readWithIdle<T>(
   }
 }
 
+/**
+ * Read a non-OK response body to a string under a SOFT idle deadline — the error-body path's analogue of
+ * `readWithIdle`. A gateway that sends non-OK HEADERS then stalls the BODY would hang the plain
+ * `await res.text()` forever (fetchBatch's `finally` never runs, the gate slot never releases). We race
+ * `res.text()` against `idleMs`; on a stall we RESOLVE with `''` and fire-and-forget `res.body?.cancel()`
+ * — never `abort()` (issue #14: abort on an in-flight gzip body can silently kill the Node process). The
+ * caller still throws the typed error with the right status; the body text only feeds optional message
+ * extraction, so an empty/truncated body on timeout is acceptable — the win is that the error surfaces
+ * PROMPTLY and the gate slot releases. (PR #16 review)
+ */
+async function readTextWithIdle(
+  res: { text(): Promise<string>; body?: ReadableStream | null },
+  idleMs: number,
+): Promise<string> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const textP = res.text();
+  textP.catch(() => {}); // if the idle timer wins we abandon this read; cancel() settles the body later
+
+  const idle = new Promise<string>((resolve) => {
+    timer = setTimeout(() => {
+      void res.body?.cancel().catch(() => {}); // graceful teardown of the stalled body — never abort()
+      resolve('');
+    }, idleMs);
+    timer.unref?.();
+  });
+  try {
+    return await Promise.race([textP, idle]);
+  } catch {
+    return ''; // a rejecting body (network drop mid-read) still yields the typed error promptly
+  } finally {
+    if (timer !== undefined) clearTimeout(timer);
+  }
+}
+
 // Portal reports a missing COLUMN in a plural TABLE; map back to the field key we requested.
 const TABLE_TO_KEY: Record<string, string> = {
   transactions: 'transaction',
@@ -191,8 +225,10 @@ export type PortalClientDeps = {
   chainName: string;
   /** connect/headers deadline per stream POST (ms). Default 30_000; small values injected in tests. */
   requestTimeoutMs?: number;
-  /** max gap between NDJSON chunks before a stalled body is aborted (ms). Default 60_000. */
+  /** max gap between NDJSON chunks before a stalled body is CANCELLED (never abort(); issue #14) (ms). Default 60_000. */
   idleTimeoutMs?: number;
+  /** connect + body deadline for the /finalized-head probe (ms). Default 10_000; small values injected in tests. */
+  finalizedHeadTimeoutMs?: number;
   fetchImpl?: typeof fetch;
   sleepImpl?: (ms: number) => Promise<void>;
   logDebug?: (msg: string) => void;
@@ -220,8 +256,18 @@ export function parseRetryAfterMs(
 ): number | undefined {
   if (header === null) return undefined;
 
-  const secs = Number(header); // delta-seconds form
-  if (Number.isFinite(secs)) return secs > 0 ? secs * 1000 : undefined;
+  // delta-seconds is RFC-7231 `1*DIGIT` — a run of ASCII digits, nothing else. `Number()` was too lax: it
+  // honored `"1e3"`, `"0x10"`, `"1.5"`, `"  120  "` (via NaN-free coercion) as advice, none of which a
+  // conforming server means as delta-seconds. We trim surrounding OWS (routinely stripped from HTTP field
+  // values) then require a pure-digit run; anything else falls through to the HTTP-date branch, where a
+  // non-date (e.g. `"1.5"`, which V8's Date.parse reads as a PAST date) yields a ≤0 delta ⇒ undefined ⇒
+  // the caller's exponential back-off. (PR #16 review)
+  const trimmed = header.trim();
+  if (/^[0-9]+$/.test(trimmed)) {
+    const secs = Number(trimmed);
+
+    return secs > 0 ? secs * 1000 : undefined; // "0" ⇒ no advice → exponential back-off
+  }
 
   const at = Date.parse(header); // HTTP-date form
   if (Number.isNaN(at)) return undefined;
@@ -238,6 +284,8 @@ export function createPortalClient(deps: PortalClientDeps): PortalClient {
   const logDebug = deps.logDebug ?? (() => {});
   const requestTimeoutMs = deps.requestTimeoutMs ?? 30_000;
   const idleTimeoutMs = deps.idleTimeoutMs ?? 60_000;
+  const finalizedHeadTimeoutMs =
+    deps.finalizedHeadTimeoutMs ?? FINALIZED_HEAD_TIMEOUT_MS;
 
   // one POST+drain; returns blocks or "done" (204); throws a typed error (throttle carries retryAfterMs).
   async function fetchBatch(
@@ -311,7 +359,10 @@ export function createPortalClient(deps: PortalClientDeps): PortalClient {
       // Transient, retry with back-off: 429/529 explicit throttle; ALL 5xx gateway/proxy hiccups; 409 on
       // the FINALIZED stream = a gateway "conflict" (finalized data doesn't reorg). Back off on any.
       if (res.status >= 500 || res.status === 429 || res.status === 409) {
-        await res.body?.cancel().catch(() => {});
+        // Fire-and-forget: cancel() settles promptly (it doesn't drain the body), so unlike an unbounded
+        // `res.text()` it can't leak the gate slot — and it's the graceful teardown, never abort(). We do
+        // NOT await it, so a pathological cancel() can't stall the throttle either. (PR #16 review)
+        void res.body?.cancel().catch(() => {});
         // Retry-After may be delta-seconds OR an HTTP-date; parse both. The date form previously fell to
         // `NaN → undefined → non-retryable hard throw` mid-run — now it backs off. (issue #9)
         const retryAfterMs = parseRetryAfterMs(res.headers.get('retry-after'));
@@ -319,7 +370,12 @@ export function createPortalClient(deps: PortalClientDeps): PortalClient {
         throw new PortalThrottleError(res.status, retryAfterMs);
       }
       if (!res.ok) {
-        const text = (await res.text()).slice(0, 300);
+        // A non-OK gateway can send headers then STALL the body — an unbounded `res.text()` would hang the
+        // await forever, the `finally` (gate.release) never runs, and every chain eventually parks in
+        // gate.acquire(). Bound it with the same SOFT idle pattern as the OK path — on a stall we resolve
+        // with what we have (never abort, per issue #14) so the typed error still throws PROMPTLY. Only
+        // the message-extraction below needs the body, so a truncated/empty body is acceptable. (PR #16 review)
+        const text = (await readTextWithIdle(res, idleTimeoutMs)).slice(0, 300);
         // a dataset that lacks a requested column (e.g. Monad has no accessList) → the whole request 400s.
         const m =
           res.status === 400 &&
@@ -462,16 +518,50 @@ export function createPortalClient(deps: PortalClientDeps): PortalClient {
   }
 
   const finalizedHead = async (): Promise<number | undefined> => {
+    // Bound the probe so a hung /finalized-head can't stall the finality-gap decision — in the SAME two
+    // phases as fetchBatch, and for the SAME reason (issue #14): `AbortSignal.timeout` would stay live
+    // while `r.json()` reads the body, and portal.ts sends `accept-encoding: gzip` globally, so a live
+    // abort landing on an in-flight gzip body is the exact process-kill shape. So:
+    //   (a) CONNECT/headers phase — a genuine AbortController.abort(), disarmed the instant headers arrive.
+    //   (b) BODY phase — a SOFT timer race on `r.json()`: on a stall we fire-and-forget `body.cancel()`
+    //       (graceful, never abort) and fall through to `undefined`.
+    // Every failure collapses to `undefined`, so the caller stays conservative. (PR #16 review)
+    const controller = new AbortController();
+    let connectTimer: ReturnType<typeof setTimeout> | undefined = setTimeout(
+      () => controller.abort(),
+      finalizedHeadTimeoutMs,
+    );
+    connectTimer.unref?.();
+    const disarm = () => {
+      if (connectTimer !== undefined) {
+        clearTimeout(connectTimer);
+        connectTimer = undefined;
+      }
+    };
+    let bodyTimer: ReturnType<typeof setTimeout> | undefined;
     try {
-      // Bound the probe so a hung /finalized-head can't stall the finality-gap decision. (addendum)
-      const h = await fetchImpl(`${portalUrl}/finalized-head`, {
+      const r = await fetchImpl(`${portalUrl}/finalized-head`, {
         headers,
-        signal: AbortSignal.timeout(FINALIZED_HEAD_TIMEOUT_MS),
-      }).then((r) => r.json());
+        signal: controller.signal,
+      });
+      disarm(); // headers arrived — never abort() once the body is streaming (issue #14)
+
+      const idle = new Promise<undefined>((resolve) => {
+        bodyTimer = setTimeout(() => {
+          void r.body?.cancel().catch(() => {});
+          resolve(undefined);
+        }, finalizedHeadTimeoutMs);
+        bodyTimer.unref?.();
+      });
+      const h = await Promise.race([r.json(), idle]);
       if (typeof h?.number === 'number') return h.number;
     } catch {
-      /* head unknown (or timed out) → caller stays conservative */
+      /* head unknown (connect timed out, fetch failed, or bad JSON) → caller stays conservative */
+    } finally {
+      disarm();
+      if (bodyTimer !== undefined) clearTimeout(bodyTimer);
     }
+
     return undefined;
   };
 

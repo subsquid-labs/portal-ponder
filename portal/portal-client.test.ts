@@ -305,6 +305,14 @@ test('parseRetryAfterMs: positive advice only; absent / "0" / past-date / garbag
     undefined,
   ); //                                                            already-past HTTP-date
   expect(parseRetryAfterMs('not-a-date', now)).toBeUndefined(); // garbage
+  // strict RFC-7231 delta-seconds is `1*DIGIT`; the lax `Number()` used to honor these non-conforming
+  // forms as advice. They must NOT be honored — each falls through to Date.parse and ends in exponential
+  // back-off (undefined): "1e3"/"0x10" are not dates; V8 parses "1.5" as a PAST date ⇒ ≤0 delta. (PR #16 review)
+  expect(parseRetryAfterMs('1e3', now)).toBeUndefined(); //       not delta-seconds, not a future date
+  expect(parseRetryAfterMs('0x10', now)).toBeUndefined(); //      hex is not delta-seconds
+  expect(parseRetryAfterMs('1.5', now)).toBeUndefined(); //       fractional ⇒ Date.parse past date ⇒ undefined
+  // surrounding OWS is trimmed (HTTP field values routinely are), so a padded pure-digit run IS honored.
+  expect(parseRetryAfterMs(' 120 ', now)).toBe(120_000); //       OWS-trimmed delta-seconds
 });
 
 test('retry-after: a header-less throttle storm backs off EXPONENTIALLY, never zero (issue #9)', async () => {
@@ -432,6 +440,38 @@ test('timeout: a body that stalls without closing hits the SOFT idle timeout, is
   expect(gate.snapshot().active).toBe(0); // slot released
 });
 
+test('timeout: a NON-OK (400) response whose body never yields still throws PortalHttpError within the idle deadline, gate released (PR #16 review)', async () => {
+  const gate = countingGate();
+  let cancelled = false;
+  const client = mk({
+    gate: gate as any,
+    requestTimeoutMs: 1_000, // headers arrive fine; the stall is on the non-OK error body
+    idleTimeoutMs: 20,
+    // 400 headers arrive, but the error body never settles → pre-fix `await res.text()` hangs forever
+    // (finally never runs, gate slot leaks). Post-fix the SOFT idle race resolves '' and the typed error
+    // still throws promptly; the stalled body is CANCELLED (never abort()).
+    fetchImpl: (async () => ({
+      status: 400,
+      ok: false,
+      headers: { get: () => null },
+      text: () => new Promise<string>(() => {}), // never settles → the idle race must win
+      body: {
+        cancel: async () => {
+          cancelled = true; // graceful teardown = body.cancel(), never abort()
+        },
+      },
+    })) as any,
+  });
+  const err = await collect(client.stream(QUERY, 0, 10)).then(
+    () => undefined,
+    (e) => e,
+  );
+  expect(err).toBeInstanceOf(PortalHttpError);
+  expect((err as PortalHttpError).status).toBe(400); // right status, surfaced promptly
+  expect(cancelled).toBe(true); // the stalled error body was CANCELLED, never aborted
+  expect(gate.snapshot().active).toBe(0); // slot released (finally ran)
+});
+
 // ── G3 (INV-7): onRows fires per ARRIVING batch, not on stream completion ─────────────────────────
 
 test('G3: onRows is called once per yielded batch, mid-stream', async () => {
@@ -470,6 +510,51 @@ test('finalizedHead: parses {number}; undefined on failure', async () => {
       }) as any,
     }).finalizedHead(),
   ).toBeUndefined();
+});
+
+test('finalizedHead: a fetch that never sends headers returns undefined at the connect deadline (PR #16 review)', async () => {
+  // The head probe fetch never resolves on its own; only the connect-phase abort (signal) rejects it. If
+  // disarm-on-headers or the connect-phase AbortController were removed this would hang forever.
+  const client = mk({
+    finalizedHeadTimeoutMs: 20,
+    fetchImpl: (async (_u: string, init: any) =>
+      new Promise((_res, reject) => {
+        init.signal.addEventListener('abort', () =>
+          reject(Object.assign(new Error('aborted'), { name: 'AbortError' })),
+        );
+      })) as any,
+  });
+  // Only the connect-phase abort can settle this; if it never fired the vitest timeout would trip instead.
+  expect(await client.finalizedHead()).toBeUndefined();
+});
+
+test('finalizedHead: headers arrive but the JSON body never settles → undefined via the SOFT race, and NO abort() fires after headers (issue #14 / PR #16 review)', async () => {
+  let abortedAfterHeaders = false;
+  let headersDelivered = false;
+  let cancelled = false;
+  const client = mk({
+    finalizedHeadTimeoutMs: 20,
+    fetchImpl: (async (_u: string, init: any) => {
+      // record any abort that lands AFTER we hand back the response (i.e. once headers "arrived")
+      init.signal.addEventListener('abort', () => {
+        if (headersDelivered) abortedAfterHeaders = true;
+      });
+      headersDelivered = true;
+
+      return {
+        // json() never settles → the soft body-timer must win, cancel the body, and resolve undefined.
+        json: () => new Promise(() => {}),
+        body: {
+          cancel: async () => {
+            cancelled = true;
+          },
+        },
+      };
+    }) as any,
+  });
+  expect(await client.finalizedHead()).toBeUndefined();
+  expect(cancelled).toBe(true); // the body was CANCELLED (graceful teardown)
+  expect(abortedAfterHeaders).toBe(false); // never aborted after headers (the #14 kill shape)
 });
 
 test('finalizedHeadRetry: retries through the injectable sleep, then gives up undefined', async () => {

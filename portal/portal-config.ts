@@ -48,7 +48,7 @@ export type PortalConfig = Readonly<{
   traceChunkBlocks: number;
   /** PORTAL_REQUEST_TIMEOUT (30000ms) — per-request connect/headers deadline for a Portal stream POST. */
   requestTimeout: number;
-  /** PORTAL_IDLE_TIMEOUT (60000ms) — max gap between NDJSON chunks before a stalled body is aborted. */
+  /** PORTAL_IDLE_TIMEOUT (60000ms) — max gap between NDJSON chunks before a stalled body is cancelled (never abort(); issue #14). */
   idleTimeout: number;
   /** PORTAL_FINALIZED_HEAD — test/ops override for the Portal finalized head. */
   finalizedHead: number | undefined;
