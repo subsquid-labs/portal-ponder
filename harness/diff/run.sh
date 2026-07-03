@@ -17,14 +17,18 @@ PORTAL="${PORTAL_URL_1:-https://portal.sqd.dev/datasets/ethereum-mainnet}"
 
 pkill -f 'ponder start --schema diff_' 2>/dev/null
 WORK="$(mktemp -d)"
+# NPM_CACHE tracks the throwaway npm cache dir (created only for a local-tarball install) so the trap
+# removes it too — the old trap leaked every per-run mktemp -d cache.
+NPM_CACHE=""
 # Cleanup on ANY exit (completion, failure, interrupt mid-run): kill the backfills AND remove the
-# throwaway install/diff workspace + per-run logs — the old trap only killed the process and leaked
-# the mktemp -d workspace every run. Set KEEP_WORKSPACES=1 to retain them for debugging.
+# throwaway install/diff workspace + npm cache + per-run logs — the old trap only killed the process
+# and leaked the mktemp -d workspace/cache every run. Set KEEP_WORKSPACES=1 to retain them.
 cleanup () {
   pkill -f 'ponder start --schema diff_' 2>/dev/null
   [ -n "${KEEP_WORKSPACES:-}" ] && return
   cd / 2>/dev/null
   rm -rf "$WORK"
+  [ -n "$NPM_CACHE" ] && rm -rf "$NPM_CACHE"
   rm -f /tmp/diff-portal.log /tmp/diff-rpc.log
 }
 trap cleanup EXIT INT TERM
@@ -33,7 +37,8 @@ echo "▶ workspace $WORK  range [$START,$END]"
 [ -n "${SQD_PONDER_TARBALL:-}" ] && node -e "const p=require('./package.json');p.dependencies['@subsquid/ponder']='file:$SQD_PONDER_TARBALL';require('fs').writeFileSync('package.json',JSON.stringify(p,null,2))"
 # fresh cache when installing a LOCAL fork build: a re-packed tarball keeps the same version
 # (0.16.6-sqd.1), so npm's by-version cache would serve stale content across rebuilds.
-echo "▶ npm install"; npm install --no-audit --no-fund --silent ${SQD_PONDER_TARBALL:+--cache "$(mktemp -d)"} || { echo "✗ install failed"; exit 1; }
+[ -n "${SQD_PONDER_TARBALL:-}" ] && NPM_CACHE="$(mktemp -d)"
+echo "▶ npm install"; npm install --no-audit --no-fund --silent ${NPM_CACHE:+--cache "$NPM_CACHE"} || { echo "✗ install failed"; exit 1; }
 
 run () { # $1=label  $2=portal-url-or-empty  $3=db  $4=port
   echo "▶ $1 backfill …"

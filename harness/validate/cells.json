@@ -442,6 +442,7 @@
       "sourceTypes": ["logs", "receipts", "traces"],
       "sourceTypesNotCovered": ["accounts", "blocks"],
       "receipts": true,
+      "requires": "explicit addresses",
       "windows": [
         {
           "strategy": "seeded-random",
@@ -453,7 +454,7 @@
         }
       ],
       "expectedRequestEstimate": 120000,
-      "notes": "Multi-source cell on base — same logs+receipts+traces coverage and the same accounts/blocks deviation as A-eth. The traces app defaults to eth V3-pool/V2-router addresses; a base run MUST set CHAIN_ID + POOL_ADDRESS + ROUTER_ADDRESS to base contracts that emit the V3 Swap event / V2 router call-traces (VERIFY against the capability report) — it is not yet wired to per-chain addresses in cells.json."
+      "notes": "Multi-source cell on base — same logs+receipts+traces coverage and the same accounts/blocks deviation as A-eth. The traces app defaults to eth V3-pool/V2-router addresses, which do NOT exist on base, so this cell carries `requires: explicit addresses`: run-cell.sh REFUSES to run it (and the app config throws) unless POOL_ADDRESS + ROUTER_ADDRESS are set to base contracts that emit the V3 Swap event / V2 router call-traces (VERIFY against the capability report). To wire A-base for a paid run, add an `env` map {POOL_ADDRESS, ROUTER_ADDRESS} to this cell (resolve-cell.mjs exports it via CELL_ENV_EXPORTS) or pass them in the environment. Base addresses are intentionally NOT hardcoded here — they must be verified against the P0 capability report, not guessed."
     },
     {
       "id": "U-eth",

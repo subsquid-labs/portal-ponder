@@ -31,6 +31,26 @@ if [ "$CELL_RUNNER" = "differential" ]; then
   echo "→ $CELL is a raw-breadth cell; run it with harness/compare/differential.ts (not run-cell.sh)"; exit 2
 fi
 
+# A cell that declares `requires` (e.g. "explicit addresses" — the traces app on a non-eth chain whose
+# per-chain Pool/Router addresses are not yet wired) MUST be given those overrides before it can run.
+# Refuse to run it with cross-chain-wrong defaults unless the operator has supplied the needed env
+# (checked here for the address case) — failing loud beats silently backfilling wrong addresses (#7).
+if [ -n "${CELL_REQUIRES:-}" ]; then
+  case "$CELL_REQUIRES" in
+    *"explicit addresses"*)
+      if [ -z "${POOL_ADDRESS:-}" ] || [ -z "${ROUTER_ADDRESS:-}" ]; then
+        echo "✗ cell $CELL requires explicit per-chain addresses ($CELL_REQUIRES): set POOL_ADDRESS and ROUTER_ADDRESS"
+        echo "  (the traces app defaults to Ethereum-mainnet Pool/Router; running them on chain $CELL_CHAIN_ID would index nonexistent contracts)"
+        exit 2
+      fi
+      ;;
+    *)
+      echo "✗ cell $CELL declares requires='$CELL_REQUIRES' but run-cell.sh has no handler for it — refusing to run"
+      exit 2
+      ;;
+  esac
+fi
+
 # WINDOW_OVERRIDE=FROM-TO forces a single window (smoke / debugging); skips head resolution.
 if [ -n "${WINDOW_OVERRIDE:-}" ]; then
   IFS='-' read -r ov_from ov_to <<<"$WINDOW_OVERRIDE"
@@ -123,6 +143,10 @@ run_window () {
   export PORTAL_URL_1="$CELL_PORTAL_URL"
   export CHAIN_ID="$CELL_CHAIN_ID"
   export INCLUDE_RECEIPTS="$CELL_RECEIPTS"
+  # per-cell env overrides from cells.json (e.g. per-chain POOL_ADDRESS/ROUTER_ADDRESS for a non-eth
+  # traces cell). Applied FIRST so an operator's explicit POOL_ADDRESS/ROUTER_ADDRESS in the
+  # environment still wins for the `requires` case (they are exported here only if the cell sets them).
+  [ -n "${CELL_ENV_EXPORTS:-}" ] && eval "$CELL_ENV_EXPORTS"
   export PORTAL_CHUNK_FIXED=1 PORTAL_CHUNK_BLOCKS="${PORTAL_CHUNK_BLOCKS_OVERRIDE:-500000}" PORTAL_CHUNK_PINNED=1
   export PORTAL_CHECKS=strict
   [ -n "$CELL_EULER_FACTORY" ] && export EULER_FACTORY="$CELL_EULER_FACTORY"

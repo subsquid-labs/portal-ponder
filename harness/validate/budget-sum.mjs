@@ -9,9 +9,11 @@
 // a new window once the campaign has met the ceiling, so a run can never blow past the budget by
 // more than the in-flight window.
 //
-// THIS IS THE $-BUDGET GUARD — it must FAIL CLOSED. An unreadable/corrupt results file or a
-// non-finite / negative request value is treated as OVER budget (exit 3), never silently skipped:
-// fail-open here spends real money. sumRequests returns { total, error } — a non-null error means the
+// THIS IS THE $-BUDGET GUARD — it must FAIL CLOSED. An unreadable/corrupt results file, a MISSING
+// `requests` field, or a non-integer / negative request value is treated as untrusted (exit 3),
+// never silently skipped or counted as zero: fail-open here spends real money. Every window/attempt
+// record must carry its own finite non-negative integer `requests` — a dropped field would
+// UNDERCOUNT the cumulative spend. sumRequests returns { total, error } — a non-null error means the
 // numbers cannot be trusted and --check must refuse to start a window.
 
 import { readdirSync, readFileSync } from 'node:fs';
@@ -21,17 +23,24 @@ import { fileURLToPath } from 'node:url';
 const HERE = dirname(fileURLToPath(import.meta.url));
 const RESULTS = resolve(HERE, 'results');
 
-// A single window/attempt's requests must be a finite, non-negative number. Anything else (NaN,
-// Infinity, negative, non-numeric) means a corrupt/tampered record — the guard cannot vouch for the
-// spend, so it fails closed.
+// A single window/attempt's requests must be a finite, non-negative INTEGER that is actually PRESENT.
+// A MISSING `requests` field is no longer treated as 0 — an old/corrupt/tampered record that dropped
+// its spend field would silently UNDERCOUNT the cumulative total (spending real money the guard never
+// saw). So the guard now FAILS CLOSED on missing/invalid too: every metered record must vouch for its
+// own spend. (undefined, null, NaN, Infinity, negative, fractional, non-numeric → invalid.)
 export function validRequests(v) {
-  const n = Number(v ?? 0);
+  if (v === undefined || v === null || v === '') {
+    return false;
+  }
 
-  return Number.isFinite(n) && n >= 0;
+  const n = Number(v);
+
+  return Number.isInteger(n) && n >= 0;
 }
 
-// Sum requests over a parsed results doc's windows AND each window's `attempts` history. Returns
-// null on the FIRST invalid value so the caller fails closed.
+// Sum requests over a parsed results doc's windows AND each window's `attempts` history. Every
+// window/attempt MUST carry its own valid `requests`. Returns null on the FIRST missing/invalid value
+// so the caller fails closed (a dropped field cannot be silently counted as zero spend).
 export function sumDoc(doc) {
   let total = 0;
   for (const w of doc.windows ?? []) {
@@ -41,7 +50,7 @@ export function sumDoc(doc) {
         return null;
       }
 
-      total += Number(row.requests ?? 0);
+      total += Number(row.requests);
     }
   }
 

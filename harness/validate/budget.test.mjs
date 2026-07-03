@@ -59,15 +59,44 @@ test('sumDoc: counts the verdict-bearing window AND every attempt', () => {
 
 // ── #10 budget-sum: validate finite/non-negative, FAIL CLOSED on corrupt/non-finite ─────────────
 
-test('validRequests: only finite, non-negative numbers are trusted', () => {
+// #22 — the budget guard FAILS CLOSED on a MISSING `requests` field too: an old/corrupt/tampered
+// record that dropped its spend field must NOT be counted as zero (that silently undercounts spend).
+// MUTATION: revert validRequests to `Number.isFinite(Number(v ?? 0)) && n>=0` (treat missing as 0) →
+// the `validRequests(undefined)`/`sumDoc(missing)` assertions below flip and this test fails.
+test('validRequests: only PRESENT finite non-negative integers are trusted (missing fails closed)', () => {
   assert.equal(validRequests(0), true);
   assert.equal(validRequests(1234), true);
   assert.equal(validRequests('999'), true);
-  assert.equal(validRequests(undefined), true); // missing → 0, legitimate
+  // a MISSING requests field is now UNTRUSTED — it must not be silently counted as zero spend
+  assert.equal(validRequests(undefined), false);
+  assert.equal(validRequests(null), false);
+  assert.equal(validRequests(''), false);
   assert.equal(validRequests(-1), false);
+  assert.equal(validRequests(1.5), false, 'a request count is an integer');
   assert.equal(validRequests(Number.NaN), false);
   assert.equal(validRequests(Number.POSITIVE_INFINITY), false);
   assert.equal(validRequests('not-a-number'), false);
+});
+
+test('sumDoc: a window/attempt MISSING its requests field fails closed → null', () => {
+  // a verdict-bearing window with no `requests` at all (a dropped/old record)
+  assert.equal(
+    sumDoc({ windows: [{ window: { tag: 'w0' }, pass: true }] }),
+    null,
+    'a window with no requests field must not be counted as zero',
+  );
+  // present on the window but MISSING on an attempt → still fails closed
+  assert.equal(
+    sumDoc({
+      windows: [
+        {
+          ...win('w0', 100),
+          attempts: [{ window: { tag: 'w0' }, pass: true }],
+        },
+      ],
+    }),
+    null,
+  );
 });
 
 test('sumDoc: a non-finite/negative requests value poisons the doc → null (fail closed)', () => {

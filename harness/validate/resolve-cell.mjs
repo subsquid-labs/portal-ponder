@@ -24,7 +24,7 @@ function shQuote(v) {
   return `'${String(v).replaceAll("'", `'\\''`)}'`;
 }
 
-function buildPlan(cellId, head) {
+export function buildPlan(cellId, head) {
   const doc = loadCells();
   const cell = doc.cells.find((c) => c.id === cellId);
   if (!cell) {
@@ -64,10 +64,16 @@ function buildPlan(cellId, head) {
     needsHead,
     windows,
     env: doc.defaults.env,
+    // Per-cell env overrides (e.g. per-chain POOL_ADDRESS/ROUTER_ADDRESS for the traces app on a
+    // non-eth chain). run-cell.sh exports these before launching the backfill. A cell that names a
+    // non-default chain for an address-defaulted app but ships no addresses is REQUIRED to carry a
+    // `requires` marker so run-cell.sh refuses to run it (rather than silently using eth defaults).
+    cellEnv: cell.env ?? {},
+    requires: cell.requires ?? '',
   };
 }
 
-function emitSh(plan) {
+export function emitSh(plan) {
   const line = (k, v) => `${k}=${shQuote(v)}`;
   const out = [
     line('CELL_ID', plan.id),
@@ -86,11 +92,25 @@ function emitSh(plan) {
     line('CELL_APP_HASH', plan.appHash ? '1' : ''),
     line('CELL_SHRINK', plan.shrink),
     line('CELL_NEEDS_HEAD', plan.needsHead ? '1' : ''),
+    line('CELL_REQUIRES', plan.requires),
     line(
       'CELL_WINDOWS',
       plan.windows.map((w) => `${w.from}|${w.to}|${w.tag}`).join(' '),
     ),
   ];
+
+  // Per-cell env overrides as sourceable `export KEY=value` lines (e.g. POOL_ADDRESS/ROUTER_ADDRESS
+  // for a non-eth traces cell). Values are shell-quoted; keys are validated to be safe env names so a
+  // malformed cells.json entry can never inject shell.
+  const envLines = [];
+  for (const [k, v] of Object.entries(plan.cellEnv)) {
+    if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(k)) {
+      throw new Error(`invalid env key in cell ${plan.id}: ${k}`);
+    }
+
+    envLines.push(`export ${k}=${shQuote(v)}`);
+  }
+  out.push(line('CELL_ENV_EXPORTS', envLines.join('; ')));
 
   return out.join('\n');
 }
@@ -116,4 +136,6 @@ function main() {
   console.log(JSON.stringify(plan, null, 2));
 }
 
-main();
+if (import.meta.url === `file://${process.argv[1]}`) {
+  main();
+}

@@ -58,11 +58,14 @@ curl -sf "http://127.0.0.1:$METER_PORT/__count" >/dev/null 2>&1 || { echo "✗ m
 # met the ceiling (fails closed on a corrupt results file too, per budget-sum.mjs).
 node "$VDIR/budget-sum.mjs" --check >/dev/null || { echo "✗ BUDGET: refusing to start CTRL windows"; exit 3; }
 
-# install a workspace whose @subsquid/ponder resolves to $2 (a file: tarball or npm:ponder alias)
+# install a workspace whose @subsquid/ponder resolves to $2 (a file: tarball or npm:ponder alias).
+# The throwaway npm cache is created UNDER the install dir ($1/.npm-cache) so it is removed together
+# with the window's workspace ($WORK) by the cleanup trap — the old `--cache "$(mktemp -d)"` created a
+# top-level tmp cache dir the trap never tracked, leaking one per install (two per CTRL window).
 install_ws () { # $1=dir  $2=dep-spec
   rm -rf "$1"; cp -r "$CELL_APP_PATH/." "$1"; ( cd "$1"
     node -e "const p=require('./package.json');p.dependencies['@subsquid/ponder']=process.argv[1];require('fs').writeFileSync('package.json',JSON.stringify(p,null,2))" "$2"
-    npm install --no-audit --no-fund --silent --cache "$(mktemp -d)" ) || { echo "✗ install failed for $2"; return 1; }
+    npm install --no-audit --no-fund --silent --cache "$1/.npm-cache" ) || { echo "✗ install failed for $2"; return 1; }
 }
 
 # run a bounded backfill (RPC only; portal unset) and wait for completion
@@ -111,7 +114,12 @@ for spec in $CELL_WINDOWS; do
   matched="$(sed -nE 's/.*logs[[:space:]]+portal=[[:space:]]*([0-9]+).*/\1/p' "$wlog" | head -1)"; [ -n "$matched" ] || matched="nan"
   pass=0; [ $rc -eq 0 ] && pass=1; [ $pass = 1 ] || fail=1
   tail -30 "$wlog" > "$wlog.tail"
-  node "$VDIR/record-result.mjs" "$CELL" "$tag" "$FROM" "$TO" "$pass" "$requests" "$dur" "$matched" 0 "$wlog.tail"
+  # persisting the result IS the budget record — if the write fails, this window's metered spend went
+  # untracked. A CTRL cell that recorded no result must NOT exit 0 (that would let real spend escape
+  # the cumulative budget guard), so a failed record fails the cell.
+  if ! node "$VDIR/record-result.mjs" "$CELL" "$tag" "$FROM" "$TO" "$pass" "$requests" "$dur" "$matched" 0 "$wlog.tail"; then
+    echo "  ✗ RECORD: failed to persist CTRL/$tag ($requests requests untracked) — failing"; fail=1
+  fi
   echo "  $([ $pass = 1 ] && echo 'PASS (fork-portal-unset ≡ upstream)' || echo FAIL)  requests=$requests  ${dur}s"
   [ -n "${KEEP_WORKSPACES:-}" ] || rm -rf "$WORK" "$wlog" "$wlog.tail"
 done
