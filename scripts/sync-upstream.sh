@@ -64,18 +64,24 @@ let n=0; for(const s of ['dependencies','devDependencies','peerDependencies']){ 
 fs.writeFileSync(pkgPath, JSON.stringify(pkg,null,2)+'\n'); console.log('  rewrote '+n+' workspace dep(s)');
 "
 
-if [ "${2:-}" = "--test" ]; then
-  # `fast-check` (property tests) is a DEV-ONLY dep of the clone — never a runtime dep of the published
-  # package. We provision it straight into the core's node_modules rather than adding it to package.json,
-  # because renaming the core to @subsquid/ponder orphans sibling workspace packages (e.g. benchmark's
-  # `ponder@workspace:*`), so a lockfile re-resolve (which a new package.json dep would force) fails.
+# `fast-check` (property tests) is a DEV-ONLY dep of the clone — never a runtime dep of the published
+# package. We provision it straight into the core's node_modules rather than adding it to package.json,
+# because renaming the core to @subsquid/ponder orphans sibling workspace packages (e.g. benchmark's
+# `ponder@workspace:*`), so a lockfile re-resolve (which a new package.json dep would force) fails.
+# Both --test and --coverage need it (the property tests import fast-check), so it's a shared step.
+provision_fastcheck() {
   echo "▶ provisioning fast-check (dev-only, for the property tests)"
   # OUTSIDE the clone so npm doesn't walk up into the pnpm workspace root. Pinned exactly for
   # reproducible CI; the whole resolved tree is copied so transitive deps can never be missed.
+  local FCDIR
   FCDIR="$(mktemp -d)"
   ( cd "$FCDIR" && npm init -y >/dev/null 2>&1 && npm install --no-audit --no-fund --silent fast-check@3.23.2 )
   cp -R "$FCDIR/node_modules/." "$CORE/node_modules/"
   rm -rf "$FCDIR"
+}
+
+if [ "${2:-}" = "--test" ]; then
+  provision_fastcheck
   echo "▶ running Portal-layer tests"
   ( cd "$CORE" && pnpm exec vitest run --config vite.portal.config.ts )
 fi
@@ -90,6 +96,9 @@ if [ "${2:-}" = "--coverage" ]; then
   VITEST_VER="$(node -e "console.log(require('$CORE/node_modules/vitest/package.json').version)")"
   echo "▶ installing @vitest/coverage-v8@$VITEST_VER (matching installed vitest)"
   ( cd "$CORE" && $PNPM add -D "@vitest/coverage-v8@$VITEST_VER" --ignore-workspace )
+
+  # AFTER `pnpm add` — it re-resolves node_modules and would prune the manually-copied tree.
+  provision_fastcheck
 
   echo "▶ running Portal-layer tests with coverage"
   ( cd "$CORE" && pnpm exec vitest run --config vite.portal.config.ts --coverage )

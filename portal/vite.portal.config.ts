@@ -22,13 +22,14 @@ export default defineConfig({
       provider: 'v8',
       reporter: ['json-summary', 'text-summary'],
       reportsDirectory: 'portal-coverage',
+      // Match the copy step's GLOB (scripts/sync-upstream.sh: portal*.ts + realtime*.ts) so a
+      // newly added Portal module is never silently dropped from the coverage denominator.
+      // Tests are excluded so they don't inflate the numbers.
       include: [
-        'src/sync-historical/portal.ts',
-        'src/sync-historical/portal-transform.ts',
-        'src/sync-historical/portal-realtime.ts',
-        'src/sync-historical/portal-realtime-wire.ts',
-        'src/sync-historical/realtime.ts',
+        'src/sync-historical/portal*.ts',
+        'src/sync-historical/realtime*.ts',
       ],
+      exclude: ['**/*.test.ts'],
     },
   },
 });
