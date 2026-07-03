@@ -46,6 +46,10 @@ export type PortalConfig = Readonly<{
   chunkFixed: boolean;
   /** PORTAL_TRACE_CHUNK_BLOCKS (2000) — trace-safe chunk cap for dense (trace/block) sources. */
   traceChunkBlocks: number;
+  /** PORTAL_REQUEST_TIMEOUT (30000ms) — per-request connect/headers deadline for a Portal stream POST. */
+  requestTimeout: number;
+  /** PORTAL_IDLE_TIMEOUT (60000ms) — max gap between NDJSON chunks before a stalled body is aborted. */
+  idleTimeout: number;
   /** PORTAL_FINALIZED_HEAD — test/ops override for the Portal finalized head. */
   finalizedHead: number | undefined;
   /** PORTAL_REALTIME — "stream" enables Portal-native realtime (else RPC realtime). */
@@ -118,6 +122,10 @@ export function loadPortalConfig(env: Env = process.env): PortalConfig {
     traceChunkBlocks: intKnob(env, 'PORTAL_TRACE_CHUNK_BLOCKS', 2_000, {
       min: 1,
     }),
+    requestTimeout: intKnob(env, 'PORTAL_REQUEST_TIMEOUT', 30_000, {
+      min: 1_000,
+    }),
+    idleTimeout: intKnob(env, 'PORTAL_IDLE_TIMEOUT', 60_000, { min: 1_000 }),
     finalizedHead: finalizedRaw
       ? intKnob(env, 'PORTAL_FINALIZED_HEAD', 0, { min: 0 })
       : undefined,

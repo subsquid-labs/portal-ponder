@@ -14,6 +14,8 @@ test('INV-14: empty env → documented defaults, frozen', () => {
   expect(c.startConcurrency).toBe(16);
   expect(c.maxRowsInMem).toBe(250_000);
   expect(c.traceChunkBlocks).toBe(2_000);
+  expect(c.requestTimeout).toBe(30_000);
+  expect(c.idleTimeout).toBe(60_000);
   expect(c.chunkFixed).toBe(false);
   expect(c.gateLog).toBe(false);
   expect(c.checks).toBe('on');
@@ -34,6 +36,8 @@ test('INV-14: valid overrides parse', () => {
     PORTAL_METRICS_FILE: '/tmp/m',
     PORTAL_REALTIME: 'stream',
     PORTAL_GATE_LOG: '1',
+    PORTAL_REQUEST_TIMEOUT: '15000',
+    PORTAL_IDLE_TIMEOUT: '45000',
   });
   expect(c.chunkBlocks).toBe(250_000);
   expect(c.readahead).toBe(3);
@@ -44,6 +48,14 @@ test('INV-14: valid overrides parse', () => {
   expect(c.metricsFile).toBe('/tmp/m');
   expect(c.realtime).toBe('stream');
   expect(c.gateLog).toBe(true);
+  expect(c.requestTimeout).toBe(15_000);
+  expect(c.idleTimeout).toBe(45_000);
+});
+
+test('INV-14: a below-floor timeout is rejected (no spurious-abort footgun)', () => {
+  expect(() => loadPortalConfig({ PORTAL_IDLE_TIMEOUT: '10' })).toThrow(
+    PortalConfigError,
+  );
 });
 
 test('INV-14: garbage numeric → loud PortalConfigError (not silent NaN)', () => {

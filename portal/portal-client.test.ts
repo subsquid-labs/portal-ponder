@@ -3,6 +3,7 @@ import {
   createPortalClient,
   ndjsonLines,
   type PortalClient,
+  parseRetryAfterMs,
 } from './portal-client.js';
 import { PortalHttpError } from './portal-errors.js';
 import type { PortalQuery } from './portal-filters.js';
@@ -118,7 +119,7 @@ test('body-size guard: over-limit body fails loud with the explicit size driver 
 
 // ── error-mapping matrix ──────────────────────────────────────────────────────────────────────────
 
-test('throttle 429 → retried, then succeeds (retryAfterMs=0 when no header → prompt retry)', async () => {
+test('throttle 429 → retried, then succeeds (a header-less throttle backs off exponentially, not zero)', async () => {
   let n = 0;
   const sleeps: number[] = [];
   const stats = createStats();
@@ -135,7 +136,7 @@ test('throttle 429 → retried, then succeeds (retryAfterMs=0 when no header →
   const out = await collect(client.stream(QUERY, 0, 10));
   expect(out).toHaveLength(1);
   expect(stats.retries).toBe(1);
-  expect(sleeps).toEqual([0]);
+  expect(sleeps).toEqual([1_000]); // 500·2^1 exponential — no advice ⇒ NOT a 0ms prompt retry (issue #9)
 });
 
 test('5xx and 409 are treated as throttle (retried)', async () => {
@@ -286,6 +287,149 @@ test('retry-after: a numeric header sleeps ra*1000 capped at 30s', async () => {
   });
   await collect(client.stream(QUERY, 0, 10));
   expect(sleeps).toEqual([2_000, 30_000]); // ra*1000, then min(ra*1000, 30_000)
+});
+
+// ── retry-after: HTTP-date form, zero-backoff, and garbage (issue #9) ──────────────────────────────
+
+test('parseRetryAfterMs: positive advice only; absent / "0" / past-date / garbage ⇒ undefined', () => {
+  const now = Date.parse('2025-01-01T00:00:00Z');
+  expect(parseRetryAfterMs('2', now)).toBe(2_000); //             delta-seconds
+  expect(parseRetryAfterMs(new Date(now + 5_000).toUTCString(), now)).toBe(
+    5_000,
+  ); //                                                            HTTP-date, 5s in the future
+  // everything below carries no usable positive advice ⇒ undefined ⇒ caller uses exponential back-off
+  expect(parseRetryAfterMs(null, now)).toBeUndefined(); //        absent (NOT Number(null)===0 → 0)
+  expect(parseRetryAfterMs('0', now)).toBeUndefined(); //         explicit zero
+  expect(parseRetryAfterMs('-5', now)).toBeUndefined(); //        negative
+  expect(parseRetryAfterMs(new Date(now - 5_000).toUTCString(), now)).toBe(
+    undefined,
+  ); //                                                            already-past HTTP-date
+  expect(parseRetryAfterMs('not-a-date', now)).toBeUndefined(); // garbage
+});
+
+test('retry-after: a header-less throttle storm backs off EXPONENTIALLY, never zero (issue #9)', async () => {
+  const sleeps: number[] = [];
+  let n = 0;
+  const client = mk({
+    sleepImpl: async (ms) => {
+      sleeps.push(ms);
+    },
+    // three header-less 429s (the common LB 502/503 shape), then success
+    fetchImpl: (async () => (n++ < 3 ? throttleRes(429) : doneRes())) as any,
+  });
+  await collect(client.stream(QUERY, 0, 10));
+  // pre-fix: Number(null)===0 → retryAfterMs 0 → the wait takes the advised branch = 0ms every attempt
+  // (an 11-deep 0ms hammer). now: no advice ⇒ 500·2^attempt.
+  expect(sleeps).toEqual([1_000, 2_000, 4_000]);
+});
+
+test('retry-after: an HTTP-date header backs off instead of hard-throwing mid-run (issue #9)', async () => {
+  const when = new Date(Date.now() + 5_000).toUTCString(); // ~5s in the future, second-granular
+  const sleeps: number[] = [];
+  let n = 0;
+  const client = mk({
+    sleepImpl: async (ms) => {
+      sleeps.push(ms);
+    },
+    fetchImpl: (async () =>
+      n++ === 0 ? throttleRes(429, when) : doneRes()) as any,
+  });
+  // pre-fix: Number(date)→NaN→undefined→non-retryable→this REJECTS. now: parsed → retried → resolves.
+  await expect(collect(client.stream(QUERY, 0, 10))).resolves.toEqual([]);
+  expect(sleeps).toHaveLength(1);
+  expect(sleeps[0]).toBeGreaterThan(1_000); // backed off toward the advised instant
+  expect(sleeps[0]).toBeLessThanOrEqual(30_000); // capped at the 30s ceiling
+});
+
+test('retry-after: a throttle with a garbage header still retries (exponential), never hard-throws (issue #9)', async () => {
+  let n = 0;
+  const client = mk({
+    fetchImpl: (async () =>
+      n++ === 0 ? throttleRes(429, 'garbage') : doneRes()) as any,
+  });
+  // a 429/5xx is always retryable; a malformed Retry-After must not turn it into a fatal error.
+  await expect(collect(client.stream(QUERY, 0, 10))).resolves.toEqual([]);
+});
+
+// ── HTTP-path deadlines: a hung request/body must abort-or-cancel, retry, and release its gate slot ──
+// (addendum) Without a deadline a hung request never runs fetchBatch's `finally`, so its gate slot leaks
+// and every chain eventually parks in gate.acquire(). A counting gate proves the slot is returned.
+
+const countingGate = () => {
+  let active = 0;
+  let peak = 0;
+  return {
+    acquire: async () => {
+      active++;
+      peak = Math.max(peak, active);
+    },
+    release() {
+      active--;
+    },
+    onOk() {},
+    onThrottle() {},
+    addRows() {},
+    freeRows() {},
+    saturated: () => false,
+    snapshot: () => ({ limit: 0, active, rows: 0 }),
+    peak: () => peak,
+  };
+};
+
+test('timeout: a fetch that never sends headers is aborted at the connect deadline, retried, gate released (addendum)', async () => {
+  const gate = countingGate();
+  let n = 0;
+  const client = mk({
+    gate: gate as any,
+    requestTimeoutMs: 20,
+    idleTimeoutMs: 20,
+    fetchImpl: (async (_u: string, init: any) => {
+      if (n++ === 0)
+        // never resolves on its own; only the connect-phase abort (signal) rejects it
+        return new Promise((_res, reject) => {
+          init.signal.addEventListener('abort', () =>
+            reject(Object.assign(new Error('aborted'), { name: 'AbortError' })),
+          );
+        });
+
+      return doneRes();
+    }) as any,
+  });
+  await expect(collect(client.stream(QUERY, 0, 10))).resolves.toEqual([]);
+  expect(n).toBe(2); // first hung → aborted + retried; second completed
+  expect(gate.snapshot().active).toBe(0); // slot released (finally ran)
+  expect(gate.peak()).toBeGreaterThanOrEqual(1); // it was acquired
+});
+
+test('timeout: a body that stalls without closing hits the SOFT idle timeout, is cancelled (not aborted), retried, gate released (addendum)', async () => {
+  const gate = countingGate();
+  let n = 0;
+  let cancelled = false;
+  const client = mk({
+    gate: gate as any,
+    requestTimeoutMs: 1_000, // headers arrive fine; the stall is on the body
+    idleTimeoutMs: 20,
+    fetchImpl: (async () => {
+      if (n++ === 0) {
+        // headers OK, but the body never produces a chunk and never closes → idle timeout fires.
+        // NB: no signal wiring — the soft timeout does NOT depend on abort reaching the stream.
+        const body = new ReadableStream<Uint8Array>({
+          start() {
+            /* never enqueue, never close */
+          },
+          cancel() {
+            cancelled = true; // graceful teardown = reader.cancel(), not abort()
+          },
+        });
+        return { status: 200, ok: true, headers: { get: () => null }, body };
+      }
+      return doneRes();
+    }) as any,
+  });
+  await expect(collect(client.stream(QUERY, 0, 10))).resolves.toEqual([]);
+  expect(n).toBe(2); // stalled body → idle-timeout + retry; second completed
+  expect(cancelled).toBe(true); // the stream was CANCELLED, never aborted
+  expect(gate.snapshot().active).toBe(0); // slot released
 });
 
 // ── G3 (INV-7): onRows fires per ARRIVING batch, not on stream completion ─────────────────────────
