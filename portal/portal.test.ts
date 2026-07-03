@@ -1245,6 +1245,155 @@ test('regression (FIX 4): a trace filter with hasTransactionReceipt inserts a re
   }
 });
 
+test('regression (FIX 4): a TRANSFER filter with hasTransactionReceipt inserts a receipt for the matched transfer tx (pins the transferFilters half of needTraceReceipts)', async () => {
+  // The FIX-4 sibling of the trace-receipt case: `needTraceReceipts` ORs the transfer half
+  // (portal-assemble.ts: `|| spec.transferFilters.some((f) => f.hasTransactionReceipt)`). A `type:'transfer'`
+  // source with hasTransactionReceipt rides the SAME unfiltered trace query, and its matched transfer's
+  // parent tx is seen by no log/tx branch — so without the transfer half of the OR, assembleRange would
+  // emit the transfer's transaction but NO receipt → buildEvents throws "Missing transaction receipt".
+  // Unlike the trace filter, a transfer only matches a NON-ZERO value frame (isTransferFilterMatched),
+  // so this mock carries `action.value: '0x1'`.
+  process.env.PORTAL_FINALIZED_HEAD = String(22200011 + 1_000_000); // no finality fallback / no head call
+  const BLOCK = 22200011;
+  const TX_INDEX = 111;
+  const TXH = '0x' + '9d'.repeat(32);
+  const B_HASH = '0x' + 'c2'.repeat(32);
+  const TARGET = '0x000000000000000000000000000000000000dead';
+  const OTHER = '0x000000000000000000000000000000000000beef';
+  const HEADER = {
+    number: BLOCK,
+    hash: B_HASH,
+    parentHash: '0x' + '00'.repeat(32),
+    timestamp: 1700000000,
+    logsBloom: '0x' + '00'.repeat(256),
+    miner: OTHER,
+    gasUsed: '0xabc',
+    gasLimit: '0x1c9c380',
+    stateRoot: '0x' + '22'.repeat(32),
+    receiptsRoot: '0x' + '33'.repeat(32),
+    transactionsRoot: '0x' + '44'.repeat(32),
+    size: '0x500',
+    difficulty: '0x0',
+    extraData: '0x',
+  };
+  // matched transfer: a top-level value-bearing call to TARGET; its parent tx carries the receipt fields.
+  const TRACE = {
+    transactionIndex: TX_INDEX,
+    traceAddress: [],
+    type: 'call',
+    subtraces: 0,
+    error: null,
+    revertReason: null,
+    action: {
+      from: OTHER,
+      to: TARGET,
+      value: '0x1', // NON-ZERO ⇒ isTransferFilterMatched (a zero-value frame would not match)
+      gas: '0x1000',
+      input: '0x',
+      sighash: '0x',
+      type: 'call',
+      callType: 'call',
+    },
+    result: { gasUsed: '0x10', output: '0x' },
+  };
+  const TX = {
+    transactionIndex: TX_INDEX,
+    hash: TXH,
+    from: OTHER,
+    to: TARGET,
+    input: '0x',
+    value: '0x1',
+    nonce: 1,
+    gas: '0x100000',
+    gasPrice: '0x1',
+    type: 0,
+    r: '0x' + '11'.repeat(32),
+    s: '0x' + '22'.repeat(32),
+    v: '0x1',
+    // receipt fields (the trace query projects RECEIPT_FIELDS when needReceipts) — toSyncReceipt reads these
+    status: '0x1',
+    cumulativeGasUsed: '0x5208',
+    gasUsed: '0x5208',
+    effectiveGasPrice: '0x1',
+    logsBloom: '0x' + '00'.repeat(256),
+    contractAddress: null,
+  };
+  const srv = http.createServer((req, res) => {
+    let body = '';
+    req.on('data', (c) => {
+      body += c;
+    });
+    req.on('end', () => {
+      const q = body ? JSON.parse(body) : {};
+      const covers =
+        (q.fromBlock ?? 0) <= BLOCK && (q.toBlock ?? 1e12) >= BLOCK;
+      if (req.url?.includes('finalized-stream') && q.traces && covers) {
+        res.writeHead(200, { 'content-type': 'application/x-ndjson' });
+        res.end(
+          JSON.stringify({
+            header: HEADER,
+            traces: [TRACE],
+            transactions: [TX],
+          }) + '\n',
+        );
+      } else {
+        res.writeHead(204).end();
+      }
+    });
+  });
+  const p: number = await new Promise((r) =>
+    srv.listen(0, () => r((srv.address() as AddressInfo).port)),
+  );
+  try {
+    const inserted = { traces: [] as any[], receipts: [] as any[] };
+    const syncStore: any = {
+      insertLogs: () => {},
+      insertBlocks: () => {},
+      insertTransactions: () => {},
+      insertTransactionReceipts: (x: any) =>
+        inserted.receipts.push(...x.transactionReceipts),
+      insertTraces: (x: any) => inserted.traces.push(...x.traces),
+    };
+    const filter: any = {
+      type: 'transfer',
+      chainId: 1,
+      sourceId: 'transfer:receipt',
+      fromAddress: undefined,
+      toAddress: TARGET,
+      includeReverted: false,
+      fromBlock: BLOCK,
+      toBlock: BLOCK,
+      hasTransactionReceipt: true, // ← the transfer-receipt config the fix must honor
+      include: [],
+    };
+    const sync = createPortalHistoricalSync({
+      common: {
+        logger: { debug() {}, info() {}, warn() {}, error() {}, trace() {} },
+      } as any,
+      chain: { id: 1, name: 'mainnet', portal: `http://localhost:${p}` } as any,
+      childAddresses: new Map(),
+      eventCallbacks: [{ filter }],
+    } as any);
+    const interval: [number, number] = [BLOCK, BLOCK];
+    await sync.syncBlockRangeData({
+      interval,
+      requiredIntervals: [{ interval, filter }],
+      requiredFactoryIntervals: [],
+      syncStore,
+    });
+    await sync.syncBlockData({ interval, logs: [], syncStore } as any);
+
+    expect(inserted.traces).toHaveLength(1); // the matched transfer is stored
+    // THE REGRESSION: its parent tx's receipt is inserted (drops if the transfer half of the OR is removed)
+    expect(inserted.receipts).toHaveLength(1);
+    expect(inserted.receipts[0].transactionHash).toBe(TXH);
+    expect(inserted.receipts[0].blockHash).toBe(B_HASH);
+  } finally {
+    srv.close();
+    delete process.env.PORTAL_FINALIZED_HEAD;
+  }
+});
+
 test('merge: N same-address event filters collapse to ONE log request (unioned topic0) — keeps body small', async () => {
   // Ponder emits one filter per event; a 24-event EVault would otherwise repeat the child-address
   // list 24× in one body and blow past MAX_RAW_QUERY_SIZE. mergeLogRequests must fold them into one.
