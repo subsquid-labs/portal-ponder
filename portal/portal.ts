@@ -135,10 +135,10 @@ const portalGate = (() => {
   // counted, so 250k ≈ 1.5-2.5 GB — it must engage BEFORE the heap dies. The prior 1.2M was dead
   // code: a 4 GB heap OOMs at ~450k rows, so the cap never fired. Scale up with --max-old-space-size.
   const MAX_ROWS = Number(process.env.PORTAL_MAX_ROWS_IN_MEM ?? 250_000);
-  let limit = START,
-    active = 0,
-    ok = 0,
-    rows = 0;
+  let limit = START;
+  let active = 0;
+  let ok = 0;
+  let rows = 0;
   const waiters: (() => void)[] = [];
   const pump = () => {
     while (active < limit && waiters.length > 0) {
@@ -229,6 +229,15 @@ export const createPortalHistoricalSync = (
   const chunkRows = new Map<number, number>(); // idx → buffered row count, for the global memory budget
   let discoveredThrough = -1; // high-water block covered by the single wide factory-discovery scan
   let discoveryP: Promise<void> = Promise.resolve(); // the (lazily extended) discovery scan promise
+  // Children discovered by the wide scan but NOT yet persisted. Ponder's core marks
+  // requiredFactoryIntervals cached (syncStore.insertIntervals, runtime/historical.ts) after EVERY
+  // interval regardless of the sync implementation, and on startup it loads children ONLY from the
+  // store (runtime/index.ts getChildAddresses) — there is no re-derivation from stored logs. So the
+  // invariant is: a factory interval marked cached MUST have its children in the store (stock parity:
+  // sync-historical/index.ts calls insertChildAddresses inside syncBlockRangeData). Discovery here
+  // only mutated the in-memory map, which made every restart/resume of a factory app silently drop
+  // child events. Flushed inside syncBlockRangeData — the SAME DB transaction as insertIntervals.
+  const pendingChildren = new Map<any, Map<Address, number>>(); // factory object → newly discovered children
   const stash = new Map<
     string,
     {
@@ -266,8 +275,10 @@ export const createPortalHistoricalSync = (
   const STREAM_REALTIME =
     Boolean(args.chain.portal) && process.env.PORTAL_REALTIME === "stream";
   const refreshPortalHead = async (): Promise<number | undefined> => {
-    if (process.env.PORTAL_FINALIZED_HEAD)
-      return (portalHead = Number(process.env.PORTAL_FINALIZED_HEAD));
+    if (process.env.PORTAL_FINALIZED_HEAD) {
+      portalHead = Number(process.env.PORTAL_FINALIZED_HEAD);
+      return portalHead;
+    }
     // retry: the head probe is cheap, and a valid head is load-bearing for the finality-gap decision.
     // On persistent failure portalHead stays undefined → the caller treats "head unknown" conservatively.
     for (let attempt = 0; attempt < 3; attempt++) {
@@ -275,7 +286,10 @@ export const createPortalHistoricalSync = (
         const h = await fetch(`${portalUrl}/finalized-head`, {
           headers: baseHeaders,
         }).then((r) => r.json());
-        if (typeof h?.number === "number") return (portalHead = h.number);
+        if (typeof h?.number === "number") {
+          portalHead = h.number;
+          return portalHead;
+        }
       } catch {
         /* retry */
       }
@@ -522,10 +536,11 @@ export const createPortalHistoricalSync = (
         if (done) break;
         stats.bytes += value.byteLength;
         buf += dec.decode(value, { stream: true });
-        let nl: number;
-        while ((nl = buf.indexOf("\n")) >= 0) {
+        let nl = buf.indexOf("\n");
+        while (nl >= 0) {
           onLine(buf.slice(0, nl));
           buf = buf.slice(nl + 1);
+          nl = buf.indexOf("\n");
         }
       }
       buf += dec.decode();
@@ -974,7 +989,17 @@ export const createPortalHistoricalSync = (
                     }).toLowerCase() as Address;
                     const bn = bl.header.number;
                     const prevBn = rec.get(child);
-                    if (prevBn === undefined || prevBn > bn) rec.set(child, bn);
+                    if (prevBn === undefined || prevBn > bn) {
+                      rec.set(child, bn);
+                      // queue for persistence. Children pre-loaded from the store (restart) have
+                      // prevBn ≤ bn and are NOT re-queued, so nothing is double-inserted.
+                      let pend = pendingChildren.get(factory);
+                      if (pend === undefined) {
+                        pend = new Map();
+                        pendingChildren.set(factory, pend);
+                      }
+                      pend.set(child, bn);
+                    }
                   }
                 }
             }
@@ -1337,6 +1362,75 @@ export const createPortalHistoricalSync = (
       const data = await Promise.all(
         idxs.map((i) => dataChunk(i, factories, filters)),
       );
+      // Persist the children discovered within THIS interval's range NOW — dataChunk awaited
+      // discovery through this interval, and this call's syncStore is the transaction core commits
+      // together with insertIntervals (which marks THIS interval's factory intervals cached, C).
+      // CRITICAL: flush ONLY children whose creation block ∈ interval — NOT the whole cross-interval
+      // queue. The wide scan discovers children across the entire backfill up-front, and core
+      // pipelines intervals concurrently, each in its OWN transaction. Grabbing the whole queue here
+      // would commit another interval's children in this interval's transaction; if this interval
+      // then rolls back while that (lower) interval already committed as cached, its child is lost —
+      // restart re-discovery is floored at the lowest UNCACHED factory interval and never rescans it.
+      // Scoping to interval keeps each child in the transaction that marks ITS range cached (parity
+      // with stock sync-historical/index.ts, which persists a per-interval child set). Children past
+      // interval[1] stay queued until their owning interval flushes them.
+      if (pendingChildren.size > 0) {
+        const flush: [any, Map<Address, number>][] = [];
+        for (const [factory, children] of pendingChildren) {
+          let inRange: Map<Address, number> | undefined;
+          for (const [child, block] of children) {
+            if (block >= interval[0] && block <= interval[1]) {
+              if (inRange === undefined) {
+                inRange = new Map();
+              }
+              inRange.set(child, block);
+            }
+          }
+          if (inRange) {
+            flush.push([factory, inRange]);
+          }
+        }
+        // dequeue the in-range children (about to be persisted); leave the rest for their interval
+        for (const [factory, children] of flush) {
+          const pend = pendingChildren.get(factory)!;
+          for (const child of children.keys()) {
+            pend.delete(child);
+          }
+          if (pend.size === 0) {
+            pendingChildren.delete(factory);
+          }
+        }
+        if (flush.length > 0) {
+          try {
+            await Promise.all(
+              flush.map(([factory, children]) =>
+                syncStore.insertChildAddresses({
+                  factory,
+                  childAddresses: children,
+                  chainId: args.chain.id,
+                }),
+              ),
+            );
+          } catch (err) {
+            // restore so nothing is silently dropped — the interval fails loud, and a retried/later
+            // call (or the restarted run's re-discovery) flushes the same children again.
+            for (const [factory, children] of flush) {
+              let pend = pendingChildren.get(factory);
+              if (pend === undefined) {
+                pend = new Map();
+                pendingChildren.set(factory, pend);
+              }
+              for (const [child, block] of children) {
+                const prev = pend.get(child);
+                if (prev === undefined || prev > block) {
+                  pend.set(child, block);
+                }
+              }
+            }
+            throw err;
+          }
+        }
+      }
       // PARALLEL read-ahead: prefetch the next chunks concurrently — but never past the backfill end
       // (bounded toBlock or finalized head), so the tail doesn't waste CU / hit 204s. Depth is bounded
       // by the GLOBAL memory budget, not a fixed count: always prefetch lead-1 (so this chain's next

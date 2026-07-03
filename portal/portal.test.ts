@@ -181,10 +181,10 @@ test("regression (C1): a 2nd log filter sharing a chunk on a LATER call is still
   // marks "required" on DIFFERENT syncBlockRangeData calls (each call carries only the filter still
   // missing its sub-interval). The bug keyed chunk 0 by idx alone, freezing it to the FIRST call's
   // single filter → the 2nd filter's log was never streamed yet its interval was marked complete.
-  const T1 = "0x" + "11".repeat(32),
-    T2 = "0x" + "22".repeat(32);
-  const A1 = "0x" + "aa".repeat(20),
-    A2 = "0x" + "bb".repeat(20);
+  const T1 = "0x" + "11".repeat(32);
+  const T2 = "0x" + "22".repeat(32);
+  const A1 = "0x" + "aa".repeat(20);
+  const A2 = "0x" + "bb".repeat(20);
   const TXA = "0x" + "a1".repeat(32),
     TXB = "0x" + "b2".repeat(32);
   const BN1 = 10,
@@ -938,6 +938,539 @@ test("merge: N same-address event filters collapse to ONE log request (unioned t
     expect(
       new Set(merged.logs[0].topic0.map((x: string) => x.toLowerCase())).size,
     ).toBe(6); // all selectors unioned
+  } finally {
+    srv.close();
+  }
+});
+
+// ── discovered factory children must be PERSISTED (restart correctness) ──────────────────────────
+// Ponder's core marks requiredFactoryIntervals cached (syncStore.insertIntervals) after EVERY
+// interval regardless of the sync implementation, and on startup loads children ONLY from the store
+// (runtime/index.ts getChildAddresses) — there is no re-derivation from stored logs. Stock sync
+// therefore persists children inside syncBlockRangeData (sync-historical/index.ts). The portal sync
+// only mutated the in-memory map: a single run worked (the map is shared), but any restart/resume
+// loaded an EMPTY child set against already-cached factory intervals — discovery never re-ran and
+// every factory-child event was silently skipped. These tests pin the persistence invariant.
+const FACTORY_ADDR = "0x" + "fa".repeat(20);
+const PROXY_CREATED_TOPIC0 = "0x" + "01".repeat(32); // factory's creation-event selector
+const CHILD_ADDR = "0x" + "c1".repeat(20);
+const CHILD_CREATED_AT = 100; // child created here (ProxyCreated log, child in topic1)
+const CHILD_EVENT_AT = 200; //  child emits its Deposit here
+const FACTORY_RANGE_END = 300;
+
+const mkFactory = (): any => ({
+  id: "factory_evault",
+  type: "log",
+  chainId: 1,
+  sourceId: "evault",
+  address: FACTORY_ADDR,
+  eventSelector: PROXY_CREATED_TOPIC0,
+  childAddressLocation: "topic1",
+  fromBlock: 0,
+  toBlock: undefined,
+});
+// log filter whose address IS the factory (ponder's shape for factory sources)
+const mkFactoryFilter = (factory: any): any => ({
+  type: "log",
+  chainId: 1,
+  sourceId: "evault:deposit",
+  address: factory,
+  topic0: DEPOSIT_TOPIC0,
+  topic1: null,
+  topic2: null,
+  topic3: null,
+  fromBlock: 0,
+  toBlock: FACTORY_RANGE_END,
+  hasTransactionReceipt: false,
+  include: [],
+});
+
+const mkFactoryHeader = (num: number) => ({
+  number: num,
+  hash: "0x" + num.toString(16).padStart(64, "0"),
+  parentHash: "0x" + "00".repeat(32),
+  timestamp: 1_700_000_000 + num,
+  logsBloom: "0x" + "00".repeat(256),
+  miner: "0x" + "99".repeat(20),
+  gasUsed: "0x1",
+  gasLimit: "0x1c9c380",
+  stateRoot: "0x" + "22".repeat(32),
+  receiptsRoot: "0x" + "33".repeat(32),
+  transactionsRoot: "0x" + "44".repeat(32),
+  size: "0x500",
+  difficulty: "0x0",
+  extraData: "0x",
+});
+
+/** Serves: the factory's ProxyCreated log for discovery requests, the child's Deposit log (+ parent
+ * tx) for data requests that carry the DISCOVERED child address. Emulates the Portal's server-side
+ * address filter — a data request without the child address gets nothing, exactly like production. */
+const factoryPortalServer = () =>
+  http.createServer((req, res) => {
+    let body = "";
+    req.on("data", (c) => {
+      body += c;
+    });
+    req.on("end", () => {
+      if (req.url?.includes("finalized-head")) {
+        res.writeHead(200, { "content-type": "application/json" });
+        res.end(JSON.stringify({ number: 1_000_000_000 }));
+        return;
+      }
+      const q = body ? JSON.parse(body) : {};
+      const from = q.fromBlock ?? 0,
+        to = q.toBlock ?? 1e12;
+      const matches = (topic0: string, addr: string) =>
+        ((q.logs ?? []) as any[]).some(
+          (s) =>
+            (!s.topic0 ||
+              s.topic0
+                .map((x: string) => x.toLowerCase())
+                .includes(topic0.toLowerCase())) &&
+            (!s.address ||
+              s.address
+                .map((x: string) => x.toLowerCase())
+                .includes(addr.toLowerCase())),
+        );
+      const out: any[] = [];
+      if (
+        from <= CHILD_CREATED_AT &&
+        to >= CHILD_CREATED_AT &&
+        matches(PROXY_CREATED_TOPIC0, FACTORY_ADDR)
+      ) {
+        out.push({
+          header: mkFactoryHeader(CHILD_CREATED_AT),
+          logs: [
+            {
+              address: FACTORY_ADDR,
+              topics: [
+                PROXY_CREATED_TOPIC0,
+                "0x" + "00".repeat(12) + CHILD_ADDR.slice(2),
+              ],
+              data: "0x",
+              transactionHash: "0x" + "f0".repeat(32),
+              transactionIndex: 0,
+              logIndex: 0,
+            },
+          ],
+        });
+      }
+      if (
+        from <= CHILD_EVENT_AT &&
+        to >= CHILD_EVENT_AT &&
+        matches(DEPOSIT_TOPIC0, CHILD_ADDR)
+      ) {
+        out.push({
+          header: mkFactoryHeader(CHILD_EVENT_AT),
+          logs: [
+            {
+              address: CHILD_ADDR,
+              topics: [DEPOSIT_TOPIC0],
+              data: "0x",
+              transactionHash: "0x" + "d1".repeat(32),
+              transactionIndex: 0,
+              logIndex: 0,
+            },
+          ],
+          transactions: [
+            {
+              transactionIndex: 0,
+              hash: "0x" + "d1".repeat(32),
+              from: "0x" + "ee".repeat(20),
+              to: CHILD_ADDR,
+              input: "0x",
+              value: "0x0",
+              nonce: 0,
+              gas: "0x1",
+              gasPrice: "0x1",
+              type: 0,
+            },
+          ],
+        });
+      }
+      if (out.length === 0) {
+        res.writeHead(204).end();
+        return;
+      }
+      res.writeHead(200, { "content-type": "application/x-ndjson" });
+      res.end(out.map((b) => JSON.stringify(b)).join("\n") + "\n");
+    });
+  });
+
+const mkFactorySyncStore = (onInsertChildren: (p: any) => void): any => ({
+  insertLogs: () => {},
+  insertBlocks: () => {},
+  insertTransactions: () => {},
+  insertTransactionReceipts: () => {},
+  insertTraces: () => {},
+  insertChildAddresses: (p: any) => onInsertChildren(p),
+});
+
+const mkFactorySync = (
+  port: number,
+  factory: any,
+  filter: any,
+  childAddresses: Map<string, Map<string, number>>,
+) =>
+  createPortalHistoricalSync({
+    common: {
+      logger: { debug() {}, info() {}, warn() {}, error() {}, trace() {} },
+    } as any,
+    chain: {
+      id: 1,
+      name: "mainnet",
+      portal: `http://localhost:${port}`,
+    } as any,
+    childAddresses: childAddresses as any,
+    eventCallbacks: [{ filter }],
+  } as any);
+
+test("regression: discovered factory children are persisted via insertChildAddresses in the SAME syncBlockRangeData call", async () => {
+  const srv = factoryPortalServer();
+  const p: number = await new Promise((r) =>
+    srv.listen(0, () => r((srv.address() as AddressInfo).port)),
+  );
+  try {
+    const factory = mkFactory();
+    const filter = mkFactoryFilter(factory);
+    const calls: any[] = [];
+    const syncStore = mkFactorySyncStore((x) => calls.push(x));
+    const sync = mkFactorySync(
+      p,
+      factory,
+      filter,
+      new Map([[factory.id, new Map()]]),
+    );
+    const interval: [number, number] = [0, FACTORY_RANGE_END];
+
+    const logs = await sync.syncBlockRangeData({
+      interval,
+      requiredIntervals: [{ interval, filter }],
+      requiredFactoryIntervals: [{ interval, factory }],
+      syncStore,
+    });
+
+    // THE REGRESSION: the child must be handed to the store in the same call — core commits this
+    // transaction together with insertIntervals (which marks the factory interval cached), so
+    // persisting later (or never) breaks every restart.
+    expect(calls).toHaveLength(1);
+    expect(calls[0].factory).toBe(factory);
+    expect(calls[0].chainId).toBe(1);
+    expect(calls[0].childAddresses.size).toBe(1);
+    expect(calls[0].childAddresses.get(CHILD_ADDR)).toBe(CHILD_CREATED_AT); // creation block, for isAddressMatched
+    // sanity: discovery→data worked — the child's own log was fetched via the discovered address
+    expect(
+      logs.some((l: any) => (l.address as string).toLowerCase() === CHILD_ADDR),
+    ).toBe(true);
+
+    // an already-persisted child is never re-inserted (no duplicate rows interval after interval)
+    await sync.syncBlockRangeData({
+      interval,
+      requiredIntervals: [{ interval, filter }],
+      requiredFactoryIntervals: [],
+      syncStore,
+    });
+    expect(calls).toHaveLength(1);
+  } finally {
+    srv.close();
+  }
+});
+
+test("regression: a failing insertChildAddresses fails LOUD and the children re-flush on the next call — never silently dropped", async () => {
+  const srv = factoryPortalServer();
+  const p: number = await new Promise((r) =>
+    srv.listen(0, () => r((srv.address() as AddressInfo).port)),
+  );
+  try {
+    const factory = mkFactory();
+    const filter = mkFactoryFilter(factory);
+    const calls: any[] = [];
+    let fail = true;
+    const syncStore = mkFactorySyncStore((x) => {
+      if (fail) throw new Error("child-address insert failed");
+      calls.push(x);
+    });
+    const sync = mkFactorySync(
+      p,
+      factory,
+      filter,
+      new Map([[factory.id, new Map()]]),
+    );
+    const interval: [number, number] = [0, FACTORY_RANGE_END];
+
+    // the interval must FAIL (core rolls back the transaction incl. insertIntervals) — a swallowed
+    // error here would mark the factory interval cached with the children lost forever.
+    await expect(
+      sync.syncBlockRangeData({
+        interval,
+        requiredIntervals: [{ interval, filter }],
+        requiredFactoryIntervals: [{ interval, factory }],
+        syncStore,
+      }),
+    ).rejects.toThrow("child-address insert failed");
+
+    // the retried interval re-flushes the SAME children (pending was restored, not cleared)
+    fail = false;
+    await sync.syncBlockRangeData({
+      interval,
+      requiredIntervals: [{ interval, filter }],
+      requiredFactoryIntervals: [{ interval, factory }],
+      syncStore,
+    });
+    expect(calls).toHaveLength(1);
+    expect(calls[0].childAddresses.get(CHILD_ADDR)).toBe(CHILD_CREATED_AT);
+  } finally {
+    srv.close();
+  }
+});
+
+test("restart: a new sync seeded ONLY with the persisted children still fetches child logs (cached factory intervals → no re-discovery)", async () => {
+  // Models the restart: factory intervals are cached (requiredFactoryIntervals = []), so discovery
+  // never runs, and childAddresses contains exactly what the store returns. BEFORE the fix the store
+  // was empty → the data request carried no child address → the Portal (server-side filter) returned
+  // nothing → the child's events were silently skipped while the interval was marked synced.
+  const srv = factoryPortalServer();
+  const p: number = await new Promise((r) =>
+    srv.listen(0, () => r((srv.address() as AddressInfo).port)),
+  );
+  try {
+    const factory = mkFactory();
+    const filter = mkFactoryFilter(factory);
+
+    // run 1: fresh backfill discovers + persists
+    const persisted: any[] = [];
+    const sync1 = mkFactorySync(
+      p,
+      factory,
+      filter,
+      new Map([[factory.id, new Map()]]),
+    );
+    const interval: [number, number] = [0, FACTORY_RANGE_END];
+    await sync1.syncBlockRangeData({
+      interval,
+      requiredIntervals: [{ interval, filter }],
+      requiredFactoryIntervals: [{ interval, factory }],
+      syncStore: mkFactorySyncStore((x) => persisted.push(x)),
+    });
+    expect(persisted).toHaveLength(1);
+
+    // run 2 ("restart"): children seeded from what run 1 persisted; factory intervals cached
+    const restored = new Map([
+      [factory.id, new Map(persisted[0].childAddresses)],
+    ]);
+    const sync2 = mkFactorySync(p, factory, filter, restored as any);
+    const resume: [number, number] = [150, FACTORY_RANGE_END]; // resume past the creation block
+    const logs = await sync2.syncBlockRangeData({
+      interval: resume,
+      requiredIntervals: [{ interval: resume, filter }],
+      requiredFactoryIntervals: [],
+      syncStore: mkFactorySyncStore(() => {}),
+    });
+
+    // with an empty store (the bug) this is [] — the silent post-restart event loss
+    expect(
+      logs.some((l: any) => (l.address as string).toLowerCase() === CHILD_ADDR),
+    ).toBe(true);
+  } finally {
+    srv.close();
+  }
+});
+
+// Two children created in DIFFERENT intervals — CHILD_LO@50 and CHILD_HI@150 — so the wide scan
+// discovers both up-front but each belongs to a different interval's transaction.
+const CHILD_LO = "0x" + "1c".repeat(20);
+const CHILD_HI = "0x" + "2c".repeat(20);
+const LO_AT = 50;
+const HI_AT = 150;
+
+/** Discovery-only server: returns ProxyCreated logs for whichever of CHILD_LO@50 / CHILD_HI@150 fall
+ * in the requested range. Data requests (Deposit topic0) get 204 — these tests assert only which
+ * children each interval hands to insertChildAddresses, not event extraction. */
+const twoChildFactoryServer = () =>
+  http.createServer((req, res) => {
+    let body = "";
+    req.on("data", (c) => {
+      body += c;
+    });
+    req.on("end", () => {
+      if (req.url?.includes("finalized-head")) {
+        res.writeHead(200, { "content-type": "application/json" });
+        res.end(JSON.stringify({ number: 1_000_000_000 }));
+        return;
+      }
+      const q = body ? JSON.parse(body) : {};
+      const from = q.fromBlock ?? 0;
+      const to = q.toBlock ?? 1e12;
+      const isDiscovery = ((q.logs ?? []) as any[]).some((s) =>
+        (s.topic0 ?? [])
+          .map((x: string) => x.toLowerCase())
+          .includes(PROXY_CREATED_TOPIC0.toLowerCase()),
+      );
+      const out: any[] = [];
+      if (isDiscovery) {
+        for (const [child, at] of [
+          [CHILD_LO, LO_AT],
+          [CHILD_HI, HI_AT],
+        ] as [string, number][]) {
+          if (from <= at && to >= at) {
+            out.push({
+              header: mkFactoryHeader(at),
+              logs: [
+                {
+                  address: FACTORY_ADDR,
+                  topics: [
+                    PROXY_CREATED_TOPIC0,
+                    "0x" + "00".repeat(12) + child.slice(2),
+                  ],
+                  data: "0x",
+                  transactionHash: "0x" + "e0".repeat(32),
+                  transactionIndex: 0,
+                  logIndex: 0,
+                },
+              ],
+            });
+          }
+        }
+      }
+      if (out.length === 0) {
+        res.writeHead(204).end();
+        return;
+      }
+      res.writeHead(200, { "content-type": "application/x-ndjson" });
+      res.end(out.map((b) => JSON.stringify(b)).join("\n") + "\n");
+    });
+  });
+
+test("regression: each syncBlockRangeData persists ONLY its interval's children, not the whole cross-interval discovery queue", async () => {
+  // The wide factory scan discovers children across the ENTIRE backfill up-front. If one call flushed
+  // the whole shared queue it would commit children that belong to OTHER, concurrently-pipelined
+  // intervals inside THIS interval's transaction. Under ponder's per-interval transactions a rollback
+  // of that interval — while a lower interval already committed as cached — permanently loses the
+  // lower interval's child (restart re-discovery is floored at the lowest UNCACHED interval and never
+  // rescans it). Each interval must flush exactly the children created in its own range.
+  const srv = twoChildFactoryServer();
+  const p: number = await new Promise((r) =>
+    srv.listen(0, () => r((srv.address() as AddressInfo).port)),
+  );
+  try {
+    const factory = mkFactory();
+    const filter = mkFactoryFilter(factory);
+    const calls: any[] = [];
+    const syncStore = mkFactorySyncStore((x) => calls.push(x));
+    const sync = mkFactorySync(
+      p,
+      factory,
+      filter,
+      new Map([[factory.id, new Map()]]),
+    );
+
+    // interval [0,100]: the wide scan finds BOTH children, but only CHILD_LO@50 belongs here
+    const lo: [number, number] = [0, 100];
+    await sync.syncBlockRangeData({
+      interval: lo,
+      requiredIntervals: [{ interval: lo, filter }],
+      requiredFactoryIntervals: [{ interval: lo, factory }],
+      syncStore,
+    });
+    expect(calls).toHaveLength(1);
+    expect([...calls[0].childAddresses.keys()]).toEqual([CHILD_LO]);
+    expect(calls[0].childAddresses.get(CHILD_LO)).toBe(LO_AT);
+    expect(calls[0].childAddresses.has(CHILD_HI)).toBe(false); // NOT this interval's child
+
+    // interval [101,200]: CHILD_HI@150 was left queued by the first call and is flushed HERE, in its
+    // own transaction — so its persistence rides the same commit that marks [101,200] cached.
+    const hi: [number, number] = [101, 200];
+    await sync.syncBlockRangeData({
+      interval: hi,
+      requiredIntervals: [{ interval: hi, filter }],
+      requiredFactoryIntervals: [{ interval: hi, factory }],
+      syncStore,
+    });
+    expect(calls).toHaveLength(2);
+    expect([...calls[1].childAddresses.keys()]).toEqual([CHILD_HI]);
+    expect(calls[1].childAddresses.get(CHILD_HI)).toBe(HI_AT);
+  } finally {
+    srv.close();
+  }
+});
+
+test("regression: a post-flush insertLogs failure fails the interval LOUD (core rolls back — never a cached interval with unpersisted children)", async () => {
+  // The child flush happens mid-syncBlockRangeData; insertLogs (and, in core, syncBlockData +
+  // insertIntervals) run AFTER it in the SAME transaction. A transient failure there MUST reject so
+  // core rolls the whole interval back — otherwise the interval is marked cached with its children
+  // absent from the store, i.e. the silent post-restart loss. Pins that the window after the flush is
+  // not swallowed (the previous loud-failure test only made insertChildAddresses itself throw).
+  const srv = factoryPortalServer();
+  const p: number = await new Promise((r) =>
+    srv.listen(0, () => r((srv.address() as AddressInfo).port)),
+  );
+  try {
+    const factory = mkFactory();
+    const filter = mkFactoryFilter(factory);
+    const calls: any[] = [];
+    const syncStore = {
+      ...mkFactorySyncStore((x) => calls.push(x)),
+      insertLogs: () => {
+        throw new Error("insertLogs failed");
+      },
+    };
+    const sync = mkFactorySync(
+      p,
+      factory,
+      filter,
+      new Map([[factory.id, new Map()]]),
+    );
+    const interval: [number, number] = [0, FACTORY_RANGE_END];
+
+    await expect(
+      sync.syncBlockRangeData({
+        interval,
+        requiredIntervals: [{ interval, filter }],
+        requiredFactoryIntervals: [{ interval, factory }],
+        syncStore,
+      }),
+    ).rejects.toThrow("insertLogs failed");
+
+    // the child WAS handed to the store before the failure — so it's part of the same transaction
+    // core rolls back; the interval is NOT marked cached, so restart re-discovery re-persists it.
+    expect(calls).toHaveLength(1);
+    expect(calls[0].childAddresses.get(CHILD_ADDR)).toBe(CHILD_CREATED_AT);
+  } finally {
+    srv.close();
+  }
+});
+
+test("regression: a child already known from the store is NOT re-flushed when discovery re-runs live", async () => {
+  // On a resumed run, childAddresses is seeded from the store yet discovery can still re-run over a
+  // partially-cached factory interval. A child re-found at its known creation block must NOT be
+  // re-queued (prevBn === bn) — else every resume re-inserts known children. The existing
+  // "already-persisted" assertion skips discovery entirely (dataChunk cache hit); this exercises the
+  // live de-dup guard.
+  const srv = factoryPortalServer();
+  const p: number = await new Promise((r) =>
+    srv.listen(0, () => r((srv.address() as AddressInfo).port)),
+  );
+  try {
+    const factory = mkFactory();
+    const filter = mkFactoryFilter(factory);
+    const calls: any[] = [];
+    const syncStore = mkFactorySyncStore((x) => calls.push(x));
+    // seed the child as if loaded from the store at its real creation block
+    const seeded = new Map([
+      [factory.id, new Map([[CHILD_ADDR, CHILD_CREATED_AT]])],
+    ]);
+    const sync = mkFactorySync(p, factory, filter, seeded as any);
+    const interval: [number, number] = [0, FACTORY_RANGE_END];
+
+    await sync.syncBlockRangeData({
+      interval,
+      requiredIntervals: [{ interval, filter }],
+      requiredFactoryIntervals: [{ interval, factory }], // discovery RUNS and re-finds CHILD_ADDR@100
+      syncStore,
+    });
+
+    // re-discovered at the same block it was seeded → not re-queued → nothing handed to the store
+    expect(calls).toHaveLength(0);
   } finally {
     srv.close();
   }
