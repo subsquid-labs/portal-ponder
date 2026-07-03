@@ -92,6 +92,7 @@ export const createPortalHistoricalSync = (
     requestTimeoutMs: cfg.requestTimeout,
     idleTimeoutMs: cfg.idleTimeout,
     logDebug: (msg) => log.debug({ service: 'portal', msg }),
+    logWarn: (msg) => log.warn({ service: 'portal', msg }),
   });
   const spec = compileFetchSpec(args.eventCallbacks ?? [], args.childAddresses);
   const discovery = createDiscovery({
