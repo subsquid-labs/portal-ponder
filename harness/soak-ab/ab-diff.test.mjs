@@ -4,18 +4,22 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { test } from 'node:test';
 import {
+  aggregateToleratedIssue27,
   CHECKPOINT_BLOCK_LEN,
   CHECKPOINT_BLOCK_OFFSET_0,
   checkpointDecision,
   checkpointMonotonic,
   chunk,
+  classifySharedTx,
   classifyTxDiff,
   collectReferenced,
   compareBucketHashes,
   extractCheckpointBlock,
+  formatToleratedIssue27Line,
   psqlExitVerdict,
   restartStats,
   sanitizeSchemaIdent,
+  TOLERATED_CLASSES,
   writeJsonAtomic,
 } from './ab-diff.mjs';
 
@@ -392,4 +396,185 @@ test('sanitizeSchemaIdent: accepts bare identifiers, rejects injection payloads,
       `must reject ${JSON.stringify(bad)}`,
     );
   }
+});
+
+// ── issue #27: tolerated access_list-null shared-tx class (classifySharedTx) ──────────────────────
+//
+// classifySharedTx classifies ONE shared tx whose full-row md5 diverged. It returns 'tolerated' ONLY
+// for the exact, fully-root-caused issue #27 shape (A-side access_list NULL, B-side non-null, ALL other
+// columns byte-identical, at/above the per-chain realtime floor, within the open window). ANY other
+// combination is a hard 'mismatch' → FAIL, exactly as before the class existed. Each adversarial case
+// below is its own test; the mutation table in the PR body records which clause each guards.
+
+// Per-chain measured realtime-span floors (min block_number of the class). The tolerated cases sit at
+// or above the chain-1 floor; sub-floor cases sit below it.
+const FLOOR_1 = 25445239; // TOLERATED_CLASSES.issue27AccessListNull.perChainFloor[1]
+
+// A shared-tx shape whose full-row md5 diverged; helper defaults are the tolerated shape (A null, B
+// non-null, ex-access_list md5 EQUAL, at the floor). Override any field to build an adversarial case.
+const sharedTx = (o = {}) => ({
+  blockNumber: FLOOR_1,
+  exAlMd5A: 'exAL', // md5 over `to_jsonb(t) - 'access_list'` — EQUAL ⇒ only access_list differs
+  exAlMd5B: 'exAL',
+  aAccessListNull: true, // A (RPC realtime) nulled the key
+  bAccessListNull: false, // B (Portal /stream) stored the chain-true value
+  ...o,
+});
+
+test('classifySharedTx: tolerated happy path — A-null, B-non-null, only access_list differs, at floor → tolerated', () => {
+  assert.equal(
+    TOLERATED_CLASSES.issue27AccessListNull.perChainFloor[1],
+    FLOOR_1,
+  );
+  assert.equal(classifySharedTx(sharedTx(), 1), 'tolerated');
+  // and comfortably above the floor is tolerated too
+  assert.equal(
+    classifySharedTx(sharedTx({ blockNumber: FLOOR_1 + 100_000 }), 1),
+    'tolerated',
+  );
+});
+
+test('classifySharedTx: A non-null but DIFFERENT from B (a real access_list divergence) → FAIL', () => {
+  // A holds a concrete value that differs from B's — NOT the null-loss shape. Guards the A-null clause:
+  // dropping `aAccessListNull === true` would wrongly tolerate a genuine access_list disagreement.
+  assert.equal(
+    classifySharedTx(sharedTx({ aAccessListNull: false }), 1),
+    'mismatch',
+  );
+});
+
+test('classifySharedTx: a SECOND column also diverges (ex-access_list md5 differs) → FAIL', () => {
+  // The rows differ on some OTHER column too, so md5 over `to_jsonb(t) - 'access_list'` is unequal.
+  // Guards the ex-AL-md5-equality clause: dropping it would let a two-column divergence hide behind an
+  // access_list gap.
+  assert.equal(
+    classifySharedTx(sharedTx({ exAlMd5B: 'DIFFERENT' }), 1),
+    'mismatch',
+  );
+});
+
+test('classifySharedTx: INVERTED asymmetry — B null, A non-null → FAIL', () => {
+  // The loss is on side B, not the RPC-realtime A leg — not this class. Guards the B-non-null clause.
+  assert.equal(
+    classifySharedTx(
+      sharedTx({ aAccessListNull: false, bAccessListNull: true }),
+      1,
+    ),
+    'mismatch',
+  );
+});
+
+test('classifySharedTx: block BELOW the per-chain floor → FAIL', () => {
+  // Below leg A's measured realtime span — outside the class's evidence. Guards the floor clause.
+  assert.equal(
+    classifySharedTx(sharedTx({ blockNumber: FLOOR_1 - 1 }), 1),
+    'mismatch',
+  );
+});
+
+test('classifySharedTx: a chain with NO floor entry → FAIL (missing floor is hard-fail, never default-tolerate)', () => {
+  // An unknown chain has no measured floor, so it CANNOT be tolerated. Guards the missing-floor
+  // hard-fail: a mutation that defaulted a missing floor to −Infinity (tolerate) would flip this.
+  assert.equal(classifySharedTx(sharedTx(), 999_999), 'mismatch');
+});
+
+test('classifySharedTx: toBlock set + block ABOVE it → FAIL (closed window)', () => {
+  // Once the fix deploys and the window closes, toBlock is set; a row past it is no longer tolerated.
+  const closed = {
+    issue27AccessListNull: {
+      ...TOLERATED_CLASSES.issue27AccessListNull,
+      toBlock: FLOOR_1 + 1000,
+    },
+  };
+  assert.equal(
+    classifySharedTx(sharedTx({ blockNumber: FLOOR_1 + 999 }), 1, closed),
+    'tolerated',
+    'a row inside the closed window is still tolerated',
+  );
+  assert.equal(
+    classifySharedTx(sharedTx({ blockNumber: FLOOR_1 + 1001 }), 1, closed),
+    'mismatch',
+    'a row past toBlock is NOT tolerated',
+  );
+  // exactly AT toBlock is still inside the window (inclusive)
+  assert.equal(
+    classifySharedTx(sharedTx({ blockNumber: FLOOR_1 + 1000 }), 1, closed),
+    'tolerated',
+  );
+});
+
+test('classifySharedTx: TOLERATED_CLASSES entry deleted → everything hard-fails again (full strictness restored)', () => {
+  // Deleting the entry (the removal instruction) must restore full strictness with no other code
+  // change — the otherwise-tolerated happy path becomes a hard mismatch. Both an empty classes map and
+  // an explicitly-deleted entry key model the removal.
+  assert.equal(classifySharedTx(sharedTx(), 1, {}), 'mismatch');
+  assert.equal(
+    classifySharedTx(sharedTx(), 1, { issue27AccessListNull: undefined }),
+    'mismatch',
+  );
+});
+
+test('classifyTxDiff: threads the tolerated tally through without failing the verdict', () => {
+  // A clean diff whose only shared divergence is the tolerated class → NOT a fail. classifyTxDiff's
+  // `fail` is driven only by unexpectedB / unreferencedA / (hard) sharedMismatch — tolerated is carried
+  // for reporting only, so the run verdict stays PASS-compatible.
+  const tol = { count: 3, perChain: { 1: 3 } };
+  const r = classifyTxDiff([], [], new Set(), 0, tol);
+  assert.equal(r.fail, false);
+  assert.deepEqual(r.toleratedIssue27, tol);
+
+  // a HARD sharedMismatch alongside tolerated rows still FAILs
+  const bad = classifyTxDiff([], [], new Set(), 1, tol);
+  assert.equal(bad.fail, true);
+  assert.equal(bad.sharedMismatch, 1);
+  assert.deepEqual(bad.toleratedIssue27, tol);
+
+  // default when no tolerated rows: an empty {count:0, perChain:{}}
+  const none = classifyTxDiff([], [], new Set());
+  assert.deepEqual(none.toleratedIssue27, { count: 0, perChain: {} });
+});
+
+test('aggregateToleratedIssue27: sums per-chain tolerated tallies across chain results', () => {
+  const results = [
+    {
+      chain: 1,
+      classes: {
+        transactions: { toleratedIssue27: { count: 2, perChain: { 1: 2 } } },
+      },
+    },
+    {
+      chain: 8453,
+      classes: {
+        transactions: { toleratedIssue27: { count: 5, perChain: { 8453: 5 } } },
+      },
+    },
+    // a chain with no tolerated rows contributes nothing
+    {
+      chain: 42161,
+      classes: {
+        transactions: { toleratedIssue27: { count: 0, perChain: {} } },
+      },
+    },
+    // a PENDING/ERROR chain with no transactions class is skipped, never throws
+    { chain: 10, classes: { note: 'no finalized overlap yet' } },
+  ];
+  assert.deepEqual(aggregateToleratedIssue27(results), {
+    count: 7,
+    perChain: { 1: 2, 8453: 5 },
+  });
+});
+
+test('formatToleratedIssue27Line: loud REMOVE line when count>0, empty string otherwise', () => {
+  assert.equal(formatToleratedIssue27Line({ count: 0, perChain: {} }), '');
+  assert.equal(formatToleratedIssue27Line(null), '');
+  assert.equal(formatToleratedIssue27Line(undefined), '');
+
+  const line = formatToleratedIssue27Line({
+    count: 7,
+    perChain: { 1: 2, 8453: 5 },
+  });
+  assert.match(line, /^TOLERATED \(known issue #27 — REMOVE/);
+  assert.match(line, /7 access_list-null rows/);
+  assert.match(line, /1:2/);
+  assert.match(line, /8453:5/);
 });

@@ -29,11 +29,41 @@ import { streamingDiff } from '../validate/diff-batched.mjs';
 
 // ── pure, unit-tested core ─────────────────────────────────────────────────────────────────────
 
+// KNOWN, FULLY-TOLERATED shared-tx divergence classes. Each entry is a NARROW, reportable, removable
+// exception to the otherwise-strict shared-tx byte-identity check — never a general mask. Deleting an
+// entry restores full strictness with no other code change (classifySharedTx returns 'mismatch' for
+// anything not matched by a live entry).
+//
+// issue27AccessListNull — issue #27, root-caused in its authoritative comment: a non-compliant RPC
+// provider omits the `accessList` key on typed realtime txs; upstream ponder tolerates the missing key
+// and persists NULL (`encode.ts`: `accessList ? JSON.stringify(...) : null`) permanently. Side A
+// (RPC-transport realtime) therefore stores access_list NULL for a span of realtime-ingested typed txs
+// while side B (Portal /stream) stored the chain-true value. Every OTHER column of those rows is
+// byte-identical (proven: md5 over `to_jsonb(t) - 'access_list'` equal on all three chains). The
+// tolerance is scoped to EXACTLY that shape (see classifySharedTx) — A-side NULL, B-side non-null, all
+// other columns identical, at/above the measured realtime-span floor per chain, within the (currently
+// open) window. `perChainFloor` values are the measured min block_number of the class per chain;
+// `toBlock` is null until the fork-side fix deploys and the realtime window closes — set it then, and
+// once the whole span is finalized-and-past, DELETE this entry to restore full strictness.
+export const TOLERATED_CLASSES = {
+  issue27AccessListNull: {
+    issue: 'https://github.com/subsquid-labs/portal-ponder/issues/27',
+    perChainFloor: { 1: 25445239, 8453: 48092254, 42161: 479635494 },
+    toBlock: null,
+  },
+};
+
 // The expected-class assertion for the transactions table. `onlyA` = txs A has but B lacks; `onlyB`
 // = txs B has but A lacks; `referenced` = the subset of onlyA that an A-side log points at;
 // `sharedMismatch` = txs present on BOTH sides whose full-row hash diverges (default 0). A tx that
 // EXISTS in both A and B must be byte-identical — the same finalized transaction indexed two ways.
-export function classifyTxDiff(onlyA, onlyB, referenced, sharedMismatch = 0) {
+export function classifyTxDiff(
+  onlyA,
+  onlyB,
+  referenced,
+  sharedMismatch = 0,
+  toleratedIssue27 = { count: 0, perChain: {} },
+) {
   const ref = referenced instanceof Set ? referenced : new Set(referenced);
   const unexpectedB = [...onlyB];
   const unreferencedA = onlyA.filter((h) => !ref.has(h));
@@ -47,7 +77,61 @@ export function classifyTxDiff(onlyA, onlyB, referenced, sharedMismatch = 0) {
     unexpectedB,
     unreferencedA,
     sharedMismatch,
+    // Reported, never fails: shared txs whose ONLY divergence is issue #27 (access_list NULL on A,
+    // chain-true on B). Counted here so the run verdict is PASS-compatible while still visible.
+    toleratedIssue27,
   };
+}
+
+// Classify ONE shared tx whose FULL-row md5 diverges between side A and side B. Returns 'tolerated'
+// ONLY for the exact, fully-root-caused issue #27 shape; ANY other divergence returns 'mismatch' → a
+// hard sharedMismatch → FAIL, exactly as before this class existed. Pure + exported so every
+// adversarial case is unit-tested and mutation-verified in isolation.
+//
+// The predicate is deliberately a conjunction of five clauses, each refusing to mask a distinct thing:
+//   1. exAlMd5A === exAlMd5B   — md5 over `to_jsonb(t) - 'access_list'`. If ANY second column also
+//      differs, these differ → 'mismatch'. This is what stops the tolerance widening to "any diff on a
+//      row that also happens to have an access_list gap".
+//   2. aAccessListNull === true — the loss is on side A (the RPC-realtime leg that nulled the key). If
+//      A is non-null-but-different from B, this is false → 'mismatch' (a real access_list divergence).
+//   3. bAccessListNull === false — side B holds a concrete value (the chain-true one). An inverted
+//      asymmetry (B null, A non-null) is NOT this class → 'mismatch'.
+//   4. blockNumber >= floor      — at/above the measured realtime-span floor for THIS chain. A missing
+//      floor entry (unknown chain) is an explicit HARD FAIL, never a default-tolerate.
+//   5. toBlock === null || blockNumber <= toBlock — within the (open) window; once toBlock is set, a
+//      row past it is NOT tolerated → 'mismatch'.
+// A missing/deleted TOLERATED_CLASSES.issue27AccessListNull entry → no floors → 'mismatch' for all.
+export function classifySharedTx(
+  { blockNumber, exAlMd5A, exAlMd5B, aAccessListNull, bAccessListNull },
+  chain,
+  classes = TOLERATED_CLASSES,
+) {
+  const entry = classes?.issue27AccessListNull;
+  if (!entry) {
+    return 'mismatch';
+  }
+
+  // Missing floor for this chain ⇒ HARD FAIL — never default-tolerate an unknown chain.
+  const floor = entry.perChainFloor?.[chain];
+  if (!Number.isFinite(floor)) {
+    return 'mismatch';
+  }
+
+  const block = Number(blockNumber);
+  const withinWindow =
+    entry.toBlock === null ||
+    entry.toBlock === undefined ||
+    block <= Number(entry.toBlock);
+
+  const tolerated =
+    exAlMd5A === exAlMd5B &&
+    aAccessListNull === true &&
+    bAccessListNull === false &&
+    Number.isFinite(block) &&
+    block >= floor &&
+    withinWindow;
+
+  return tolerated ? 'tolerated' : 'mismatch';
 }
 
 // A psql child is only a trustworthy data source if it exited cleanly. A non-zero exit (bad SQL,
@@ -447,12 +531,19 @@ async function diffBlocks(urlA, urlB, chain, lo, hi) {
 // between the RPC-sourced A store and the Portal-sourced B store — both write the same ponder_sync
 // schema from the same finalized chain data).
 async function diffTx(urlA, urlB, chain, lo, hi) {
+  // Per side per tx: hash, full-row md5, block_number, ex-access_list md5 (the jsonb-minus idiom used
+  // for total_difficulty in diffBlocks), and (access_list IS NULL) as psql's t/f flag. The extra
+  // columns are what classifySharedTx needs to tell the tolerated issue #27 shape apart from any real
+  // divergence WITHOUT loosening the strict full-row identity for every other column.
   const txSql =
-    `select "hash", md5(to_jsonb(t)::text) from ponder_sync.transactions t ` +
+    `select "hash", md5(to_jsonb(t)::text), block_number, ` +
+    `md5((to_jsonb(t)-'access_list')::text), (access_list is null) ` +
+    `from ponder_sync.transactions t ` +
     `where chain_id=${chain} and block_number between ${lo} and ${hi} order by "hash"`;
   const onlyA = [];
   const onlyB = [];
   let sharedMismatch = 0;
+  const toleratedIssue27 = { count: 0, perChain: {} };
   const ia = psqlRows(urlA, txSql)[Symbol.asyncIterator]();
   const ib = psqlRows(urlB, txSql)[Symbol.asyncIterator]();
   let a = await ia.next();
@@ -467,9 +558,26 @@ async function diffTx(urlA, urlB, chain, lo, hi) {
       onlyB.push(hb);
       b = await ib.next();
     } else {
-      // shared tx (same hash on both sides) — the full-row md5 must be identical.
+      // shared tx (same hash on both sides) — the full-row md5 must be identical, EXCEPT for the one
+      // fully-root-caused, reported tolerated class (issue #27); anything else is a hard mismatch.
       if (a.value[1] !== b.value[1]) {
-        sharedMismatch += 1;
+        const verdict = classifySharedTx(
+          {
+            blockNumber: a.value[2],
+            exAlMd5A: a.value[3],
+            exAlMd5B: b.value[3],
+            aAccessListNull: a.value[4] === 't',
+            bAccessListNull: b.value[4] === 't',
+          },
+          chain,
+        );
+        if (verdict === 'tolerated') {
+          toleratedIssue27.count += 1;
+          toleratedIssue27.perChain[chain] =
+            (toleratedIssue27.perChain[chain] ?? 0) + 1;
+        } else {
+          sharedMismatch += 1;
+        }
       }
 
       a = await ia.next();
@@ -491,7 +599,13 @@ async function diffTx(urlA, urlB, chain, lo, hi) {
     );
   });
 
-  return classifyTxDiff(onlyA, onlyB, referenced, sharedMismatch);
+  return classifyTxDiff(
+    onlyA,
+    onlyB,
+    referenced,
+    sharedMismatch,
+    toleratedIssue27,
+  );
 }
 
 async function bucketHashes(url, chain, lo, hi, bucket) {
@@ -681,6 +795,8 @@ async function main() {
     );
   }
 
+  const toleratedIssue27 = aggregateToleratedIssue27(results);
+
   const status = {
     ts: new Date().toISOString(),
     chains: results.map((r) => r.chain),
@@ -693,6 +809,9 @@ async function main() {
     lagA: Object.fromEntries(results.map((r) => [r.chain, r.lagA ?? null])),
     lagB: Object.fromEntries(results.map((r) => [r.chain, r.lagB ?? null])),
     checkpointRegressions: regressions,
+    // Aggregate of the reported-but-tolerated issue #27 shared-tx class across all chains. A run whose
+    // only divergence is this class is PASS (never fails the verdict); the count keeps it VISIBLE.
+    toleratedIssue27,
     counters: Object.fromEntries(
       results.map((r) => [r.chain, { lo: r.lo, hi: r.hi, verdict: r.verdict }]),
     ),
@@ -705,7 +824,51 @@ async function main() {
   // ever sees only the old complete file or the new complete file, never a partial one.
   writeJsonAtomic(checkpointFile, nextCheckpoints);
   console.log(JSON.stringify(status, null, 2));
+  const toleratedLine = formatToleratedIssue27Line(toleratedIssue27);
+  if (toleratedLine) {
+    console.log(toleratedLine);
+  }
+
   process.exit(verdict === 'FAIL' ? 1 : 0);
+}
+
+// Sum the per-chain issue #27 tolerated tallies from every chain result into one {count, perChain}.
+// Pure + exported: the status JSON's top-level counter and the human line both read this, so a
+// mutation that miscounts is caught directly rather than only through a full run.
+export function aggregateToleratedIssue27(results) {
+  const perChain = {};
+  let count = 0;
+  for (const r of results) {
+    const tol = r?.classes?.transactions?.toleratedIssue27;
+    if (!tol) {
+      continue;
+    }
+
+    count += tol.count ?? 0;
+    for (const [chain, n] of Object.entries(tol.perChain ?? {})) {
+      perChain[chain] = (perChain[chain] ?? 0) + n;
+    }
+  }
+
+  return { count, perChain };
+}
+
+// One human-readable line for a run that carried tolerated issue #27 rows (empty string ⇒ print
+// nothing). The wording is deliberately loud about REMOVAL so the class cannot quietly become
+// permanent. Pure + exported so the message contract is asserted.
+export function formatToleratedIssue27Line(tolerated) {
+  if (!tolerated || (tolerated.count ?? 0) <= 0) {
+    return '';
+  }
+
+  const breakdown = Object.entries(tolerated.perChain ?? {})
+    .map(([chain, n]) => `${chain}:${n}`)
+    .join(', ');
+
+  return (
+    `TOLERATED (known issue #27 — REMOVE when the fix deploys and the window closes): ` +
+    `${tolerated.count} access_list-null rows (${breakdown})`
+  );
 }
 
 // Atomic JSON write: serialize to a sibling temp file, then rename over the target (rename is atomic
