@@ -14,6 +14,14 @@
 // Two "PG connections" = two `psql` processes (no npm driver → runs on the box with node + psql).
 //   DATABASE_URL_A=… DATABASE_URL_B=… CHAINS=1,8453,42161 CUTOVER=<block> \
 //   STATUS_FILE=soak-ab-status.json node harness/soak-ab/ab-diff.mjs
+//
+// AB_SCHEMA_B (REQUIRED in the real deployment): Soak B runs `ponder start --schema <app-schema>`
+// (e.g. soak_b), so its `_ponder_checkpoint` table lives in that schema — NOT on psql's default
+// search_path. The checkpoint monotonicity guard's query MUST qualify the table with that schema
+// or it errors every run and silently falls back to the sync-store block max (dead guard). Set
+// AB_SCHEMA_B to Soak B's DATABASE_SCHEMA value. Empty ⇒ unqualified `_ponder_checkpoint` (the
+// legacy behavior, for a store on the default search_path). The identifier is sanitized before it
+// reaches SQL.
 
 import { spawn } from 'node:child_process';
 import { readFileSync, renameSync, writeFileSync } from 'node:fs';
@@ -103,6 +111,57 @@ export function checkpointMonotonic(values) {
   }
 
   return { ok: true };
+}
+
+// ── ponder checkpoint encoding (verified against ponder@0.16.6 source) ──────────────────────────
+// packages/core src/utils/checkpoint.ts (published: package/dist/esm/utils/checkpoint.js). The 75-char
+// `_ponder_checkpoint.latest_checkpoint` (VARCHAR(75), created in database/index.js) is:
+//   blockTimestamp(10) chainId(16) blockNumber(16) transactionIndex(16) eventType(1) eventIndex(16)
+// so blockNumber occupies 0-based offsets [26,42) — 1-based SQL substring position 27, length 16.
+// We extract the BLOCK-NUMBER field (a plain integer height, Number-safe and on the SAME scale as the
+// overlapBound sync-store block max), NOT Number(whole-encoded-checkpoint): the full ~75-digit value
+// overflows Number's ~16 significant digits, so same-second block rewinds are invisible AND, after a
+// later fallback to the small-scale block max, a checkpoint-scale prior value would wrongly read as a
+// rewind (false FAIL). The block field keeps the monotonicity series coherent across fallback flapping.
+export const CHECKPOINT_BLOCK_OFFSET_0 = 26; // 0-based char offset of blockNumber (10 + 16)
+export const CHECKPOINT_BLOCK_LEN = 16; // BLOCK_NUMBER_DIGITS
+// 1-based position for SQL substring(str from <pos> for <len>).
+export const CHECKPOINT_BLOCK_SQL_POS = CHECKPOINT_BLOCK_OFFSET_0 + 1; // 27
+
+// Extract the block-number field from a raw 75-char encoded checkpoint string. Returns the height as a
+// decimal string (no Number() — the field is <=16 digits but the caller wants an exact, BigInt-safe
+// value), or null for a malformed/short/absent checkpoint. Pure + exported: mutate the offset/len and
+// the extraction test reads the wrong slice and fails.
+export function extractCheckpointBlock(raw) {
+  if (typeof raw !== 'string') {
+    return null;
+  }
+
+  const seg = raw.slice(
+    CHECKPOINT_BLOCK_OFFSET_0,
+    CHECKPOINT_BLOCK_OFFSET_0 + CHECKPOINT_BLOCK_LEN,
+  );
+  if (seg.length !== CHECKPOINT_BLOCK_LEN || !/^\d+$/.test(seg)) {
+    return null;
+  }
+
+  return String(BigInt(seg));
+}
+
+// A schema name goes verbatim into `"<schema>"._ponder_checkpoint` — reject anything that is not a
+// bare SQL identifier so it can never carry an injection payload. Empty ⇒ null (caller emits the
+// unqualified table name, the legacy default-search_path behavior). Pure + exported.
+export function sanitizeSchemaIdent(schema) {
+  if (schema === undefined || schema === null || schema === '') {
+    return null;
+  }
+  if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(schema)) {
+    throw new Error(
+      `AB_SCHEMA_B is not a valid SQL identifier: ${JSON.stringify(schema)}`,
+    );
+  }
+
+  return schema;
 }
 
 // Compare per-bucket checkpoint hashes: shared buckets must match (determinism); buckets on only one
@@ -262,25 +321,30 @@ async function overlapBound(url, chain) {
 }
 
 // Real indexing progress for the monotonicity guard: ponder's own `_ponder_checkpoint` row (in the
-// APP schema, not ponder_sync) is the source of truth for how far indexing has committed — the
-// encoded checkpoint embeds the block height in its leading digits (a fixed-width zero-padded,
-// lexicographically-ordered string). max(ponder_sync.blocks.number) is only how far the SYNC store
-// reached, which can move independently of committed indexing progress; a resume that rewound the
-// COMMITTED checkpoint but kept sync-store rows would slip past a block-max guard. We extract the
-// block-height integer from the latest checkpoint across all `_ponder_checkpoint` rows for this
-// chain. Falls back to the sync-store block max only if `_ponder_checkpoint` is absent (older stores)
-// so the guard is never silently disabled.
-async function checkpointProgress(url, chain) {
-  // Probe `_ponder_checkpoint` directly and tolerate its absence. The encoded `latest_checkpoint`
-  // embeds the committed block height in its leading segment; strip non-digits so we get a comparable
-  // numeric height regardless of the exact checkpoint encoding width across ponder versions. On ANY
-  // error (missing table/column — an older store, or the table not on the search_path) we fall back
-  // to the sync-store block max so the monotonicity guard is never silently disabled.
+// APP schema, not ponder_sync) is the source of truth for how far indexing has committed. The encoded
+// `latest_checkpoint` is a fixed-width string whose blockNumber field sits at offsets [26,42) (see the
+// verified layout above) — we extract THAT field as a plain block height. max(ponder_sync.blocks.number)
+// is only how far the SYNC store reached, which can move independently of committed indexing progress;
+// a resume that rewound the COMMITTED checkpoint but kept sync-store rows would slip past a block-max
+// guard. Falls back to the sync-store block max only if `_ponder_checkpoint` is absent/unreadable
+// (older store, or wrong schema) so the guard is never silently disabled.
+async function checkpointProgress(url, chain, schema) {
+  // `_ponder_checkpoint` lives in Soak B's APP schema (ponder start --schema <schema>), which is NOT
+  // on psql's default search_path — so we QUALIFY the table with the (sanitized) schema. Empty schema
+  // ⇒ unqualified (legacy default-search_path stores). We select the blockNumber SUBSTRING of the
+  // encoded checkpoint (position CHECKPOINT_BLOCK_SQL_POS, length CHECKPOINT_BLOCK_LEN) cast to numeric
+  // — a Number-safe height on the SAME scale as the overlapBound fallback, so the monotonicity series
+  // stays coherent even when a run flaps between the two sources. On ANY error (missing table/column —
+  // an older store, or the schema truly absent) we fall back to the sync-store block max rather than
+  // disabling the guard.
+  const table = schema
+    ? `"${schema}"._ponder_checkpoint`
+    : '_ponder_checkpoint';
   try {
     const v = await psqlScalar(
       url,
-      `select coalesce(max(nullif(regexp_replace(split_part(latest_checkpoint,'_',1),'\\D','','g'),'')::numeric),0)::text ` +
-        `from _ponder_checkpoint where chain_id=${chain}`,
+      `select coalesce(max(substring(latest_checkpoint from ${CHECKPOINT_BLOCK_SQL_POS} for ${CHECKPOINT_BLOCK_LEN})::numeric),0)::text ` +
+        `from ${table} where chain_id=${chain}`,
     );
     const n = Number(v ?? 0);
     if (Number.isFinite(n) && n > 0) {
@@ -396,13 +460,21 @@ async function bucketHashes(url, chain, lo, hi, bucket) {
   return map;
 }
 
-async function compareChain(urlA, urlB, chain, cutover, margin, bucket) {
+async function compareChain(
+  urlA,
+  urlB,
+  chain,
+  cutover,
+  margin,
+  bucket,
+  schemaB,
+) {
   const [boundA, boundB, progressB] = await Promise.all([
     overlapBound(urlA, chain),
     overlapBound(urlB, chain),
     // Soak B's COMMITTED indexing progress from `_ponder_checkpoint` — the real value the
     // monotonicity guard asserts, not merely how far the sync store reached (see checkpointProgress).
-    checkpointProgress(urlB, chain),
+    checkpointProgress(urlB, chain, schemaB),
   ]);
   const hi = Math.min(boundA, boundB) - margin;
   const lo = cutover;
@@ -480,6 +552,10 @@ async function main() {
   const cutover = Number(process.env.CUTOVER ?? 0);
   const margin = Number(process.env.FINALITY_MARGIN ?? 64);
   const bucket = Number(process.env.BUCKET ?? 1000);
+  // Schema Soak B's `_ponder_checkpoint` lives in (its DATABASE_SCHEMA / `ponder start --schema`
+  // value). Unset ⇒ unqualified (default search_path). Sanitized — it goes into SQL. A bad identifier
+  // fails loud here (before any per-chain query) rather than silently disabling the checkpoint guard.
+  const schemaB = sanitizeSchemaIdent(process.env.AB_SCHEMA_B ?? '');
   const statusFile = process.env.STATUS_FILE ?? 'soak-ab-status.json';
   const checkpointFile =
     process.env.CHECKPOINT_FILE ?? 'soak-ab-checkpoints.json';
@@ -488,7 +564,7 @@ async function main() {
   for (const chain of chains) {
     try {
       results.push(
-        await compareChain(urlA, urlB, chain, cutover, margin, bucket),
+        await compareChain(urlA, urlB, chain, cutover, margin, bucket, schemaB),
       );
     } catch (e) {
       results.push({ chain, verdict: 'ERROR', classes: { error: e.message } });

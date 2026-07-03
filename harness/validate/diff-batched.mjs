@@ -4,13 +4,19 @@
 // so peak memory is one batch per side regardless of table size (the Euler-eth full history is
 // millions of rows). Tolerances match diff.mjs exactly:
 //   - logs / transactions / transaction_receipts / traces : strict set + field identity
-//   - blocks : total_difficulty excluded; ASYMMETRIC — a portal-only block (A) FAILS (the Portal
-//     path invented a block RPC never saw); only an rpc-only block (B) is tolerated (the stock RPC
-//     path stores inert event-less blocks it traced); a shared-key field mismatch always FAILS
+//   - blocks : total_difficulty excluded; ASYMMETRIC by default — a portal-only block (A) FAILS (the
+//     Portal path invented a block RPC never saw); only an rpc-only block (B) is tolerated (the stock
+//     RPC path stores inert event-less blocks it traced); a shared-key field mismatch always FAILS.
+//     This asymmetry is CALIBRATED FOR portal-vs-RPC (A=portal, B=rpc). For a portal-vs-PORTAL diff
+//     (e.g. the chaos verify: a resumed store vs a clean baseline, both Portal-built) there is no
+//     inert-block asymmetry — a B-only (baseline-only) block means the resumed store is MISSING a
+//     block, which MUST fail. Pass STRICT_BLOCKS=1 (or --strict-blocks) to force the `blocks` table
+//     to mode:'strict' so a one-sided block on EITHER side fails.
 //
 // Modes:
 //   node diff-batched.mjs <pgliteDirA> <pgliteDirB> [--app-hash]   diff sync stores (exit 0/1)
 //   node diff-batched.mjs --app-hash <pgliteDir> [--schema NAME]   ordered md5 over app tables
+//   STRICT_BLOCKS=1 node diff-batched.mjs A B                       blocks table strict (portal-vs-portal)
 //
 // The pure comparison + hashing core is exported for unit tests (fixture rows, no database).
 
@@ -201,6 +207,24 @@ const TABLES = {
   },
 };
 
+// Resolve the per-table comparison specs for a run. `strictBlocks` promotes the `blocks` table from
+// its default ASYMMETRIC 'blocks' mode to 'strict': the asymmetry only holds for portal-vs-RPC (a
+// tolerated inert RPC-only block); for a portal-vs-PORTAL diff (chaos resume vs baseline) a one-sided
+// block on EITHER side is a real gap and must fail. Pure + exported so a test can assert the override
+// flips ONLY the blocks mode (and a mutation that ignores the flag is caught).
+export function resolveTableSpecs(strictBlocks) {
+  if (!strictBlocks) {
+    return TABLES;
+  }
+
+  const out = {};
+  for (const [table, spec] of Object.entries(TABLES)) {
+    out[table] = table === 'blocks' ? { ...spec, mode: 'strict' } : spec;
+  }
+
+  return out;
+}
+
 const BATCH = 50_000;
 
 const toBig = (v) => (typeof v === 'bigint' ? v : BigInt(v));
@@ -250,15 +274,16 @@ function keyFnFor(keys) {
   return (row) => keys.map((k) => toBig(row[k]));
 }
 
-async function diffStores(dirA, dirB, { PGlite }) {
+async function diffStores(dirA, dirB, { PGlite, strictBlocks = false }) {
   const dbA = await PGlite.create(dirA);
   const dbB = await PGlite.create(dirB);
   let fail = 0;
+  const specs = resolveTableSpecs(strictBlocks);
   console.log(
-    `\nbatched byte-identity diff  (portal=${dirA}  vs  rpc=${dirB})\n`,
+    `\nbatched byte-identity diff  (A=${dirA}  vs  B=${dirB})${strictBlocks ? '  [STRICT_BLOCKS: portal-vs-portal]' : ''}\n`,
   );
 
-  for (const [table, spec] of Object.entries(TABLES)) {
+  for (const [table, spec] of Object.entries(specs)) {
     const keyFn = keyFnFor(spec.keys);
     const streamA = keysetRows(dbA, table, spec.keys);
     const streamB = keysetRows(dbB, table, spec.keys);
@@ -419,12 +444,16 @@ async function main() {
   const [dirA, dirB] = argv;
   if (!dirA || !dirB) {
     console.error(
-      'usage: diff-batched.mjs <pgliteDirA> <pgliteDirB> [--app-hash]',
+      'usage: diff-batched.mjs <pgliteDirA> <pgliteDirB> [--app-hash] [--strict-blocks]',
     );
     process.exit(2);
   }
 
-  const fail = await diffStores(dirA, dirB, { PGlite });
+  // STRICT_BLOCKS=1 or --strict-blocks promotes the blocks table to strict for a portal-vs-PORTAL
+  // diff (e.g. chaos resume vs baseline) where a one-sided block on EITHER side is a real gap.
+  const strictBlocks =
+    process.env.STRICT_BLOCKS === '1' || argv.includes('--strict-blocks');
+  const fail = await diffStores(dirA, dirB, { PGlite, strictBlocks });
 
   if (argv.includes('--app-hash')) {
     const [ha, hb] = await Promise.all([

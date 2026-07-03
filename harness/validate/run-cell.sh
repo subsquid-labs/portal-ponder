@@ -144,8 +144,12 @@ run_window () {
   export CHAIN_ID="$CELL_CHAIN_ID"
   export INCLUDE_RECEIPTS="$CELL_RECEIPTS"
   # per-cell env overrides from cells.json (e.g. per-chain POOL_ADDRESS/ROUTER_ADDRESS for a non-eth
-  # traces cell). Applied FIRST so an operator's explicit POOL_ADDRESS/ROUTER_ADDRESS in the
-  # environment still wins for the `requires` case (they are exported here only if the cell sets them).
+  # traces cell). `eval` runs AFTER the operator's environment, so a cell that ships an env map
+  # OVERRIDES the operator's same-named vars — intended: config-as-code, so a cell resolves to the
+  # same addresses on every run regardless of ambient env (deterministic cells). The operator-env
+  # path in the `requires` guard above only matters when the cell ships NO env map (nothing to export
+  # here): then the operator must supply POOL_ADDRESS/ROUTER_ADDRESS and those survive as the effective
+  # values.
   [ -n "${CELL_ENV_EXPORTS:-}" ] && eval "$CELL_ENV_EXPORTS"
   export PORTAL_CHUNK_FIXED=1 PORTAL_CHUNK_BLOCKS="${PORTAL_CHUNK_BLOCKS_OVERRIDE:-500000}" PORTAL_CHUNK_PINNED=1
   export PORTAL_CHECKS=strict

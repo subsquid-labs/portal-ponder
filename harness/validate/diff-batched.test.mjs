@@ -6,6 +6,7 @@ import {
   hashRows,
   mergeCompare,
   normRow,
+  resolveTableSpecs,
 } from './diff-batched.mjs';
 
 // key by (block_number, log_index) as the real logs table would be ordered
@@ -228,4 +229,65 @@ test('appHashVerdict: with nonempty tables, PASS on identical / DIVERGE on diffe
   );
   assert.equal(diverge.ok, false);
   assert.equal(diverge.verdict, 'DIVERGE');
+});
+
+// STRICT_BLOCKS override (chaos verify-resume: portal-vs-PORTAL). Default the blocks table is
+// ASYMMETRIC ('blocks'): a B-only block is a tolerated inert RPC block. In the chaos context both
+// stores are Portal-built, so a BASELINE-only (B-only) block means the RESUMED store is MISSING a
+// block → must FAIL. resolveTableSpecs(true) must flip ONLY blocks to 'strict'.
+// MUTATION: make resolveTableSpecs ignore the flag (return TABLES / drop the `table==='blocks'`
+// override) → the strict-mode B-only diff below no longer fails and this test fails.
+test('resolveTableSpecs: STRICT_BLOCKS flips only the blocks table to strict', () => {
+  const def = resolveTableSpecs(false);
+  assert.equal(def.blocks.mode, 'blocks', 'default blocks mode is asymmetric');
+
+  const strict = resolveTableSpecs(true);
+  assert.equal(
+    strict.blocks.mode,
+    'strict',
+    'override promotes blocks to strict',
+  );
+  assert.equal(strict.logs.mode, 'strict', 'logs unchanged');
+  assert.equal(strict.transactions.mode, 'strict', 'transactions unchanged');
+  // total_difficulty must still be dropped under the override — the promotion changes mode only.
+  assert.ok(strict.blocks.drop.has('total_difficulty'));
+  // the default spec object must not be mutated in place
+  assert.equal(def.blocks.mode, 'blocks');
+});
+
+test('STRICT_BLOCKS: a baseline-only (B-only) block FAILS (chaos resume vs baseline)', async () => {
+  // chaos-resumed store A is MISSING baseline block 101 that a clean run has.
+  const chaos = [
+    { number: 100, hash: 'h100' },
+    { number: 102, hash: 'h102' },
+  ];
+  const baseline = [
+    { number: 100, hash: 'h100' },
+    { number: 101, hash: 'h101' }, // baseline has it; the resumed store dropped it → real gap
+    { number: 102, hash: 'h102' },
+  ];
+  const strictMode = resolveTableSpecs(true).blocks.mode;
+  const strict = await mergeCompare(chaos, baseline, {
+    keyFn: blockKey,
+    drop: resolveTableSpecs(true).blocks.drop,
+    mode: strictMode,
+  });
+  assert.equal(
+    strict.fail,
+    true,
+    'a baseline-only block (missing from the resumed store) must FAIL under STRICT_BLOCKS',
+  );
+  assert.equal(strict.onlyB, 1);
+
+  // proof the default mode would WRONGLY tolerate the same missing block (why the override exists).
+  const tolerant = await mergeCompare(chaos, baseline, {
+    keyFn: blockKey,
+    drop: resolveTableSpecs(false).blocks.drop,
+    mode: resolveTableSpecs(false).blocks.mode,
+  });
+  assert.equal(
+    tolerant.fail,
+    false,
+    'the default asymmetric blocks mode tolerates the B-only block — the bug the override fixes',
+  );
 });

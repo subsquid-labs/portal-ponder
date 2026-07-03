@@ -146,3 +146,25 @@ test('killsSatisfied: kills below MIN_KILLS is NOT satisfied; at/above the floor
   assert.equal(killsSatisfied(-3, 1).ok, false);
   assert.equal(killsSatisfied(2.5, 1).ok, false);
 });
+
+// A garbage MIN_KILLS must NOT silently disable the floor: Number('garbage')=NaN and `k < NaN` is
+// false, so without validating `min` a store with ANY kills would read as satisfied. MUTATION: remove
+// the `!Number.isInteger(min) || min < 0` guard → killsSatisfied(5,'garbage').ok becomes true and the
+// first assertion below fails.
+test('killsSatisfied: a non-integer / negative MIN_KILLS fails closed (floor never silently disabled)', () => {
+  assert.equal(
+    killsSatisfied(5, 'garbage').ok,
+    false,
+    'a NaN floor must not read as satisfied',
+  );
+  assert.match(
+    killsSatisfied(5, 'garbage').reason,
+    /MIN_KILLS is not a valid floor/,
+  );
+  assert.equal(killsSatisfied(5, undefined).ok, false);
+  assert.equal(killsSatisfied(5, NaN).ok, false);
+  assert.equal(killsSatisfied(5, -1).ok, false);
+  assert.equal(killsSatisfied(5, 2.5).ok, false);
+  // a valid integer floor of 0 still works (a chaos run with a legitimately zero floor)
+  assert.equal(killsSatisfied(0, 0).ok, true);
+});

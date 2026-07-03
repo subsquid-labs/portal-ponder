@@ -92,6 +92,14 @@ export function killsSatisfied(kills, minKills) {
   if (!Number.isInteger(k) || k < 0) {
     return { ok: false, reason: `kills is not a valid count (${kills})` };
   }
+  // A garbage MIN_KILLS (e.g. 'abc' → NaN) must NOT silently disable the floor: `k < NaN` is false,
+  // which would read as satisfied. Validate min the same way as kills and fail closed.
+  if (!Number.isInteger(min) || min < 0) {
+    return {
+      ok: false,
+      reason: `MIN_KILLS is not a valid floor (${minKills})`,
+    };
+  }
   if (k < min) {
     return {
       ok: false,

@@ -105,7 +105,12 @@ echo "▶ byte-diff chaos vs baseline"
 DIFFWORK="$(mktemp -d)"; WORKSPACES="$WORKSPACES $DIFFWORK"; cp -r "$APP/." "$DIFFWORK/"; cd "$DIFFWORK"
 [ -d node_modules/@electric-sql/pglite ] || npm install --no-audit --no-fund --silent >/dev/null 2>&1
 cp "$ROOT/harness/validate/diff-batched.mjs" "$DIFFWORK/diff-batched.mjs"
-node "$DIFFWORK/diff-batched.mjs" "$CHAOS_DB" "$BASELINE_DB" || fail=1
+# STRICT_BLOCKS=1: this is a portal-vs-PORTAL diff (resumed chaos store vs a clean Portal-built
+# baseline), NOT the portal-vs-RPC diff diff-batched's default 'blocks' asymmetry is calibrated for.
+# There is no inert RPC-only block here — a baseline-only (B-only) block means the RESUMED store is
+# MISSING a block, which must FAIL (chaos acceptance is byte-identical). The default asymmetric mode
+# would silently tolerate that missing block; strict fails a one-sided block on either side.
+STRICT_BLOCKS=1 node "$DIFFWORK/diff-batched.mjs" "$CHAOS_DB" "$BASELINE_DB" || fail=1
 cp "$CDIR/check-intervals.mjs" "$DIFFWORK/check-intervals.mjs"
 echo "▶ intervals tiling check"
 node "$DIFFWORK/check-intervals.mjs" "$CHAOS_DB" "$FROM" "$TO" || fail=1

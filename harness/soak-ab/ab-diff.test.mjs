@@ -4,15 +4,34 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { test } from 'node:test';
 import {
+  CHECKPOINT_BLOCK_LEN,
+  CHECKPOINT_BLOCK_OFFSET_0,
   checkpointMonotonic,
   chunk,
   classifyTxDiff,
   collectReferenced,
   compareBucketHashes,
+  extractCheckpointBlock,
   psqlExitVerdict,
   restartStats,
+  sanitizeSchemaIdent,
   writeJsonAtomic,
 } from './ab-diff.mjs';
+
+// Build a real ponder@0.16.6-encoded checkpoint the way encodeCheckpoint does (verified against
+// package/src/utils/checkpoint.ts): timestamp(10) chainId(16) blockNumber(16) txIndex(16)
+// eventType(1) eventIndex(16) = 75 chars. Used to prove extractCheckpointBlock reads the right field.
+const encodeCheckpoint = ({
+  ts = 0n,
+  chainId = 0n,
+  blockNumber = 0n,
+  txIndex = 0n,
+  eventType = 0,
+  eventIndex = 0n,
+}) =>
+  `${String(ts).padStart(10, '0')}${String(chainId).padStart(16, '0')}` +
+  `${String(blockNumber).padStart(16, '0')}${String(txIndex).padStart(16, '0')}` +
+  `${eventType}${String(eventIndex).padStart(16, '0')}`;
 
 test('classifyTxDiff: B missing A parent txs, all log-referenced → expected class (PASS)', () => {
   const onlyA = ['0xaa', '0xbb']; // A has these, B (realtime stream) does not
@@ -247,4 +266,82 @@ test('restartStats: counts restarts, reports last, flags crash-loop only above 3
     restartsLastHour: 0,
     crashLoop: false,
   });
+});
+
+// The checkpoint monotonicity guard extracts the BLOCK-NUMBER field of ponder's encoded
+// `latest_checkpoint`, NOT Number(whole-75-digit-checkpoint) (which overflows Number's precision so
+// same-second rewinds are invisible). Offsets verified against ponder@0.16.6 checkpoint.ts:
+// blockNumber occupies 0-based [26,42). MUTATION: change CHECKPOINT_BLOCK_OFFSET_0 (e.g. 26→10, the
+// chainId field) or the length → the extracted value no longer equals the blockNumber and this fails.
+test('extractCheckpointBlock: reads the blockNumber field of a real 0.16.6 checkpoint', () => {
+  // sanity-lock the verified layout constants themselves
+  assert.equal(
+    CHECKPOINT_BLOCK_OFFSET_0,
+    26,
+    '0-based blockNumber offset (10+16)',
+  );
+  assert.equal(CHECKPOINT_BLOCK_LEN, 16, 'BLOCK_NUMBER_DIGITS');
+
+  const cp = encodeCheckpoint({
+    ts: 1_700_000_000n,
+    chainId: 8453n,
+    blockNumber: 12_345_678n,
+    txIndex: 42n,
+    eventType: 5,
+    eventIndex: 3n,
+  });
+  assert.equal(cp.length, 75, 'a full checkpoint is 75 chars');
+  assert.equal(
+    extractCheckpointBlock(cp),
+    '12345678',
+    'the blockNumber field is extracted, not the timestamp/chainId prefix',
+  );
+
+  // the extraction must NOT be confused by a large chainId (16 digits) that could look like a big
+  // number if the offset were wrong — block 1 with a max-ish chainId still extracts as "1".
+  const cp2 = encodeCheckpoint({
+    ts: 9_999_999_999n,
+    chainId: 9_999_999_999_999n,
+    blockNumber: 1n,
+  });
+  assert.equal(extractCheckpointBlock(cp2), '1');
+
+  // block 0 (genesis / no progress) extracts as "0", never null
+  assert.equal(extractCheckpointBlock(encodeCheckpoint({})), '0');
+
+  // malformed / short / non-string → null (caller falls back to the sync-store block max)
+  assert.equal(extractCheckpointBlock('too-short'), null);
+  assert.equal(extractCheckpointBlock(null), null);
+  assert.equal(extractCheckpointBlock(undefined), null);
+});
+
+// AB_SCHEMA_B is interpolated verbatim into `"<schema>"._ponder_checkpoint`, so it MUST be a bare SQL
+// identifier — anything else is rejected (fail loud) rather than reaching the query. Empty ⇒ null so
+// the caller emits the unqualified table (legacy default-search_path behavior).
+test('sanitizeSchemaIdent: accepts bare identifiers, rejects injection payloads, empty → null', () => {
+  assert.equal(sanitizeSchemaIdent('soak_b'), 'soak_b');
+  assert.equal(sanitizeSchemaIdent('_ponder'), '_ponder');
+  assert.equal(sanitizeSchemaIdent('Euler_RT_b2'), 'Euler_RT_b2');
+
+  // empty / unset ⇒ null (unqualified table, default search_path)
+  assert.equal(sanitizeSchemaIdent(''), null);
+  assert.equal(sanitizeSchemaIdent(undefined), null);
+  assert.equal(sanitizeSchemaIdent(null), null);
+
+  // anything not ^[A-Za-z_][A-Za-z0-9_]*$ throws — a quote/space/paren/dot/hyphen cannot reach SQL
+  for (const bad of [
+    'a"; drop table x; --',
+    'a b',
+    'a-b',
+    'a.b',
+    "a'b",
+    '1abc',
+    'a)b',
+  ]) {
+    assert.throws(
+      () => sanitizeSchemaIdent(bad),
+      /not a valid SQL identifier/,
+      `must reject ${JSON.stringify(bad)}`,
+    );
+  }
 });
