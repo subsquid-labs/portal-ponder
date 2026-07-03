@@ -1,11 +1,17 @@
 import assert from 'node:assert/strict';
+import { existsSync, mkdtempSync, readdirSync, readFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import { test } from 'node:test';
 import {
   checkpointMonotonic,
+  chunk,
   classifyTxDiff,
+  collectReferenced,
   compareBucketHashes,
   psqlExitVerdict,
   restartStats,
+  writeJsonAtomic,
 } from './ab-diff.mjs';
 
 test('classifyTxDiff: B missing A parent txs, all log-referenced → expected class (PASS)', () => {
@@ -51,12 +57,97 @@ test('classifyTxDiff: a SHARED tx whose full-row fields diverge → FAIL', () =>
   assert.equal(ok.fail, false);
 });
 
+// #21 — the referenced-parent-tx lookup must verify EVERY onlyA hash, no fixed skip-threshold. The
+// old `onlyA.length <= 200_000` gate left referenced=[] on a large soak so classifyTxDiff mass-FAILed
+// healthy parent-tx gaps. collectReferenced chunks the IN-list and unions across ALL chunks.
+
+test('chunk: splits into fixed-size batches covering every item, last batch is the remainder', () => {
+  assert.deepEqual(chunk([1, 2, 3, 4, 5], 2), [[1, 2], [3, 4], [5]]);
+  assert.deepEqual(chunk([], 2), []);
+  assert.deepEqual(chunk([1, 2], 5), [[1, 2]]);
+  // an onlyA larger than the default chunk size is split, not skipped
+  const big = Array.from({ length: 12_003 }, (_, i) => i);
+  const batches = chunk(big);
+  assert.equal(batches.length, 3, '12003 / 5000 → 3 chunks');
+  assert.equal(batches.flat().length, big.length, 'every item is covered');
+});
+
+test('collectReferenced: unions referenced hashes across EVERY chunk (any onlyA size verified)', async () => {
+  // 3 chunks of 2 — the referenced hashes live in the FIRST, MIDDLE, and LAST chunk. A mutation that
+  // stops after the first chunk (or applies the old <=200_000 skip) would miss the middle/last ones.
+  const hashes = ['a', 'b', 'c', 'd', 'e', 'f'];
+  const seen = new Set(['a', 'd', 'f']); // referenced parent txs, one per chunk
+  const calls = [];
+  const lookup = async (batch) => {
+    calls.push([...batch]);
+
+    return batch.filter((h) => seen.has(h));
+  };
+  const referenced = await collectReferenced(hashes, lookup, 2);
+  assert.deepEqual(calls, [
+    ['a', 'b'],
+    ['c', 'd'],
+    ['e', 'f'],
+  ]);
+  assert.deepEqual(
+    referenced.sort(),
+    ['a', 'd', 'f'],
+    'referenced hashes from every chunk are unioned',
+  );
+
+  // and this is what makes the difference downstream: with the full referenced set, an onlyA of all
+  // three referenced hashes is the EXPECTED realtime gap (PASS); if the lookup missed later chunks,
+  // classifyTxDiff would flag the un-found ones as unreferenced → false FAIL.
+  const cls = classifyTxDiff(['a', 'd', 'f'], [], new Set(referenced));
+  assert.equal(
+    cls.fail,
+    false,
+    'a fully-referenced large onlyA is the expected gap, not a FAIL',
+  );
+});
+
 test('checkpointMonotonic: non-decreasing passes, a regression fails at the point', () => {
   assert.deepEqual(checkpointMonotonic([1n, 1n, 5n, 9n]), { ok: true });
   assert.deepEqual(checkpointMonotonic(['10', '20', '20', '30']), { ok: true });
   const bad = checkpointMonotonic([100n, 250n, 240n]);
   assert.equal(bad.ok, false);
   assert.equal(bad.at, 2);
+});
+
+// #9 — the checkpoint ledger (the monotonicity source) must be persisted atomically (temp + rename)
+// so a torn write never corrupts it. MUTATION: replace `renameSync(tmp, file)` with a plain
+// `writeFileSync(file, ...)` that leaves the temp file behind (or drop the rename) → the "no temp
+// file remains" assertion fails.
+test('writeJsonAtomic: writes the target with correct content and leaves NO temp file (rename ran)', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'ab-atomic-'));
+  const target = join(dir, 'soak-ab-checkpoints.json');
+  const data = { 1: [100, 200, 300], 8453: [7, 8] };
+
+  writeJsonAtomic(target, data);
+
+  assert.equal(existsSync(target), true, 'the target file exists after write');
+  assert.deepEqual(
+    JSON.parse(readFileSync(target, 'utf8')),
+    data,
+    'target has the full serialized content',
+  );
+  // the atomic path is temp-file + rename: after a successful rename NO `.tmp.*` sibling remains. A
+  // mutation that writes directly (no rename) would leave the temp file, failing this assertion.
+  const leftovers = readdirSync(dir).filter((f) => f.includes('.tmp.'));
+  assert.deepEqual(
+    leftovers,
+    [],
+    'no temp file remains — the rename completed',
+  );
+
+  // a second write overwrites atomically (rename over an existing target)
+  const data2 = { 1: [100, 200, 300, 400] };
+  writeJsonAtomic(target, data2);
+  assert.deepEqual(JSON.parse(readFileSync(target, 'utf8')), data2);
+  assert.deepEqual(
+    readdirSync(dir).filter((f) => f.includes('.tmp.')),
+    [],
+  );
 });
 
 test('psqlExitVerdict: a clean exit passes; ANY non-clean exit fails (no silent zero-rows)', () => {

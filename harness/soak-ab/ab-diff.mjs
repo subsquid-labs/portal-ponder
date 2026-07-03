@@ -16,7 +16,7 @@
 //   STATUS_FILE=soak-ab-status.json node harness/soak-ab/ab-diff.mjs
 
 import { spawn } from 'node:child_process';
-import { readFileSync, writeFileSync } from 'node:fs';
+import { readFileSync, renameSync, writeFileSync } from 'node:fs';
 import { streamingDiff } from '../validate/diff-batched.mjs';
 
 // ── pure, unit-tested core ─────────────────────────────────────────────────────────────────────
@@ -58,6 +58,35 @@ export function psqlExitVerdict({ code, signal, spawnError }) {
   }
 
   return { ok: true };
+}
+
+// Split an array of hashes into fixed-size chunks (default 5000) for a chunked IN-list lookup. Pure +
+// exported: the referenced-parent-tx lookup must verify ANY onlyA size, so it splits into bounded IN
+// lists rather than skipping the lookup above a fixed threshold (the old `onlyA.length <= 200_000`
+// gate classified every parent-tx gap in a large healthy soak as unreferenced → false FAIL).
+export function chunk(items, size = 5000) {
+  const out = [];
+  for (let i = 0; i < items.length; i += size) {
+    out.push(items.slice(i, i + size));
+  }
+
+  return out;
+}
+
+// Collect the referenced subset of `hashes` by running `lookup(batch)` over EVERY chunk and unioning
+// the results. `lookup` is an async fn batch → referenced-hashes-in-batch (the psql IN-list query in
+// diffTx). Pure over its callback + exported so a mutation that stops after the first chunk (leaving
+// later chunks' referenced hashes unfound) is caught by a test rather than surfacing as a false FAIL.
+export async function collectReferenced(hashes, lookup, size = 5000) {
+  const referenced = [];
+  for (const batch of chunk(hashes, size)) {
+    const found = await lookup(batch);
+    for (const h of found) {
+      referenced.push(h);
+    }
+  }
+
+  return referenced;
 }
 
 // _ponder_checkpoint (or any progress value) must never go backwards across runs.
@@ -232,6 +261,39 @@ async function overlapBound(url, chain) {
   return Number(v ?? 0);
 }
 
+// Real indexing progress for the monotonicity guard: ponder's own `_ponder_checkpoint` row (in the
+// APP schema, not ponder_sync) is the source of truth for how far indexing has committed — the
+// encoded checkpoint embeds the block height in its leading digits (a fixed-width zero-padded,
+// lexicographically-ordered string). max(ponder_sync.blocks.number) is only how far the SYNC store
+// reached, which can move independently of committed indexing progress; a resume that rewound the
+// COMMITTED checkpoint but kept sync-store rows would slip past a block-max guard. We extract the
+// block-height integer from the latest checkpoint across all `_ponder_checkpoint` rows for this
+// chain. Falls back to the sync-store block max only if `_ponder_checkpoint` is absent (older stores)
+// so the guard is never silently disabled.
+async function checkpointProgress(url, chain) {
+  // Probe `_ponder_checkpoint` directly and tolerate its absence. The encoded `latest_checkpoint`
+  // embeds the committed block height in its leading segment; strip non-digits so we get a comparable
+  // numeric height regardless of the exact checkpoint encoding width across ponder versions. On ANY
+  // error (missing table/column — an older store, or the table not on the search_path) we fall back
+  // to the sync-store block max so the monotonicity guard is never silently disabled.
+  try {
+    const v = await psqlScalar(
+      url,
+      `select coalesce(max(nullif(regexp_replace(split_part(latest_checkpoint,'_',1),'\\D','','g'),'')::numeric),0)::text ` +
+        `from _ponder_checkpoint where chain_id=${chain}`,
+    );
+    const n = Number(v ?? 0);
+    if (Number.isFinite(n) && n > 0) {
+      return n;
+    }
+  } catch {
+    // _ponder_checkpoint not resolvable (older store / different schema) — fall through to the
+    // sync-store block max below rather than disabling the guard.
+  }
+
+  return overlapBound(url, chain);
+}
+
 async function diffLogs(urlA, urlB, chain, lo, hi) {
   const sql =
     `select block_number, log_index, md5(to_jsonb(t)::text) from ponder_sync.logs t ` +
@@ -305,14 +367,19 @@ async function diffTx(urlA, urlB, chain, lo, hi) {
     }
   }
 
-  let referenced = [];
-  if (onlyA.length > 0 && onlyA.length <= 200_000) {
-    const inList = onlyA.map((h) => `'${h.replace(/'/g, '')}'`).join(',');
-    referenced = await psqlList(
+  // Which onlyA hashes are referenced by an A-side log (a legit realtime parent-tx gap)? Verify EVERY
+  // onlyA hash regardless of count by chunking the IN list into bounded queries (no fixed threshold):
+  // the old `onlyA.length <= 200_000` skip left `referenced=[]` on a large healthy soak, so
+  // classifyTxDiff saw every gap as unreferenced and mass-FAILed a healthy run. collectReferenced
+  // accumulates across every chunk so any onlyA size is fully verified.
+  const referenced = await collectReferenced(onlyA, (batch) => {
+    const inList = batch.map((h) => `'${h.replace(/'/g, '')}'`).join(',');
+
+    return psqlList(
       urlA,
       `select distinct transaction_hash from ponder_sync.logs where chain_id=${chain} and transaction_hash in (${inList})`,
     );
-  }
+  });
 
   return classifyTxDiff(onlyA, onlyB, referenced, sharedMismatch);
 }
@@ -330,9 +397,12 @@ async function bucketHashes(url, chain, lo, hi, bucket) {
 }
 
 async function compareChain(urlA, urlB, chain, cutover, margin, bucket) {
-  const [boundA, boundB] = await Promise.all([
+  const [boundA, boundB, progressB] = await Promise.all([
     overlapBound(urlA, chain),
     overlapBound(urlB, chain),
+    // Soak B's COMMITTED indexing progress from `_ponder_checkpoint` — the real value the
+    // monotonicity guard asserts, not merely how far the sync store reached (see checkpointProgress).
+    checkpointProgress(urlB, chain),
   ]);
   const hi = Math.min(boundA, boundB) - margin;
   const lo = cutover;
@@ -342,8 +412,9 @@ async function compareChain(urlA, urlB, chain, cutover, margin, bucket) {
     hi,
     lagA: 0,
     lagB: 0,
-    // Soak B's max synced block — the per-run progress value monotonicity is asserted against.
-    progressB: boundB,
+    // Soak B's committed indexing checkpoint — the per-run progress value monotonicity is asserted
+    // against (never rewinds across hourly runs).
+    progressB,
     verdict: 'PASS',
     classes: {},
   };
@@ -506,12 +577,21 @@ async function main() {
   };
 
   writeFileSync(statusFile, `${JSON.stringify(status, null, 2)}\n`);
-  writeFileSync(
-    checkpointFile,
-    `${JSON.stringify(nextCheckpoints, null, 2)}\n`,
-  );
+  // The checkpoint file is the monotonicity ledger — a torn write (process killed mid-write) would
+  // corrupt it and, on the next run, either fail-closed on the parse error or lose the prior series
+  // (silently disabling the rewind guard). Write it atomically: full temp file + rename, so a reader
+  // ever sees only the old complete file or the new complete file, never a partial one.
+  writeJsonAtomic(checkpointFile, nextCheckpoints);
   console.log(JSON.stringify(status, null, 2));
   process.exit(verdict === 'FAIL' ? 1 : 0);
+}
+
+// Atomic JSON write: serialize to a sibling temp file, then rename over the target (rename is atomic
+// within a filesystem). Exported so a mutation that skips the rename is caught by a test.
+export function writeJsonAtomic(file, data) {
+  const tmp = `${file}.tmp.${process.pid}`;
+  writeFileSync(tmp, `${JSON.stringify(data, null, 2)}\n`);
+  renameSync(tmp, file);
 }
 
 if (import.meta.url === `file://${process.argv[1]}`) {

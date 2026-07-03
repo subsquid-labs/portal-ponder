@@ -4,8 +4,9 @@
 // so peak memory is one batch per side regardless of table size (the Euler-eth full history is
 // millions of rows). Tolerances match diff.mjs exactly:
 //   - logs / transactions / transaction_receipts / traces : strict set + field identity
-//   - blocks : total_difficulty excluded; blocks present on only one side are reported, not failed
-//     (the stock RPC path stores inert event-less blocks it traced)
+//   - blocks : total_difficulty excluded; ASYMMETRIC — a portal-only block (A) FAILS (the Portal
+//     path invented a block RPC never saw); only an rpc-only block (B) is tolerated (the stock RPC
+//     path stores inert event-less blocks it traced); a shared-key field mismatch always FAILS
 //
 // Modes:
 //   node diff-batched.mjs <pgliteDirA> <pgliteDirB> [--app-hash]   diff sync stores (exit 0/1)
@@ -68,8 +69,15 @@ async function* fromArray(rows) {
   }
 }
 
-// Streaming merge-compare of two key-ordered async row streams. `mode='strict'` fails on any
-// only-one-side row; `mode='blocks'` reports them but only fails on a shared-key field mismatch.
+// Streaming merge-compare of two key-ordered async row streams. Modes:
+//   • 'strict' : ANY only-one-side row fails, plus any shared-key field mismatch.
+//   • 'blocks' : ASYMMETRIC, mirroring harness/diff/diff.mjs `blocksVerdict`. A is the Portal store
+//     and B is the stock-RPC store (see diffStores / run.sh: dirA=portal, dirB=rpc). A portal-only
+//     block (onlyA) is a block the Portal path invented that RPC never saw → FAIL. An rpc-only block
+//     (onlyB) is a tolerated inert event-less block the stock RPC path traced but never referenced →
+//     reported, not failed. A shared-key field mismatch is always a FAIL. Before this fix 'blocks'
+//     was vacuous — it failed only on a shared mismatch and let a portal-only block sail through the
+//     F-full differ.
 // Returns counters and small samples (never the whole diff) so memory stays bounded.
 export async function streamingDiff(
   iterA,
@@ -112,7 +120,9 @@ export async function streamingDiff(
     if (step < 0) {
       res.aCount++;
       res.onlyA++;
-      if (mode === 'strict') {
+      // A-only (portal-only) fails under BOTH strict and blocks: strict tolerates nothing, and a
+      // portal-only block is a block the Portal path invented that RPC never saw (asymmetric blocks).
+      if (mode === 'strict' || mode === 'blocks') {
         res.fail = true;
         sample('A-only', normRow(a.value, drop));
       }
@@ -120,6 +130,8 @@ export async function streamingDiff(
     } else if (step > 0) {
       res.bCount++;
       res.onlyB++;
+      // B-only (rpc-only) fails ONLY under strict; under blocks it is the tolerated inert event-less
+      // block the stock RPC path traced but never referenced.
       if (mode === 'strict') {
         res.fail = true;
         sample('B-only', normRow(b.value, drop));

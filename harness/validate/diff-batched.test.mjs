@@ -61,7 +61,8 @@ test('strict mode: a shared-key field mismatch FAILS', async () => {
   assert.equal(r.mismatch, 1);
 });
 
-test('blocks mode: RPC-only inert block is reported, not failed', async () => {
+test('blocks mode: RPC-only (B-only) inert block is reported, not failed', async () => {
+  // A = portal, B = rpc (diffStores/run.sh: dirA=dbPortal, dirB=dbRpc)
   const portal = [
     { number: 100, hash: 'h100' },
     { number: 102, hash: 'h102' },
@@ -77,6 +78,31 @@ test('blocks mode: RPC-only inert block is reported, not failed', async () => {
   });
   assert.equal(r.fail, false, 'extra RPC-only block must not fail');
   assert.equal(r.onlyB, 1);
+  assert.equal(r.shared, 2);
+});
+
+// #19 — the batched 'blocks' mode is ASYMMETRIC (mirrors harness/diff/diff.mjs blocksVerdict): a
+// PORTAL-only block (onlyA) is a block the Portal path invented that RPC never saw → FAIL. Before the
+// fix 'blocks' mode set res.fail only on a shared mismatch, so a portal-only block sailed through the
+// F-full batched differ. MUTATION: revert the `mode === 'blocks'` branch on the onlyA (step<0) side
+// back to `mode === 'strict'` → this test fails (r.fail becomes false).
+test('blocks mode: a PORTAL-only (A-only) block FAILS (asymmetric — #19)', async () => {
+  const portal = [
+    { number: 100, hash: 'h100' },
+    { number: 101, hash: 'h101' }, // portal invented block 101 — RPC never saw it
+    { number: 102, hash: 'h102' },
+  ];
+  const rpc = [
+    { number: 100, hash: 'h100' },
+    { number: 102, hash: 'h102' },
+  ];
+  const r = await mergeCompare(portal, rpc, {
+    keyFn: blockKey,
+    mode: 'blocks',
+  });
+  assert.equal(r.fail, true, 'a portal-only block must FAIL under blocks mode');
+  assert.equal(r.onlyA, 1);
+  assert.equal(r.onlyB, 0);
   assert.equal(r.shared, 2);
 });
 
@@ -121,15 +147,34 @@ test('strict mode over {key,hash} rows: a one-sided block FAILS (ab-diff finaliz
   );
   assert.equal(strict.onlyA, 1);
 
-  // proof this is the mode that matters: the old 'blocks' tolerance would NOT have failed it
-  const tolerant = await mergeCompare(a, b, {
+  // proof strict is the mode that matters for the FINALIZED overlap: an rpc-only (B-only) block —
+  // which the asymmetric 'blocks' mode still TOLERATES as an inert event-less RPC block — must FAIL
+  // under strict, because in the finalized overlap a one-sided block is a real gap, not inert.
+  const bExtra = [
+    hashRow(100, 'h100'),
+    hashRow(101, 'h101'),
+    hashRow(102, 'h102'),
+    hashRow(103, 'h103'), // only in B
+  ];
+  const strictBExtra = await mergeCompare(a, bExtra, {
+    keyFn: keyOfHashRow,
+    mode: 'strict',
+  });
+  assert.equal(
+    strictBExtra.fail,
+    true,
+    'a B-only finalized block must FAIL under strict',
+  );
+  assert.equal(strictBExtra.onlyB, 1);
+
+  const tolerant = await mergeCompare(a, bExtra, {
     keyFn: keyOfHashRow,
     mode: 'blocks',
   });
   assert.equal(
     tolerant.fail,
     false,
-    "'blocks' mode tolerates the one-sided block (the pre-fix bug)",
+    "'blocks' mode tolerates the rpc-only inert block (not the finalized-overlap mode)",
   );
 });
 
