@@ -31,6 +31,17 @@ RPC="${CHAOS_RPC:-https://ethereum-rpc.publicnode.com}"
 BASELINE_DB="${BASELINE_DB:-/tmp/chaos-baseline}"
 CHAIN_ID="${CHAOS_CHAIN_ID:-1}"
 FACTORY="${EULER_FACTORY:-0x29a56a1b8214D9Cf7c5561811750D5cBDb45CC8e}"
+BASELINE_META="$BASELINE_DB.meta.json"
+CHAOS_META="$CHAOS_DB.meta.json"
+
+# write baseline metadata describing what this baseline was built for, so a future reuse can confirm
+# it still matches the chaos run it's asked to validate.
+write_baseline_meta () {
+  CHAOS_META_APP="$APP" CHAOS_META_FROM="$FROM" CHAOS_META_TO="$TO" CHAOS_META_PORTAL="$PORTAL" \
+  CHAOS_META_TARBALL="${SQD_PONDER_TARBALL:-}" CHAOS_META_CHAIN_ID="$CHAIN_ID" CHAOS_META_FACTORY="$FACTORY" \
+  CHAOS_META_SCENARIO="baseline" CHAOS_META_KILLS="0" \
+    node "$CDIR/chaos-meta.mjs" write "$BASELINE_META"
+}
 
 if [ ! -d "$BASELINE_DB" ]; then
   echo "▶ building clean baseline store $BASELINE_DB (no kills)"
@@ -50,6 +61,24 @@ if [ ! -d "$BASELINE_DB" ]; then
   pkill -f 'ponder start --schema baseline' 2>/dev/null; sleep 1
   grep -qiE 'Completed indexing across' /tmp/chaos-baseline.log || { echo "✗ baseline did not complete"; tail -4 /tmp/chaos-baseline.log; exit 1; }
   cd "$ROOT"
+  write_baseline_meta || { echo "✗ could not write baseline metadata"; exit 1; }
+else
+  echo "▶ reusing existing baseline store $BASELINE_DB — validating its metadata matches this run"
+  # a REUSED baseline must have been built for the SAME app/range/portal/tarball, else a byte-diff of
+  # two unrelated stores is meaningless (a silent false pass). Refuse a stale/mismatched baseline.
+  # If the chaos run wrote no metadata (older store), build a fresh comparison record from THIS run's
+  # env so at least the invocation's app/range/portal/tarball are checked against the baseline.
+  if [ ! -f "$CHAOS_META" ]; then
+    echo "  (chaos store has no metadata — synthesizing this run's params for the check)"
+    CHAOS_META_APP="$APP" CHAOS_META_FROM="$FROM" CHAOS_META_TO="$TO" CHAOS_META_PORTAL="$PORTAL" \
+    CHAOS_META_TARBALL="${SQD_PONDER_TARBALL:-}" CHAOS_META_CHAIN_ID="$CHAIN_ID" CHAOS_META_FACTORY="$FACTORY" \
+      node "$CDIR/chaos-meta.mjs" write "$CHAOS_META" || { echo "✗ could not synthesize chaos metadata"; exit 1; }
+  fi
+  if [ ! -f "$BASELINE_META" ]; then
+    echo "✗ reused baseline $BASELINE_DB has NO metadata — refusing (cannot prove it matches this run). Delete it to rebuild."
+    exit 1
+  fi
+  node "$CDIR/chaos-meta.mjs" match "$BASELINE_META" "$CHAOS_META" || { echo "✗ baseline is stale/mismatched — refusing to reuse it"; exit 1; }
 fi
 
 fail=0

@@ -29,6 +29,13 @@ FACTORY="${EULER_FACTORY:-0x29a56a1b8214D9Cf7c5561811750D5cBDb45CC8e}"
 TRIGGER="${TRIGGER:-poisson-45s}"
 MEAN="${MEAN:-45}"
 MAX_KILLS="${MAX_KILLS:-30}"
+# a resume run is only meaningful if it was actually killed at least once — a run that "completes"
+# with kills==0 proves nothing about resume. Fail unless at least MIN_KILLS kills happened.
+MIN_KILLS="${MIN_KILLS:-1}"
+SCENARIO="${CHAOS_SCENARIO:-none}"
+# run metadata sits next to the chaos DB so verify-resume can confirm the baseline it diffs against
+# was built for the SAME app/range/portal/tarball (a stale/mismatched baseline is a silent false pass)
+META="$DB.meta.json"
 
 case "$TRIGGER" in
   on-chunk-fetch-log)         REGEX="${TRIGGER_REGEX:-\[portalGate\]}" ;;
@@ -116,4 +123,17 @@ done
 
 echo "▶ kill-loop finished: attempts=$attempt kills=$kills done=$DONE  store=$DB"
 [ "$DONE" = 1 ] || { echo "✗ did not complete within MAX_KILLS=$MAX_KILLS"; exit 1; }
+
+# a completion with too few kills proves nothing about resume — fail unless MIN_KILLS were reached.
+if [ "$kills" -lt "$MIN_KILLS" ]; then
+  echo "✗ completed with kills=$kills < MIN_KILLS=$MIN_KILLS — a resume run must be killed at least MIN_KILLS times to prove anything"
+  exit 1
+fi
+
+# persist run metadata alongside the store so verify-resume can confirm its baseline is comparable
+CHAOS_META_APP="$APP" CHAOS_META_FROM="$FROM" CHAOS_META_TO="$TO" CHAOS_META_PORTAL="$PORTAL" \
+CHAOS_META_TARBALL="${SQD_PONDER_TARBALL:-}" CHAOS_META_CHAIN_ID="$CHAIN_ID" CHAOS_META_FACTORY="$FACTORY" \
+CHAOS_META_SCENARIO="$SCENARIO" CHAOS_META_KILLS="$kills" \
+  node "$CDIR/chaos-meta.mjs" write "$META" || { echo "✗ could not write chaos metadata $META"; exit 1; }
+
 echo "→ now verify: bash harness/chaos/verify-resume.sh $DB $FROM $TO"
