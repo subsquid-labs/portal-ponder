@@ -25,6 +25,8 @@ PGADMIN_URL="${PGADMIN_URL:-postgres:///postgres}"
 MEM_HIGH="${SOAK_B_MEM_HIGH:-6G}"
 MEM_MAX="${SOAK_B_MEM_MAX:-8G}"
 UNIT_DIR="${SYSTEMD_DIR:-/etc/systemd/system}"
+RESTART_LOG="${SOAK_B_RESTART_LOG:-$HOME/soak-b-restarts.log}"
+RESTART_LOG_DIR="$(dirname "$RESTART_LOG")"
 
 HERE="$(cd "$(dirname "$0")" && pwd)"
 
@@ -89,12 +91,15 @@ chmod 600 "$ENVFILE"
 echo "  wrote $ENVFILE (chmod 600)"
 
 # ── 4. render + install the unit; enable but DO NOT start ──
+touch "$RESTART_LOG" 2>/dev/null || true
 RENDER="$(mktemp)"
 sed -e "s#@@WORKDIR@@#${WORKDIR}#g" \
     -e "s#@@ENVFILE@@#${ENVFILE}#g" \
     -e "s#@@PORT@@#${PORT}#g" \
     -e "s#@@MEM_HIGH@@#${MEM_HIGH}#g" \
     -e "s#@@MEM_MAX@@#${MEM_MAX}#g" \
+    -e "s#@@RESTART_LOG@@#${RESTART_LOG}#g" \
+    -e "s#@@RESTART_LOG_DIR@@#${RESTART_LOG_DIR}#g" \
     "$HERE/soak-b.service" > "$RENDER"
 
 if [ -w "$UNIT_DIR" ] || [ "$(id -u)" = 0 ]; then
@@ -109,3 +114,4 @@ else
 fi
 rm -f "$RENDER"
 echo "▶ Soak B provisioned. Start manually; then run harness/soak-ab/ab-diff.mjs hourly."
+echo "   restart log: $RESTART_LOG (ab-diff.mjs reads restartCount/lastRestartAt; >3/h = crash-loop alert)"

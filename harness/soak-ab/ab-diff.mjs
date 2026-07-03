@@ -71,6 +71,34 @@ export function compareBucketHashes(aBuckets, bBuckets) {
   return { ok: mismatches.length === 0, mismatches, onlyA, onlyB };
 }
 
+// Restart accounting from the systemd ExecStartPre log (one UTC-timestamp line per (re)start). In
+// stream mode a fatal unknown-head / reorg-gap exits 75 and systemd restarts — designed recovery, so
+// only the RATE matters: >3 restarts in the trailing hour is a crash-loop alert.
+export function restartStats(lines, nowMs = Date.now()) {
+  const stamps = [];
+  for (const line of lines) {
+    const m = line.trim().match(/^(\d{4}-\d\d-\d\dT[\d:.]+Z)/);
+    if (m) {
+      stamps.push(Date.parse(m[1]));
+    }
+  }
+  stamps.sort((x, y) => x - y);
+
+  const hourAgo = nowMs - 3_600_000;
+  const restartsLastHour = stamps.filter((t) => t >= hourAgo).length;
+  const lastRestartAt =
+    stamps.length > 0
+      ? new Date(stamps[stamps.length - 1]).toISOString()
+      : null;
+
+  return {
+    restartCount: stamps.length,
+    lastRestartAt,
+    restartsLastHour,
+    crashLoop: restartsLastHour > 3,
+  };
+}
+
 // ── psql adapters ──────────────────────────────────────────────────────────────────────────────
 
 const SEP = '\x1f'; // unit separator — never appears in the hex/numeric fields we select
@@ -316,10 +344,41 @@ async function main() {
       ? 'PASS'
       : 'PENDING';
 
+  // Soak B restart signal (from the systemd ExecStartPre log).
+  const restartLog =
+    process.env.RESTART_LOG ?? `${process.env.HOME ?? '.'}/soak-b-restarts.log`;
+  let restarts = {
+    restartCount: 0,
+    lastRestartAt: null,
+    restartsLastHour: 0,
+    crashLoop: false,
+  };
+  try {
+    restarts = restartStats(readFileSync(restartLog, 'utf8').split('\n'));
+  } catch {
+    // no restart log yet — Soak B not started, or first boot
+  }
+
+  const alerts = [];
+  if (restarts.crashLoop) {
+    alerts.push(
+      `crash-loop: ${restarts.restartsLastHour} restarts in the last hour (>3)`,
+    );
+  }
+  if (verdict === 'FAIL') {
+    alerts.push(
+      'finalized-diff: an unexpected finalized-overlap divergence (see diffClasses)',
+    );
+  }
+
   const status = {
     ts: new Date().toISOString(),
     chains: results.map((r) => r.chain),
     verdict,
+    restartCount: restarts.restartCount,
+    lastRestartAt: restarts.lastRestartAt,
+    restartsLastHour: restarts.restartsLastHour,
+    alerts,
     diffClasses: Object.fromEntries(results.map((r) => [r.chain, r.classes])),
     lagA: Object.fromEntries(results.map((r) => [r.chain, r.lagA ?? null])),
     lagB: Object.fromEntries(results.map((r) => [r.chain, r.lagB ?? null])),

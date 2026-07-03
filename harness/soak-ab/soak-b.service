@@ -26,12 +26,21 @@ Environment=CI=true
 # The soak indexes the SAME 3 chains as Soak A; the app's ponder.config.ts reads SOAK_CHAINS.
 Environment=SOAK_CHAINS=eth,base,arbitrum
 
+# Restart counting is a first-class soak signal. Each (re)start appends a UTC timestamp to the
+# restart log; ab-diff.mjs reads it into restartCount / lastRestartAt and alerts on >3 restarts/hour
+# (crash-loop). In PORTAL_REALTIME=stream mode unknown-head and reorg-gap conditions are FATAL by
+# design and exit 75 (EX_TEMPFAIL) — Restart=on-failure makes that the intended restart-recovery,
+# NOT a soak failure (only the crash-loop RATE is an alert).
+Environment=SOAK_B_RESTART_LOG=@@RESTART_LOG@@
+ExecStartPre=/bin/sh -c 'echo "$(date -u +%%Y-%%m-%%dT%%H:%%M:%%SZ) restart" >> "$SOAK_B_RESTART_LOG"'
+
 ExecStart=@@WORKDIR@@/node_modules/.bin/ponder start --schema soak_b --port @@PORT@@
 
 # RSS cap — MemoryHigh throttles, MemoryMax is the hard kill ceiling (the soak asserts it holds).
 MemoryHigh=@@MEM_HIGH@@
 MemoryMax=@@MEM_MAX@@
 
+# on-failure covers exit 75 (the designed stream-mode restart) and any crash/OOM/signal.
 Restart=on-failure
 RestartSec=10
 # 2 planned SIGKILL+restart drills mid-soak are exercised by the operator via `systemctl kill -s KILL`.
@@ -40,7 +49,7 @@ TimeoutStopSec=30
 
 NoNewPrivileges=true
 ProtectSystem=strict
-ReadWritePaths=@@WORKDIR@@
+ReadWritePaths=@@WORKDIR@@ @@RESTART_LOG_DIR@@
 
 [Install]
 WantedBy=multi-user.target

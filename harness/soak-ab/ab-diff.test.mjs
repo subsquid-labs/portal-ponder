@@ -4,6 +4,7 @@ import {
   checkpointMonotonic,
   classifyTxDiff,
   compareBucketHashes,
+  restartStats,
 } from './ab-diff.mjs';
 
 test('classifyTxDiff: B missing A parent txs, all log-referenced → expected class (PASS)', () => {
@@ -66,4 +67,44 @@ test('compareBucketHashes: shared buckets must match; one-sided buckets are repo
   assert.equal(badRes.ok, false);
   assert.equal(badRes.mismatches.length, 1);
   assert.equal(badRes.mismatches[0].bucket, '1');
+});
+
+test('restartStats: counts restarts, reports last, flags crash-loop only above 3/hour', () => {
+  const now = Date.parse('2026-07-03T12:00:00Z');
+  // 2 restarts within the hour, 1 old → not a crash-loop
+  const calm = restartStats(
+    [
+      '2026-07-03T09:00:00Z restart',
+      '2026-07-03T11:30:00Z restart',
+      '2026-07-03T11:55:00Z restart',
+      '', // trailing blank line from the log split
+    ],
+    now,
+  );
+  assert.equal(calm.restartCount, 3);
+  assert.equal(calm.lastRestartAt, '2026-07-03T11:55:00.000Z');
+  assert.equal(calm.restartsLastHour, 2);
+  assert.equal(calm.crashLoop, false);
+
+  // 4 restarts within the hour → crash-loop
+  const loop = restartStats(
+    [
+      '2026-07-03T11:10:00Z restart',
+      '2026-07-03T11:25:00Z restart',
+      '2026-07-03T11:40:00Z restart',
+      '2026-07-03T11:59:00Z restart',
+    ],
+    now,
+  );
+  assert.equal(loop.restartsLastHour, 4);
+  assert.equal(loop.crashLoop, true);
+
+  // empty / never-started
+  const none = restartStats([], now);
+  assert.deepEqual(none, {
+    restartCount: 0,
+    lastRestartAt: null,
+    restartsLastHour: 0,
+    crashLoop: false,
+  });
 });

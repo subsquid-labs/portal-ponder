@@ -125,7 +125,14 @@ memory. It asserts: **logs** strict row-set + field identity (PRIMARY, must be 0
 identity (total_difficulty excluded); **transactions** are EXACTLY the expected class — B may be
 missing parent txs for realtime-ingested spans, each referenced by an A-side log; anything else FAILS;
 per-1000-block checkpoint hashes match; `_ponder_checkpoint` is monotonic. It writes
-`soak-ab-status.json` for the hourly monitor.
+`soak-ab-status.json` (`verdict`, `restartCount`, `lastRestartAt`, `restartsLastHour`, `alerts`,
+`diffClasses`, `lagA`/`lagB`, `counters`) for the hourly monitor.
+
+**Restart signal** — in `PORTAL_REALTIME=stream` mode, unknown-head / reorg-gap are FATAL by design
+and exit **75 (EX_TEMPFAIL)**; `Restart=on-failure` makes that a designed restart-recovery, not a
+soak failure. The unit's `ExecStartPre` appends a UTC timestamp to `$SOAK_B_RESTART_LOG` on every
+(re)start; `ab-diff.mjs` reads it into `restartCount`/`lastRestartAt` and raises a **crash-loop**
+alert when restarts exceed 3/hour. Point `ab-diff.mjs` at the same log via `RESTART_LOG=…`.
 
 **Guardrails** (`deploy-soak-b.sh`): DB is `euler_rt_b` and nothing else; port is never `:9547`; the
 `euler` prod DB is never touched; secrets are copied into a `chmod 600` env file, never printed/committed.
