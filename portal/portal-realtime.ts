@@ -40,7 +40,7 @@ export type Reconcile =
   | { kind: 'append' } //   extends the tip (normal case)
   | { kind: 'duplicate' } // already the tip (idempotent re-delivery)
   | { kind: 'reorg'; commonAncestor: Light; reorgedBlocks: Light[] } // forks off an earlier block
-  | { kind: 'gap' }; //     parent is unknown (beyond our window / a skipped block) → caller must re-sync
+  | { kind: 'gap' }; //     parent unknown (beyond our window / a skipped block) → FATAL; restart to re-sync (finding 7)
 
 /**
  * Reconcile a newly-streamed block against the local unfinalized chain (oldest→newest, linked
@@ -97,6 +97,14 @@ export type PortalRealtimeArgs = {
   /** the block header fields ponder needs */
   blockFields?: Record<string, boolean>;
   logFields?: Record<string, boolean>;
+  /**
+   * Current logs-filter revision. The Portal filters `/stream` SERVER-side, so a `logs` change after a
+   * connection opens (a newly-discovered factory child) can't reach THAT connection. streamHotBlocks
+   * snapshots this at open and re-opens with the widened filter the moment it advances, so the child's
+   * logs are caught on the next block instead of only after an unrelated reconnect. Absent ⇒ constant 0
+   * (never reopens). (finding 4)
+   */
+  getLogsRevision?: () => number;
   signal?: AbortSignal;
   fetchImpl?: typeof fetch;
 };
@@ -155,18 +163,27 @@ export async function* streamHotBlocks(
       await sleep(1000, args.signal);
       continue;
     }
+    // Snapshot the filter revision at open; if it advances while streaming (a child was discovered), break
+    // to re-open with the widened server-side filter NOW rather than waiting for an unrelated reconnect.
+    // Breaking early cancels the ndjsonLines reader (its finally), closing this connection. (finding 4)
+    const openedRev = args.getLogsRevision?.() ?? 0;
+    let reopen = false;
     try {
       for await (const line of ndjsonLines(res.body)) {
         const batch = JSON.parse(line);
         if (batch?.header?.number != null) {
           cursor = batch.header.number + 1; // resume past this block on reconnect
           yield { header: batch.header, logs: batch.logs ?? [] };
+          if ((args.getLogsRevision?.() ?? 0) !== openedRev) {
+            reopen = true;
+            break;
+          }
         }
       }
     } catch {
       /* stream cut — reconnect from cursor */
     }
-    await sleep(200, args.signal);
+    if (!reopen) await sleep(200, args.signal); // filter changed ⇒ re-open immediately, no backoff
   }
 }
 
@@ -215,11 +232,23 @@ export async function* portalRealtimeEvents(
     const light = toLight(header);
     const r = reconcile(unfinalized, light);
     if (r.kind === 'duplicate') continue;
+
     if (r.kind === 'gap') {
-      // parent unknown: our window is behind a deeper reorg. Drop to a resync by clearing and continuing
-      // from this block (the finalized floor still protects already-committed data).
-      unfinalized.length = 0;
-    } else if (r.kind === 'reorg') {
+      // Parent unknown: the streamed block doesn't attach to our unfinalized window — a reorg deeper than
+      // the window (e.g. one that landed while the stream was disconnected, past our resume cursor). We
+      // can't locate the fork point, so we can't emit a correct rollback; silently clearing the window (the
+      // prior INV-10 "gap resets" behavior) left the already-indexed UNFINALIZED blocks on the WRONG fork
+      // with no reorg event, and dropped the skipped span. Fail loud instead — the finalized floor protects
+      // only COMMITTED data; a restart re-derives the window cleanly from historical. NOTE (finding 4 × 7):
+      // a forced reopen on child discovery widens the reconnect window in which a concurrent deep reorg
+      // surfaces here as a fatal gap rather than a handled reorg — accepted, a crash beats silent
+      // corruption. (finding 7 / G5; a walk-parents-and-refetch auto-recovery is a follow-up.)
+      throw new Error(
+        `Portal realtime: streamed block ${light.number} (${light.hash}) has an unknown parent ${light.parentHash} — a reorg deeper than the unfinalized window, or a skipped block. Cannot reconcile safely; restart to re-sync from the finalized head.`,
+      );
+    }
+
+    if (r.kind === 'reorg') {
       // trim the local chain and surface the rollback to the common ancestor
       while (
         unfinalized.length &&
@@ -233,8 +262,8 @@ export async function* portalRealtimeEvents(
       };
     }
     // INV-10 tripwire: the unfinalized chain stays strictly increasing and parentHash-linked on every
-    // append. `reconcile` guarantees this (append/reorg/gap all restore linkage), so this O(1) check can
-    // only fire on a reconcile regression.
+    // append. `reconcile` guarantees this (append/reorg restore linkage; a gap is now fatal above), so this
+    // O(1) check can only fire on a reconcile regression.
     if (unfinalized.length > 0) {
       const tip = unfinalized[unfinalized.length - 1]!;
       invariant(

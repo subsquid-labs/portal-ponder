@@ -26,6 +26,7 @@ import type {
   EventCallback,
   Factory,
   FactoryId,
+  Filter,
   LightBlock,
   SyncLog,
 } from '@/internal/types.js';
@@ -70,6 +71,9 @@ const portalHeaders = (): Record<string, string> => {
 
 const cleanUrl = (portal: string): string => portal.replace(/\/$/, '');
 
+const sleep = (ms: number): Promise<void> =>
+  new Promise((r) => setTimeout(r, ms));
+
 // ─────────────────────────────── Portal finalized head + finality clamp ───────────────────────────────
 
 /** Poll the Portal `/finalized-head` (reused by both the historical finality-gap decision and here). */
@@ -106,15 +110,30 @@ export async function clampFinalizedToPortalHead(params: {
   if (isPortalRealtime(chain) === false) return finalizedBlock;
 
   const portalUrl = cleanUrl(chain.portal!);
-  const head = await portalFinalizedHead(
-    portalUrl,
-    portalHeaders(),
-    params.fetchImpl,
-  );
-  // Head unknown → stay conservative and keep the RPC finalized block (historical's own RPC finality-gap
-  // fallback remains the safety net). Portal at/ahead of RPC finalized → nothing to clamp.
-  if (head === undefined || head >= hexToNumber(finalizedBlock.number))
-    return finalizedBlock;
+  // The Portal finalized head IS the finality boundary in stream mode — load-bearing, so retry the cheap
+  // probe (transient blips are routine under multichain load) before deciding.
+  let head: number | undefined;
+  for (let attempt = 0; attempt < 3; attempt++) {
+    head = await portalFinalizedHead(
+      portalUrl,
+      portalHeaders(),
+      params.fetchImpl,
+    );
+    if (head !== undefined) break;
+
+    await sleep(200 * (attempt + 1));
+  }
+  // Head UNKNOWN after retries: FATAL in stream mode. The old behavior passed the RPC finalized block
+  // through, which leaves historical targeting (portalHead, rpcFinalized] — a range stream mode's
+  // historical seam serves nothing for — while realtime starts ABOVE it: a permanent silent gap. The RPC
+  // finality-gap fallback is SUPPRESSED in stream mode, so there is no safe conservative default; fail loud
+  // at startup rather than run with a hole. (finding 6 / C11 / G4)
+  if (head === undefined)
+    throw new Error(
+      `Portal ${chain.name}: /finalized-head probe failed in stream mode (PORTAL_REALTIME=stream) — cannot establish the finality boundary. Check Portal connectivity for ${portalUrl}.`,
+    );
+  // Portal at/ahead of RPC finalized → nothing to clamp (never RAISE the boundary).
+  if (head >= hexToNumber(finalizedBlock.number)) return finalizedBlock;
 
   const clamped = (await eth_getBlockByNumber(rpc, [numberToHex(head), false], {
     retryNullBlockRequest: true,
@@ -224,6 +243,36 @@ export function toRealtimeSyncEvent(
   }
 }
 
+// ─────────────────────────────── stream-mode capability gate ───────────────────────────────
+
+/**
+ * Stream mode only emits `block` events carrying LOGS — no transactions, receipts, or traces (see
+ * `toRealtimeSyncEvent`). So a non-log source (trace/transfer/transaction/block filter) would receive NO
+ * realtime events, yet ponder still finalizes its intervals as cached → a permanent, SILENT gap. Likewise
+ * a log source that requested transaction receipts (`hasTransactionReceipt`) can't be served. Refuse to
+ * start rather than corrupt. The historical Portal backfill supports every source type up to the finalized
+ * head, so this rejects only PORTAL_REALTIME=stream — not the chain. (finding 5)
+ */
+export function assertStreamModeSupported(
+  filters: Filter[],
+  chainName: string,
+): void {
+  const nonLog = [
+    ...new Set(filters.filter((f) => f.type !== 'log').map((f) => f.type)),
+  ].sort();
+  if (nonLog.length > 0)
+    throw new Error(
+      `Portal ${chainName}: PORTAL_REALTIME=stream serves only log sources, but this chain has ${nonLog.join(', ')} source(s). Realtime would silently skip their events while marking the range synced. Use the default RPC realtime (unset PORTAL_REALTIME) or remove the non-log sources.`,
+    );
+
+  const needsReceipts = filters.some((f) => f.hasTransactionReceipt === true);
+
+  if (needsReceipts)
+    throw new Error(
+      `Portal ${chainName}: PORTAL_REALTIME=stream cannot serve transaction receipts (a log source sets hasTransactionReceipt), so realtime would drop them. Use the default RPC realtime (unset PORTAL_REALTIME).`,
+    );
+}
+
 // ─────────────────────────────── drop-in realtime generator ───────────────────────────────
 
 /**
@@ -243,6 +292,14 @@ export async function* getPortalRealtimeEventGenerator(params: {
 }) {
   const { common, chain, eventCallbacks, syncProgress, childAddresses } =
     params;
+  // Belt-and-braces (the wiring's getLocalSyncProgress asserts this at process start too): fail loud BEFORE
+  // streaming if this chain has sources stream mode can't serve (non-log / receipt-requiring) — else their
+  // events are silently skipped while their intervals are marked synced. (finding 5)
+  assertStreamModeSupported(
+    eventCallbacks.map((e) => e.filter),
+    chain.name,
+  );
+
   const portalUrl = cleanUrl(chain.portal!);
   const headers = portalHeaders();
   const factories = uniqueFactories(eventCallbacks);
@@ -256,6 +313,9 @@ export async function* getPortalRealtimeEventGenerator(params: {
   // Mutable: rebuilt (in place) whenever a new child is discovered so the next stream reconnection filters
   // the new child's logs too (portal-realtime.ts re-reads this array when it re-opens the stream).
   const logs = buildPortalLogRequests(eventCallbacks, childAddresses);
+  // Bumps on every `logs` rebuild; streamHotBlocks watches it and re-opens the /stream the moment it
+  // advances so the widened server-side filter takes effect on the next block. (finding 4)
+  let logsRevision = 0;
 
   let childCount = 0;
   for (const [, m] of childAddresses) childCount += m.size;
@@ -278,6 +338,7 @@ export async function* getPortalRealtimeEventGenerator(params: {
       logs,
       blockFields: BLOCK_FIELDS,
       logFields: LOG_FIELDS,
+      getLogsRevision: () => logsRevision,
       finalizedHead: () =>
         portalFinalizedHead(portalUrl, headers, params.fetchImpl),
       finalizePollMs: params.finalizePollMs,
@@ -306,6 +367,7 @@ export async function* getPortalRealtimeEventGenerator(params: {
         const next = buildPortalLogRequests(eventCallbacks, childAddresses);
         logs.length = 0;
         logs.push(...next); // mutate in place — picked up on the next `/stream` reconnection
+        logsRevision++; // force streamHotBlocks to re-open with the widened filter now (finding 4)
       }
 
       yield { chain, event: toRealtimeSyncEvent(ev, discovered) };
