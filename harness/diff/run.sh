@@ -16,13 +16,29 @@ PORTAL="${PORTAL_URL_1:-https://portal.sqd.dev/datasets/ethereum-mainnet}"
 : "${PONDER_RPC_URL_1:?set PONDER_RPC_URL_1 to an eth archive RPC that supports debug_traceBlockByNumber}"
 
 pkill -f 'ponder start --schema diff_' 2>/dev/null
-WORK="$(mktemp -d)"; trap 'pkill -f "ponder start --schema diff_" 2>/dev/null' EXIT
+WORK="$(mktemp -d)"
+# NPM_CACHE tracks the throwaway npm cache dir (created only for a local-tarball install) so the trap
+# removes it too — the old trap leaked every per-run mktemp -d cache.
+NPM_CACHE=""
+# Cleanup on ANY exit (completion, failure, interrupt mid-run): kill the backfills AND remove the
+# throwaway install/diff workspace + npm cache + per-run logs — the old trap only killed the process
+# and leaked the mktemp -d workspace/cache every run. Set KEEP_WORKSPACES=1 to retain them.
+cleanup () {
+  pkill -f 'ponder start --schema diff_' 2>/dev/null
+  [ -n "${KEEP_WORKSPACES:-}" ] && return
+  cd / 2>/dev/null
+  rm -rf "$WORK"
+  [ -n "$NPM_CACHE" ] && rm -rf "$NPM_CACHE"
+  rm -f /tmp/diff-portal.log /tmp/diff-rpc.log
+}
+trap cleanup EXIT INT TERM
 cp -r "$APP/." "$WORK/"; cd "$WORK"
 echo "▶ workspace $WORK  range [$START,$END]"
 [ -n "${SQD_PONDER_TARBALL:-}" ] && node -e "const p=require('./package.json');p.dependencies['@subsquid/ponder']='file:$SQD_PONDER_TARBALL';require('fs').writeFileSync('package.json',JSON.stringify(p,null,2))"
 # fresh cache when installing a LOCAL fork build: a re-packed tarball keeps the same version
 # (0.16.6-sqd.1), so npm's by-version cache would serve stale content across rebuilds.
-echo "▶ npm install"; npm install --no-audit --no-fund --silent ${SQD_PONDER_TARBALL:+--cache "$(mktemp -d)"} || { echo "✗ install failed"; exit 1; }
+[ -n "${SQD_PONDER_TARBALL:-}" ] && NPM_CACHE="$(mktemp -d)"
+echo "▶ npm install"; npm install --no-audit --no-fund --silent ${NPM_CACHE:+--cache "$NPM_CACHE"} || { echo "✗ install failed"; exit 1; }
 
 run () { # $1=label  $2=portal-url-or-empty  $3=db  $4=port
   echo "▶ $1 backfill …"
@@ -34,8 +50,12 @@ run () { # $1=label  $2=portal-url-or-empty  $3=db  $4=port
     # backfill window automatically (this is what a real deploy→head client gets: zero params).
     # Only for a LARGE bounded *test* range do we split it into chunks, purely so a 500k-block
     # comparison shows incremental progress / read-ahead instead of one big fetch.
-    if [ "$(( END - START ))" -gt 60000 ]; then export PORTAL_CHUNK_FIXED=1 PORTAL_CHUNK_BLOCKS=50000 PORTAL_READAHEAD="${READAHEAD:-4}"; else unset PORTAL_CHUNK_FIXED PORTAL_CHUNK_BLOCKS PORTAL_READAHEAD; fi
-  else unset PORTAL_URL_1 PORTAL_CHUNK_FIXED PORTAL_CHUNK_BLOCKS PORTAL_READAHEAD; fi
+    # PORTAL_CHUNK_PINNED=1 (set by harness/validate/run-cell.sh) hands chunk control to the caller
+    # so the campaign's fixed 500k grid straddling is honoured verbatim.
+    if [ -z "${PORTAL_CHUNK_PINNED:-}" ]; then
+      if [ "$(( END - START ))" -gt 60000 ]; then export PORTAL_CHUNK_FIXED=1 PORTAL_CHUNK_BLOCKS=50000 PORTAL_READAHEAD="${READAHEAD:-4}"; else unset PORTAL_CHUNK_FIXED PORTAL_CHUNK_BLOCKS PORTAL_READAHEAD; fi
+    fi
+  else unset PORTAL_URL_1; [ -z "${PORTAL_CHUNK_PINNED:-}" ] && unset PORTAL_CHUNK_FIXED PORTAL_CHUNK_BLOCKS PORTAL_READAHEAD; fi
   local t0=$SECONDS
   ./node_modules/.bin/ponder start --schema "diff_$1" --port "$4" > "/tmp/diff-$1.log" 2>&1 &
   local pid=$! done=0
@@ -59,5 +79,8 @@ SPEEDUP=$(awk -v p="${WALL_portal:-0}" -v r="${WALL_rpc:-0}" 'BEGIN{ if (p>0) pr
 echo "⏱ BACKFILL WALL-CLOCK [$START,$END] — Portal ${WALL_portal}s vs RPC ${WALL_rpc}s  →  $SPEEDUP"
 echo ""
 echo "▶ diffing ponder_sync stores"
-cp "$ROOT/harness/diff/diff.mjs" "$WORK/diff.mjs"   # run from $WORK so @electric-sql/pglite resolves
-node "$WORK/diff.mjs" "$WORK/dbPortal" "$WORK/dbRpc"
+# DIFF_SCRIPT defaults to the in-memory diff.mjs; the validation harness points it at
+# harness/validate/diff-batched.mjs for the full-range F-full cell (constant-memory streaming diff).
+DIFF_SCRIPT="${DIFF_SCRIPT:-$ROOT/harness/diff/diff.mjs}"
+cp "$DIFF_SCRIPT" "$WORK/diff.mjs"   # run from $WORK so @electric-sql/pglite resolves
+node "$WORK/diff.mjs" "$WORK/dbPortal" "$WORK/dbRpc" ${DIFF_ARGS:-}

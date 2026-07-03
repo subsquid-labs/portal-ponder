@@ -14,7 +14,9 @@ export default createConfig({
   },
   chains: {
     mainnet: {
-      id: 1,
+      // CHAIN_ID / ERC20_ADDRESS let the validation harness (harness/validate) reuse this
+      // logs+receipts shape on any paid chain; defaults keep the standalone eth USDC run unchanged.
+      id: Number(process.env.CHAIN_ID ?? 1),
       rpc: (process.env.PONDER_RPC_URL_1 ?? "").includes(",")
         ? process.env.PONDER_RPC_URL_1.split(",")
             .map((x) => x.trim())
@@ -27,8 +29,9 @@ export default createConfig({
     USDC: {
       abi: [transfer] as const,
       chain: "mainnet",
-      address: "0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48",
-      includeTransactionReceipts: true,
+      address: (process.env.ERC20_ADDRESS ??
+        "0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48") as `0x${string}`,
+      includeTransactionReceipts: process.env.INCLUDE_RECEIPTS !== "false",
       startBlock: Number(process.env.PONDER_START ?? 22_200_000),
       endBlock: process.env.PONDER_END
         ? Number(process.env.PONDER_END)

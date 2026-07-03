@@ -1,0 +1,4 @@
+{
+  "maxRequests": 4000000,
+  "note": "Cumulative JSON-RPC calls (summed over results/*.json, as tallied by rpc-meter.mjs) that the campaign may spend before run-cell.sh refuses to start a new window. 4M calls ≈ $20 at $5/1M (rpc.subsquid.io). CTO ceiling is $25 / 5M — raise deliberately, never silently."
+}
