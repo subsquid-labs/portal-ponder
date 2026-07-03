@@ -39,12 +39,12 @@ Captured on a single OVH box (Ubuntu 24.04). The run is deliberately bounded to 
 | binance | 260,605 | 126 | 126 / 129 | 4/4 ✓ |
 | linea | 257,099 | 88 | 88 / 100 | 4/4 ✓ |
 | bob | 100,634 | 27 | 27 / 27 ✓ | 4/4 ✓ |
-| hyperliquid | 67,314 | 58 | **58 / 0** | 4/4 ✓ |
+| hyperliquid | 67,314 | 58 | 58 / 58 (subgraph lagging ~4M blocks) | 4/4 ✓ |
 | tac | 49,324 | 36 | 36 / 36 ✓ | 4/4 ✓ |
 | polygon | 803 | 25 | 25 / 25 ✓ | 4/4 ✓ |
 | **total** | **28,405,932** | **2,484** | | **60/60 ✓** |
 
-`hyperliquid 58 / 0`: Euler's public subgraph reports **zero** vaults there — the fork indexes 58. High-block / high-TPS chains are exactly where subgraphs are slow-to-unviable, and where the Portal backfill wins.
+`HyperEVM 58 / 58`: at run time (July 1, 2026 heads), Euler's then-deployed HyperEVM subgraph reported **zero** vaults. It has since been redeployed and, as of a live re-check on 2026-07-03, now reports the same **58** vaults this indexer found — but it's still stalled roughly **4M blocks** behind the HyperEVM chain tip (weeks of lag), all 58 vaults predating its indexed head. The Portal backfill covered the same full history in minutes. High-throughput chains remain exactly where subgraph infrastructure struggles.
 
 ---
 
@@ -54,7 +54,7 @@ Data correctness was treated as the gate: **the report does not ship unless the 
 
 1. **Windowed completeness — 60/60 exact.** For each chain we sampled four 100k-block windows (early / 40% / 75% / head) and compared the indexed event count to the Portal's, both filtered to the discovered children + the 24 event topics. **Every window matched exactly** — e.g. ethereum `[24.21M–24.31M]` 28,825 = 28,825; berachain `[17.48M–17.58M]` **282,320 = 282,320**.
 2. **Cross-run reproducibility — identical.** Two independent runs with *different* chunking, heap, and Postgres configs produced the **identical** 28,405,932-event total. A data-loss bug would diverge; it doesn't.
-3. **Vault discovery cross-checked vs Euler's own live subgraph.** Discovered vault counts match Euler exactly where the chain is fully active (polygon 25/25, tac 36/36, bob 27/27, berachain 59/59…). The gaps on larger chains are **not missing data**: for ethereum, the Portal shows **872** vaults created by our head vs Euler's 897 — **25 were created after our fixed head** (Euler's subgraph runs ahead), and the remaining **22 are discovered-but-eventless** (created, never used), confirmed because our indexed total equals the Portal total for the events that do exist.
+3. **Vault discovery cross-checked vs Euler's own live subgraph.** Discovered vault counts match Euler exactly where the chain is fully active (berachain 59/59, polygon 25/25, bob 27/27, tac 36/36, HyperEVM 58/58 — HyperEVM's subgraph lagging ~4M blocks behind chain tip). Live-verified 2026-07-03 against Euler's public Goldsky subgraphs (`euler-v2-<net>/latest` and `euler-simple-<net>/latest`). The gaps on larger chains are **not missing data**: for ethereum, the Portal shows **872** vaults created by our head vs Euler's 897 — **25 were created after our fixed head** (Euler's subgraph runs ahead), and the remaining **22 are discovered-but-eventless** (created, never used), confirmed because our indexed total equals the Portal total for the events that do exist.
 
 **On the 24-event superset:** it is complete for the `IEVault` interface. The only vault log *outside* it is `Genesis()` — a no-parameter genesis marker emitted once per vault — which is already captured as vault creation via `ProxyCreated` discovery, so nothing is lost.
 
