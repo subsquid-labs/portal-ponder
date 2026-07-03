@@ -34,8 +34,12 @@ run () { # $1=label  $2=portal-url-or-empty  $3=db  $4=port
     # backfill window automatically (this is what a real deploy→head client gets: zero params).
     # Only for a LARGE bounded *test* range do we split it into chunks, purely so a 500k-block
     # comparison shows incremental progress / read-ahead instead of one big fetch.
-    if [ "$(( END - START ))" -gt 60000 ]; then export PORTAL_CHUNK_FIXED=1 PORTAL_CHUNK_BLOCKS=50000 PORTAL_READAHEAD="${READAHEAD:-4}"; else unset PORTAL_CHUNK_FIXED PORTAL_CHUNK_BLOCKS PORTAL_READAHEAD; fi
-  else unset PORTAL_URL_1 PORTAL_CHUNK_FIXED PORTAL_CHUNK_BLOCKS PORTAL_READAHEAD; fi
+    # PORTAL_CHUNK_PINNED=1 (set by harness/validate/run-cell.sh) hands chunk control to the caller
+    # so the campaign's fixed 500k grid straddling is honoured verbatim.
+    if [ -z "${PORTAL_CHUNK_PINNED:-}" ]; then
+      if [ "$(( END - START ))" -gt 60000 ]; then export PORTAL_CHUNK_FIXED=1 PORTAL_CHUNK_BLOCKS=50000 PORTAL_READAHEAD="${READAHEAD:-4}"; else unset PORTAL_CHUNK_FIXED PORTAL_CHUNK_BLOCKS PORTAL_READAHEAD; fi
+    fi
+  else unset PORTAL_URL_1; [ -z "${PORTAL_CHUNK_PINNED:-}" ] && unset PORTAL_CHUNK_FIXED PORTAL_CHUNK_BLOCKS PORTAL_READAHEAD; fi
   local t0=$SECONDS
   ./node_modules/.bin/ponder start --schema "diff_$1" --port "$4" > "/tmp/diff-$1.log" 2>&1 &
   local pid=$! done=0
@@ -59,5 +63,8 @@ SPEEDUP=$(awk -v p="${WALL_portal:-0}" -v r="${WALL_rpc:-0}" 'BEGIN{ if (p>0) pr
 echo "⏱ BACKFILL WALL-CLOCK [$START,$END] — Portal ${WALL_portal}s vs RPC ${WALL_rpc}s  →  $SPEEDUP"
 echo ""
 echo "▶ diffing ponder_sync stores"
-cp "$ROOT/harness/diff/diff.mjs" "$WORK/diff.mjs"   # run from $WORK so @electric-sql/pglite resolves
-node "$WORK/diff.mjs" "$WORK/dbPortal" "$WORK/dbRpc"
+# DIFF_SCRIPT defaults to the in-memory diff.mjs; the validation harness points it at
+# harness/validate/diff-batched.mjs for the full-range F-full cell (constant-memory streaming diff).
+DIFF_SCRIPT="${DIFF_SCRIPT:-$ROOT/harness/diff/diff.mjs}"
+cp "$DIFF_SCRIPT" "$WORK/diff.mjs"   # run from $WORK so @electric-sql/pglite resolves
+node "$WORK/diff.mjs" "$WORK/dbPortal" "$WORK/dbRpc" ${DIFF_ARGS:-}
