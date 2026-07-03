@@ -66,8 +66,8 @@ test('INV-2: assembleRange returns exactly the in-range logs (vs brute-force fil
       fc.integer({ min: 0, max: 30 }),
       fc.integer({ min: 0, max: 30 }),
       (blockNums, a, b) => {
-        const lo = Math.min(a, b),
-          hi = Math.max(a, b);
+        const lo = Math.min(a, b);
+        const hi = Math.max(a, b);
         const cd = createChunkData();
         const model: number[] = []; // expected log block numbers (with multiplicity)
         for (const bn of new Set(blockNums)) {

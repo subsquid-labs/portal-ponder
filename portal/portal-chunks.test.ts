@@ -31,10 +31,10 @@ test('INV-2 support: chunks of an interval cover it, are disjoint, and are grid-
       fc.integer({ min: 0, max: 5_000_000 }),
       fc.integer({ min: 0, max: 5_000_000 }),
       (cb, a, b) => {
-        const lo = Math.min(a, b),
-          hi = Math.max(a, b);
-        const startIdx = idxOf(lo, cb),
-          endIdx = idxOf(hi, cb);
+        const lo = Math.min(a, b);
+        const hi = Math.max(a, b);
+        const startIdx = idxOf(lo, cb);
+        const endIdx = idxOf(hi, cb);
         const ranges: [number, number][] = [];
         for (let i = startIdx; i <= endIdx; i++)
           ranges.push(chunkRange(i, cb, 0, INF));

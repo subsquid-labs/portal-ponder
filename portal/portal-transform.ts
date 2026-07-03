@@ -187,16 +187,16 @@ export const cmpTraceAddr = (a: number[], b: number[]): number => {
 /** Portal Parity trace → geth callTracer CallFrame (+ index/subcalls). Reads nested
  * action/result; callType lives at action.callType. CREATE2 is indistinguishable. */
 export const parityToCallFrame = (t: any, index: number): any | undefined => {
-  const a = t.action ?? {},
-    r = t.result ?? {};
-  let type: string,
-    from: any,
-    to: any,
-    value: any,
-    gas: any,
-    gasUsed: any,
-    input: any,
-    output: any;
+  const a = t.action ?? {};
+  const r = t.result ?? {};
+  let type: string;
+  let from: any;
+  let to: any;
+  let value: any;
+  let gas: any;
+  let gasUsed: any;
+  let input: any;
+  let output: any;
   if (t.type === 'call') {
     type =
       CALL_TYPE[
