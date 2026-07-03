@@ -446,17 +446,17 @@ test('INV-9: an unknown head (probe persistently failing) delegates to RPC', asy
   }
 }, 20_000); // the head probe retries with real backoff before giving up
 
-test('INV-9: stream-realtime mode suppresses the RPC fallback (warn + empty, NOT delegated)', async () => {
+test('INV-9: stream-realtime mode suppresses the RPC fallback (empty, NOT delegated) — known head past the interval', async () => {
   delete process.env.PORTAL_FINALIZED_HEAD;
   process.env.PORTAL_REALTIME = 'stream';
   const srv = headServer(() => 100);
   const port = await listen(srv);
   try {
-    const warns: string[] = [];
+    const debugs: string[] = [];
     const logger = {
       ...stubLogger(),
-      warn(x: any) {
-        warns.push(x?.msg ?? '');
+      debug(x: any) {
+        debugs.push(x?.msg ?? '');
       },
     };
     let rpcTouched = false;
@@ -488,7 +488,10 @@ test('INV-9: stream-realtime mode suppresses the RPC fallback (warn + empty, NOT
       syncStore: mkSyncStore(),
     });
     expect(logs).toEqual([]);
-    expect(warns.some((m) => m.includes('RPC fallback suppressed'))).toBe(true);
+    // known head past the interval → the by-design case: log at debug, serve nothing (realtime covers it)
+    expect(debugs.some((m) => m.includes('realtime /stream covers it'))).toBe(
+      true,
+    );
     expect(rpcTouched).toBe(false); // never delegated
 
     // NOT delegated: syncBlockData is a portal-side no-op, not an RPC-sync call
@@ -504,6 +507,36 @@ test('INV-9: stream-realtime mode suppresses the RPC fallback (warn + empty, NOT
     srv.close();
   }
 });
+
+test('INV-9: stream-realtime mode with an UNKNOWN head is FATAL — refuses to mark the range synced with no data (finding 6)', async () => {
+  delete process.env.PORTAL_FINALIZED_HEAD;
+  process.env.PORTAL_REALTIME = 'stream';
+  const srv = headServer(() => 'fail'); // probe persistently fails → head unknown
+  const port = await listen(srv);
+  try {
+    let rpcTouched = false;
+    const rpc: any = {
+      request: async () => {
+        rpcTouched = true;
+        return [];
+      },
+    };
+    const filter = mkFilter({ fromBlock: 150, toBlock: 200 });
+    const sync = mkSync(port, filter, { rpc });
+    const interval: [number, number] = [150, 200];
+    await expect(
+      sync.syncBlockRangeData({
+        interval,
+        requiredIntervals: [{ interval, filter }],
+        requiredFactoryIntervals: [],
+        syncStore: mkSyncStore(),
+      }),
+    ).rejects.toThrow(/finalized-head probe failed/);
+    expect(rpcTouched).toBe(false); // fatal, NOT delegated to RPC (suppressed in stream mode)
+  } finally {
+    srv.close();
+  }
+}, 20_000); // the head probe retries with real backoff before giving up
 
 // ── INV-12 stash lifecycle ──────────────────────────────────────────────────────────────────────────
 

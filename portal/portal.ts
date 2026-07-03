@@ -415,9 +415,20 @@ export const createPortalHistoricalSync = (
           isFinalityGap(interval[1], portalHead)
         ) {
           if (STREAM_REALTIME) {
-            log.warn({
+            // Stream mode does NOT delegate to RPC — the Portal `/stream` covers (portal-head → tip]. But
+            // head UNKNOWN (probe persistently failing) means we can't locate the historical↔realtime
+            // boundary: returning [] would mark this interval synced with NO data while realtime streams
+            // only ABOVE the head we can't find — a permanent silent gap. Fail loud. A KNOWN head with the
+            // interval past it is by design (clampFinalizedToPortalHead keeps historical at/under the head,
+            // realtime /stream serves the remainder). (finding 6 / C11 / INV-9)
+            if (portalHead === undefined)
+              throw new Error(
+                `Portal ${chain.name}: /finalized-head probe failed in stream mode (PORTAL_REALTIME=stream) — cannot establish the historical/realtime boundary for [${interval[0]},${interval[1]}]. Refusing to mark the range synced with no data. Check Portal connectivity for ${portalUrl}.`,
+              );
+
+            log.debug({
               service: 'portal',
-              msg: `Portal ${chain.name} [${interval[0]},${interval[1]}] past/unknown finalized head in stream mode → RPC fallback suppressed (realtime /stream covers the gap)`,
+              msg: `Portal ${chain.name} [${interval[0]},${interval[1]}] past finalized head ${portalHead} in stream mode → realtime /stream covers it`,
             });
             return [];
           }

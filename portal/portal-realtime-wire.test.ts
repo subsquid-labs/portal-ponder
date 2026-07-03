@@ -8,6 +8,7 @@ import type {
 } from '@/internal/types.js';
 import type { PortalRealtimeEvent } from './portal-realtime.js';
 import {
+  assertStreamModeSupported,
   buildPortalLogRequests,
   clampFinalizedToPortalHead,
   discoverChildAddresses,
@@ -88,6 +89,30 @@ test("isPortalRealtime: only when a chain has a Portal source AND the flag is 's
   expect(isPortalRealtime({ portal: 'http://p' })).toBe(false); // flag off → A-path
   delete process.env.PORTAL_REALTIME;
   expect(isPortalRealtime({ portal: 'http://p' })).toBe(false); // unset → A-path
+});
+
+// ─────────────────────────────── stream-mode capability gate (finding 5) ───────────────────────────────
+
+test('assertStreamModeSupported: log-only sources are accepted', () => {
+  expect(() =>
+    assertStreamModeSupported([logFilter()], 'mainnet'),
+  ).not.toThrow();
+});
+
+test('assertStreamModeSupported: a non-log source is refused — it would be silently skipped while marked synced (finding 5)', () => {
+  const trace = { type: 'trace' } as any;
+  expect(() =>
+    assertStreamModeSupported([logFilter(), trace], 'mainnet'),
+  ).toThrow(/only log sources, but this chain has trace/);
+});
+
+test('assertStreamModeSupported: a log source that needs transaction receipts is refused (finding 5)', () => {
+  expect(() =>
+    assertStreamModeSupported(
+      [logFilter({ hasTransactionReceipt: true })],
+      'mainnet',
+    ),
+  ).toThrow(/transaction receipts/);
 });
 
 // ─────────────────────────────── light-block conversion ───────────────────────────────
@@ -289,7 +314,7 @@ test('clampFinalizedToPortalHead: Portal at/ahead of RPC finalized → no clamp 
   expect(out).toBe(finalized);
 });
 
-test('clampFinalizedToPortalHead: Portal head unknown (probe fails) → conservative passthrough', async () => {
+test('clampFinalizedToPortalHead: Portal head unknown in stream mode → FATAL (never silently passes the RPC finalized through) (finding 6)', async () => {
   process.env.PORTAL_REALTIME = 'stream';
   const fetchImpl = (async () => {
     throw new Error('down');
@@ -300,13 +325,16 @@ test('clampFinalizedToPortalHead: Portal head unknown (probe fails) → conserva
     parentHash: '0xp',
     timestamp: '0x1',
   } as LightBlock;
-  const out = await clampFinalizedToPortalHead({
-    chain: { portal: 'http://p', name: 'c' } as any,
-    rpc: {} as any,
-    finalizedBlock: finalized,
-    fetchImpl,
-  });
-  expect(out).toBe(finalized);
+  // Old behavior passed `finalized` through — leaving historical targeting (portalHead, rpcFinalized] while
+  // realtime starts above it: a permanent silent gap. In stream mode a head we can't probe is fatal.
+  await expect(
+    clampFinalizedToPortalHead({
+      chain: { portal: 'http://p', name: 'c' } as any,
+      rpc: {} as any,
+      finalizedBlock: finalized,
+      fetchImpl,
+    }),
+  ).rejects.toThrow(/finalized-head probe failed/);
 });
 
 test('clampFinalizedToPortalHead: Portal head BELOW RPC finalized → refetch the block at the Portal head', async () => {

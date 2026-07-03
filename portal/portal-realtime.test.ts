@@ -3,6 +3,7 @@ import {
   type Light,
   portalRealtimeEvents,
   reconcile,
+  streamHotBlocks,
   takeFinalized,
 } from './portal-realtime.js';
 
@@ -161,4 +162,129 @@ test('portalRealtimeEvents: a re-streamed fork emits a reorg to the common ances
   expect(reorg).toBeDefined();
   expect(reorg.block.hash).toBe('a'); // common ancestor = block 10
   expect(reorg.reorgedBlocks.map((b: Light) => b.hash)).toEqual(['b']);
+});
+
+test('portalRealtimeEvents: an unknown-parent gap is FATAL, not silently skipped (finding 7)', async () => {
+  const batches = [
+    {
+      header: { number: 10, hash: 'a', parentHash: 'z', timestamp: 10 },
+      logs: [],
+    },
+    // block 12's parent is unknown to our window ([10]) — a reorg deeper than the window (e.g. one that
+    // landed while disconnected, past the resume cursor). The old code silently cleared and continued.
+    {
+      header: { number: 12, hash: 'c', parentHash: 'unknown', timestamp: 12 },
+      logs: [],
+    },
+  ];
+  const ac = new AbortController();
+  const iter = portalRealtimeEvents({
+    portalUrl: 'http://portal',
+    headers: {},
+    fromBlock: 10,
+    logs: [],
+    fetchImpl: mockFetch(batches, () => ac.abort()),
+    signal: ac.signal,
+    finalizedHead: async () => 0,
+    finalizePollMs: 999999,
+  });
+  const seen: any[] = [];
+  await expect(
+    (async () => {
+      for await (const e of iter) seen.push(e);
+    })(),
+  ).rejects.toThrow(/unknown parent/i);
+  // block 10 was delivered before the gap; the gap block was NOT swallowed into a silent resync
+  expect(seen.some((e) => e.type === 'block' && e.block.number === '0xa')).toBe(
+    true,
+  );
+});
+
+test('streamHotBlocks: re-opens the /stream with the widened filter the moment the logs revision advances (finding 4)', async () => {
+  const enc = new TextEncoder();
+  const streamOf = (block: any, close: boolean) =>
+    new ReadableStream({
+      start(c) {
+        c.enqueue(enc.encode(`${JSON.stringify(block)}\n`));
+        if (close) c.close(); // else leave open — only the revision change tears it down
+      },
+    });
+  const bodies: any[] = [];
+  let conn = 0;
+  const fetchImpl = (async (_url: string, init: any) => {
+    bodies.push(JSON.parse(init.body));
+    conn += 1;
+    if (conn === 1)
+      // connection 1: deliver block 100, then stay OPEN (no more data) so nothing but a rev change reopens it
+      return {
+        status: 200,
+        ok: true,
+        body: streamOf(
+          {
+            header: {
+              number: 100,
+              hash: 'h100',
+              parentHash: 'h99',
+              timestamp: 1,
+            },
+            logs: [],
+          },
+          false,
+        ),
+      };
+    if (conn === 2)
+      // connection 2 (after the reopen): deliver block 101 and close
+      return {
+        status: 200,
+        ok: true,
+        body: streamOf(
+          {
+            header: {
+              number: 101,
+              hash: 'h101',
+              parentHash: 'h100',
+              timestamp: 2,
+            },
+            logs: [],
+          },
+          true,
+        ),
+      };
+    return { status: 204, ok: false, body: null };
+  }) as any;
+
+  const logs: any[] = [{ address: ['0xfactory'], topic0: ['0xproxycreated'] }];
+  let rev = 0;
+  const ac = new AbortController();
+  const gen = streamHotBlocks({
+    portalUrl: 'http://portal',
+    headers: {},
+    fromBlock: 100,
+    logs,
+    getLogsRevision: () => rev,
+    fetchImpl,
+    signal: ac.signal,
+  });
+
+  const first = await gen.next(); // block 100 from connection 1
+  expect(first.value?.header.number).toBe(100);
+  expect(bodies).toHaveLength(1);
+  expect(bodies[0].fromBlock).toBe(100);
+
+  // a newly-discovered factory child widens the filter and bumps the revision
+  logs.length = 0;
+  logs.push({
+    address: ['0xfactory', '0xnewchild'],
+    topic0: ['0xproxycreated'],
+  });
+  rev = 1;
+
+  const second = await gen.next(); // rev advanced → connection 1 torn down, reopen resumes from cursor 101
+  expect(second.value?.header.number).toBe(101);
+  expect(bodies).toHaveLength(2);
+  expect(bodies[1].fromBlock).toBe(101); // resumed PAST block 100 (no re-delivery / spurious reorg)
+  expect(bodies[1].logs[0].address).toContain('0xnewchild'); // reopened with the widened filter
+
+  await gen.return(undefined); // stop the generator
+  ac.abort();
 });

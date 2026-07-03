@@ -48,25 +48,33 @@ export async function* ndjsonLines(
   const reader = body.getReader();
   const dec = new TextDecoder();
   let buf = '';
-  for (;;) {
-    const { done, value } = await reader.read();
-    if (done) break;
-
-    if (value) {
-      onBytes?.(value.byteLength);
-      buf += dec.decode(value, { stream: true });
-    }
+  // A consumer may `break` early (the realtime stream re-opens the moment the logs filter revision bumps —
+  // finding 4); cancel the reader in `finally` so the underlying response body is closed rather than left
+  // locked+open. Fire-and-forget (NOT awaited): on a fully-drained stream it's a no-op, and awaiting the
+  // socket teardown on every historical fetch would add needless latency to the hot path.
+  try {
     for (;;) {
-      const nl = buf.indexOf('\n');
-      if (nl < 0) break;
+      const { done, value } = await reader.read();
+      if (done) break;
 
-      const line = buf.slice(0, nl);
-      buf = buf.slice(nl + 1);
-      if (line) yield line;
+      if (value) {
+        onBytes?.(value.byteLength);
+        buf += dec.decode(value, { stream: true });
+      }
+      for (;;) {
+        const nl = buf.indexOf('\n');
+        if (nl < 0) break;
+
+        const line = buf.slice(0, nl);
+        buf = buf.slice(nl + 1);
+        if (line) yield line;
+      }
     }
+    buf += dec.decode();
+    if (buf) yield buf;
+  } finally {
+    void reader.cancel().catch(() => {});
   }
-  buf += dec.decode();
-  if (buf) yield buf;
 }
 
 // Portal reports a missing COLUMN in a plural TABLE; map back to the field key we requested.

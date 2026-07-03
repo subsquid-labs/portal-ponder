@@ -123,15 +123,18 @@ index c5dfe5d..f80cd2a 100644
  import type { SyncBlock } from "@/internal/types.js";
  import { eth_getBlockByNumber } from "@/rpc/actions.js";
  import type { Rpc } from "@/rpc/index.js";
-+import { clampFinalizedToPortalHead } from "@/sync-historical/portal-realtime-wire.js";
++import { assertStreamModeSupported, clampFinalizedToPortalHead, isPortalRealtime } from "@/sync-historical/portal-realtime-wire.js";
  import {
    getFilterFactories,
    getFilterFromBlock,
-@@ -144,7 +145,15 @@ export async function getLocalSyncProgress(params: {
+@@ -144,7 +145,18 @@ export async function getLocalSyncProgress(params: {
          ],
    );
  
 -  syncProgress.finalized = params.finalizedBlock;
++  // Fail loud at process start (not after a multi-day backfill) if stream mode can't serve a source. (finding 5)
++  if (isPortalRealtime(params.chain))
++    assertStreamModeSupported(params.filters, params.chain.name);
 +  // Portal stream-realtime: lower the finalized block to the Portal head so historical stops there and
 +  // realtime streams `[portal-head+1 → tip]`. Pass-through in the A-path (no portal / flag off).
 +  const finalizedBlock = await clampFinalizedToPortalHead({
