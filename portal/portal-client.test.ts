@@ -5,7 +5,11 @@ import {
   type PortalClient,
   parseRetryAfterMs,
 } from './portal-client.js';
-import { PortalHttpError } from './portal-errors.js';
+import {
+  isTransientError,
+  PortalHttpError,
+  PortalTruncatedBodyError,
+} from './portal-errors.js';
 import type { PortalQuery } from './portal-filters.js';
 import type { Gate } from './portal-gate.js';
 import { createStats } from './portal-metrics.js';
@@ -220,6 +224,109 @@ test('dataset-start 400 clamps the cursor forward, not a crash', async () => {
   });
   await collect(client.stream(QUERY, 0, 5000));
   expect(clampedFrom).toBe(1000);
+});
+
+test('dataset-start skip is LOUD: one warn naming the skipped range, then debug (no per-chunk storm)', async () => {
+  // A dataset with partial history relative to the chain used to skip [fromBlock, startsAt) with NO
+  // signal at any level — the interval assembled empty and was marked synced, indistinguishable from
+  // full coverage. The skip stays (a chain genuinely starting at S must not crash-loop), but it must
+  // be observable.
+  const warns: string[] = [];
+  const debugs: string[] = [];
+  const client = mk({
+    fetchImpl: (async (_u: string, init: any) => {
+      const q = JSON.parse(init.body);
+      if (q.fromBlock < 1000) return badRes('dataset starts from block 1000');
+
+      return doneRes();
+    }) as any,
+    logWarn: (m: string) => warns.push(m),
+    logDebug: (m: string) => debugs.push(m),
+  });
+  await collect(client.stream(QUERY, 0, 5000)); //   prefix skip: [0, 999]
+  await collect(client.stream(QUERY, 100, 900)); //  whole chunk precedes the dataset
+  expect(warns).toHaveLength(1); // loud exactly once per client
+  expect(warns[0]).toMatch(/starts at block 1000/);
+  expect(warns[0]).toMatch(/\[0, 999\]/); // the exact skipped range
+  expect(warns[0]).toMatch(/partial/i); // actionable: names the dataset-gap possibility
+  // the second skip is still visible, one level down
+  expect(debugs.some((m) => /\[100, 900\]/.test(m))).toBe(true);
+});
+
+// ── truncated bodies (close-delimited response cut mid-line) ───────────────────────────────────────
+
+test('a body cut mid-NDJSON-line retries from the same cursor (transient), not a fatal SyntaxError', async () => {
+  // An intermediary that downgrades away the framing (HTTP/1.1 close-delimited, no Content-Length)
+  // delivers a mid-line cut as CLEAN EOF: ndjsonLines flushes the partial line, JSON.parse throws, and
+  // the SyntaxError matched nothing in isNetworkError → the whole sync died on a proxy hiccup. The
+  // batch was never yielded and the cursor never advanced, so the retry is lossless.
+  // NB the cut here ends OUTSIDE a JSON string (after the colon): V8 raises "Unexpected end of JSON
+  // input" for it. A cut INSIDE a string raises "Unterminated string in JSON…", which the pre-fix
+  // regex matched by ACCIDENT (the substring "terminated") — so only the typed error makes every cut
+  // shape retryable, not just the lucky one.
+  let call = 0;
+  const froms: number[] = [];
+  const client = mk({
+    fetchImpl: (async (_u: string, init: any) => {
+      call += 1;
+      froms.push(JSON.parse(init.body).fromBlock);
+      if (call === 1)
+        return {
+          status: 200,
+          ok: true,
+          headers: { get: () => null },
+          body: streamOf(['{"header":{"number":7}}\n{"header":{"number":']), // cut mid-line, clean close
+        };
+      if (call === 2)
+        return ndjsonRes([
+          { header: { number: 7 } },
+          { header: { number: 8 } },
+        ]);
+
+      return doneRes();
+    }) as any,
+  });
+  const out = await collect(client.stream(QUERY, 0, 8));
+  expect(out).toHaveLength(2); // both blocks delivered exactly once, from the retry
+  expect((out[0] as any).header.number).toBe(7);
+  // pin the SAME-cursor claim: the retry re-requests from the identical fromBlock — an
+  // implementation that advanced the cursor while discarding the partial batch would fail here
+  expect(froms[1]).toBe(froms[0]);
+});
+
+test('isTransientError: PortalTruncatedBodyError and gzip-truncation shapes are retryable', () => {
+  expect(
+    isTransientError(
+      new PortalTruncatedBodyError(
+        5,
+        new SyntaxError('Unexpected end of JSON input'),
+      ),
+    ),
+  ).toBe(true);
+  // truncated gzip member (accept-encoding: gzip is sent globally) → zlib error, not a socket error
+  const zlibErr = Object.assign(new Error('unexpected end of file'), {
+    cause: { code: 'Z_BUF_ERROR' },
+  });
+  expect(isTransientError(zlibErr)).toBe(true);
+  const premature = Object.assign(new Error('premature close'), {
+    cause: { code: 'ERR_STREAM_PREMATURE_CLOSE' },
+  });
+  expect(isTransientError(premature)).toBe(true);
+  // raw zlib shape: the code sits at the TOP level, no `cause` wrapper, and the message
+  // ("unexpected end of file") matches nothing in the regex on its own
+  const rawZlib = Object.assign(new Error('unexpected end of file'), {
+    code: 'Z_BUF_ERROR',
+  });
+  expect(isTransientError(rawZlib)).toBe(true);
+  // ...and the code-only premature-close shape (underscored) is still matched
+  const prematureCode = Object.assign(new Error('stream ended'), {
+    code: 'ERR_STREAM_PREMATURE_CLOSE',
+  });
+  expect(isTransientError(prematureCode)).toBe(true);
+  // a fatal 400 whose body text merely CONTAINS "premature" must stay fatal
+  expect(
+    isTransientError(new Error('400: field "prematureBlocks" is unknown')),
+  ).toBe(false);
 });
 
 test("'query is too large' 400 → actionable PORTAL_MAX_ADDRESSES error (bytes cap, not range)", async () => {

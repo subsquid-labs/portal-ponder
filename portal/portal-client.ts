@@ -22,6 +22,7 @@ import {
   PortalQueryTooLargeError,
   PortalSchemaFieldError,
   PortalThrottleError,
+  PortalTruncatedBodyError,
 } from './portal-errors.js';
 import {
   DROPPABLE_FIELDS,
@@ -258,6 +259,7 @@ export type PortalClientDeps = {
   fetchImpl?: typeof fetch;
   sleepImpl?: (ms: number) => Promise<void>;
   logDebug?: (msg: string) => void;
+  logWarn?: (msg: string) => void;
 };
 
 /** Head probe deadline — a small GET; if it hangs, callers stay conservative rather than block. */
@@ -308,6 +310,27 @@ export function createPortalClient(deps: PortalClientDeps): PortalClient {
   const fetchImpl = deps.fetchImpl ?? fetch;
   const sleep = deps.sleepImpl ?? realSleep;
   const logDebug = deps.logDebug ?? (() => {});
+  const logWarn = deps.logWarn ?? (() => {});
+  // dataset-start skips are loud ONCE per client (warn), then debug — a dataset starting above genesis
+  // makes EVERY chunk below it skip, and one actionable warning beats a per-chunk storm.
+  let warnedDatasetStart = false;
+  const warnDatasetStart = (
+    skipLo: number,
+    skipHi: number,
+    startsAt: number,
+  ) => {
+    const msg =
+      `Portal ${chainName}: dataset starts at block ${startsAt} — blocks [${skipLo}, ${skipHi}] ` +
+      `are NOT served and will be marked synced EMPTY. Expected when the chain itself begins at ` +
+      `${startsAt}; if the chain has real history below that block, the Portal dataset is partial ` +
+      `and those blocks are silently missing — backfill them over RPC or raise the source fromBlock.`;
+    if (warnedDatasetStart) {
+      logDebug(msg);
+    } else {
+      warnedDatasetStart = true;
+      logWarn(msg);
+    }
+  };
   const requestTimeoutMs = deps.requestTimeoutMs ?? 30_000;
   const idleTimeoutMs = deps.idleTimeoutMs ?? 60_000;
   const finalizedHeadTimeoutMs =
@@ -450,7 +473,17 @@ export function createPortalClient(deps: PortalClientDeps): PortalClient {
         },
         idleTimeoutMs,
       )) {
-        const b = JSON.parse(line) as RawBlock;
+        let b: RawBlock;
+        try {
+          b = JSON.parse(line) as RawBlock;
+        } catch (cause) {
+          // A close-delimited response cut mid-body surfaces as CLEAN EOF — read() reports `done`, so
+          // the truncation is only detectable here, on the flushed partial line. Nothing from this
+          // batch was yielded and the cursor is unchanged, so surface a typed TRANSIENT error and let
+          // the retry loop re-fetch the same range losslessly. (A bare SyntaxError matched nothing in
+          // isNetworkError and killed the whole sync on a proxy hiccup.)
+          throw new PortalTruncatedBodyError(cursor, cause);
+        }
         blocks.push(b);
         if (typeof b.header?.number === 'number' && b.header.number > last)
           last = b.header.number;
@@ -458,7 +491,9 @@ export function createPortalClient(deps: PortalClientDeps): PortalClient {
       gate.onOk(); // clean full response → a generation of these ramps concurrency up
       return { blocks, last };
     } catch (err) {
-      if (isNetworkError(err)) gate.onThrottle(); // dropped/timed-out connections under load = congestion
+      // dropped/timed-out/cut connections under load = congestion
+      if (isNetworkError(err) || err instanceof PortalTruncatedBodyError)
+        gate.onThrottle();
       throw err;
     } finally {
       disarmConnect();
@@ -499,11 +534,18 @@ export function createPortalClient(deps: PortalClientDeps): PortalClient {
             );
           }
           if (err instanceof PortalDatasetStartError) {
-            if (err.startsAt > to) return; // whole chunk precedes the dataset — nothing to fetch
+            if (err.startsAt > to) {
+              // whole chunk precedes the dataset — nothing to fetch
+              warnDatasetStart(cursor, to, err.startsAt);
+
+              return;
+            }
             if (err.startsAt > cursor) {
+              // skip the missing prefix
+              warnDatasetStart(cursor, err.startsAt - 1, err.startsAt);
               cursor = err.startsAt;
               continue;
-            } // skip the missing prefix
+            }
             throw err; // start ≤ cursor yet still 400 ⇒ not a below-start issue; surface it
           }
           if (err instanceof PortalSchemaFieldError) {

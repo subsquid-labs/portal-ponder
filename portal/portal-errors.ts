@@ -88,6 +88,26 @@ export class PortalQueryTooLargeError extends Error {
 }
 
 /**
+ * A response body that ended mid-NDJSON-line. A close-delimited response (an intermediary that
+ * downgraded away the framing) cut mid-body surfaces as a CLEAN EOF — `read()` reports `done`, so the
+ * truncation is detectable only when the flushed partial line fails to parse. The batch was never
+ * yielded and the cursor never advanced, so a retry from the same cursor is lossless and duplicate-free
+ * — exactly what the retry loop exists for. Always transient.
+ */
+export class PortalTruncatedBodyError extends Error {
+  readonly cursor: number;
+  constructor(cursor: number, cause: unknown) {
+    super(
+      `Portal response body truncated mid-line @ ${cursor} (connection cut without framing): ${
+        cause instanceof Error ? cause.message : String(cause)
+      }`,
+    );
+    this.name = 'PortalTruncatedBodyError';
+    this.cursor = cursor;
+  }
+}
+
+/**
  * A violated runtime invariant (see portal-invariant.ts + INVARIANTS.md). The repo's
  * philosophy: a loud crash beats silent corruption. Carries the invariant `id` and a
  * structured `context` so a failure points straight at the catalog row.
@@ -124,13 +144,19 @@ export function isNetworkError(err: unknown): boolean {
     | {
         message?: string;
         name?: string;
+        code?: string;
         cause?: { message?: string; code?: string };
       }
     | undefined;
   const m =
-    `${e?.message ?? ''} ${e?.cause?.message ?? ''} ${e?.cause?.code ?? ''}`.toLowerCase();
+    `${e?.message ?? ''} ${e?.code ?? ''} ${e?.cause?.message ?? ''} ${e?.cause?.code ?? ''}`.toLowerCase();
+  // z_buf_error / "premature close": a truncated gzip body (the client sends accept-encoding: gzip)
+  // surfaces as a zlib error rather than a socket error — same dropped connection, same retry.
+  // Raw zlib errors carry the code at the TOP level (no `cause` wrapper), hence `e?.code` above.
+  // `premature[ _]close` (not bare `premature`) so a 400 whose body text merely contains the word
+  // stays fatal, while both the message ("premature close") and code (ERR_STREAM_PREMATURE_CLOSE) match.
   return (
-    /socket|closed|econnreset|fetch failed|terminated|timeout|network|epipe|und_err/.test(
+    /socket|closed|econnreset|fetch failed|terminated|timeout|network|epipe|und_err|z_buf_error|premature[ _]close/.test(
       m,
     ) || e?.name === 'AbortError'
   );
@@ -140,9 +166,11 @@ export function isNetworkError(err: unknown): boolean {
  * The full retryable set: network noise plus EVERY throttle response. A 429/5xx/409 is always retryable —
  * the back-off (advised `retryAfterMs` vs exponential) is chosen at the retry site, but the decision to
  * retry never depends on the Retry-After header parsing (a missing/garbage header must not turn a throttle
- * into a hard throw). (issue #9)
+ * into a hard throw). (issue #9) A truncated body is retryable by construction: the batch was never
+ * yielded, so the same-cursor retry is lossless.
  */
 export function isTransientError(err: unknown): boolean {
   if (err instanceof PortalThrottleError) return true;
+  if (err instanceof PortalTruncatedBodyError) return true;
   return isNetworkError(err);
 }
