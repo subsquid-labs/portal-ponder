@@ -40,6 +40,43 @@ index acea95b..c502c66 100644
    ws: string | undefined;
    pollingInterval: number;
    finalityBlockCount: number;
+diff --git a/packages/core/src/rpc/actions.ts b/packages/core/src/rpc/actions.ts
+index 64bbcbe..f79b91e 100644
+--- a/packages/core/src/rpc/actions.ts
++++ b/packages/core/src/rpc/actions.ts
+@@ -893,6 +893,32 @@ export const standardizeTransactions = (
+       transaction.gas = "0x0";
+     }
+ 
++    // `accessList` is mandatory on every typed-envelope transaction: EIP-2930 (0x1), EIP-1559
++    // (0x2), EIP-4844 (0x3), and EIP-7702 (0x4) all carry it per spec. A non-compliant provider
++    // that omits the key would otherwise sail through here and encode to a permanent NULL in the
++    // sync store (`onConflictDoNothing`) — silent column-level data loss. Fail loud instead of
++    // defaulting to `[]`, which would fabricate an empty list over a real one. Legacy (0x0), OP
++    // deposit (0x7e), and unknown/system envelopes (e.g. Arbitrum internals) carry no access list
++    // and are left untouched.
++    const txType: string | undefined = transaction.type;
++    if (
++      (txType === "0x1" ||
++        txType === "0x2" ||
++        txType === "0x3" ||
++        txType === "0x4") &&
++      (transaction as { accessList?: unknown }).accessList === undefined
++    ) {
++      const error = new RpcProviderError(
++        `Invalid RPC response: 'transaction.accessList' is a required property on type ${txType} transactions`,
++      );
++      error.meta = [
++        "Please report this error to the RPC operator.",
++        requestText(request),
++      ];
++      error.stack = undefined;
++      throw error;
++    }
++
+     if (hexToBigInt(transaction.blockNumber) > PG_BIGINT_MAX) {
+       const error = new RpcProviderError(
+         `Invalid RPC response: 'transaction.blockNumber' (${hexToBigInt(transaction.blockNumber)}) is larger than the maximum allowed value (${PG_BIGINT_MAX}).`,
 diff --git a/packages/core/src/runtime/historical.ts b/packages/core/src/runtime/historical.ts
 index 0bd78dc..413c537 100644
 --- a/packages/core/src/runtime/historical.ts
@@ -116,7 +153,7 @@ index 0bd78dc..413c537 100644
    const { callback: intervalCallback, generator: intervalGenerator } =
      createCallbackGenerator<{
 diff --git a/packages/core/src/runtime/index.ts b/packages/core/src/runtime/index.ts
-index c5dfe5d..f80cd2a 100644
+index c5dfe5d..23d2ead 100644
 --- a/packages/core/src/runtime/index.ts
 +++ b/packages/core/src/runtime/index.ts
 @@ -10,6 +10,7 @@ import type {
@@ -130,7 +167,7 @@ index c5dfe5d..f80cd2a 100644
 @@ -144,7 +145,18 @@ export async function getLocalSyncProgress(params: {
          ],
    );
-
+ 
 -  syncProgress.finalized = params.finalizedBlock;
 +  // Fail loud at process start (not after a multi-day backfill) if stream mode can't serve a source. (finding 5)
 +  if (isPortalRealtime(params.chain))
@@ -147,7 +184,7 @@ index c5dfe5d..f80cd2a 100644
    syncProgress.start = diagnostics[0];
    if (diagnostics.length === 2) {
      syncProgress.current = diagnostics[1];
-@@ -157,7 +166,7 @@ export async function getLocalSyncProgress(params: {
+@@ -157,7 +169,7 @@ export async function getLocalSyncProgress(params: {
    // Latest `toBlock` among all `filters`
    const end = Math.max(...params.filters.map((filter) => filter.toBlock!));
  
