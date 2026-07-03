@@ -15,7 +15,6 @@
  * real network or timers.
  */
 import {
-  NoProgressError,
   PortalDatasetStartError,
   PortalHttpError,
   PortalQueryTooLargeError,
@@ -74,9 +73,12 @@ const stripFields = (q: PortalQuery, dropped: Set<string>): PortalQuery => {
   return { ...q, fields };
 };
 
+// Row accounting is CONSERVATIVE (INV-7): each block counts its header too, so header-only batches
+// (block-interval includeAllBlocks scans, whose retained headers are real buffered memory) register
+// against the budget instead of registering ~0.
 const countRows = (blocks: RawBlock[]): number => {
   let n = 0;
-  for (const b of blocks) n += (b.logs?.length ?? 0) + (b.transactions?.length ?? 0) + (b.traces?.length ?? 0);
+  for (const b of blocks) n += 1 + (b.logs?.length ?? 0) + (b.transactions?.length ?? 0) + (b.traces?.length ?? 0);
   return n;
 };
 
@@ -90,6 +92,8 @@ export type StreamOpts = {
 export interface PortalClient {
   /** GET /finalized-head → the finalized block number (undefined on any failure). */
   finalizedHead(): Promise<number | undefined>;
+  /** finalizedHead() with a bounded retry (backoff via the injectable sleep). */
+  finalizedHeadRetry(attempts?: number): Promise<number | undefined>;
   /** POST /finalized-stream and yield parsed NDJSON batches over [from, to]. */
   stream(query: PortalQuery, from: number, to: number, opts?: StreamOpts): AsyncGenerator<RawBlock[]>;
 }
@@ -215,7 +219,9 @@ export function createPortalClient(deps: PortalClientDeps): PortalClient {
       if (batch === "done") return;
       if (onRows) onRows(countRows(batch.blocks));
       yield batch.blocks;
-      if (batch.last < cursor) throw new NoProgressError(cursor);
+      // Progress by construction (INV-13): fetchBatch initialises `last = cursor` and only ever raises
+      // it, so `cursor = last + 1 ≥ cursor + 1` — the cursor strictly advances on every yielded batch,
+      // and a 204 terminates. No runtime guard is needed (and none could ever fire).
       cursor = batch.last + 1;
     }
   }
@@ -228,5 +234,16 @@ export function createPortalClient(deps: PortalClientDeps): PortalClient {
     return undefined;
   };
 
-  return { finalizedHead, stream };
+  // The head probe is cheap and load-bearing for the finality-gap decision, so callers retry it.
+  // `sleepImpl` injection keeps the retry cadence testable (no real timers in unit tests).
+  const finalizedHeadRetry = async (attempts = 3): Promise<number | undefined> => {
+    for (let attempt = 0; attempt < attempts; attempt++) {
+      const h = await finalizedHead();
+      if (h !== undefined) return h;
+      await sleep(200 * (attempt + 1));
+    }
+    return undefined;
+  };
+
+  return { finalizedHead, finalizedHeadRetry, stream };
 }

@@ -86,16 +86,6 @@ export class PortalQueryTooLargeError extends Error {
   }
 }
 
-/** The stream failed to advance past the cursor (a Portal that returned a lower `last`). */
-export class NoProgressError extends Error {
-  readonly cursor: number;
-  constructor(cursor: number) {
-    super(`Portal no progress @ ${cursor}`);
-    this.name = "NoProgressError";
-    this.cursor = cursor;
-  }
-}
-
 /**
  * A violated runtime invariant (see portal-invariant.ts + INVARIANTS.md). The repo's
  * philosophy: a loud crash beats silent corruption. Carries the invariant `id` and a
@@ -105,7 +95,10 @@ export class InvariantViolation extends Error {
   readonly id: string;
   readonly context: Record<string, unknown> | undefined;
   constructor(id: string, msg: string, context?: Record<string, unknown>) {
-    super(`Invariant ${id} violated: ${msg}${context ? ` — ${safeJson(context)}` : ""}`);
+    super(
+      `Invariant ${id} violated: ${msg}${context ? ` — ${safeJson(context)}` : ""} ` +
+        `(see portal/INVARIANTS.md ${id}; set PORTAL_CHECKS=off to bypass runtime checks)`,
+    );
     this.name = "InvariantViolation";
     this.id = id;
     this.context = context;

@@ -11,9 +11,11 @@ field per chain that routes the historical backfill through SQD Portal (realtime
   number, so a plain mirror (`0.16.6`) can't be re-published after a bad build. Each release is
   published with `--tag latest`, so `npm i @subsquid/ponder` resolves it (npm doesn't auto-pick a
   prerelease otherwise); an exact build can be pinned as `@subsquid/ponder@0.16.6-sqd.1`.
-- **We don't hand-maintain a fork.** This repo holds only the **Portal layer** (`portal/`): two modules
-  (`portal.ts`, `portal-transform.ts`) + a per-version `wiring/<ver>.patch` (the 4 one-line touch-points)
-  + `config.ts` (`withPortal`). That's the entire diff against upstream.
+- **We don't hand-maintain a fork.** This repo holds only the **Portal layer** (`portal/`): the
+  `portal-*.ts` modules (an invariant-first functional core behind the `portal.ts` shell — see
+  `portal/INVARIANTS.md`) + a per-version `wiring/<ver>.patch` (the 4 one-line touch-points). That's
+  the entire diff against upstream. (`portal/config.ts` is a repo-side compat-harness utility — not
+  part of the published build.)
 - **The fork is generated.** `scripts/sync-upstream.sh <ver>` clones `ponder@<ver>`, applies the layer,
   renames the package, and builds — producing the publishable package. Tracking a new ponder version is
   "author one small patch + run the script", not "merge a fork".

@@ -110,10 +110,16 @@ export function createDiscovery(deps: DiscoveryDeps): Discovery {
     through = to; // optimistic advance so concurrent ensures dedup onto one scan
     status = "scanning";
     const p = (async () => {
-      await earlier.catch(() => {}); // G2: a prior failure doesn't poison this extension
+      // G2/INV-3: a predecessor extension's failure MUST propagate. This extension only scans
+      // [through+1..to] on the assumption the predecessor covered everything below it; swallowing the
+      // failure and then confirming `to` would certify coverage over the predecessor's unscanned gap —
+      // permanently losing any child created inside it. By rethrowing, this extension rejects BEFORE
+      // scanning, its catch below rolls `through` back to `confirmed`, and the awaiting data chunks
+      // reject (G1-evicted) → a later interval replans contiguously from confirmed+1 / the floor.
+      await earlier;
       stats.discChunks += windows.length;
       await Promise.all(windows.map(([lo, hi]) => scanWindow(lo, hi)));
-      confirmed = to; // INV-3: advance the confirmed watermark ONLY on success
+      confirmed = to; // INV-3: advance the confirmed watermark ONLY on success (never past a gap)
       status = "idle";
     })();
     inflight = p;

@@ -65,11 +65,17 @@ export const createPortalHistoricalSync = (args: CreateHistoricalSyncParameters)
   const discovery = createDiscovery({ client, childAddresses: args.childAddresses, factories: spec.factories, discoveryWindows: cfg.discoveryWindows, stats });
 
   // ── mutable shell state ──────────────────────────────────────────────────────────────────────────
-  const dataCache = new Map<number, Promise<ChunkData>>(); // idx → chunk (INV-1: filter-complete)
-  const chunkSpecId = new Map<number, symbol>(); //          idx → fetch-spec identity (INV-1)
-  const chunkRows = new Map<number, number>(); //            idx → registered rows (freed on evict/reject)
-  const stash = new Map<string, StashEntry>(); //            interval → block-data, consumed by syncBlockData
-  const delegated = new Set<string>(); //                    interval keys routed to RPC (finality gap)
+  // One cache entry per chunk idx. `token` keys the row accounting to THIS fetch (not the idx): a stale
+  // in-flight fetch evicted and replaced at the same idx can neither register rows into nor free rows
+  // from the replacement's budget — its own token is freed exactly once (idempotent). `coveredTo` is the
+  // upper bound this fetch actually covered (head-clamped at fetch time), revalidated on every hit
+  // (INV-13: a chunk truncated at a then-lower finalized head is refetched, never served stale).
+  type RowToken = { rows: number; freed: boolean };
+  type CacheEntry = { promise: Promise<ChunkData>; specId: symbol; coveredTo: number; token: RowToken };
+  const dataCache = new Map<number, CacheEntry>();
+  const freeToken = (t: RowToken): void => { if (!t.freed) { t.freed = true; gate.freeRows(t.rows); } };
+  const stash = new Map<string, StashEntry>(); // interval → block-data, consumed by syncBlockData
+  const delegated = new Set<string>(); //        interval keys routed to RPC (finality gap)
   let chunkBlocks = cfg.chunkBlocks;
   let chunkSizeP: Promise<void> | undefined;
   let discStartIdx: number | undefined; // factory-deploy chunk = discovery floor (C4: clamps DOWNWARD)
@@ -89,11 +95,8 @@ export const createPortalHistoricalSync = (args: CreateHistoricalSyncParameters)
 
   const refreshPortalHead = async (): Promise<number | undefined> => {
     if (cfg.finalizedHead !== undefined) return (portalHead = cfg.finalizedHead);
-    for (let attempt = 0; attempt < 3; attempt++) {
-      const h = await client.finalizedHead();
-      if (h !== undefined) return (portalHead = h);
-      await new Promise((r) => setTimeout(r, 200 * (attempt + 1)));
-    }
+    const h = await client.finalizedHeadRetry(3); // retry lives in the client (injectable sleep)
+    if (h !== undefined) return (portalHead = h);
     return portalHead; // may be a kept-prior value, or undefined if never probed successfully
   };
 
@@ -106,21 +109,35 @@ export const createPortalHistoricalSync = (args: CreateHistoricalSyncParameters)
     })());
 
   // ── one data chunk: gated on discovery-through-this-chunk, then the source streams ──────────────────
-  const dataChunk = (idx: number): Promise<ChunkData> => {
+  // `needTo` = the highest block the CALLER requires this chunk to cover (interval end / current grid
+  // end). A cached entry is served only when its fetch actually covered that far (INV-13).
+  const dataChunk = (idx: number, needTo: number): Promise<ChunkData> => {
     const cached = dataCache.get(idx);
     if (cached) {
-      stats.cacheHits++;
-      invariant("INV-1", chunkSpecId.get(idx) === spec.id, "cached chunk built under a different fetch-spec", () => ({ idx }));
-      return cached;
+      invariant("INV-1", cached.specId === spec.id, "cached chunk built under a different fetch-spec", () => ({ idx }));
+      if (cached.coveredTo >= needTo) { stats.cacheHits++; return cached.promise; }
+      // Head-boundary staleness (INV-13, bug found relative to main): this chunk was fetched while the
+      // Portal head sat inside its grid range, so it was truncated at the then-head. The head has since
+      // advanced past what the caller needs — serving the cache would silently omit (fetchTimeHead,
+      // needTo]. Evict + refetch the whole chunk under the current head.
+      dataCache.delete(idx);
+      freeToken(cached.token);
+      log.debug({ service: "portal", msg: `Portal ${chain.name}: chunk ${idx} covered to ${cached.coveredTo} < needed ${needTo} (head advanced) → refetch` });
     }
+    const [from, to] = chunkRange(idx, chunkBlocks, spec.backfillStart, dataEnd());
+    // INV-9: a Portal data request never targets past the known finalized head (an explicit backfill
+    // toBlock may exceed it by configuration — the delegation branch already guards served intervals).
+    invariant("INV-9", portalHead === undefined || to <= portalHead || spec.backfillEnd !== undefined, "data request targets past the Portal finalized head", () => ({ idx, to, portalHead }));
+    const token: RowToken = { rows: 0, freed: false };
+    // G3: register rows as batches ARRIVE. Guarded by the token so a stale stream that outlives its
+    // eviction cannot register orphaned rows (S1: accounting is per-fetch, not per-idx).
+    const onRows = (n: number): void => { if (token.freed) return; token.rows += n; gate.addRows(n); };
     const p = (async (): Promise<ChunkData> => {
-      const [from, to] = chunkRange(idx, chunkBlocks, spec.backfillStart, dataEnd());
       await discovery.ensure(to, { chunkBlocks, endHint: spec.backfillEnd ?? portalHead ?? to }); // children ≤ this chunk are known
       invariant("INV-3", spec.factories.length === 0 || discStartIdx === undefined || discovery.through() >= to, "data fetch under a stale discovery watermark", () => ({ idx, through: discovery.through(), to }));
       stats.dataChunks++;
       const cd = createChunkData();
       const neededMissing = new Set<string>();
-      const onRows = (n: number): void => { chunkRows.set(idx, (chunkRows.get(idx) ?? 0) + n); gate.addRows(n); }; // G3: register as batches arrive
 
       const lq = spec.logQuery();
       if (lq) for await (const blocks of client.stream(lq, from, to, { neededMissing, onRows })) {
@@ -158,20 +175,22 @@ export const createPortalHistoricalSync = (args: CreateHistoricalSyncParameters)
       }
       return cd;
     })();
-    chunkSpecId.set(idx, spec.id);
-    dataCache.set(idx, p);
-    // G1 (INV-13): a rejected chunk promise is evicted immediately (and its registered rows freed) so a
-    // later interval RETRIES rather than replaying the cached rejection forever.
+    const entry: CacheEntry = { promise: p, specId: spec.id, coveredTo: to, token };
+    dataCache.set(idx, entry);
+    // G1 (INV-13): a rejected chunk promise is evicted immediately (and its registered rows freed — via
+    // ITS token, exactly once) so a later interval RETRIES rather than replaying the cached rejection.
     p.catch(() => {
-      if (dataCache.get(idx) === p) { dataCache.delete(idx); chunkSpecId.delete(idx); }
-      gate.freeRows(chunkRows.get(idx) ?? 0); chunkRows.delete(idx);
+      if (dataCache.get(idx) === entry) dataCache.delete(idx);
+      freeToken(token);
     });
     return p;
   };
 
   const evictBehind = (intervalStart: number): void => {
     for (const i of evictionPlan(dataCache.keys(), chunkBlocks, intervalStart)) {
-      dataCache.delete(i); chunkSpecId.delete(i); gate.freeRows(chunkRows.get(i) ?? 0); chunkRows.delete(i);
+      const entry = dataCache.get(i)!;
+      dataCache.delete(i);
+      freeToken(entry.token);
     }
   };
 
@@ -199,8 +218,8 @@ export const createPortalHistoricalSync = (args: CreateHistoricalSyncParameters)
       const capped = traceSafeChunkBlocks(chunkBlocks, spec.needTraces || spec.needBlocks, cfg.traceChunkBlocks);
       if (capped !== chunkBlocks) {
         chunkBlocks = capped;
-        dataCache.clear(); chunkSpecId.clear();
-        for (const r of chunkRows.values()) gate.freeRows(r); chunkRows.clear();
+        for (const entry of dataCache.values()) freeToken(entry.token);
+        dataCache.clear();
         discStartIdx = undefined; discovery.reset();
         log.debug({ service: "portal", msg: `Portal ${chain.name}: dense sources → chunkBlocks capped to ${chunkBlocks} (grid reset)` });
       }
@@ -215,11 +234,16 @@ export const createPortalHistoricalSync = (args: CreateHistoricalSyncParameters)
       const startIdx = idxOf(interval[0], chunkBlocks), endIdx = idxOf(interval[1], chunkBlocks);
       const idxs: number[] = [];
       for (let i = startIdx; i <= endIdx; i++) idxs.push(i);
-      const data = await Promise.all(idxs.map(dataChunk));
+      // needTo per chunk: the interval's requirement clamped to the chunk's current grid end — a cached
+      // entry truncated at an older, lower head fails the coveredTo check and is refetched (INV-13).
+      const needToOf = (i: number): number => Math.min(chunkRange(i, chunkBlocks, spec.backfillStart, dataEnd())[1], interval[1]);
+      const data = await Promise.all(idxs.map((i) => dataChunk(i, needToOf(i))));
 
       // PARALLEL read-ahead: prefetch ahead (never past the backfill end) — depth bounded by the shared
       // memory budget, not a fixed count (always lead-1; deeper only while unsaturated).
-      for (const d of readAheadPlan(endIdx, chunkBlocks, dataEnd(), cfg.readahead, gate.saturated())) void dataChunk(d).catch(() => {});
+      for (const d of readAheadPlan(endIdx, chunkBlocks, dataEnd(), cfg.readahead, gate.saturated())) {
+        void dataChunk(d, chunkRange(d, chunkBlocks, spec.backfillStart, dataEnd())[1]).catch(() => {});
+      }
 
       const tXform = Date.now(); // decode/transform time: Portal NDJSON → Ponder Sync* shapes
       const assembled = assembleRange(data, interval, spec, args.childAddresses);
@@ -228,7 +252,11 @@ export const createPortalHistoricalSync = (args: CreateHistoricalSyncParameters)
       evictBehind(interval[0]); // free chunks fully behind the cursor + their memory budget
 
       await syncStore.insertLogs({ logs: assembled.logs, chainId: chain.id });
-      invariant("INV-12", !stash.has(ikey(interval)) && !delegated.has(ikey(interval)), "stash entry created twice / for a delegated interval", () => ({ key: ikey(interval) }));
+      // INV-12: a stash entry is created then consumed exactly once. An upstream retry can legitimately
+      // re-issue a range, so production (`on`) keeps the pre-refactor OVERWRITE semantics with a debug
+      // log; `strict` (tests/CI) makes the double-set loud.
+      invariantStrict("INV-12", () => !stash.has(ikey(interval)) && !delegated.has(ikey(interval)), "stash entry created twice / for a delegated interval", () => ({ key: ikey(interval) }));
+      if (stash.has(ikey(interval))) log.debug({ service: "portal", msg: `Portal ${chain.name} [${interval[0]},${interval[1]}]: stash entry overwritten (upstream range retry)` });
       stash.set(ikey(interval), { blocks: assembled.blocks, txs: assembled.txs, receipts: assembled.receipts, traces: assembled.traces, closest: assembled.closest });
 
       log.debug({ service: "portal", msg: `Portal ${chain.name} [${interval[0]},${interval[1]}]: ${assembled.logs.length} logs (dataChunks=${stats.dataChunks} discChunks=${stats.discChunks} http=${stats.http} hits=${stats.cacheHits} inflight=${stats.maxInflight} err=${stats.errors})` });
