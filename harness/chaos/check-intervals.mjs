@@ -47,6 +47,32 @@ export function tileVerdict(ranges, want) {
   return { ok: true, reason: `tiled [${only.lo},${only.hi})` };
 }
 
+// Aggregate verdict over every interval row (each `{fragment_id, blocks}`). ZERO rows is a hard FAIL:
+// a resume that wrote nothing leaves an empty ponder_sync.intervals, which must NOT be read as a
+// vacuous PASS — a non-empty requested window with no interval coverage is the exact gap the chaos
+// campaign hunts. `rows` is the raw query result; `blocksOf` extracts the range text of a row.
+export function intervalsVerdict(rows, want, blocksOf = (r) => r.blocks) {
+  if (rows.length === 0) {
+    return {
+      ok: false,
+      fragments: [],
+      reason: `no interval rows for window [${want.from},${want.to}]`,
+    };
+  }
+
+  const fragments = rows.map((row) => ({
+    fragmentId: row.fragment_id,
+    ...tileVerdict(parseRanges(blocksOf(row)), want),
+  }));
+  const ok = fragments.every((f) => f.ok);
+
+  return {
+    ok,
+    fragments,
+    reason: ok ? 'every fragment tiles the window' : 'gap/short coverage',
+  };
+}
+
 async function main() {
   const [dir, fromArg, toArg] = process.argv.slice(2);
   if (!dir || fromArg === undefined || toArg === undefined) {
@@ -79,25 +105,25 @@ async function main() {
   );
   await db.close();
 
-  let fail = 0;
   console.log(`\nintervals tiling check  dir=${dir}  want=[${from},${to}]\n`);
-  for (const row of rows) {
-    const v = tileVerdict(parseRanges(row.blocks), { from, to });
-    if (!v.ok) {
-      fail = 1;
-    }
 
+  const verdict = intervalsVerdict(rows, { from, to });
+  if (rows.length === 0) {
+    console.log(`  ❌ ${verdict.reason}`);
+  }
+
+  for (const f of verdict.fragments) {
     console.log(
-      `  ${v.ok ? '✅' : '❌'} ${String(row.fragment_id).slice(0, 48).padEnd(48)} ${v.reason}`,
+      `  ${f.ok ? '✅' : '❌'} ${String(f.fragmentId).slice(0, 48).padEnd(48)} ${f.reason}`,
     );
   }
 
   console.log(
-    fail
-      ? '\n❌ intervals do NOT tile — gap/short coverage\n'
-      : '\n✅ every fragment tiles the window exactly\n',
+    verdict.ok
+      ? '\n✅ every fragment tiles the window exactly\n'
+      : '\n❌ intervals do NOT tile — gap/short coverage\n',
   );
-  process.exit(fail);
+  process.exit(verdict.ok ? 0 : 1);
 }
 
 if (import.meta.url === `file://${process.argv[1]}`) {

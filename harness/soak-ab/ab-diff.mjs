@@ -36,6 +36,24 @@ export function classifyTxDiff(onlyA, onlyB, referenced) {
   };
 }
 
+// A psql child is only a trustworthy data source if it exited cleanly. A non-zero exit (bad SQL,
+// connection refused, auth failure) or a spawn error must NEVER be read as "zero rows" — that is the
+// false-PASS class: an empty/partial stream silently compared as a completed diff. Pure so it can be
+// asserted directly.
+export function psqlExitVerdict({ code, signal, spawnError }) {
+  if (spawnError) {
+    return { ok: false, reason: `psql spawn failed: ${spawnError}` };
+  }
+  if (signal) {
+    return { ok: false, reason: `psql killed by signal ${signal}` };
+  }
+  if (code !== 0) {
+    return { ok: false, reason: `psql exited ${code}` };
+  }
+
+  return { ok: true };
+}
+
 // _ponder_checkpoint (or any progress value) must never go backwards across runs.
 export function checkpointMonotonic(values) {
   for (let i = 1; i < values.length; i++) {
@@ -103,15 +121,42 @@ export function restartStats(lines, nowMs = Date.now()) {
 
 const SEP = '\x1f'; // unit separator — never appears in the hex/numeric fields we select
 
-// Stream rows of a query as string[] (fields split on SEP), constant memory.
+// Stream rows of a query as string[] (fields split on SEP), constant memory. `-v ON_ERROR_STOP=1`
+// makes a mid-query server error a non-zero exit rather than a partial stream; we additionally await
+// the child's terminal state and throw on any non-clean exit (spawn error / signal / non-zero code)
+// so a failed query can NEVER be silently read as "zero rows" (the false-PASS class).
 async function* psqlRows(url, sql) {
   const proc = spawn(
     'psql',
-    [url, '-X', '-q', '-A', '-t', '-F', SEP, '-c', sql],
+    [
+      url,
+      '-X',
+      '-q',
+      '-A',
+      '-t',
+      '-v',
+      'ON_ERROR_STOP=1',
+      '-F',
+      SEP,
+      '-c',
+      sql,
+    ],
     {
       stdio: ['ignore', 'pipe', 'inherit'],
     },
   );
+
+  let spawnError = null;
+  proc.on('error', (e) => {
+    spawnError = e.message;
+  });
+
+  const exited = new Promise((resolve) => {
+    proc.on('close', (code, signal) => {
+      resolve({ code, signal });
+    });
+  });
+
   let buf = '';
   for await (const chunk of proc.stdout) {
     buf += chunk.toString('utf8');
@@ -129,6 +174,12 @@ async function* psqlRows(url, sql) {
 
   if (buf.trim().length > 0) {
     yield buf.split(SEP);
+  }
+
+  const { code, signal } = await exited;
+  const verdict = psqlExitVerdict({ code, signal, spawnError });
+  if (!verdict.ok) {
+    throw new Error(verdict.reason);
   }
 }
 
@@ -260,7 +311,17 @@ async function compareChain(urlA, urlB, chain, cutover, margin, bucket) {
   ]);
   const hi = Math.min(boundA, boundB) - margin;
   const lo = cutover;
-  const out = { chain, lo, hi, lagA: 0, lagB: 0, verdict: 'PASS', classes: {} };
+  const out = {
+    chain,
+    lo,
+    hi,
+    lagA: 0,
+    lagB: 0,
+    // Soak B's max synced block — the per-run progress value monotonicity is asserted against.
+    progressB: boundB,
+    verdict: 'PASS',
+    classes: {},
+  };
   out.lagA = boundA - Math.min(boundA, boundB);
   out.lagB = boundB - Math.min(boundA, boundB);
 
@@ -324,6 +385,8 @@ async function main() {
   const margin = Number(process.env.FINALITY_MARGIN ?? 64);
   const bucket = Number(process.env.BUCKET ?? 1000);
   const statusFile = process.env.STATUS_FILE ?? 'soak-ab-status.json';
+  const checkpointFile =
+    process.env.CHECKPOINT_FILE ?? 'soak-ab-checkpoints.json';
 
   const results = [];
   for (const chain of chains) {
@@ -334,6 +397,30 @@ async function main() {
     } catch (e) {
       results.push({ chain, verdict: 'ERROR', classes: { error: e.message } });
     }
+  }
+
+  // Checkpoint monotonicity across runs: Soak B's per-chain progress must never rewind between
+  // hourly runs. A regression (a resume/restart that lost ground) is a hard FAIL, wired into both
+  // the verdict/exit code and the alerts — not merely logged.
+  const prior = loadPriorCheckpoints(checkpointFile);
+  const nextCheckpoints = { ...prior };
+  const regressions = [];
+  for (const r of results) {
+    if (r.progressB === undefined) {
+      continue;
+    }
+
+    const history = Array.isArray(prior[r.chain]) ? prior[r.chain] : [];
+    const series = [...history, r.progressB];
+    const mono = checkpointMonotonic(series);
+    if (!mono.ok) {
+      regressions.push({ chain: r.chain, prev: mono.prev, cur: mono.cur });
+      r.verdict = 'FAIL';
+      r.classes = { ...r.classes, checkpointRegression: mono };
+    }
+
+    // keep a bounded tail so the file does not grow unbounded across a long soak
+    nextCheckpoints[r.chain] = series.slice(-64);
   }
 
   const verdict = results.some(
@@ -365,7 +452,12 @@ async function main() {
       `crash-loop: ${restarts.restartsLastHour} restarts in the last hour (>3)`,
     );
   }
-  if (verdict === 'FAIL') {
+  for (const reg of regressions) {
+    alerts.push(
+      `checkpoint-regression: chain ${reg.chain} rewound ${reg.prev} → ${reg.cur} between runs`,
+    );
+  }
+  if (verdict === 'FAIL' && regressions.length === 0) {
     alerts.push(
       'finalized-diff: an unexpected finalized-overlap divergence (see diffClasses)',
     );
@@ -382,12 +474,17 @@ async function main() {
     diffClasses: Object.fromEntries(results.map((r) => [r.chain, r.classes])),
     lagA: Object.fromEntries(results.map((r) => [r.chain, r.lagA ?? null])),
     lagB: Object.fromEntries(results.map((r) => [r.chain, r.lagB ?? null])),
+    checkpointRegressions: regressions,
     counters: Object.fromEntries(
       results.map((r) => [r.chain, { lo: r.lo, hi: r.hi, verdict: r.verdict }]),
     ),
   };
 
   writeFileSync(statusFile, `${JSON.stringify(status, null, 2)}\n`);
+  writeFileSync(
+    checkpointFile,
+    `${JSON.stringify(nextCheckpoints, null, 2)}\n`,
+  );
   console.log(JSON.stringify(status, null, 2));
   process.exit(verdict === 'FAIL' ? 1 : 0);
 }

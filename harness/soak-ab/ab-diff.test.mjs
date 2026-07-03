@@ -4,6 +4,7 @@ import {
   checkpointMonotonic,
   classifyTxDiff,
   compareBucketHashes,
+  psqlExitVerdict,
   restartStats,
 } from './ab-diff.mjs';
 
@@ -41,6 +42,39 @@ test('checkpointMonotonic: non-decreasing passes, a regression fails at the poin
   const bad = checkpointMonotonic([100n, 250n, 240n]);
   assert.equal(bad.ok, false);
   assert.equal(bad.at, 2);
+});
+
+test('psqlExitVerdict: a clean exit passes; ANY non-clean exit fails (no silent zero-rows)', () => {
+  // the ONLY passing case: exit 0, no signal, no spawn error
+  assert.deepEqual(
+    psqlExitVerdict({ code: 0, signal: null, spawnError: null }),
+    {
+      ok: true,
+    },
+  );
+
+  // a non-zero exit (bad SQL / connection refused / auth failure) must FAIL, never read as zero rows
+  const nonzero = psqlExitVerdict({ code: 2, signal: null, spawnError: null });
+  assert.equal(nonzero.ok, false);
+  assert.match(nonzero.reason, /exited 2/);
+
+  // killed by signal → fail
+  const killed = psqlExitVerdict({
+    code: null,
+    signal: 'SIGKILL',
+    spawnError: null,
+  });
+  assert.equal(killed.ok, false);
+  assert.match(killed.reason, /SIGKILL/);
+
+  // spawn failure (psql not on PATH) → fail, takes precedence
+  const noBin = psqlExitVerdict({
+    code: null,
+    signal: null,
+    spawnError: 'spawn psql ENOENT',
+  });
+  assert.equal(noBin.ok, false);
+  assert.match(noBin.reason, /ENOENT/);
 });
 
 test('compareBucketHashes: shared buckets must match; one-sided buckets are reported not failed', () => {
