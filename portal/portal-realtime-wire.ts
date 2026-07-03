@@ -40,6 +40,7 @@ import {
   BLOCK_FIELDS,
   buildPortalLogRequests,
   LOG_FIELDS,
+  TX_FIELDS,
   uniqueFactories,
 } from './portal-filters.js';
 import {
@@ -76,17 +77,23 @@ const sleep = (ms: number): Promise<void> =>
 
 // ─────────────────────────────── Portal finalized head + finality clamp ───────────────────────────────
 
-/** Poll the Portal `/finalized-head` (reused by both the historical finality-gap decision and here). */
+/** Poll the Portal `/finalized-head` (reused by both the historical finality-gap decision and here).
+ * Carries the canonical hash when the endpoint provides one — it arms portalRealtimeEvents' wrong-fork
+ * finalize guard (a local block finalized by NUMBER must match the canonical hash at that height). */
 export async function portalFinalizedHead(
   portalUrl: string,
   headers: Record<string, string>,
   fetchImpl: typeof fetch = fetch,
-): Promise<number | undefined> {
+): Promise<{ number: number; hash?: string } | undefined> {
   try {
     const h = await fetchImpl(`${cleanUrl(portalUrl)}/finalized-head`, {
       headers,
     }).then((r) => r.json());
-    if (typeof h?.number === 'number') return h.number;
+    if (typeof h?.number === 'number')
+      return {
+        number: h.number,
+        hash: typeof h?.hash === 'string' ? h.hash : undefined,
+      };
   } catch {
     /* head unknown → caller stays conservative */
   }
@@ -110,18 +117,33 @@ export async function clampFinalizedToPortalHead(params: {
   if (isPortalRealtime(chain) === false) return finalizedBlock;
 
   const portalUrl = cleanUrl(chain.portal!);
-  // The Portal finalized head IS the finality boundary in stream mode — load-bearing, so retry the cheap
-  // probe (transient blips are routine under multichain load) before deciding.
+  // An explicit PORTAL_FINALIZED_HEAD pin is AUTHORITATIVE for the finality boundary — the historical
+  // seam (portal.ts refreshPortalHead, FIX 5) already treats it that way. Probing the live head here
+  // while portal.ts honors the pin made the two seams disagree: with pin < live head, this clamp set the
+  // boundary at the live head, historical intervals in (pin, liveHead] hit portal.ts's "realtime /stream
+  // covers it" branch (its head IS the pin) and were marked synced EMPTY, while realtime streamed from
+  // liveHead+1 — the exact G4/C11 silent gap the stream-mode throws were added to close.
+  const pinRaw = process.env.PORTAL_FINALIZED_HEAD;
+  const pin = pinRaw ? Number(pinRaw) : undefined;
   let head: number | undefined;
-  for (let attempt = 0; attempt < 3; attempt++) {
-    head = await portalFinalizedHead(
-      portalUrl,
-      portalHeaders(),
-      params.fetchImpl,
-    );
-    if (head !== undefined) break;
+  if (pin !== undefined && Number.isInteger(pin) && pin >= 0) {
+    head = pin;
+  } else {
+    // The Portal finalized head IS the finality boundary in stream mode — load-bearing, so retry the
+    // cheap probe (transient blips are routine under multichain load) before deciding.
+    for (let attempt = 0; attempt < 3; attempt++) {
+      const probed = await portalFinalizedHead(
+        portalUrl,
+        portalHeaders(),
+        params.fetchImpl,
+      );
+      if (probed !== undefined) {
+        head = probed.number;
+        break;
+      }
 
-    await sleep(200 * (attempt + 1));
+      await sleep(200 * (attempt + 1));
+    }
   }
   // Head UNKNOWN after retries: FATAL in stream mode. The old behavior passed the RPC finalized block
   // through, which leaves historical targeting (portalHead, rpcFinalized] — a range stream mode's
@@ -212,8 +234,11 @@ export const lightToLightBlock = (l: Light): LightBlock => ({
 });
 
 /**
- * PortalRealtimeEvent → ponder RealtimeSyncEvent. `block` becomes a log-only BlockWithEventData (no
- * txs/receipts/traces — euler is log-indexed); `reorg`/`finalize` pass through with hex LightBlocks.
+ * PortalRealtimeEvent → ponder RealtimeSyncEvent. `block` carries the matched logs AND their parent
+ * transactions (the stream projects TX_FIELDS via the log requests' `transaction: true` — same relation
+ * as the historical logQuery, so `event.transaction` works and the finalize-time store insert matches
+ * the backfill's rows). Receipts/traces stay unserved — `assertStreamModeSupported` refuses those
+ * configs up front. `reorg`/`finalize` pass through with hex LightBlocks.
  */
 export function toRealtimeSyncEvent(
   ev: PortalRealtimeEvent,
@@ -226,7 +251,7 @@ export function toRealtimeSyncEvent(
         hasMatchedFilter: ev.hasMatchedFilter,
         block: ev.block,
         logs: ev.logs,
-        transactions: [],
+        transactions: ev.transactions,
         transactionReceipts: [],
         traces: [],
         childAddresses,
@@ -246,12 +271,12 @@ export function toRealtimeSyncEvent(
 // ─────────────────────────────── stream-mode capability gate ───────────────────────────────
 
 /**
- * Stream mode only emits `block` events carrying LOGS — no transactions, receipts, or traces (see
- * `toRealtimeSyncEvent`). So a non-log source (trace/transfer/transaction/block filter) would receive NO
- * realtime events, yet ponder still finalizes its intervals as cached → a permanent, SILENT gap. Likewise
- * a log source that requested transaction receipts (`hasTransactionReceipt`) can't be served. Refuse to
- * start rather than corrupt. The historical Portal backfill supports every source type up to the finalized
- * head, so this rejects only PORTAL_REALTIME=stream — not the chain. (finding 5)
+ * Stream mode only emits `block` events carrying LOGS and their parent TRANSACTIONS — no receipts or
+ * traces (see `toRealtimeSyncEvent`). So a non-log source (trace/transfer/transaction/block filter) would
+ * receive NO realtime events, yet ponder still finalizes its intervals as cached → a permanent, SILENT
+ * gap. Likewise a log source that requested transaction receipts (`hasTransactionReceipt`) can't be
+ * served. Refuse to start rather than corrupt. The historical Portal backfill supports every source type
+ * up to the finalized head, so this rejects only PORTAL_REALTIME=stream — not the chain. (finding 5)
  */
 export function assertStreamModeSupported(
   filters: Filter[],
@@ -330,6 +355,20 @@ export async function* getPortalRealtimeEventGenerator(params: {
 
   const controller = new AbortController();
   let lastFinalized = startupFinalized;
+  // Redelivery handshake (same-block child discovery): when block N discovers a NEW child, its own
+  // same-block logs were filtered out server-side by the connection N arrived on. We suppress N's
+  // incomplete event, widen the filter (logsRevision++), and streamHotBlocks re-opens FROM N; the
+  // re-delivered N (now complete) reconciles as a duplicate that `shouldRedeliver` marks awaited, and
+  // only THAT one is forwarded to ponder. While awaiting, a finalize at/above N is held back (ponder
+  // hasn't seen N — finalizing it would mark the interval cached without N's data; the next poll
+  // re-emits it) and a reorg that removes N clears the wait.
+  let awaiting: { hash: string; number: number } | undefined;
+  const rebuildLogs = (): void => {
+    const next = buildPortalLogRequests(eventCallbacks, childAddresses);
+    logs.length = 0;
+    logs.push(...next); // mutate in place — picked up on the next `/stream` (re)connection
+    logsRevision++; // force streamHotBlocks to re-open with the changed filter now (finding 4)
+  };
   try {
     for await (const ev of portalRealtimeEvents({
       portalUrl,
@@ -338,7 +377,16 @@ export async function* getPortalRealtimeEventGenerator(params: {
       logs,
       blockFields: BLOCK_FIELDS,
       logFields: LOG_FIELDS,
+      txFields: TX_FIELDS,
       getLogsRevision: () => logsRevision,
+      // the reconcile anchor: the startup finalized block — an empty window appends ONLY a child of it
+      anchor: {
+        number: startupFinalized,
+        hash: syncProgress.finalized.hash as string,
+        parentHash: syncProgress.finalized.parentHash as string,
+        timestamp: hexToNumber(syncProgress.finalized.timestamp),
+      },
+      shouldRedeliver: (hash) => awaiting?.hash === hash,
       finalizedHead: () =>
         portalFinalizedHead(portalUrl, headers, params.fetchImpl),
       finalizePollMs: params.finalizePollMs,
@@ -346,6 +394,11 @@ export async function* getPortalRealtimeEventGenerator(params: {
       fetchImpl: params.fetchImpl,
     })) {
       if (ev.type === 'finalize') {
+        // Hold back a finalize covering a block ponder hasn't received yet (suppressed for redelivery):
+        // handleRealtimeSyncEvent would mark its interval cached WITHOUT its data. Finality is monotonic
+        // and re-polled, so the next finalize (after the redelivery lands) re-covers it.
+        if (awaiting !== undefined && ev.block.number >= awaiting.number)
+          continue;
         // Q3 safety: never regress ponder's finalized/safe checkpoints. Suppress a finalize at/below the
         // startup boundary or below one already emitted (Portal head only ever advances, so this is defensive).
         const n = ev.block.number;
@@ -356,18 +409,51 @@ export async function* getPortalRealtimeEventGenerator(params: {
       }
 
       if (ev.type === 'reorg') {
+        // The awaited block was reorged away before its redelivery — stop waiting for it. Ponder never
+        // saw it (suppressed), and a rollback to the common ancestor is a no-op for blocks it never had.
+        if (
+          awaiting !== undefined &&
+          ev.reorgedBlocks.some((b) => b.hash === awaiting!.hash)
+        )
+          awaiting = undefined;
+        // Prune reorged-out factory children from the RUNNING map (stock createRealtimeSync does this via
+        // childAddressesPerBlock): a child whose creation block was reorged away must stop matching —
+        // otherwise every later log from that address is indexed as a phantom child event until restart.
+        // Only stream-discovered children can sit above the common ancestor (historical children are at/
+        // below finality), so this never touches the preloaded map entries. Narrow the server filter too.
+        const ancestor = ev.block.number;
+        let pruned = false;
+        for (const [, rec] of childAddresses)
+          for (const [address, creationBlock] of rec)
+            if (creationBlock > ancestor) {
+              rec.delete(address);
+              pruned = true;
+            }
+        if (pruned) rebuildLogs();
+
         yield { chain, event: toRealtimeSyncEvent(ev, new Map()) };
         continue;
       }
 
       // block
-      const discovered = discoverChildAddresses(ev.logs, factories);
       const blockNumber = hexToNumber(ev.block.number);
+      if (awaiting !== undefined) {
+        // The only block event that may arrive while awaiting is the redelivery itself; anything else
+        // means the stream skipped past the suppressed block — ponder would silently miss it. Fail loud.
+        if (ev.block.hash !== awaiting.hash)
+          throw new Error(
+            `Portal realtime: awaiting redelivery of block ${awaiting.number} (${awaiting.hash}) after child discovery, but received ${blockNumber} (${ev.block.hash}) — the suppressed block would be silently skipped. Restart to re-sync from the finalized head.`,
+          );
+        awaiting = undefined;
+      }
+      const discovered = discoverChildAddresses(ev.logs, factories);
       if (applyDiscovered(discovered, childAddresses, blockNumber)) {
-        const next = buildPortalLogRequests(eventCallbacks, childAddresses);
-        logs.length = 0;
-        logs.push(...next); // mutate in place — picked up on the next `/stream` reconnection
-        logsRevision++; // force streamHotBlocks to re-open with the widened filter now (finding 4)
+        rebuildLogs();
+        // NEW children in THIS block: its own logs from them were server-side filtered out on the
+        // connection it arrived on. Suppress the incomplete event and await the complete redelivery
+        // (streamHotBlocks re-opens from this block; converges — the child set only grows).
+        awaiting = { hash: ev.block.hash as string, number: blockNumber };
+        continue;
       }
 
       yield { chain, event: toRealtimeSyncEvent(ev, discovered) };

@@ -16,14 +16,20 @@
  * The reorg/finalize reconciliation is pure + unit-tested; the `/stream` read and `/finalized-head` poll
  * are the I/O shell.
  */
-import type { SyncBlockHeader, SyncLog } from '@/internal/types.js';
+import type {
+  SyncBlockHeader,
+  SyncLog,
+  SyncTransaction,
+} from '@/internal/types.js';
 import { ndjsonLines } from './portal-client.js';
 import { invariant } from './portal-invariant.js';
 import {
   type RawHeader,
   type RawLog,
+  type RawTx,
   toSyncBlockHeader,
   toSyncLog,
+  toSyncTransaction,
 } from './portal-transform.js';
 
 // ─────────────────────────────── pure reorg / finalize core (unit-tested) ───────────────────────────────
@@ -47,14 +53,47 @@ export type Reconcile =
  * parentHash→hash). Pure. With `includeAllBlocks` the happy path is always `append`; a reorg re-streams
  * from the fork point, so the new block's `parentHash` matches an EARLIER block — everything after that
  * common ancestor is reorged.
+ *
+ * `anchor` is the last FINALIZED block (startup boundary, then each finalize's tip). It closes two holes
+ * the bare window had:
+ *   • An EMPTY window (routine right after a finalize, and at startup) used to blind-`append` ANYTHING —
+ *     a skipped block or a wrong-fork block at exactly that boundary was undetectable. With the anchor,
+ *     only a block extending it appends; the anchor block itself re-delivered is a `duplicate`; anything
+ *     else is a `gap` (fatal — a fork below finality has no safe recovery).
+ *   • A depth-1 fork at the boundary (new tip whose parent IS the finalized block, forking off the sole
+ *     window entry) used to read as a fatal `gap` even though the common ancestor is known-safe. With the
+ *     anchor it reconciles as a normal `reorg` off the anchor, reorging the whole window.
+ * `anchor === undefined` (unknown at startup) keeps the old blind-append behavior.
  */
-export function reconcile(unfinalized: Light[], next: Light): Reconcile {
-  if (unfinalized.length === 0) return { kind: 'append' };
+export function reconcile(
+  unfinalized: Light[],
+  next: Light,
+  anchor?: Light,
+): Reconcile {
+  if (unfinalized.length === 0) {
+    if (anchor === undefined) return { kind: 'append' };
+    if (next.hash === anchor.hash) return { kind: 'duplicate' };
+    if (next.parentHash === anchor.hash) return { kind: 'append' };
+
+    return { kind: 'gap' };
+  }
   const tip = unfinalized[unfinalized.length - 1]!;
   if (next.hash === tip.hash) return { kind: 'duplicate' };
   if (next.parentHash === tip.hash) return { kind: 'append' };
   const idx = unfinalized.findIndex((b) => b.hash === next.parentHash);
-  if (idx === -1) return { kind: 'gap' };
+  if (idx === -1) {
+    // fork at the finality boundary: the parent is the last-finalized anchor, so the common ancestor is
+    // known-safe and the WHOLE window is the reorged suffix — a normal reorg, not a fatal gap.
+    if (anchor !== undefined && next.parentHash === anchor.hash)
+      return {
+        kind: 'reorg',
+        commonAncestor: anchor,
+        reorgedBlocks: [...unfinalized],
+      };
+
+    return { kind: 'gap' };
+  }
+
   return {
     kind: 'reorg',
     commonAncestor: unfinalized[idx]!,
@@ -105,18 +144,29 @@ export type PortalRealtimeArgs = {
    * (never reopens). (finding 4)
    */
   getLogsRevision?: () => number;
+  /**
+   * Transaction fields to project. When set, every log request carries `transaction: true` so the Portal
+   * includes each matched log's PARENT transaction in the block batch — the same relation the historical
+   * logQuery uses. Absent ⇒ no transactions requested (batches carry `transactions: []`).
+   */
+  txFields?: Record<string, boolean>;
   signal?: AbortSignal;
   fetchImpl?: typeof fetch;
 };
 
 /**
- * Stream fork-aware hot-blocks with `includeAllBlocks` (every header + filtered logs). Yields raw Portal
- * batch objects `{ header, logs }`. Re-opens the stream from the last seen block on disconnect so it runs
- * continuously; a reorg simply re-streams from the fork point (reconcile() detects it).
+ * Stream fork-aware hot-blocks with `includeAllBlocks` (every header + filtered logs + the matched logs'
+ * parent transactions when `txFields` is set). Yields raw Portal batch objects `{ header, logs,
+ * transactions }`. Re-opens the stream from the last seen block on disconnect so it runs continuously; a
+ * reorg simply re-streams from the fork point (reconcile() detects it).
  */
 export async function* streamHotBlocks(
   args: PortalRealtimeArgs,
-): AsyncGenerator<{ header: RawHeader; logs: RawLog[] }> {
+): AsyncGenerator<{
+  header: RawHeader;
+  logs: RawLog[];
+  transactions: RawTx[];
+}> {
   const fetchImpl = args.fetchImpl ?? fetch;
   let cursor = args.fromBlock;
   for (;;) {
@@ -140,8 +190,11 @@ export async function* streamHotBlocks(
           transactionHash: true,
           transactionIndex: true,
         },
+        ...(args.txFields ? { transaction: args.txFields } : {}),
       },
-      logs: args.logs,
+      logs: args.txFields
+        ? args.logs.map((r) => ({ ...r, transaction: true }))
+        : args.logs,
     });
     let res: Response;
     try {
@@ -160,6 +213,15 @@ export async function* streamHotBlocks(
       continue;
     } // no hot data yet; re-poll
     if (!res.ok) {
+      // A 4xx (except 429) is DETERMINISTIC — the same body will 400 forever (e.g. a dataset that can't
+      // serve a requested field). Retrying it every second is a silent, permanent tip outage; fail loud
+      // instead. 429/5xx are load — retry. Cancel the body either way so the socket doesn't leak.
+      void res.body?.cancel().catch(() => {});
+      if (res.status >= 400 && res.status < 500 && res.status !== 429)
+        throw new Error(
+          `Portal /stream rejected the realtime query (HTTP ${res.status}) — deterministic, not retried. PORTAL_REALTIME=stream cannot serve this configuration; unset it to use RPC realtime.`,
+        );
+
       await sleep(1000, args.signal);
       continue;
     }
@@ -173,8 +235,20 @@ export async function* streamHotBlocks(
         const batch = JSON.parse(line);
         if (batch?.header?.number != null) {
           cursor = batch.header.number + 1; // resume past this block on reconnect
-          yield { header: batch.header, logs: batch.logs ?? [] };
+          yield {
+            header: batch.header,
+            logs: batch.logs ?? [],
+            transactions: batch.transactions ?? [],
+          };
           if ((args.getLogsRevision?.() ?? 0) !== openedRev) {
+            // The filter widened while THIS block was being consumed — a factory child was discovered in
+            // it, and the child's own same-block logs were filtered out server-side by the filter this
+            // connection opened with. Re-open from THIS block (not past it): the new connection
+            // re-delivers it under the widened filter, and the consumer accepts exactly the duplicate it
+            // awaits (the redelivery handshake in portalRealtimeEvents / the wire). Resuming from
+            // `number + 1` here permanently lost the child's block-N logs — ponder marked the interval
+            // cached on finalize, so the gap survived restarts.
+            cursor = batch.header.number;
             reopen = true;
             break;
           }
@@ -213,25 +287,45 @@ export type PortalRealtimeEvent =
       type: 'block';
       block: SyncBlockHeader;
       logs: SyncLog[];
+      transactions: SyncTransaction[];
       hasMatchedFilter: boolean;
     }
   | { type: 'reorg'; block: Light; reorgedBlocks: Light[] }
   | { type: 'finalize'; block: Light };
 
+/** The finalized-head poll result: the canonical hash (when the endpoint carries one) arms the
+ * wrong-fork finalize guard below. A bare number keeps the old behavior (no hash check). */
+export type FinalizedHead = number | { number: number; hash?: string };
+
 export async function* portalRealtimeEvents(
   args: PortalRealtimeArgs & {
-    finalizedHead: () => Promise<number | undefined>;
+    finalizedHead: () => Promise<FinalizedHead | undefined>;
     finalizePollMs?: number;
+    /**
+     * The last FINALIZED block at startup (syncProgress.finalized as a Light) — the reconcile anchor.
+     * Advanced to each finalize's tip. Absent ⇒ the empty-window blind-append behavior (legacy).
+     */
+    anchor?: Light;
+    /**
+     * Redelivery handshake (same-block child discovery): when the consumer discovers a factory child in
+     * block N, it suppresses N's incomplete event, widens the filter, and streamHotBlocks re-opens FROM
+     * N. The re-delivered N reconciles as `duplicate`; this predicate (owned by the consumer) marks it
+     * as awaited, so it is RE-EMITTED with the widened filter's logs instead of skipped.
+     */
+    shouldRedeliver?: (hash: string) => boolean;
   },
 ): AsyncGenerator<PortalRealtimeEvent> {
   const unfinalized: Light[] = [];
+  let anchor = args.anchor;
   let lastFinalizePoll = 0;
   const pollMs = args.finalizePollMs ?? 4000;
 
-  for await (const { header, logs } of streamHotBlocks(args)) {
+  for await (const { header, logs, transactions } of streamHotBlocks(args)) {
     const light = toLight(header);
-    const r = reconcile(unfinalized, light);
-    if (r.kind === 'duplicate') continue;
+    const r = reconcile(unfinalized, light, anchor);
+    const redelivered =
+      r.kind === 'duplicate' && (args.shouldRedeliver?.(light.hash) ?? false);
+    if (r.kind === 'duplicate' && !redelivered) continue;
 
     if (r.kind === 'gap') {
       // Parent unknown: the streamed block doesn't attach to our unfinalized window — a reorg deeper than
@@ -263,20 +357,23 @@ export async function* portalRealtimeEvents(
     }
     // INV-10 tripwire: the unfinalized chain stays strictly increasing and parentHash-linked on every
     // append. `reconcile` guarantees this (append/reorg restore linkage; a gap is now fatal above), so this
-    // O(1) check can only fire on a reconcile regression.
-    if (unfinalized.length > 0) {
-      const tip = unfinalized[unfinalized.length - 1]!;
-      invariant(
-        'INV-10',
-        light.parentHash === tip.hash && light.number > tip.number,
-        'unfinalized chain link broken on append',
-        () => ({
-          tip: { number: tip.number, hash: tip.hash },
-          next: { number: light.number, parentHash: light.parentHash },
-        }),
-      );
+    // O(1) check can only fire on a reconcile regression. A redelivered duplicate is ALREADY the tip —
+    // no append, no check.
+    if (!redelivered) {
+      if (unfinalized.length > 0) {
+        const tip = unfinalized[unfinalized.length - 1]!;
+        invariant(
+          'INV-10',
+          light.parentHash === tip.hash && light.number > tip.number,
+          'unfinalized chain link broken on append',
+          () => ({
+            tip: { number: tip.number, hash: tip.hash },
+            next: { number: light.number, parentHash: light.parentHash },
+          }),
+        );
+      }
+      unfinalized.push(light);
     }
-    unfinalized.push(light);
 
     const block = toSyncBlockHeader(header);
     const syncLogs = logs.map((l) => toSyncLog(l, header));
@@ -284,6 +381,9 @@ export async function* portalRealtimeEvents(
       type: 'block',
       block,
       logs: syncLogs,
+      transactions: (transactions ?? []).map((t) =>
+        toSyncTransaction(t, header),
+      ),
       hasMatchedFilter: syncLogs.length > 0,
     };
 
@@ -292,9 +392,29 @@ export async function* portalRealtimeEvents(
     if (now - lastFinalizePoll >= pollMs) {
       lastFinalizePoll = now;
       const fh = await args.finalizedHead().catch(() => undefined);
-      if (fh !== undefined) {
-        const { finalizedTip, remaining } = takeFinalized(unfinalized, fh);
+      const fhNumber = typeof fh === 'number' ? fh : fh?.number;
+      const fhHash = typeof fh === 'object' ? fh?.hash : undefined;
+      if (fhNumber !== undefined) {
+        const { finalizedTip, remaining } = takeFinalized(
+          unfinalized,
+          fhNumber,
+        );
         if (finalizedTip) {
+          // Wrong-fork finalize guard: `takeFinalized` splits by NUMBER; if the probe carries the
+          // canonical hash and our local block at that height differs, the window sits on a fork that
+          // lost to a finalized competitor — persisting it as finalized would commit wrong-fork data
+          // with no rollback event. No safe silent recovery: fail loud, restart re-derives from the
+          // finalized head.
+          if (
+            fhHash !== undefined &&
+            finalizedTip.number === fhNumber &&
+            finalizedTip.hash !== fhHash
+          )
+            throw new Error(
+              `Portal realtime: local block ${finalizedTip.number} (${finalizedTip.hash}) diverges from the canonical finalized block (${fhHash}) — the unfinalized window is on a losing fork at/below finality. Cannot finalize safely; restart to re-sync from the finalized head.`,
+            );
+
+          anchor = finalizedTip; // the reconcile anchor advances with finality
           unfinalized.length = 0;
           unfinalized.push(...remaining);
           yield { type: 'finalize', block: finalizedTip };

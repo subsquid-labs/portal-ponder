@@ -167,7 +167,7 @@ test('discoverChildAddresses: multiple children in one block', () => {
 
 // ─────────────────────────────── event conversion ───────────────────────────────
 
-test('toRealtimeSyncEvent: block → log-only BlockWithEventData (no txs/receipts/traces, childAddresses, no blockCallback)', () => {
+test('toRealtimeSyncEvent: block → BlockWithEventData with logs + their parent TRANSACTIONS (no receipts/traces, childAddresses, no blockCallback)', () => {
   const factory = eulerFactory();
   const childAddresses = new Map([
     [factory, new Set<Address>(['0xchild' as Address])],
@@ -181,6 +181,9 @@ test('toRealtimeSyncEvent: block → log-only BlockWithEventData (no txs/receipt
       timestamp: '0x1',
     } as any,
     logs: [{ address: '0xchild' } as any],
+    // the matched log's parent tx rides the stream (TX_FIELDS via `transaction: true`) — it must reach
+    // ponder's BlockWithEventData, so `event.transaction` works and the finalize insert stores it
+    transactions: [{ hash: '0xt' } as any],
     hasMatchedFilter: true,
   };
   const ev = toRealtimeSyncEvent(block, childAddresses) as Extract<
@@ -189,7 +192,7 @@ test('toRealtimeSyncEvent: block → log-only BlockWithEventData (no txs/receipt
   >;
   expect(ev.type).toBe('block');
   expect(ev.hasMatchedFilter).toBe(true);
-  expect(ev.transactions).toEqual([]);
+  expect(ev.transactions).toEqual([{ hash: '0xt' }]); // passthrough, not []
   expect(ev.transactionReceipts).toEqual([]);
   expect(ev.traces).toEqual([]);
   expect(ev.childAddresses).toBe(childAddresses);
@@ -388,15 +391,23 @@ test('clampFinalizedToPortalHead: Portal head BELOW RPC finalized → refetch th
 
 // ─────────────────────────────── end-to-end generator ───────────────────────────────
 
-// mock the Portal /stream (NDJSON batches once → 204) and /finalized-head (JSON)
-function mockPortal(batches: any[], finalizedHead: number) {
-  let streamed = false;
-  return (async (url: string) => {
+// mock the Portal /stream — one NDJSON connection per entry in `connections` (then 204) — and
+// /finalized-head (JSON). `seenBodies` (optional) collects each /stream request body for filter asserts.
+function mockPortalConns(
+  connections: any[][],
+  finalizedHead: number,
+  seenBodies?: any[],
+) {
+  let conn = 0;
+  return (async (url: string, init?: any) => {
     if (url.endsWith('/finalized-head'))
       return { json: async () => ({ number: finalizedHead }) };
-    if (streamed) return { status: 204, ok: false, body: null };
-    streamed = true;
-    const lines = batches.map((b) => JSON.stringify(b) + '\n').join('');
+    if (seenBodies && init?.body) seenBodies.push(JSON.parse(init.body));
+    if (conn >= connections.length)
+      return { status: 204, ok: false, body: null };
+    const lines = connections[conn++]!.map(
+      (b) => JSON.stringify(b) + '\n',
+    ).join('');
     const body = new ReadableStream({
       start(c) {
         c.enqueue(new TextEncoder().encode(lines));
@@ -406,17 +417,36 @@ function mockPortal(batches: any[], finalizedHead: number) {
     return { status: 200, ok: true, body };
   }) as any;
 }
+const mockPortal = (batches: any[], finalizedHead: number) =>
+  mockPortalConns([batches], finalizedHead);
 
-test('getPortalRealtimeEventGenerator: streams block events, discovers a new child, and updates the running childAddresses; terminates at endBlock', async () => {
+test('getPortalRealtimeEventGenerator: a child discovered in block N gets N RE-DELIVERED complete — its SAME-BLOCK logs are not lost; terminates at endBlock', async () => {
+  // The /stream filter is server-side and snapshotted at connection open, so a child created in block N
+  // has its own block-N logs filtered out of the connection N arrived on. The old flow forwarded N's
+  // incomplete event and resumed from N+1 — the child's same-block logs were permanently lost (interval
+  // marked cached on finalize). Now the wire suppresses the incomplete event, widens the filter, and the
+  // stream re-opens FROM N: ponder receives exactly ONE block event for N, carrying the child's log.
   process.env.PORTAL_REALTIME = 'stream';
   const factory = eulerFactory();
   const child = '0x1111111111111111111111111111111111111111';
-  const batches = [
+  const childDeposit = {
+    address: child,
+    topics: [DEPOSIT],
+    data: '0x',
+    blockNumber: 101,
+    logIndex: 1,
+    transactionHash: '0xtx2',
+    transactionIndex: 0,
+    removed: false,
+  };
+  const conn1 = [
     {
       header: { number: 100, hash: 'h100', parentHash: 'h99', timestamp: 1000 },
       logs: [],
     },
     {
+      // the OLD filter matches only the factory's creation event — the child's own Deposit in the SAME
+      // block was filtered out server-side and is absent here
       header: {
         number: 101,
         hash: 'h101',
@@ -426,9 +456,22 @@ test('getPortalRealtimeEventGenerator: streams block events, discovers a new chi
       logs: [proxyLog(child, { blockNumber: 101 })],
     },
   ];
+  const conn2 = [
+    {
+      // the reopened connection (widened filter) re-delivers block 101 COMPLETE
+      header: {
+        number: 101,
+        hash: 'h101',
+        parentHash: 'h100',
+        timestamp: 1012,
+      },
+      logs: [proxyLog(child, { blockNumber: 101 }), childDeposit],
+    },
+  ];
   const childAddresses = new Map<string, Map<Address, number>>([
     ['euler-factory', new Map()],
   ]);
+  const bodies: any[] = [];
   const events: any[] = [];
   for await (const { event } of getPortalRealtimeEventGenerator({
     common: { logger: { info() {}, debug() {}, warn() {}, trace() {} } } as any,
@@ -446,21 +489,132 @@ test('getPortalRealtimeEventGenerator: streams block events, discovers a new chi
       end: { number: '0x65' } as any,
     },
     childAddresses,
-    fetchImpl: mockPortal(batches, 0),
+    fetchImpl: mockPortalConns([conn1, conn2], 0, bodies),
   })) {
     events.push(event);
   }
 
   const blocks = events.filter((e) => e.type === 'block');
-  expect(blocks.length).toBe(2);
+  expect(blocks.length).toBe(2); // EXACTLY one event per block — no double-delivery of 101
   expect(blocks[0].block.number).toBe('0x64'); // 100
-  expect(blocks[1].block.number).toBe('0x65'); // 101
-  // block 101 discovered the new vault → surfaced on the event AND folded into the running map
+  expect(blocks[1].block.number).toBe('0x65'); // 101 (the redelivered, COMPLETE version)
+  // THE REGRESSION: the child's own same-block Deposit is present on the (single) block-101 event
+  expect(
+    blocks[1].logs.some(
+      (l: any) => l.address === child && l.topics[0] === DEPOSIT,
+    ),
+  ).toBe(true);
+  // discovery still surfaced on the event AND folded into the running map
   expect([...blocks[1].childAddresses.get(factory)!]).toEqual([child]);
   expect(childAddresses.get('euler-factory')!.get(child as Address)).toBe(101);
-  // conversion shape
-  expect(blocks[1].transactions).toEqual([]);
+  // the redelivery connection re-opened FROM block 101 with the WIDENED server-side filter
+  const reopened = bodies[bodies.length - 1];
+  expect(reopened.fromBlock).toBe(101);
+  expect(JSON.stringify(reopened.logs)).toContain(child);
   expect(blocks[1].blockCallback).toBeUndefined();
+});
+
+test('getPortalRealtimeEventGenerator: a reorg PRUNES reorged-out children from the running map and narrows the filter', async () => {
+  // Stock createRealtimeSync deletes reorged blocks' children (childAddressesPerBlock); without pruning,
+  // a child whose creation block was reorged away keeps matching — every later log from that address is
+  // indexed as a phantom child event until restart.
+  process.env.PORTAL_REALTIME = 'stream';
+  const factory = eulerFactory();
+  const child = '0x2222222222222222222222222222222222222222';
+  const conn1 = [
+    {
+      header: { number: 100, hash: 'h100', parentHash: 'h99', timestamp: 1000 },
+      logs: [],
+    },
+    {
+      header: {
+        number: 101,
+        hash: 'h101a',
+        parentHash: 'h100',
+        timestamp: 1012,
+      },
+      logs: [proxyLog(child, { blockNumber: 101 })],
+    },
+  ];
+  const conn2 = [
+    {
+      // redelivery of 101a (same-block handshake) — still carries the creation log
+      header: {
+        number: 101,
+        hash: 'h101a',
+        parentHash: 'h100',
+        timestamp: 1012,
+      },
+      logs: [proxyLog(child, { blockNumber: 101 })],
+    },
+    {
+      // the fork: 101b replaces 101a (parent = 100) — the creation event is GONE on the new fork
+      header: {
+        number: 101,
+        hash: 'h101b',
+        parentHash: 'h100',
+        timestamp: 1013,
+      },
+      logs: [],
+    },
+  ];
+  // the prune rebuilds the filter (revision bump) → the stream re-opens from the tip; the re-delivered
+  // tip is a routine duplicate (skipped — no redelivery awaited), then the chain continues
+  const conn3 = [
+    {
+      header: {
+        number: 101,
+        hash: 'h101b',
+        parentHash: 'h100',
+        timestamp: 1013,
+      },
+      logs: [],
+    },
+    {
+      header: {
+        number: 102,
+        hash: 'h102b',
+        parentHash: 'h101b',
+        timestamp: 1024,
+      },
+      logs: [],
+    },
+  ];
+  const childAddresses = new Map<string, Map<Address, number>>([
+    ['euler-factory', new Map()],
+  ]);
+  const bodies: any[] = [];
+  const events: any[] = [];
+  for await (const { event } of getPortalRealtimeEventGenerator({
+    common: { logger: { info() {}, debug() {}, warn() {}, trace() {} } } as any,
+    chain: { id: 1, name: 'mainnet', portal: 'http://portal' } as any,
+    rpc: {} as any,
+    eventCallbacks: [{ filter: logFilter({ address: factory as any }) } as any],
+    syncProgress: {
+      finalized: {
+        number: '0x63',
+        hash: 'h99',
+        parentHash: 'h98',
+        timestamp: '0x1',
+      } as any,
+      end: { number: '0x66' } as any,
+    },
+    childAddresses,
+    fetchImpl: mockPortalConns([conn1, conn2, conn3], 0, bodies),
+  })) {
+    events.push(event);
+  }
+
+  const reorg = events.find((e) => e.type === 'reorg');
+  expect(reorg).toBeDefined();
+  expect(reorg.block.hash).toBe('h100'); // common ancestor
+  // THE REGRESSION: the reorged-out child is pruned from the running map…
+  expect(childAddresses.get('euler-factory')!.has(child as Address)).toBe(
+    false,
+  );
+  // …and the server-side filter was rebuilt WITHOUT it after the reorg
+  const last = bodies[bodies.length - 1];
+  expect(JSON.stringify(last.logs)).not.toContain(child);
 });
 
 test('getPortalRealtimeEventGenerator: emits a monotonic finalize (above the startup finalized) from the head poll', async () => {

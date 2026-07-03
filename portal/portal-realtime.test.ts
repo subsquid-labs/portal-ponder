@@ -279,12 +279,174 @@ test('streamHotBlocks: re-opens the /stream with the widened filter the moment t
   });
   rev = 1;
 
-  const second = await gen.next(); // rev advanced → connection 1 torn down, reopen resumes from cursor 101
+  const second = await gen.next(); // rev advanced → connection 1 torn down, reopen re-delivers block 100
   expect(second.value?.header.number).toBe(101);
   expect(bodies).toHaveLength(2);
-  expect(bodies[1].fromBlock).toBe(101); // resumed PAST block 100 (no re-delivery / spurious reorg)
+  // Re-opened FROM block 100, NOT 101: the child discovered in block 100 may have emitted its own logs
+  // in that same block, and they were filtered out server-side by connection 1's narrower filter. The
+  // re-delivered 100 reconciles as a duplicate that only an awaited redelivery re-emits (no spurious
+  // reorg). Resuming from 101 permanently lost those same-block child logs.
+  expect(bodies[1].fromBlock).toBe(100);
   expect(bodies[1].logs[0].address).toContain('0xnewchild'); // reopened with the widened filter
 
   await gen.return(undefined); // stop the generator
   ac.abort();
+});
+
+// ─────────────────────────────── reconcile anchor (finality boundary) ───────────────────────────────
+
+test('reconcile: an EMPTY window with an anchor appends ONLY a child of the anchor (else duplicate/gap)', () => {
+  const anchor = L(10, 'a', 'z');
+  expect(reconcile([], L(11, 'b', 'a'), anchor)).toEqual({ kind: 'append' });
+  // the anchor block itself re-delivered (reopen from the finalized cursor) is idempotent
+  expect(reconcile([], L(10, 'a', 'z'), anchor)).toEqual({
+    kind: 'duplicate',
+  });
+  // a block that does NOT extend the finalized anchor: skipped span or wrong fork → gap (fatal), the
+  // pre-anchor blind append was undetectable
+  expect(reconcile([], L(12, 'c', 'unknown'), anchor)).toEqual({
+    kind: 'gap',
+  });
+});
+
+test('reconcile: a depth-1 fork at the finality boundary reorgs off the ANCHOR instead of a fatal gap', () => {
+  const anchor = L(10, 'a', 'z');
+  const window = [L(11, 'b', 'a')];
+  const r = reconcile(window, L(11, 'b2', 'a'), anchor); // 11' whose parent IS the finalized block
+  expect(r.kind).toBe('reorg');
+  if (r.kind === 'reorg') {
+    expect(r.commonAncestor.hash).toBe('a'); // the anchor is the known-safe common ancestor
+    expect(r.reorgedBlocks.map((b) => b.hash)).toEqual(['b']); // the whole window is reorged
+  }
+  // without the anchor this same shape was a fatal gap
+  expect(reconcile(window, L(11, 'b2', 'a')).kind).toBe('gap');
+});
+
+// ─────────────────────────────── redelivery handshake + finalize guards ───────────────────────────────
+
+test('portalRealtimeEvents: an AWAITED duplicate is re-emitted with the new logs (same-block child discovery); a routine duplicate stays skipped', async () => {
+  const h = (n: number, hash: string, parent: string, ts: number) => ({
+    number: n,
+    hash,
+    parentHash: parent,
+    timestamp: ts,
+  });
+  const creation = {
+    address: '0xfactory',
+    topics: ['0xcreated'],
+    data: '0x',
+    logIndex: 0,
+    transactionHash: '0xtx1',
+    transactionIndex: 0,
+  };
+  const childLog = {
+    address: '0xchild',
+    topics: ['0xdeposit'],
+    data: '0x',
+    logIndex: 1,
+    transactionHash: '0xtx1',
+    transactionIndex: 0,
+  };
+  const tx = {
+    transactionIndex: 0,
+    hash: '0xtx1',
+    from: '0xfrom',
+    to: '0xto',
+    input: '0x',
+    value: '0x0',
+    nonce: 0,
+    gas: '0x1',
+    type: 0,
+  };
+  const batches = [
+    // the incomplete first delivery (old server filter): only the creation log
+    { header: h(100, 'h100', 'h99', 1000), logs: [creation] },
+    // the awaited redelivery (widened filter): creation + the child's own same-block log + parent tx
+    {
+      header: h(100, 'h100', 'h99', 1000),
+      logs: [creation, childLog],
+      transactions: [tx],
+    },
+    // a routine duplicate of the same block — NOT awaited → skipped (no triple delivery)
+    { header: h(100, 'h100', 'h99', 1000), logs: [creation, childLog] },
+    { header: h(101, 'h101', 'h100', 1012), logs: [] },
+  ];
+  let awaitHash: string | undefined = 'h100'; // the consumer awaits exactly one redelivery of h100
+  const ac = new AbortController();
+  const events: any[] = [];
+  for await (const e of portalRealtimeEvents({
+    portalUrl: 'http://portal',
+    headers: {},
+    fromBlock: 100,
+    logs: [],
+    fetchImpl: mockFetch(batches, () => ac.abort()),
+    signal: ac.signal,
+    finalizedHead: async () => 0,
+    finalizePollMs: 999999,
+    shouldRedeliver: (hash) => {
+      if (awaitHash !== hash) return false;
+      awaitHash = undefined; // consumed — later duplicates are routine
+
+      return true;
+    },
+  })) {
+    events.push(e);
+  }
+  const blocks = events.filter((e) => e.type === 'block');
+  expect(blocks.length).toBe(3); // 100 (incomplete), 100 (redelivered), 101 — the 3rd duplicate skipped
+  expect(blocks[1].block.number).toBe('0x64'); // the redelivery is the SAME block…
+  expect(blocks[1].logs.map((l: any) => l.address)).toEqual([
+    '0xfactory',
+    '0xchild',
+  ]); // …with the widened filter's logs
+  expect(blocks[1].transactions).toHaveLength(1); // parent txs ride the stream (toSyncTransaction shape)
+  expect(blocks[1].transactions[0].hash).toBe('0xtx1');
+  expect(events.some((e) => e.type === 'reorg')).toBe(false); // no spurious reorg from the redelivery
+  expect(blocks[2].block.number).toBe('0x65'); // the chain continues cleanly past it
+});
+
+test('portalRealtimeEvents: a finalize whose canonical hash mismatches the local block is FATAL (wrong-fork finalize)', async () => {
+  // takeFinalized splits by NUMBER; when /finalized-head carries the canonical hash and our local block
+  // at that height differs, the window is on a fork that lost to a finalized competitor. Persisting it
+  // as finalized would commit wrong-fork data with no rollback event — fail loud instead.
+  const batches = [
+    {
+      header: { number: 10, hash: 'a', parentHash: 'z', timestamp: 10 },
+      logs: [],
+    },
+  ];
+  const ac = new AbortController();
+  const iter = portalRealtimeEvents({
+    portalUrl: 'http://portal',
+    headers: {},
+    fromBlock: 10,
+    logs: [],
+    fetchImpl: mockFetch(batches, () => ac.abort()),
+    signal: ac.signal,
+    finalizedHead: async () => ({ number: 10, hash: 'a-canonical' }), // ≠ local 'a'
+    finalizePollMs: 0,
+  });
+  await expect(
+    (async () => {
+      for await (const _ of iter) {
+        /* drain */
+      }
+    })(),
+  ).rejects.toThrow(/losing fork/i);
+});
+
+test('streamHotBlocks: a deterministic 4xx from /stream is FATAL, not an infinite silent retry loop', async () => {
+  const fetchImpl = (async () => ({
+    status: 400,
+    ok: false,
+    body: { cancel: async () => {} },
+  })) as any;
+  const gen = streamHotBlocks({
+    portalUrl: 'http://portal',
+    headers: {},
+    fromBlock: 100,
+    logs: [],
+    fetchImpl,
+  });
+  await expect(gen.next()).rejects.toThrow(/deterministic/);
 });
