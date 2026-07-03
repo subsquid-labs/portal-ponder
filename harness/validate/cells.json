@@ -1,0 +1,508 @@
+{
+  "version": 1,
+  "note": "Validation-campaign matrix (see /scratchpad/campaign-plan.md §'Matrix cells'). Each cell is fork-vs-stock via harness/diff/run.sh unless 'runner' says otherwise; pin ONE SQD_PONDER_TARBALL for the whole campaign. Window strategies are expanded deterministically by harness/validate/windows.mjs. expectedRequestEstimate is an ADVISORY order-of-magnitude of stock-side JSON-RPC calls for the budget guard; the real count is metered per window.",
+  "defaults": {
+    "portalBase": "https://portal.sqd.dev/datasets",
+    "rpcBase": "https://rpc.subsquid.io",
+    "env": {
+      "PORTAL_CHUNK_FIXED": "1",
+      "PORTAL_CHUNK_BLOCKS": "500000",
+      "PORTAL_CHECKS": "strict"
+    }
+  },
+  "apps": {
+    "erc20": "harness/diff/erc20-app",
+    "euler": "harness/diff/euler-app",
+    "univ3": "harness/diff/univ3-app",
+    "traces": "harness/diff/app"
+  },
+  "chains": {
+    "eth": {
+      "chainId": 1,
+      "portalDataset": "ethereum-mainnet",
+      "rpcSlug": "eth",
+      "eulerFactory": "0x29a56a1b8214D9Cf7c5561811750D5cBDb45CC8e",
+      "eulerDeploy": 20529207,
+      "head": 25436954,
+      "erc20": "0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48"
+    },
+    "base": {
+      "chainId": 8453,
+      "portalDataset": "base-mainnet",
+      "rpcSlug": "base",
+      "eulerFactory": "0x7F321498A801A191a93C840750ed637149dDf8D0",
+      "eulerDeploy": 22282411,
+      "head": 48055440,
+      "erc20": "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913"
+    },
+    "arbitrum": {
+      "chainId": 42161,
+      "portalDataset": "arbitrum-one",
+      "rpcSlug": "arbitrum-one",
+      "eulerFactory": "0x78Df1CF5bf06a7f27f2ACc580B934238C1b80D50",
+      "eulerDeploy": 238643655,
+      "head": 479230602,
+      "erc20": "0xaf88d065e77c8cC2239327C5EDb3A432268e5831"
+    },
+    "polygon": {
+      "chainId": 137,
+      "portalDataset": "polygon-mainnet",
+      "rpcSlug": "polygon",
+      "eulerFactory": "0xB1771a13e2a13fCafA89B00335915E732B9466b7",
+      "eulerDeploy": 86932985,
+      "head": 89464275,
+      "erc20": "0x3c499c542cEF5E3811e1192ce70d8cC03d5c3359"
+    },
+    "bsc": {
+      "chainId": 56,
+      "portalDataset": "binance-mainnet",
+      "rpcSlug": "bsc",
+      "eulerFactory": "0x7F53E2755eB3c43824E162F7F6F087832B9C9Df6",
+      "eulerDeploy": 46370000,
+      "head": 107428243,
+      "erc20": "0x55d398326f99059fF775485246999027B3197955"
+    },
+    "avalanche": {
+      "chainId": 43114,
+      "portalDataset": "avalanche-mainnet",
+      "rpcSlug": "ava",
+      "eulerFactory": "0xaf4B4c18B17F6a2B32F6c398a3910bdCD7f26181",
+      "eulerDeploy": 56805796,
+      "head": 89201801,
+      "erc20": "0xB97EF9Ef8734C71904D8002F8b6Bc66Dd9c48a6E"
+    }
+  },
+  "addressNote": "erc20 addresses are the canonical native-USDC (BSC: USDT) contracts per chain; VERIFY each against the P0 capability report before the paid run.",
+  "cells": [
+    {
+      "id": "SMOKE",
+      "app": "erc20",
+      "chain": "eth",
+      "chainId": 1,
+      "sourceTypes": ["logs", "receipts"],
+      "receipts": true,
+      "windows": [{ "from": 20000000, "to": 20000012, "tag": "smoke" }],
+      "expectedRequestEstimate": 200,
+      "notes": "Plumbing smoke: one tiny window, runnable on the public Portal + a free RPC (RPC_URL_OVERRIDE) to prove run-cell.sh end-to-end without paid endpoints. Not part of the paid matrix."
+    },
+    {
+      "id": "CTRL",
+      "runner": "ctrl-cell",
+      "app": "erc20",
+      "chain": "eth",
+      "chainId": 1,
+      "sourceTypes": ["logs", "receipts"],
+      "receipts": true,
+      "windows": [
+        {
+          "strategy": "seeded-random",
+          "seed": 20240701,
+          "from": 20000000,
+          "to": 20500000,
+          "count": 10,
+          "size": 1000
+        }
+      ],
+      "expectedRequestEstimate": 40000,
+      "notes": "Evidence layer 4: genuine upstream ponder@0.16.6 vs fork-with-portal-unset, same config/range → proves the Portal patch is inert on the stock RPC path. Run via ctrl-cell.sh (needs UPSTREAM_PONDER_VERSION)."
+    },
+    {
+      "id": "L-eth",
+      "app": "erc20",
+      "chain": "eth",
+      "chainId": 1,
+      "sourceTypes": ["logs", "receipts"],
+      "receipts": true,
+      "windows": [
+        {
+          "strategy": "seeded-random",
+          "seed": 101,
+          "from": 19000000,
+          "to": 20500000,
+          "count": 4,
+          "size": 2000
+        },
+        {
+          "strategy": "seeded-random",
+          "seed": 102,
+          "from": 19000000,
+          "to": 20500000,
+          "count": 4,
+          "size": 5000
+        }
+      ],
+      "autoShrink": { "threshold": 50000 },
+      "expectedRequestEstimate": 120000,
+      "notes": "Evidence layer 3: stratified byte windows, logs+receipts. Dense windows auto-shrink at >50k matched rows."
+    },
+    {
+      "id": "L-base",
+      "app": "erc20",
+      "chain": "base",
+      "chainId": 8453,
+      "sourceTypes": ["logs", "receipts"],
+      "receipts": true,
+      "windows": [
+        {
+          "strategy": "seeded-random",
+          "seed": 201,
+          "from": 24000000,
+          "to": 40000000,
+          "count": 4,
+          "size": 2000
+        },
+        {
+          "strategy": "seeded-random",
+          "seed": 202,
+          "from": 24000000,
+          "to": 40000000,
+          "count": 4,
+          "size": 5000
+        }
+      ],
+      "autoShrink": { "threshold": 50000 },
+      "expectedRequestEstimate": 120000,
+      "notes": "Dense base: the cell that should surface A-side ResponseBodyTooLargeError windows Portal streams through."
+    },
+    {
+      "id": "L-arbitrum",
+      "app": "erc20",
+      "chain": "arbitrum",
+      "chainId": 42161,
+      "sourceTypes": ["logs", "receipts"],
+      "receipts": true,
+      "windows": [
+        {
+          "strategy": "seeded-random",
+          "seed": 301,
+          "from": 250000000,
+          "to": 470000000,
+          "count": 4,
+          "size": 2000
+        },
+        {
+          "strategy": "seeded-random",
+          "seed": 302,
+          "from": 250000000,
+          "to": 470000000,
+          "count": 4,
+          "size": 5000
+        }
+      ],
+      "autoShrink": { "threshold": 50000 },
+      "expectedRequestEstimate": 120000,
+      "notes": "High block-rate chain: exercises the density-scaled chunking (fewer, wider chunks)."
+    },
+    {
+      "id": "L-polygon",
+      "app": "erc20",
+      "chain": "polygon",
+      "chainId": 137,
+      "sourceTypes": ["logs", "receipts"],
+      "receipts": true,
+      "windows": [
+        {
+          "strategy": "seeded-random",
+          "seed": 401,
+          "from": 60000000,
+          "to": 89000000,
+          "count": 4,
+          "size": 2000
+        },
+        {
+          "strategy": "seeded-random",
+          "seed": 402,
+          "from": 60000000,
+          "to": 89000000,
+          "count": 4,
+          "size": 5000
+        }
+      ],
+      "autoShrink": { "threshold": 50000 },
+      "expectedRequestEstimate": 120000,
+      "notes": "Stratified logs+receipts."
+    },
+    {
+      "id": "L-bsc",
+      "app": "erc20",
+      "chain": "bsc",
+      "chainId": 56,
+      "sourceTypes": ["logs", "receipts"],
+      "receipts": true,
+      "windows": [
+        {
+          "strategy": "seeded-random",
+          "seed": 501,
+          "from": 40000000,
+          "to": 107000000,
+          "count": 4,
+          "size": 2000
+        },
+        {
+          "strategy": "seeded-random",
+          "seed": 502,
+          "from": 40000000,
+          "to": 107000000,
+          "count": 4,
+          "size": 5000
+        }
+      ],
+      "autoShrink": { "threshold": 50000 },
+      "expectedRequestEstimate": 120000,
+      "notes": "BSC ERC20 is USDT (canonical). Stratified logs+receipts."
+    },
+    {
+      "id": "L-avalanche",
+      "app": "erc20",
+      "chain": "avalanche",
+      "chainId": 43114,
+      "sourceTypes": ["logs", "receipts"],
+      "receipts": true,
+      "windows": [
+        {
+          "strategy": "seeded-random",
+          "seed": 601,
+          "from": 57000000,
+          "to": 89000000,
+          "count": 4,
+          "size": 2000
+        },
+        {
+          "strategy": "seeded-random",
+          "seed": 602,
+          "from": 57000000,
+          "to": 89000000,
+          "count": 4,
+          "size": 5000
+        }
+      ],
+      "autoShrink": { "threshold": 50000 },
+      "expectedRequestEstimate": 120000,
+      "notes": "Stratified logs+receipts."
+    },
+    {
+      "id": "F-full",
+      "app": "euler",
+      "chain": "eth",
+      "chainId": 1,
+      "sourceTypes": ["factory", "logs", "transactions", "receipts"],
+      "receipts": true,
+      "differ": "batched",
+      "appHash": true,
+      "windows": [{ "strategy": "full-range", "from": 20529207 }],
+      "expectedRequestEstimate": 1030000,
+      "notes": "Evidence layer 2: the $7 cell. Euler-app eth FULL history [deploy → pinned head], every sync-store row byte-diffed via the constant-memory diff-batched.mjs + app-table checkpoint hash. ~1.03M stock-side requests."
+    },
+    {
+      "id": "F-base",
+      "app": "euler",
+      "chain": "base",
+      "chainId": 8453,
+      "sourceTypes": ["factory", "logs", "transactions", "receipts"],
+      "receipts": true,
+      "windows": [
+        {
+          "strategy": "seeded-random",
+          "seed": 810,
+          "from": 22282411,
+          "to": 48000000,
+          "count": 4,
+          "size": 50000
+        }
+      ],
+      "expectedRequestEstimate": 200000,
+      "notes": "F-multi: euler factory on base, 4×50k."
+    },
+    {
+      "id": "F-arbitrum",
+      "app": "euler",
+      "chain": "arbitrum",
+      "chainId": 42161,
+      "sourceTypes": ["factory", "logs", "transactions", "receipts"],
+      "receipts": true,
+      "windows": [
+        {
+          "strategy": "seeded-random",
+          "seed": 820,
+          "from": 238643655,
+          "to": 479000000,
+          "count": 4,
+          "size": 50000
+        }
+      ],
+      "expectedRequestEstimate": 200000,
+      "notes": "F-multi: euler factory on arbitrum, 4×50k."
+    },
+    {
+      "id": "F-bsc",
+      "app": "euler",
+      "chain": "bsc",
+      "chainId": 56,
+      "sourceTypes": ["factory", "logs", "transactions", "receipts"],
+      "receipts": true,
+      "windows": [
+        {
+          "strategy": "seeded-random",
+          "seed": 830,
+          "from": 46370000,
+          "to": 107000000,
+          "count": 4,
+          "size": 50000
+        }
+      ],
+      "expectedRequestEstimate": 200000,
+      "notes": "F-multi: euler factory on bsc, 4×50k."
+    },
+    {
+      "id": "F-avalanche",
+      "app": "euler",
+      "chain": "avalanche",
+      "chainId": 43114,
+      "sourceTypes": ["factory", "logs", "transactions", "receipts"],
+      "receipts": true,
+      "windows": [
+        {
+          "strategy": "seeded-random",
+          "seed": 840,
+          "from": 56805796,
+          "to": 89000000,
+          "count": 4,
+          "size": 50000
+        }
+      ],
+      "expectedRequestEstimate": 200000,
+      "notes": "F-multi: euler factory on avalanche, 4×50k."
+    },
+    {
+      "id": "F-polygon",
+      "app": "euler",
+      "chain": "polygon",
+      "chainId": 137,
+      "sourceTypes": ["factory", "logs", "transactions", "receipts"],
+      "receipts": true,
+      "windows": [
+        {
+          "strategy": "seeded-random",
+          "seed": 850,
+          "from": 86932985,
+          "to": 89000000,
+          "count": 4,
+          "size": 50000
+        }
+      ],
+      "expectedRequestEstimate": 200000,
+      "notes": "F-multi: euler factory on polygon (+polygon), 4×50k."
+    },
+    {
+      "id": "T-eth",
+      "app": "traces",
+      "chain": "eth",
+      "chainId": 1,
+      "sourceTypes": ["logs", "receipts", "traces"],
+      "receipts": true,
+      "windows": [
+        {
+          "strategy": "seeded-random",
+          "seed": 900,
+          "from": 19000000,
+          "to": 20500000,
+          "count": 20,
+          "size": 300
+        }
+      ],
+      "expectedRequestEstimate": 90000,
+      "notes": "Trace cell (includeCallTraces): needs an archive RPC with debug_traceBlockByNumber. eth 20×300. Trace cells on other chains are gated on the P0 capability report."
+    },
+    {
+      "id": "A-eth",
+      "app": "traces",
+      "chain": "eth",
+      "chainId": 1,
+      "sourceTypes": ["logs", "receipts", "traces", "accounts", "blocks"],
+      "receipts": true,
+      "windows": [
+        {
+          "strategy": "seeded-random",
+          "seed": 1000,
+          "from": 19000000,
+          "to": 20500000,
+          "count": 20,
+          "size": 1000
+        }
+      ],
+      "expectedRequestEstimate": 120000,
+      "notes": "All-source-types cell. NOTE: harness/diff/app exercises logs+receipts+traces; a purpose-built app adding account (tx from/to) + block-interval sources is still needed for full 5-type coverage (spec deviation — see README)."
+    },
+    {
+      "id": "A-base",
+      "app": "traces",
+      "chain": "base",
+      "chainId": 8453,
+      "sourceTypes": ["logs", "receipts", "traces", "accounts", "blocks"],
+      "receipts": true,
+      "windows": [
+        {
+          "strategy": "seeded-random",
+          "seed": 1010,
+          "from": 24000000,
+          "to": 40000000,
+          "count": 20,
+          "size": 1000
+        }
+      ],
+      "expectedRequestEstimate": 120000,
+      "notes": "All-source-types cell on base. Same all-5-app caveat as A-eth. Uses base V3 pool/router addresses in the app — VERIFY against the capability report."
+    },
+    {
+      "id": "U-eth",
+      "app": "univ3",
+      "chain": "eth",
+      "chainId": 1,
+      "sourceTypes": ["factory", "logs", "receipts"],
+      "receipts": true,
+      "windows": [
+        {
+          "strategy": "seeded-random",
+          "seed": 1100,
+          "from": 12369621,
+          "to": 15000000,
+          "count": 10,
+          "size": 500
+        }
+      ],
+      "expectedRequestEstimate": 60000,
+      "notes": ">1k-children factory stress (UniswapV3Factory), eth 10×500."
+    },
+    {
+      "id": "E-eth",
+      "app": "euler",
+      "chain": "eth",
+      "chainId": 1,
+      "sourceTypes": ["factory", "logs", "receipts"],
+      "receipts": true,
+      "windows": [
+        { "strategy": "format-era", "chainId": 1, "span": 50 },
+        {
+          "strategy": "chunk-grid",
+          "from": 20500000,
+          "to": 22000000,
+          "chunk": 500000,
+          "delta": 2
+        },
+        { "strategy": "deploy-floor", "deploy": 20529207, "pad": 100 },
+        { "from": 20529000, "to": 20529100, "tag": "empty-pre-deploy" },
+        { "strategy": "frontier", "span": 30 }
+      ],
+      "expectedRequestEstimate": 8000,
+      "notes": "Edge/boundary set (~12 windows): format eras (pre-Byzantium receipts, Merge, blob/type-3, type-4), chunk-grid edges ±2, deploy floor, an empty pre-deploy range, and the live-head frontier."
+    },
+    {
+      "id": "R",
+      "runner": "differential",
+      "sourceTypes": ["raw"],
+      "chains": ["eth", "base", "arbitrum", "polygon", "bsc", "avalanche"],
+      "spotsPerChain": 30,
+      "notes": "Evidence layer: raw breadth via harness/compare/differential.ts (all 6 slugs × 30 spots). Handled by that tool, NOT run-cell.sh — run-cell.sh skips 'differential' cells with a pointer."
+    }
+  ]
+}
