@@ -207,6 +207,7 @@ export const createPortalHistoricalSync = (
 
   const stats = {
     dataChunks: 0,
+    extends: 0, // frontier chunks re-fetched over a newly-finalized tail (partial, not a fresh chunk)
     discChunks: 0,
     http: 0,
     logs: 0,
@@ -227,6 +228,11 @@ export const createPortalHistoricalSync = (
   };
   const dataCache = new Map<number, Promise<ChunkData>>(); // keyed by chunk index
   const chunkRows = new Map<number, number>(); // idx → buffered row count, for the global memory budget
+  // idx → the block this cached chunk was actually fetched THROUGH. The FRONTIER chunk (grid end past
+  // Portal's finalized head) is fetched TRUNCATED at the head (chunkRange clamps `to` to portalHead);
+  // when the head later advances, a chunk whose coveredTo < its now-desired end must be EXTENDED before
+  // it's served — else the interval reaching into (coveredTo, need] is marked synced over a silent gap.
+  const chunkCoveredTo = new Map<number, number>();
   let discoveredThrough = -1; // high-water block covered by the single wide factory-discovery scan
   let discoveryP: Promise<void> = Promise.resolve(); // the (lazily extended) discovery scan promise
   // Children discovered by the wide scan but NOT yet persisted. Ponder's core marks
@@ -313,6 +319,7 @@ export const createPortalHistoricalSync = (
           portalFinalizedHead: portalHead ?? null,
           fetch: {
             dataChunks: stats.dataChunks,
+            extends: stats.extends,
             discChunks: stats.discChunks,
             http: stats.http,
             bytes: stats.bytes,
@@ -1016,27 +1023,23 @@ export const createPortalHistoricalSync = (
     factories: any[],
     filters: LogFilter[],
   ): Promise<ChunkData> {
-    let p = dataCache.get(idx);
-    if (p) {
-      stats.cacheHits++;
-      return p;
-    }
-    p = (async () => {
-      await ensureDiscoveredThrough(idx, factories); // correctness: children ≤ this chunk are known
-      stats.dataChunks++;
-      const [from, to] = chunkRange(idx);
+    // Desired coverage RIGHT NOW: grid end clamped to the live backfill end / portal head. For a fully
+    // finalized chunk this equals the grid end and never grows; for the FRONTIER chunk it grows as the
+    // Portal head advances — which is what drives the extend path below.
+    const [gridFrom, desiredTo] = chunkRange(idx);
+
+    // Stream this chunk's four source shapes over [from,to] and MERGE into `data`. Append-only: the
+    // extend path calls this AGAIN for a disjoint tail (coveredTo, desiredTo], so it must add to — never
+    // reset — the maps. Each call raises its own crash on a needed-but-missing field within ITS range.
+    const runStreams = async (
+      data: ChunkData,
+      from: number,
+      to: number,
+    ): Promise<void> => {
       const logRequests = mergeLogRequests(
         filters.flatMap((f) => logRequestsFor(f)),
       ).map((r) => ({ ...r, transaction: true }));
-      const data: ChunkData = {
-        headers: new Map(),
-        logs: new Map(),
-        txs: new Map(),
-        traceBlocks: new Map(),
-        blockHeaders: new Map(),
-        txBlocks: new Map(),
-      };
-      const neededMissing = new Set<string>(); // needed fields the dataset lacked on THIS chunk
+      const neededMissing = new Set<string>(); // needed fields the dataset lacked on THIS range
       if (logRequests.length > 0) {
         const q = {
           type: "evm",
@@ -1160,15 +1163,62 @@ export const createPortalHistoricalSync = (
           `Portal dataset for ${args.chain.name} is missing [${[...neededMissing].join(", ")}] on blocks [${from},${to}], which contain matched data your indexer needs — a Portal dataset-completeness gap. Failing fast rather than serving incomplete data; report the gap to SQD, or start your indexer past the affected range.`,
         );
       }
-      // register this chunk's buffered size with the GLOBAL memory budget (freed when evicted).
+    };
+
+    // Reconcile this chunk's buffered-row count with the GLOBAL memory budget by DELTA, so an extend
+    // adds only its NEW rows (the whole count is freed when the chunk is evicted).
+    const account = (data: ChunkData): void => {
       let rc = data.blockHeaders.size;
       for (const a of data.logs.values()) rc += a.length;
       for (const a of data.txs.values()) rc += a.length;
       for (const b of data.traceBlocks.values())
         rc += b.traces.length + b.txs.length;
       for (const b of data.txBlocks.values()) rc += b.txs.length;
+      const prev = chunkRows.get(idx) ?? 0;
       chunkRows.set(idx, rc);
-      portalGate.addRows(rc);
+      portalGate.addRows(rc - prev);
+    };
+
+    const cached = dataCache.get(idx);
+    if (cached) {
+      // coveredTo is set in lockstep with every dataCache entry (fresh, extend, clear, evict), so a
+      // cached chunk always has one; the ?? fallback treats an (unreachable) missing entry as "fully
+      // covered" — i.e. reverts to a blind cache hit, never a spurious extend.
+      const coveredTo = chunkCoveredTo.get(idx) ?? Number.POSITIVE_INFINITY;
+      if (desiredTo <= coveredTo) {
+        stats.cacheHits++;
+        return cached;
+      }
+
+      // Frontier chunk cached truncated at a head that has since advanced → EXTEND it: fetch ONLY the
+      // newly finalized tail (coveredTo, desiredTo] and merge, instead of serving the stale gapped chunk.
+      stats.extends++;
+      chunkCoveredTo.set(idx, desiredTo); // optimistic high-water so concurrent callers don't double-extend
+      const extended = (async () => {
+        const data = await cached;
+        await ensureDiscoveredThrough(idx, factories); // discovery must reach the extended tail too
+        await runStreams(data, coveredTo + 1, desiredTo);
+        account(data);
+        return data;
+      })();
+      dataCache.set(idx, extended);
+      return extended;
+    }
+
+    chunkCoveredTo.set(idx, desiredTo);
+    const p = (async () => {
+      await ensureDiscoveredThrough(idx, factories); // correctness: children ≤ this chunk are known
+      stats.dataChunks++;
+      const data: ChunkData = {
+        headers: new Map(),
+        logs: new Map(),
+        txs: new Map(),
+        traceBlocks: new Map(),
+        blockHeaders: new Map(),
+        txBlocks: new Map(),
+      };
+      await runStreams(data, gridFrom, desiredTo);
+      account(data);
       return data;
     })();
     dataCache.set(idx, p);
@@ -1331,6 +1381,7 @@ export const createPortalHistoricalSync = (
         dataCache.clear();
         for (const r of chunkRows.values()) portalGate.freeRows(r);
         chunkRows.clear();
+        chunkCoveredTo.clear();
         discStartIdx = undefined;
         discoveredThrough = -1;
         discoveryP = Promise.resolve();
@@ -1507,6 +1558,7 @@ export const createPortalHistoricalSync = (
           dataCache.delete(i);
           portalGate.freeRows(chunkRows.get(i) ?? 0);
           chunkRows.delete(i);
+          chunkCoveredTo.delete(i);
         } // evict behind + free its memory budget
 
       const syncTraces = needTraces
@@ -1542,7 +1594,7 @@ export const createPortalHistoricalSync = (
 
       log.debug({
         service: "portal",
-        msg: `Portal ${args.chain.name} [${interval[0]},${interval[1]}]: ${syncLogs.length} logs (dataChunks=${stats.dataChunks} discChunks=${stats.discChunks} http=${stats.http} hits=${stats.cacheHits} inflight=${stats.maxInflight} err=${stats.errors})`,
+        msg: `Portal ${args.chain.name} [${interval[0]},${interval[1]}]: ${syncLogs.length} logs (dataChunks=${stats.dataChunks} extends=${stats.extends} discChunks=${stats.discChunks} http=${stats.http} hits=${stats.cacheHits} inflight=${stats.maxInflight} err=${stats.errors})`,
       });
       return syncLogs;
     },

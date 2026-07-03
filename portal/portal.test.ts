@@ -1534,3 +1534,122 @@ test("guard: an over-limit request body fails loud with the explicit size driver
     srv.close();
   }
 });
+
+test('regression: frontier chunk truncated at a lagging Portal head is EXTENDED when the head advances (no silent gap)', async () => {
+  // The FRONTIER chunk (grid end past Portal's finalized head) is fetched TRUNCATED at the head, then
+  // cached by idx ALONE. If the head later advances and a LATER interval in the SAME chunk reaches into
+  // the newly-finalized tail, a blind cache hit would serve the stale truncated chunk — and the interval
+  // is marked synced with ZERO data over (oldHead, need]: a permanent silent gap. The fix records how far
+  // each chunk was fetched (coveredTo) and EXTENDS it (streams only the new tail) before serving past it.
+  // Reproduces the tail-of-backfill case where the Portal head catches up mid-run.
+  delete process.env.PORTAL_FINALIZED_HEAD; // let refreshPortalHead PROBE the mock so the head can advance
+  // PORTAL_CHUNK_FIXED stays "1" (beforeEach) → chunkBlocks = 500k, so blocks 50 & 150 share chunk 0,
+  // whose grid end (499_999) is far past both heads → chunk 0 is the frontier chunk.
+
+  const A_BLOCK = 50; // ≤ head H1 → interval A caches chunk 0 truncated at [0, H1]
+  const H1 = 100;
+  const B_BLOCK = 150; // ∈ (H1, H2] → interval B needs the newly-finalized tail of chunk 0
+  const H2 = 200;
+  let head = H1;
+
+  const hashOf = (n: number) => `0x${n.toString(16).padStart(64, '0')}`;
+  const txHashOf = (n: number) =>
+    `0x${(n + 1_000_000).toString(16).padStart(64, '0')}`;
+  const mkBlock = (n: number) => ({
+    ...FIXTURE_BLOCK,
+    header: { ...FIXTURE_BLOCK.header, number: n, hash: hashOf(n) },
+    logs: [{ ...FIXTURE_BLOCK.logs[0], transactionHash: txHashOf(n) }],
+    transactions: [{ ...FIXTURE_BLOCK.transactions[0], hash: txHashOf(n) }],
+  });
+
+  const srv = http.createServer((req, res) => {
+    let body = '';
+    req.on('data', (c) => {
+      body += c;
+    });
+    req.on('end', () => {
+      if (req.url?.includes('finalized-head')) {
+        res.writeHead(200, { 'content-type': 'application/json' });
+        res.end(JSON.stringify({ number: head }));
+        return;
+      }
+      const q = body ? JSON.parse(body) : {};
+      const from = q.fromBlock ?? 0;
+      const to = q.toBlock ?? 1e12;
+      const out = [A_BLOCK, B_BLOCK]
+        .filter((n) => from <= n && to >= n)
+        .map(mkBlock);
+      if (out.length === 0) {
+        res.writeHead(204).end();
+        return;
+      }
+      res.writeHead(200, { 'content-type': 'application/x-ndjson' });
+      res.end(out.map((b) => JSON.stringify(b)).join('\n') + '\n');
+    });
+  });
+  const p: number = await new Promise((r) =>
+    srv.listen(0, () => r((srv.address() as AddressInfo).port)),
+  );
+
+  try {
+    const inserted = { logs: [] as any[] };
+    const syncStore: any = {
+      insertLogs: (x: any) => inserted.logs.push(...x.logs),
+      insertBlocks: () => {},
+      insertTransactions: () => {},
+      insertTransactionReceipts: () => {},
+      insertTraces: () => {},
+    };
+    const filter: any = {
+      type: 'log',
+      chainId: 1,
+      sourceId: 's',
+      address: VAULT,
+      topic0: DEPOSIT_TOPIC0,
+      topic1: null,
+      topic2: null,
+      topic3: null,
+      fromBlock: 0,
+      toBlock: undefined, // UNBOUNDED backfill → chunkRange clamps the chunk end to the Portal head
+      hasTransactionReceipt: false,
+      include: [],
+    };
+    const sync = createPortalHistoricalSync({
+      common: {
+        logger: { debug() {}, info() {}, warn() {}, error() {}, trace() {} },
+      } as any,
+      chain: { id: 1, name: 'mainnet', portal: `http://localhost:${p}` } as any,
+      childAddresses: new Map(),
+      eventCallbacks: [{ filter }],
+    } as any);
+
+    // interval A ends at block 50 ≤ head H1 → chunk 0 fetched + cached truncated at [0, 100].
+    const iA: [number, number] = [A_BLOCK, A_BLOCK];
+    await sync.syncBlockRangeData({
+      interval: iA,
+      requiredIntervals: [{ interval: iA, filter }],
+      requiredFactoryIntervals: [],
+      syncStore,
+    });
+
+    head = H2; // Portal advances mid-run (H1 → H2), finalizing block 150
+
+    // interval B ends at block 150 ∈ (H1, H2] → same chunk 0, past its cached tail. Must EXTEND, not
+    // serve the stale [0, 100] chunk (which never streamed block 150).
+    const iB: [number, number] = [B_BLOCK, B_BLOCK];
+    await sync.syncBlockRangeData({
+      interval: iB,
+      requiredIntervals: [{ interval: iB, filter }],
+      requiredFactoryIntervals: [],
+      syncStore,
+    });
+
+    // BEFORE FIX: dataChunk(0) is a blind idx cache hit → block-150 log never streamed → only 1 log.
+    // AFTER FIX:  coveredTo(100) < desiredTo(200) → chunk 0 extended over (100, 200] → block 150 present.
+    const b150 = inserted.logs.find((l) => l.blockHash === hashOf(B_BLOCK));
+    expect(b150).toBeDefined();
+    expect(inserted.logs).toHaveLength(2);
+  } finally {
+    srv.close();
+  }
+});
