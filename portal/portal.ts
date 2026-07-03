@@ -325,6 +325,7 @@ export const createPortalHistoricalSync = (
       // this architecture): the FRONTIER chunk was fetched TRUNCATED at the then-finalized head; the
       // head has since advanced. Serving the stale cache would mark the interval synced over a silent
       // gap — EXTEND instead: stream ONLY the newly finalized tail (coveredTo, desiredTo] and merge.
+      stats.extends++;
       const extendFrom = cached.coveredTo + 1;
       cached.coveredTo = desiredTo; // optimistic high-water so concurrent callers don't double-extend
       const prev = cached.promise;
@@ -542,7 +543,7 @@ export const createPortalHistoricalSync = (
 
       log.debug({
         service: 'portal',
-        msg: `Portal ${chain.name} [${interval[0]},${interval[1]}]: ${assembled.logs.length} logs (dataChunks=${stats.dataChunks} discChunks=${stats.discChunks} http=${stats.http} hits=${stats.cacheHits} inflight=${stats.maxInflight} err=${stats.errors})`,
+        msg: `Portal ${chain.name} [${interval[0]},${interval[1]}]: ${assembled.logs.length} logs (dataChunks=${stats.dataChunks} extends=${stats.extends} discChunks=${stats.discChunks} http=${stats.http} hits=${stats.cacheHits} inflight=${stats.maxInflight} err=${stats.errors})`,
       });
       return assembled.logs;
     },

@@ -247,9 +247,10 @@ test('G3: buffered rows are visible to the gate MID-CHUNK (registered per arrivi
   }
 });
 
-// ── INV-13 frontier extend (adapted from PR #5 — same fix, this architecture) ───────────────────────
+// ── INV-13 frontier extend: TAIL-ONLY angle (outcome parity itself is pinned by main's #5 test in
+// portal.test.ts, which passes unchanged against this architecture) ─────────────────────────────────
 
-test('frontier chunk truncated at a lagging Portal head is EXTENDED when the head advances (no silent gap)', async () => {
+test('frontier extend streams ONLY the newly-finalized tail (the extend request starts at coveredTo+1)', async () => {
   delete process.env.PORTAL_FINALIZED_HEAD; // let refreshPortalHead PROBE the mock so the head can advance
   const A_BLOCK = 50; //  ≤ head H1 → interval A caches chunk 0 truncated at [0, H1]
   const H1 = 100;

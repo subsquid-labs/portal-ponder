@@ -10,6 +10,7 @@ import { createStats, writeMetrics } from './portal-metrics.js';
 test('writeMetrics: the metrics file matches the documented shape field-for-field', () => {
   const stats = createStats();
   stats.dataChunks = 3;
+  stats.extends = 1;
   stats.discChunks = 2;
   stats.http = 7;
   stats.bytes = 1234;
@@ -56,6 +57,7 @@ test('writeMetrics: the metrics file matches the documented shape field-for-fiel
       portalFinalizedHead: 21_000_000,
       fetch: {
         dataChunks: 3,
+        extends: 1,
         discChunks: 2,
         http: 7,
         bytes: 1234,

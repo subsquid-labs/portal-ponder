@@ -13,6 +13,8 @@ import type { Gate } from './portal-gate.js';
 /** Mutable per-chain counters accumulated across a backfill. */
 export type PortalStats = {
   dataChunks: number;
+  /** frontier chunks re-fetched over a newly-finalized tail (partial, not a fresh chunk) */
+  extends: number;
   discChunks: number;
   http: number;
   logs: number;
@@ -34,6 +36,7 @@ export type PortalStats = {
 
 export const createStats = (): PortalStats => ({
   dataChunks: 0,
+  extends: 0,
   discChunks: 0,
   http: 0,
   logs: 0,
@@ -84,6 +87,7 @@ export function writeMetrics(args: {
         portalFinalizedHead: portalHead ?? null,
         fetch: {
           dataChunks: stats.dataChunks,
+          extends: stats.extends,
           discChunks: stats.discChunks,
           http: stats.http,
           bytes: stats.bytes,
