@@ -15,5 +15,20 @@ export default defineConfig({
       'src/sync-historical/realtime*.test.ts',
     ],
     testTimeout: 15000,
+    // Coverage is scoped to the Portal layer (the whole diff vs upstream ponder). Inert on a plain
+    // `--test` run: it only activates under `--coverage` (see scripts/sync-upstream.sh --coverage),
+    // so the normal path needs no coverage provider installed.
+    coverage: {
+      provider: 'v8',
+      reporter: ['json-summary', 'text-summary'],
+      reportsDirectory: 'portal-coverage',
+      include: [
+        'src/sync-historical/portal.ts',
+        'src/sync-historical/portal-transform.ts',
+        'src/sync-historical/portal-realtime.ts',
+        'src/sync-historical/portal-realtime-wire.ts',
+        'src/sync-historical/realtime.ts',
+      ],
+    },
   },
 });
