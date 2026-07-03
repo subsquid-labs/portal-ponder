@@ -40,6 +40,16 @@ case "$TRIGGER" in
 esac
 
 WORK="$(mktemp -d)"
+# Cleanup on ANY exit (completion, interrupt, InvariantViolation-stop): remove the throwaway install
+# workspace and the per-attempt run logs. The chaos store ($DB) is intentionally kept (verify-resume
+# reads it). Set KEEP_WORKSPACES=1 to retain the workspace + logs for debugging.
+ATTEMPT_LOG_GLOB="/tmp/chaos-attempt-*.log"
+cleanup () {
+  [ -n "${KEEP_WORKSPACES:-}" ] && return
+  rm -rf "$WORK"
+  rm -f $ATTEMPT_LOG_GLOB
+}
+trap cleanup EXIT INT TERM
 cp -r "$APP/." "$WORK/"
 cd "$WORK"
 [ -n "${SQD_PONDER_TARBALL:-}" ] && node -e "const p=require('./package.json');p.dependencies['@subsquid/ponder']='file:'+process.env.SQD_PONDER_TARBALL;require('fs').writeFileSync('package.json',JSON.stringify(p,null,2))"
@@ -85,7 +95,9 @@ while [ "$DONE" = 0 ] && [ "$kills" -lt "$MAX_KILLS" ]; do
   fi
 
   if crashed_invariant "$LOG"; then
-    echo "  ✗ InvariantViolation in attempt $attempt — STOP (see $LOG)"; kill -9 -"$PGID" 2>/dev/null; exit 1
+    # a real failure to investigate — preserve the log past the cleanup trap by moving it aside
+    KEEP_LOG="$(mktemp /tmp/chaos-invariant-XXXXXX.log)"; cp "$LOG" "$KEEP_LOG"
+    echo "  ✗ InvariantViolation in attempt $attempt — STOP (see $KEEP_LOG)"; kill -9 -"$PGID" 2>/dev/null; exit 1
   fi
 
   if [ "$DONE" = 1 ]; then

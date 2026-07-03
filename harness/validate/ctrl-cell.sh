@@ -36,8 +36,18 @@ fi
 METER_PORT="$(( 8900 + (RANDOM % 300) ))"
 METER_TARGET="$RPC_TARGET" METER_PORT="$METER_PORT" node "$VDIR/rpc-meter.mjs" &
 METER_PID=$!
-cleanup () { kill "$METER_PID" 2>/dev/null; pkill -f 'ponder start --schema ctrl_' 2>/dev/null; }
-trap cleanup EXIT
+# Cleanup on ANY exit (including interrupt mid-window): kill the meter + backfills and remove the
+# current window's throwaway workspace and temp files. Set KEEP_WORKSPACES=1 to retain them.
+WORK=""
+wlog=""
+cleanup () {
+  kill "$METER_PID" 2>/dev/null
+  pkill -f 'ponder start --schema ctrl_' 2>/dev/null
+  [ -n "${KEEP_WORKSPACES:-}" ] && return
+  [ -n "$WORK" ] && rm -rf "$WORK"
+  [ -n "$wlog" ] && rm -f "$wlog" "$wlog.tail"
+}
+trap cleanup EXIT INT TERM
 for _ in $(seq 1 40); do curl -sf "http://127.0.0.1:$METER_PORT/__count" >/dev/null 2>&1 && break; sleep 0.25; done
 
 # install a workspace whose @subsquid/ponder resolves to $2 (a file: tarball or npm:ponder alias)
@@ -90,7 +100,7 @@ for spec in $CELL_WINDOWS; do
   tail -30 "$wlog" > "$wlog.tail"
   node "$VDIR/record-result.mjs" "$CELL" "$tag" "$FROM" "$TO" "$pass" "$requests" "$dur" "$matched" 0 "$wlog.tail"
   echo "  $([ $pass = 1 ] && echo 'PASS (fork-portal-unset ≡ upstream)' || echo FAIL)  requests=$requests  ${dur}s"
-  rm -rf "$WORK" "$wlog" "$wlog.tail"
+  [ -n "${KEEP_WORKSPACES:-}" ] || rm -rf "$WORK" "$wlog" "$wlog.tail"
 done
 
 echo "▶ CTRL done. results/$CELL.json"

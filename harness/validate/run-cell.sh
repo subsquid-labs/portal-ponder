@@ -66,8 +66,17 @@ METER_PORT="$(( 8600 + (RANDOM % 300) ))"
 METER_FILE="$(mktemp)"
 METER_TARGET="$RPC_TARGET" METER_PORT="$METER_PORT" METER_FILE="$METER_FILE" node "$VDIR/rpc-meter.mjs" &
 METER_PID=$!
-cleanup () { kill "$METER_PID" 2>/dev/null; pkill -f 'ponder start --schema diff_' 2>/dev/null; rm -f "$METER_FILE"; }
-trap cleanup EXIT
+# WINDOW_TMP tracks the in-flight window's tmpfiles so an interrupt mid-window does not leak them
+# (each window normally removes its own on the happy path). Set KEEP_WORKSPACES=1 to retain.
+WINDOW_TMP=""
+cleanup () {
+  kill "$METER_PID" 2>/dev/null
+  pkill -f 'ponder start --schema diff_' 2>/dev/null
+  [ -n "${KEEP_WORKSPACES:-}" ] && return
+  rm -f "$METER_FILE"
+  [ -n "$WINDOW_TMP" ] && rm -f $WINDOW_TMP
+}
+trap cleanup EXIT INT TERM
 
 for _ in $(seq 1 40); do curl -sf "http://127.0.0.1:$METER_PORT/__count" >/dev/null 2>&1 && break; sleep 0.25; done
 curl -sf "http://127.0.0.1:$METER_PORT/__count" >/dev/null 2>&1 || { echo "✗ meter did not start on :$METER_PORT"; exit 1; }
@@ -79,6 +88,7 @@ meter_total () { curl -sf "http://127.0.0.1:$METER_PORT/__count" | node -e 'let 
 run_window () {
   local from="$1" to="$2" tag="$3" shrunk="$4"
   local wlog; wlog="$(mktemp)"
+  WINDOW_TMP="$wlog $wlog.tail"
 
   # budget guard — refuse to START a window once the campaign has met the ceiling
   node "$VDIR/budget-sum.mjs" --check >/dev/null || { echo "✗ BUDGET: refusing to start $CELL/$tag"; return 3; }
@@ -113,15 +123,22 @@ run_window () {
   echo "    $([ $pass = 1 ] && echo PASS || echo FAIL)  requests=$requests  ${dur}s  matched=$matched"
   [ $pass = 1 ] || { echo "    ── diff/run tail ──"; sed 's/^/    /' "$wlog.tail"; }
 
-  # auto-shrink: a dense window (> threshold matched rows) is halved and re-run once
+  # window status carries the diff verdict up to `exit $fail`: a FAILing window (pass=0) MUST make
+  # the cell fail. Without this, run_window always returned 0 and cell exit status was always 0 —
+  # a data-mismatch was recorded as pass=false in the json yet the script exited "success".
+  local wstatus=0
+  [ $pass = 1 ] || wstatus=1
+
+  # auto-shrink: a dense window (> threshold matched rows) is halved and re-run once. The shrunk
+  # sub-run's failure propagates too.
   if [ "$shrunk" = "0" ] && [ -n "$CELL_SHRINK" ] && [ "$matched" != "nan" ] && [ "$matched" -gt "$CELL_SHRINK" ] 2>/dev/null; then
     local half=$(( (to - from) / 2 ))
     echo "    ↳ auto-shrink: $matched > $CELL_SHRINK matched rows → halving to [$from,$(( from + half ))]"
-    run_window "$from" "$(( from + half ))" "$tag+shrunk" 1
+    run_window "$from" "$(( from + half ))" "$tag+shrunk" 1 || wstatus=1
   fi
 
-  rm -f "$wlog" "$wlog.tail"
-  return 0
+  [ -n "${KEEP_WORKSPACES:-}" ] || rm -f "$wlog" "$wlog.tail"
+  return $wstatus
 }
 
 fail=0

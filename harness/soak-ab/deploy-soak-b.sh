@@ -27,19 +27,24 @@ MEM_MAX="${SOAK_B_MEM_MAX:-8G}"
 UNIT_DIR="${SYSTEMD_DIR:-/etc/systemd/system}"
 RESTART_LOG="${SOAK_B_RESTART_LOG:-$HOME/soak-b-restarts.log}"
 RESTART_LOG_DIR="$(dirname "$RESTART_LOG")"
+# The unit runs UNPRIVILEGED. Default to the invoking operator's own account (resolved live), never
+# root and never a name baked into the committed unit template.
+RUN_USER="${SOAK_B_USER:-$(id -un)}"
+RUN_GROUP="${SOAK_B_GROUP:-$(id -gn)}"
 
 HERE="$(cd "$(dirname "$0")" && pwd)"
 
 # ── GUARDRAILS ── absolute refusals, checked before anything is created ──
 [ "$DB_NAME" = "euler_rt_b" ] || { echo "✗ GUARDRAIL: DB name must be euler_rt_b (got $DB_NAME)"; exit 1; }
 [ "$PORT" != "9547" ] || { echo "✗ GUARDRAIL: :9547 is the euler prod port — refusing"; exit 1; }
+[ "$RUN_USER" != "root" ] || { echo "✗ GUARDRAIL: refusing to run the soak as root — set SOAK_B_USER"; exit 1; }
 case "$SOAK_A_ENV" in *euler-rt.env|*.env) : ;; *) echo "✗ SOAK_A_ENV must be an .env file"; exit 1 ;; esac
 if grep -qiE 'DATABASE_URL=.*/euler(\b|["'\'' ])' "$SOAK_A_ENV" 2>/dev/null; then
   : # Soak A's env legitimately references its own DB; we DERIVE a new one below and never reuse it.
 fi
 
 echo "▶ Soak B deploy (BUILD-ONLY, will not start)"
-echo "  db=$DB_NAME port=$PORT workdir=$WORKDIR unit=$UNIT_DIR/soak-b.service"
+echo "  db=$DB_NAME port=$PORT workdir=$WORKDIR user=$RUN_USER unit=$UNIT_DIR/soak-b.service"
 
 # ── 1. workspace: copy Soak A's app config, swap in the pinned tarball ──
 mkdir -p "$WORKDIR"
@@ -96,6 +101,8 @@ RENDER="$(mktemp)"
 sed -e "s#@@WORKDIR@@#${WORKDIR}#g" \
     -e "s#@@ENVFILE@@#${ENVFILE}#g" \
     -e "s#@@PORT@@#${PORT}#g" \
+    -e "s#@@USER@@#${RUN_USER}#g" \
+    -e "s#@@GROUP@@#${RUN_GROUP}#g" \
     -e "s#@@MEM_HIGH@@#${MEM_HIGH}#g" \
     -e "s#@@MEM_MAX@@#${MEM_MAX}#g" \
     -e "s#@@RESTART_LOG@@#${RESTART_LOG}#g" \

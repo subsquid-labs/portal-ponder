@@ -12,6 +12,12 @@ Wants=network-online.target
 
 [Service]
 Type=simple
+
+# Run as an UNPRIVILEGED account, never root. Rendered by deploy-soak-b.sh from $SOAK_B_USER
+# (default: the invoking operator's own login, resolved at deploy time — never hard-coded here).
+User=@@USER@@
+Group=@@GROUP@@
+
 WorkingDirectory=@@WORKDIR@@
 
 # All secrets + tunables live in this chmod-600 file (PORTAL_API_KEY, SQD_RPC_KEY, DATABASE_URL, …).
@@ -47,9 +53,19 @@ RestartSec=10
 KillSignal=SIGTERM
 TimeoutStopSec=30
 
+# Hardening: unprivileged, no new privileges, minimal filesystem + kernel surface. The process only
+# needs its workdir and the restart-log dir writable; everything else is read-only or hidden.
 NoNewPrivileges=true
 ProtectSystem=strict
+ProtectHome=read-only
 ReadWritePaths=@@WORKDIR@@ @@RESTART_LOG_DIR@@
+PrivateTmp=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+RestrictRealtime=true
+LockPersonality=true
 
 [Install]
 WantedBy=multi-user.target
