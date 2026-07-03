@@ -67,10 +67,11 @@ if [ "${2:-}" = "--test" ]; then
   # because renaming the core to @subsquid/ponder orphans sibling workspace packages (e.g. benchmark's
   # `ponder@workspace:*`), so a lockfile re-resolve (which a new package.json dep would force) fails.
   echo "▶ provisioning fast-check (dev-only, for the property tests)"
-  # OUTSIDE the clone so npm doesn't walk up into the pnpm workspace root.
+  # OUTSIDE the clone so npm doesn't walk up into the pnpm workspace root. Pinned exactly for
+  # reproducible CI; the whole resolved tree is copied so transitive deps can never be missed.
   FCDIR="$(mktemp -d)"
-  ( cd "$FCDIR" && npm init -y >/dev/null 2>&1 && npm install --no-audit --no-fund --silent fast-check@^3 )
-  cp -R "$FCDIR/node_modules/fast-check" "$FCDIR/node_modules/pure-rand" "$CORE/node_modules/"
+  ( cd "$FCDIR" && npm init -y >/dev/null 2>&1 && npm install --no-audit --no-fund --silent fast-check@3.23.2 )
+  cp -R "$FCDIR/node_modules/." "$CORE/node_modules/"
   rm -rf "$FCDIR"
   echo "▶ running Portal-layer tests"
   ( cd "$CORE" && pnpm exec vitest run --config vite.portal.config.ts )
