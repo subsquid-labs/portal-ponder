@@ -30,10 +30,11 @@ export class PortalHttpError extends Error {
 
 /**
  * A throttle / congestion response (HTTP 429/5xx/409 on the finalized stream, or a
- * timed-out/reset connection). `retryAfterMs` is the server-advised back-off in ms:
- * `0` when no numeric Retry-After header is present (retry promptly), a positive value
- * when advised, and `undefined` only when the header is a non-numeric HTTP-date — in
- * which case the response is NOT retried (mirrors the original behaviour exactly).
+ * timed-out/reset connection). Always retryable. `retryAfterMs` is the server-advised
+ * back-off in ms (see `parseRetryAfterMs`): a strictly-positive value from a delta-seconds
+ * OR an HTTP-date header when the server advised one, else `undefined` — meaning "no useful
+ * advice", so the caller falls back to exponential back-off (NOT a hard throw, and NOT a
+ * zero-wait retry). (issue #9)
  */
 export class PortalThrottleError extends Error {
   readonly status: number | undefined;
@@ -135,8 +136,13 @@ export function isNetworkError(err: unknown): boolean {
   );
 }
 
-/** The full retryable set: network noise plus throttle responses carrying a concrete back-off. */
+/**
+ * The full retryable set: network noise plus EVERY throttle response. A 429/5xx/409 is always retryable —
+ * the back-off (advised `retryAfterMs` vs exponential) is chosen at the retry site, but the decision to
+ * retry never depends on the Retry-After header parsing (a missing/garbage header must not turn a throttle
+ * into a hard throw). (issue #9)
+ */
 export function isTransientError(err: unknown): boolean {
-  if (err instanceof PortalThrottleError) return err.retryAfterMs !== undefined;
+  if (err instanceof PortalThrottleError) return true;
   return isNetworkError(err);
 }

@@ -249,6 +249,60 @@ test('INV-3/G2 interleaving: a successor extension rejects when its in-flight pr
   expect(childAddresses.get('f')!.get('0xaaa' as Address)).toBe(CHILD_AT);
 });
 
+// ── reset() generation guard: a scan invalidated by a mid-scan reset never advances the watermark ────
+// (issue #9) reset() forgets the floor + watermark (a dense-source grid reset). A scan that was already
+// in flight must not, on its late completion, advance `confirmed` past the reset — because a subsequent
+// failure would then roll `through` up to that stale watermark, certifying coverage the new grid never
+// scanned. Latent today (reset only fires before any scan exists); the generation stamp closes it.
+
+test('reset() during an in-flight scan: the stale completion never advances the confirmed watermark (issue #9)', async () => {
+  let release: (() => void) | undefined;
+  let failNext = false;
+  const client: PortalClient = {
+    finalizedHead: async () => undefined,
+    finalizedHeadRetry: async () => undefined,
+    async *stream(_q, from, to) {
+      if (failNext) throw new Error('scan failed');
+
+      // hold the FIRST scan open until the test releases it (so reset() can fire mid-scan)
+      if (release === undefined)
+        await new Promise<void>((r) => {
+          release = r;
+        });
+
+      if (from <= 42 && to >= 42) yield [proxy('0xaaa', 42)] as any;
+    },
+  };
+  const childAddresses: ChildAddresses = new Map([
+    ['f', new Map<Address, number>()],
+  ]);
+  const d = createDiscovery({
+    client,
+    childAddresses,
+    factories: [factory()],
+    discoveryWindows: 1,
+    stats: createStats(),
+  });
+  d.setFloor(0);
+
+  const p = d.ensure(500, { chunkBlocks: 1000, endHint: 500 }); // scans [0,500], held open
+  while (release === undefined) await new Promise((r) => setTimeout(r, 1));
+
+  d.reset(); // a grid reset fires WHILE the scan is in flight
+  expect(d.snapshot().through).toBe(-1); // reset cleared the optimistic watermark
+  release!(); // the stale scan now completes AFTER the reset
+  await p;
+
+  // The exact corruption issue #9 describes: were the stale completion allowed to set `confirmed = 500`,
+  // this later FAILING scan would roll `through` up to 500 — certifying [0,500] covered when it was not.
+  failNext = true;
+  d.setFloor(0);
+  await expect(
+    d.ensure(300, { chunkBlocks: 1000, endHint: 300 }),
+  ).rejects.toThrow('scan failed');
+  expect(d.through()).toBe(-1); // fixed: -1 (stale completion ignored); buggy: 500 (rolled up to stale)
+});
+
 test('INV-3 property: random ensures + injected window failures → coverage below through() is always complete; retry converges', async () => {
   await fc.assert(
     fc.asyncProperty(

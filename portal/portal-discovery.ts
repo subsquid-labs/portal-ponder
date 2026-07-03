@@ -120,6 +120,12 @@ export function createDiscovery(deps: DiscoveryDeps): Discovery {
   let confirmed = -1; // last SUCCESSFUL watermark (rollback target)
   let status: DiscoveryStatus = 'idle';
   let inflight: Promise<void> = Promise.resolve();
+  // Bumped by reset(). Each scan captures the generation at plan time; a scan that resolves OR rejects
+  // after a reset changed the generation must NOT touch the watermark. Otherwise a stale success advances
+  // `confirmed` past the reset, and a later failure rolls `through` up to that stale watermark — certifying
+  // coverage over a range the post-reset grid never scanned (issue #9). Latent today (reset fires only
+  // before any scan exists), guarded cheaply so a future caller that resets mid-scan stays correct.
+  let generation = 0;
   // INV-15: children discovered by the wide scan but NOT yet persisted. Ponder's core marks
   // requiredFactoryIntervals cached after EVERY interval and on startup loads children ONLY from the
   // store (no re-derivation from logs) — so a factory interval marked cached MUST have its children in
@@ -225,6 +231,7 @@ export function createDiscovery(deps: DiscoveryDeps): Discovery {
     if (plan === null) return inflight; // no floor yet OR already covered
     const { to, windows } = plan;
     const earlier = inflight;
+    const gen = generation; // stamp: a reset() after this point invalidates this scan
     through = to; // optimistic advance so concurrent ensures dedup onto one scan
     status = 'scanning';
     const p = (async () => {
@@ -237,6 +244,8 @@ export function createDiscovery(deps: DiscoveryDeps): Discovery {
       await earlier;
       stats.discChunks += windows.length;
       await Promise.all(windows.map(([lo, hi]) => scanWindow(lo, hi)));
+      if (gen !== generation) return; // a reset() invalidated this scan — never confirm over it (issue #9)
+
       confirmed = to; // INV-3: advance the confirmed watermark ONLY on success (never past a gap)
       status = 'idle';
     })();
@@ -244,6 +253,8 @@ export function createDiscovery(deps: DiscoveryDeps): Discovery {
     // On failure roll the optimistic watermark back to the last good one and drop the rejected promise so
     // a later ensure re-plans (the awaiting data chunk still sees `p` reject and retries).
     p.catch(() => {
+      if (gen !== generation) return; // invalidated by reset() — leave the post-reset state untouched (issue #9)
+
       through = confirmed;
       status = 'failed';
       if (inflight === p) inflight = Promise.resolve();
@@ -263,6 +274,7 @@ export function createDiscovery(deps: DiscoveryDeps): Discovery {
       confirmed = -1;
       status = 'idle';
       inflight = Promise.resolve();
+      generation++; // invalidate any in-flight scan stamped with the previous generation (issue #9)
     },
     ensure,
     through: () => through,

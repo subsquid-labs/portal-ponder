@@ -185,10 +185,10 @@ test('regression (C1): a 2nd log filter sharing a chunk on a LATER call is still
   const T2 = '0x' + '22'.repeat(32);
   const A1 = '0x' + 'aa'.repeat(20);
   const A2 = '0x' + 'bb'.repeat(20);
-  const TXA = '0x' + 'a1'.repeat(32),
-    TXB = '0x' + 'b2'.repeat(32);
-  const BN1 = 10,
-    BN2 = 11; // both in chunk 0
+  const TXA = '0x' + 'a1'.repeat(32);
+  const TXB = '0x' + 'b2'.repeat(32);
+  const BN1 = 10;
+  const BN2 = 11; // both in chunk 0
 
   const mkBlock = (
     num: number,
@@ -264,8 +264,8 @@ test('regression (C1): a 2nd log filter sharing a chunk on a LATER call is still
         return;
       }
       const q = body ? JSON.parse(body) : {};
-      const from = q.fromBlock ?? 0,
-        to = q.toBlock ?? 1e12;
+      const from = q.fromBlock ?? 0;
+      const to = q.toBlock ?? 1e12;
       const out: any[] = [];
       if (from <= BN1 && to >= BN1 && matches(q.logs, T1, A1))
         out.push(mkBlock(BN1, A1, T1, TXA));
@@ -714,10 +714,10 @@ test('regression (C6): deep matched trace is stored at its FULL-tree pre-order i
   // filter server-side and rank over the matched SUBSET (→ 0). The fake server emulates Portal's
   // callTo filtering, so this fails before the fix (index 0) and passes after (index 7).
   process.env.PORTAL_FINALIZED_HEAD = String(22200011 + 1_000_000); // no finality fallback / no head call
-  const BLOCK = 22200011,
-    TX_INDEX = 111;
-  const TX_HASH = '0x' + '7e'.repeat(32),
-    B_HASH = '0x' + 'b1'.repeat(32);
+  const BLOCK = 22200011;
+  const TX_INDEX = 111;
+  const TX_HASH = '0x' + '7e'.repeat(32);
+  const B_HASH = '0x' + 'b1'.repeat(32);
   const TARGET = '0x000000000000000000000000000000000000dead';
   const OTHER = '0x000000000000000000000000000000000000beef';
   const mkTrace = (traceAddress: number[], to: string, subtraces: number) => ({
@@ -1018,8 +1018,8 @@ const factoryPortalServer = () =>
         return;
       }
       const q = body ? JSON.parse(body) : {};
-      const from = q.fromBlock ?? 0,
-        to = q.toBlock ?? 1e12;
+      const from = q.fromBlock ?? 0;
+      const to = q.toBlock ?? 1e12;
       const matches = (topic0: string, addr: string) =>
         ((q.logs ?? []) as any[]).some(
           (s) =>

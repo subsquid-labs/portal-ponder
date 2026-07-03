@@ -3,6 +3,7 @@ import {
   createPortalClient,
   ndjsonLines,
   type PortalClient,
+  parseRetryAfterMs,
 } from './portal-client.js';
 import { PortalHttpError } from './portal-errors.js';
 import type { PortalQuery } from './portal-filters.js';
@@ -118,7 +119,7 @@ test('body-size guard: over-limit body fails loud with the explicit size driver 
 
 // ── error-mapping matrix ──────────────────────────────────────────────────────────────────────────
 
-test('throttle 429 → retried, then succeeds (retryAfterMs=0 when no header → prompt retry)', async () => {
+test('throttle 429 → retried, then succeeds (a header-less throttle backs off exponentially, not zero)', async () => {
   let n = 0;
   const sleeps: number[] = [];
   const stats = createStats();
@@ -135,7 +136,7 @@ test('throttle 429 → retried, then succeeds (retryAfterMs=0 when no header →
   const out = await collect(client.stream(QUERY, 0, 10));
   expect(out).toHaveLength(1);
   expect(stats.retries).toBe(1);
-  expect(sleeps).toEqual([0]);
+  expect(sleeps).toEqual([1_000]); // 500·2^1 exponential — no advice ⇒ NOT a 0ms prompt retry (issue #9)
 });
 
 test('5xx and 409 are treated as throttle (retried)', async () => {
@@ -288,6 +289,221 @@ test('retry-after: a numeric header sleeps ra*1000 capped at 30s', async () => {
   expect(sleeps).toEqual([2_000, 30_000]); // ra*1000, then min(ra*1000, 30_000)
 });
 
+// ── retry-after: HTTP-date form, zero-backoff, and garbage (issue #9) ──────────────────────────────
+
+test('parseRetryAfterMs: positive advice only; absent / "0" / past-date / garbage ⇒ undefined', () => {
+  const now = Date.parse('2025-01-01T00:00:00Z');
+  expect(parseRetryAfterMs('2', now)).toBe(2_000); //             delta-seconds
+  expect(parseRetryAfterMs(new Date(now + 5_000).toUTCString(), now)).toBe(
+    5_000,
+  ); //                                                            HTTP-date, 5s in the future
+  // everything below carries no usable positive advice ⇒ undefined ⇒ caller uses exponential back-off
+  expect(parseRetryAfterMs(null, now)).toBeUndefined(); //        absent (NOT Number(null)===0 → 0)
+  expect(parseRetryAfterMs('0', now)).toBeUndefined(); //         explicit zero
+  expect(parseRetryAfterMs('-5', now)).toBeUndefined(); //        negative
+  expect(parseRetryAfterMs(new Date(now - 5_000).toUTCString(), now)).toBe(
+    undefined,
+  ); //                                                            already-past HTTP-date
+  expect(parseRetryAfterMs('not-a-date', now)).toBeUndefined(); // garbage
+  // strict RFC-7231 delta-seconds is `1*DIGIT`; the lax `Number()` used to honor these non-conforming
+  // forms as advice. They must NOT be honored — each falls through to Date.parse and ends in exponential
+  // back-off (undefined): "1e3"/"0x10" are not dates; V8 parses "1.5" as a PAST date ⇒ ≤0 delta. (PR #16 review)
+  expect(parseRetryAfterMs('1e3', now)).toBeUndefined(); //       not delta-seconds, not a future date
+  expect(parseRetryAfterMs('0x10', now)).toBeUndefined(); //      hex is not delta-seconds
+  expect(parseRetryAfterMs('1.5', now)).toBeUndefined(); //       fractional ⇒ Date.parse past date ⇒ undefined
+  // surrounding OWS is trimmed (HTTP field values routinely are), so a padded pure-digit run IS honored.
+  expect(parseRetryAfterMs(' 120 ', now)).toBe(120_000); //       OWS-trimmed delta-seconds
+});
+
+test('retry-after: a header-less throttle storm backs off EXPONENTIALLY, never zero (issue #9)', async () => {
+  const sleeps: number[] = [];
+  let n = 0;
+  const client = mk({
+    sleepImpl: async (ms) => {
+      sleeps.push(ms);
+    },
+    // three header-less 429s (the common LB 502/503 shape), then success
+    fetchImpl: (async () => (n++ < 3 ? throttleRes(429) : doneRes())) as any,
+  });
+  await collect(client.stream(QUERY, 0, 10));
+  // pre-fix: Number(null)===0 → retryAfterMs 0 → the wait takes the advised branch = 0ms every attempt
+  // (an 11-deep 0ms hammer). now: no advice ⇒ 500·2^attempt.
+  expect(sleeps).toEqual([1_000, 2_000, 4_000]);
+});
+
+test('retry-after: an HTTP-date header backs off instead of hard-throwing mid-run (issue #9)', async () => {
+  const when = new Date(Date.now() + 5_000).toUTCString(); // ~5s in the future, second-granular
+  const sleeps: number[] = [];
+  let n = 0;
+  const client = mk({
+    sleepImpl: async (ms) => {
+      sleeps.push(ms);
+    },
+    fetchImpl: (async () =>
+      n++ === 0 ? throttleRes(429, when) : doneRes()) as any,
+  });
+  // pre-fix: Number(date)→NaN→undefined→non-retryable→this REJECTS. now: parsed → retried → resolves.
+  await expect(collect(client.stream(QUERY, 0, 10))).resolves.toEqual([]);
+  expect(sleeps).toHaveLength(1);
+  expect(sleeps[0]).toBeGreaterThan(1_000); // backed off toward the advised instant
+  expect(sleeps[0]).toBeLessThanOrEqual(30_000); // capped at the 30s ceiling
+});
+
+test('retry-after: a throttle with a garbage header still retries (exponential), never hard-throws (issue #9)', async () => {
+  let n = 0;
+  const client = mk({
+    fetchImpl: (async () =>
+      n++ === 0 ? throttleRes(429, 'garbage') : doneRes()) as any,
+  });
+  // a 429/5xx is always retryable; a malformed Retry-After must not turn it into a fatal error.
+  await expect(collect(client.stream(QUERY, 0, 10))).resolves.toEqual([]);
+});
+
+// ── HTTP-path deadlines: a hung request/body must abort-or-cancel, retry, and release its gate slot ──
+// (addendum) Without a deadline a hung request never runs fetchBatch's `finally`, so its gate slot leaks
+// and every chain eventually parks in gate.acquire(). A counting gate proves the slot is returned.
+
+const countingGate = () => {
+  let active = 0;
+  let peak = 0;
+  return {
+    acquire: async () => {
+      active++;
+      peak = Math.max(peak, active);
+    },
+    release() {
+      active--;
+    },
+    onOk() {},
+    onThrottle() {},
+    addRows() {},
+    freeRows() {},
+    saturated: () => false,
+    snapshot: () => ({ limit: 0, active, rows: 0 }),
+    peak: () => peak,
+  };
+};
+
+test('timeout: a fetch that never sends headers is aborted at the connect deadline, retried, gate released (addendum)', async () => {
+  const gate = countingGate();
+  let n = 0;
+  const client = mk({
+    gate: gate as any,
+    requestTimeoutMs: 20,
+    idleTimeoutMs: 20,
+    fetchImpl: (async (_u: string, init: any) => {
+      if (n++ === 0)
+        // never resolves on its own; only the connect-phase abort (signal) rejects it
+        return new Promise((_res, reject) => {
+          init.signal.addEventListener('abort', () =>
+            reject(Object.assign(new Error('aborted'), { name: 'AbortError' })),
+          );
+        });
+
+      return doneRes();
+    }) as any,
+  });
+  await expect(collect(client.stream(QUERY, 0, 10))).resolves.toEqual([]);
+  expect(n).toBe(2); // first hung → aborted + retried; second completed
+  expect(gate.snapshot().active).toBe(0); // slot released (finally ran)
+  expect(gate.peak()).toBeGreaterThanOrEqual(1); // it was acquired
+});
+
+test('timeout: a body that stalls without closing hits the SOFT idle timeout, is cancelled (not aborted), retried, gate released (addendum)', async () => {
+  const gate = countingGate();
+  let n = 0;
+  let cancelled = false;
+  const client = mk({
+    gate: gate as any,
+    requestTimeoutMs: 1_000, // headers arrive fine; the stall is on the body
+    idleTimeoutMs: 20,
+    fetchImpl: (async () => {
+      if (n++ === 0) {
+        // headers OK, but the body never produces a chunk and never closes → idle timeout fires.
+        // NB: no signal wiring — the soft timeout does NOT depend on abort reaching the stream.
+        const body = new ReadableStream<Uint8Array>({
+          start() {
+            /* never enqueue, never close */
+          },
+          cancel() {
+            cancelled = true; // graceful teardown = reader.cancel(), not abort()
+          },
+        });
+        return { status: 200, ok: true, headers: { get: () => null }, body };
+      }
+      return doneRes();
+    }) as any,
+  });
+  await expect(collect(client.stream(QUERY, 0, 10))).resolves.toEqual([]);
+  expect(n).toBe(2); // stalled body → idle-timeout + retry; second completed
+  expect(cancelled).toBe(true); // the stream was CANCELLED, never aborted
+  expect(gate.snapshot().active).toBe(0); // slot released
+});
+
+test('timeout: a NON-OK (400) response whose body never yields still throws PortalHttpError within the idle deadline, gate released (PR #16 review)', async () => {
+  const gate = countingGate();
+  let cancelled = false;
+  const client = mk({
+    gate: gate as any,
+    requestTimeoutMs: 1_000, // headers arrive fine; the stall is on the non-OK error body
+    idleTimeoutMs: 20,
+    // 400 headers arrive, but the error body never yields a chunk. Post-fix we OWN the reader and race
+    // each read against the idle timer; on the stall we `reader.cancel()` (legal — we hold the lock) and
+    // resolve with the partial text, so the typed error still throws PROMPTLY. A REAL `Response` wrapping
+    // a real ReadableStream is required so the stream LOCKING is real: the pre-fix `res.text()` locks the
+    // body, then `res.body.cancel()` REJECTS (spec: cancel on a locked stream) and the cancel() callback
+    // never fires — the exact bug a fake `{ cancel }` mock hid (regression against 7b5791cd).
+    fetchImpl: (async () =>
+      new Response(
+        new ReadableStream<Uint8Array>({
+          start() {
+            /* never enqueue, never close → the body-idle timer must win */
+          },
+          cancel() {
+            cancelled = true; // graceful teardown = reader.cancel(), never abort()
+          },
+        }),
+        { status: 400 },
+      )) as any,
+  });
+  const err = await collect(client.stream(QUERY, 0, 10)).then(
+    () => undefined,
+    (e) => e,
+  );
+  expect(err).toBeInstanceOf(PortalHttpError);
+  expect((err as PortalHttpError).status).toBe(400); // right status, surfaced promptly
+  expect(cancelled).toBe(true); // the stalled error body's cancel() callback actually fired
+  expect(gate.snapshot().active).toBe(0); // slot released (finally ran)
+});
+
+test('non-OK (400): a REAL streamed error body is read to completion (across chunks) and its schema message extracted', async () => {
+  // The read loop must ACCUMULATE a multi-chunk body that closes normally — not just handle the stall. A
+  // real Response whose 400 body streams the column-not-found message in two chunks proves readTextWithIdle
+  // reassembles the full text (TextDecoder streaming) so the schema-field extraction still fires.
+  const client = mk({
+    idleTimeoutMs: 1_000, // the body closes promptly; no stall
+    fetchImpl: (async (_u: string, init: any) => {
+      const q = JSON.parse(init.body);
+      return q.fields?.transaction?.accessList !== undefined
+        ? new Response(
+            streamOf([
+              "column 'access_list_size' is not ",
+              "found in 'transactions'",
+            ]),
+            { status: 400 },
+          )
+        : ndjsonRes([{ header: { number: 10 } }]);
+    }) as any,
+  });
+  const neededMissing = new Set<string>();
+  const q: PortalQuery = {
+    type: 'evm',
+    fields: { transaction: { accessList: true, hash: true } },
+  };
+  await collect(client.stream(q, 0, 10, { neededMissing }));
+  expect(neededMissing.size).toBe(0); // droppable accessList → dropped silently on the retry (message read)
+});
+
 // ── G3 (INV-7): onRows fires per ARRIVING batch, not on stream completion ─────────────────────────
 
 test('G3: onRows is called once per yielded batch, mid-stream', async () => {
@@ -326,6 +542,70 @@ test('finalizedHead: parses {number}; undefined on failure', async () => {
       }) as any,
     }).finalizedHead(),
   ).toBeUndefined();
+});
+
+test('finalizedHead: parses a REAL streamed JSON body (reader-owning read; json() ≡ text+parse)', async () => {
+  // The happy path now flows through the reader-owning readTextWithIdle → JSON.parse. Prove a genuine
+  // Response whose body streams in two chunks and CLOSES parses correctly (a body that closes must never
+  // idle-stall). json() ≡ text+parse, so this stays green on both the fixed and the old r.json() form.
+  expect(
+    await mk({
+      finalizedHeadTimeoutMs: 1_000,
+      fetchImpl: (async () =>
+        new Response(streamOf(['{"number":', '456}']))) as any,
+    }).finalizedHead(),
+  ).toBe(456);
+});
+
+test('finalizedHead: a fetch that never sends headers returns undefined at the connect deadline (PR #16 review)', async () => {
+  // The head probe fetch never resolves on its own; only the connect-phase abort (signal) rejects it. If
+  // disarm-on-headers or the connect-phase AbortController were removed this would hang forever.
+  const client = mk({
+    finalizedHeadTimeoutMs: 20,
+    fetchImpl: (async (_u: string, init: any) =>
+      new Promise((_res, reject) => {
+        init.signal.addEventListener('abort', () =>
+          reject(Object.assign(new Error('aborted'), { name: 'AbortError' })),
+        );
+      })) as any,
+  });
+  // Only the connect-phase abort can settle this; if it never fired the vitest timeout would trip instead.
+  expect(await client.finalizedHead()).toBeUndefined();
+});
+
+test('finalizedHead: headers arrive but the JSON body never settles → undefined via the SOFT race, and NO abort() fires after headers (issue #14 / PR #16 review)', async () => {
+  let abortedAfterHeaders = false;
+  let headersDelivered = false;
+  let cancelled = false;
+  const client = mk({
+    finalizedHeadTimeoutMs: 20,
+    fetchImpl: (async (_u: string, init: any) => {
+      // record any abort that lands AFTER we hand back the response (i.e. once headers "arrived")
+      init.signal.addEventListener('abort', () => {
+        if (headersDelivered) abortedAfterHeaders = true;
+      });
+      headersDelivered = true;
+
+      // A REAL Response wrapping a ReadableStream that never yields a chunk → the reader-owning read
+      // stalls on the idle timer, `reader.cancel()` fires (legal — we own the lock), the accumulated ''
+      // fails JSON.parse, and we fall through to undefined. A REAL Response makes the stream LOCKING real:
+      // the pre-fix `r.json()` locks the body, then `r.body.cancel()` REJECTS and the cancel() callback
+      // never fires — the exact bug a fake `{ cancel }` mock hid.
+      return new Response(
+        new ReadableStream<Uint8Array>({
+          start() {
+            /* never enqueue, never close */
+          },
+          cancel() {
+            cancelled = true;
+          },
+        }),
+      );
+    }) as any,
+  });
+  expect(await client.finalizedHead()).toBeUndefined();
+  expect(cancelled).toBe(true); // the body's cancel() callback actually fired (graceful teardown)
+  expect(abortedAfterHeaders).toBe(false); // never aborted after headers (the #14 kill shape)
 });
 
 test('finalizedHeadRetry: retries through the injectable sleep, then gives up undefined', async () => {
