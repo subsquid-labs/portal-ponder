@@ -194,6 +194,35 @@ test('INV-1 support: compileFetchSpec is deterministic in structure and frozen',
   expect(a.logQuery()).toEqual(b.logQuery());
 });
 
+test('INV-16/C10: an undefined fromBlock anchors backfillStart at genesis (0)', () => {
+  // A missing fromBlock means "from genesis" (ponder runtime reads `filter.fromBlock ?? 0`). If ANY
+  // source omits it the floor MUST be 0, else chunkRange clamps every fetch past the earliest DEFINED
+  // start and the unbounded source's [0, min) history is assembled empty and marked synced (silent gap).
+  const allDefined = compileFetchSpec(
+    [
+      { filter: logFilter({ fromBlock: 15_000_000 }) },
+      { filter: logFilter({ fromBlock: 8_000_000 }) },
+    ],
+    new Map(),
+  );
+  expect(allDefined.backfillStart).toBe(8_000_000); // all defined ⇒ min
+
+  const mixed = compileFetchSpec(
+    [
+      { filter: logFilter({ fromBlock: 15_000_000 }) },
+      { filter: logFilter({ fromBlock: undefined }) }, // genesis source
+    ],
+    new Map(),
+  );
+  expect(mixed.backfillStart).toBe(0); // ANY undefined ⇒ 0 (this line fails on the pre-fix Math.min)
+
+  const allUndefined = compileFetchSpec(
+    [{ filter: logFilter({ fromBlock: undefined }) }],
+    new Map(),
+  );
+  expect(allUndefined.backfillStart).toBe(0);
+});
+
 test('INV-5 support: the trace request carries NO trace filter (fetch-all)', () => {
   const trace: any = {
     type: 'trace',

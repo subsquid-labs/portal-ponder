@@ -1653,3 +1653,128 @@ test('regression: frontier chunk truncated at a lagging Portal head is EXTENDED 
     srv.close();
   }
 });
+
+test('regression: an undefined fromBlock is genesis — the [0, min) prefix of an unbounded source is NOT silently skipped (C10, ports #8 by @mo4islona)', async () => {
+  // f1 has NO fromBlock (⇒ genesis); f2 starts at 15M. The bug took Math.min over only the DEFINED
+  // fromBlocks → backfillStart=15M → chunkRange clamped chunk 0's fetch to start at 15M, so f1's block-100
+  // log was never streamed and its [0,15M) history was silently marked synced. After the fix the floor is
+  // 0 (any undefined ⇒ genesis, symmetric with backfillEnd). PORTAL_CHUNK_FIXED=1 + head=2e9 come from the
+  // beforeEach: chunkBlocks stays 500k → block 100 ∈ chunk 0, and [100,100] is well under the head.
+  const T1 = '0x' + '11'.repeat(32);
+  const A1 = '0x' + 'aa'.repeat(20); // f1 — unbounded (genesis) source
+  const A2 = '0x' + 'bb'.repeat(20); // f2 — fromBlock 15M
+  const BN1 = 100;
+  const TXA = '0x' + 'a1'.repeat(32);
+  const mkBlock = () => ({
+    ...FIXTURE_BLOCK,
+    header: {
+      ...FIXTURE_BLOCK.header,
+      number: BN1,
+      hash: '0x' + BN1.toString(16).padStart(64, '0'),
+    },
+    logs: [
+      {
+        address: A1,
+        topics: [T1],
+        data: '0x',
+        transactionHash: TXA,
+        transactionIndex: 0,
+        logIndex: 0,
+      },
+    ],
+    transactions: [
+      {
+        ...FIXTURE_BLOCK.transactions[0],
+        transactionIndex: 0,
+        hash: TXA,
+        from: A1,
+        to: A1,
+      },
+    ],
+  });
+  const srv = http.createServer((req, res) => {
+    let body = '';
+    req.on('data', (c) => {
+      body += c;
+    });
+    req.on('end', () => {
+      if (req.url?.includes('finalized-head')) {
+        res.writeHead(200, { 'content-type': 'application/json' });
+        res.end(JSON.stringify({ number: 1_000_000_000 }));
+        return;
+      }
+      const q = body ? JSON.parse(body) : {};
+      const from = q.fromBlock ?? 0;
+      const to = q.toBlock ?? 1e12;
+      const wantsA1 = (q.logs ?? []).some((s: any) =>
+        (s.address ?? [])
+          .map((x: string) => x.toLowerCase())
+          .includes(A1.toLowerCase()),
+      );
+      if (from <= BN1 && to >= BN1 && wantsA1) {
+        res.writeHead(200, { 'content-type': 'application/x-ndjson' });
+        res.end(JSON.stringify(mkBlock()) + '\n');
+        return;
+      }
+
+      res.writeHead(204).end();
+    });
+  });
+  const p: number = await new Promise((r) =>
+    srv.listen(0, () => r((srv.address() as AddressInfo).port)),
+  );
+  try {
+    const inserted = { logs: [] as any[] };
+    const syncStore: any = {
+      insertLogs: (x: any) => inserted.logs.push(...x.logs),
+      insertBlocks: () => {},
+      insertTransactions: () => {},
+      insertTransactionReceipts: () => {},
+      insertTraces: () => {},
+      insertChildAddresses: () => {},
+    };
+    const mkFilter = (
+      sourceId: string,
+      address: string,
+      topic0: string,
+      fromBlock: number | undefined,
+    ): any => ({
+      type: 'log',
+      chainId: 1,
+      sourceId,
+      address,
+      topic0,
+      topic1: null,
+      topic2: null,
+      topic3: null,
+      fromBlock,
+      toBlock: undefined,
+      hasTransactionReceipt: false,
+      include: [],
+    });
+    const f1 = mkFilter('s1', A1, T1, undefined); // no fromBlock ⇒ genesis
+    const f2 = mkFilter('s2', A2, '0x' + '22'.repeat(32), 15_000_000);
+    const sync = createPortalHistoricalSync({
+      common: {
+        logger: { debug() {}, info() {}, warn() {}, error() {}, trace() {} },
+      },
+      chain: { id: 1, name: 'mainnet', portal: `http://localhost:${p}` },
+      childAddresses: new Map(),
+      eventCallbacks: [{ filter: f1 }, { filter: f2 }],
+    } as any);
+    const iA: [number, number] = [BN1, BN1];
+    const logs = await sync.syncBlockRangeData({
+      interval: iA,
+      requiredIntervals: [{ interval: iA, filter: f1 }],
+      requiredFactoryIntervals: [],
+      syncStore,
+    } as any);
+    // BEFORE FIX: floor=15M → chunk 0's fetch clamped to [15M, …] → block 100 never streamed → 0 logs.
+    // AFTER FIX:  floor=0 → chunk 0's fetch [0, 499_999] reaches block 100 → f1's log present.
+    expect(inserted.logs).toHaveLength(1);
+    expect(inserted.logs[0].topics[0].toLowerCase()).toBe(T1.toLowerCase());
+    expect(logs).toHaveLength(1);
+  } finally {
+    srv.close();
+  }
+});

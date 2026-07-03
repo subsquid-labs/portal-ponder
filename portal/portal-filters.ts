@@ -356,10 +356,16 @@ export function compileFetchSpec(
 
   // the chain's actual backfill window, from the filters — used to bound chunk fetches so a bounded
   // backfill (or the tail) never over-fetches. Fully automatic; no client tuning.
-  const froms = fs
-    .map((f) => f.fromBlock)
-    .filter((b): b is number => b != null);
-  const backfillStart = froms.length ? Math.min(...froms) : 0;
+  // A source with NO fromBlock starts at genesis (ponder's runtime reads `filter.fromBlock ?? 0`); if
+  // ANY source omits it the floor MUST be 0 — symmetric with backfillEnd's undefined-⇒-unbounded rule
+  // below. Taking Math.min over only the DEFINED fromBlocks would clamp every chunk fetch past the
+  // earliest DEFINED start (chunkRange, portal-chunks.ts) and mark the [0, min) prefix of an unbounded
+  // source synced over a permanent silent gap — the whole pre-min history lost. (INV-16 / C10)
+  const froms = fs.map((f) => f.fromBlock);
+  const backfillStart =
+    froms.length && froms.every((b) => b != null)
+      ? Math.min(...(froms as number[]))
+      : 0;
   const tos = fs.map((f) => f.toBlock);
   const backfillEnd =
     tos.length && tos.every((t) => t != null)
