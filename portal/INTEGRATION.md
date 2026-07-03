@@ -128,6 +128,7 @@ The defaults run well without configuration. These environment variables overrid
 | `PORTAL_FINALIZED_HEAD` | unset | Pin the Portal finalized head (testing/ops); overrides the `/finalized-head` probe. |
 | `PORTAL_METRICS_FILE` | unset | Write per-chain JSON metrics to `<path>.<chainId>`. |
 | `PORTAL_GATE_LOG` | unset | Set to `1` to log the shared controller every 20 s. |
+| `PORTAL_CHECKS` | `on` | Runtime invariant checks ([INVARIANTS.md](INVARIANTS.md)): `on` runs the O(1) checks (a violated invariant crashes loud instead of corrupting silently); `strict` adds O(n) whole-structure checks (CI/tests); `off` disables all checks — only as a last-resort perf escape hatch or to bypass a false-positive crash while a fix ships. |
 
 Raising concurrency does not help when indexing is the bottleneck, which for a full-history resync it usually is — the fetch is already ahead. The knobs that matter most in practice are the memory budget (`PORTAL_MAX_ROWS_IN_MEM`) on a constrained box and, for a keyed deployment, `PORTAL_API_KEY`.
 

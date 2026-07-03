@@ -17,6 +17,14 @@ PNPM="corepack pnpm@9.10.0"
 
 [ -f "$WIRING" ] || { echo "✗ no wiring patch for $VER at portal/wiring/$VER.patch — author it (PUBLISHING.md §'Adding a version')"; exit 1; }
 
+if [ "${2:-}" = "--test" ]; then
+  # Formatting/lint gate BEFORE anything is copied: the Portal layer must be clean under the repo's
+  # own Biome (root biome.json; version pinned to the repo devDependency). `check` fails on format
+  # drift and lint ERRORS (warnings pass) — so an unformatted file can never ship silently.
+  echo "▶ biome check (repo config, pinned 2.5.2)"
+  ( cd "$ROOT" && npx -y @biomejs/biome@2.5.2 check portal/ --diagnostic-level=error )
+fi
+
 echo "▶ cloning ponder@$VER → $WORK"
 rm -rf "$WORK"; git clone --quiet --depth 1 --branch "ponder@$VER" https://github.com/ponder-sh/ponder "$WORK"
 
