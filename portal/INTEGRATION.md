@@ -152,7 +152,7 @@ Both runs indexed the identical 28.4M events; only the configuration differed. T
 
 ## Where the code lives
 
-The `portal/` layer is a functional core behind an imperative shell, organised around explicit invariants (see [`INVARIANTS.md`](INVARIANTS.md), INV-1…INV-14):
+The `portal/` layer is a functional core behind an imperative shell, organised around explicit invariants (see [`INVARIANTS.md`](INVARIANTS.md), INV-1…INV-15):
 
 - `portal.ts` — orchestration shell (`createPortalHistoricalSync`): chunk cache, stash, delegation, seam methods.
 - `portal-config.ts` / `portal-errors.ts` / `portal-invariant.ts` — frozen config (INV-14), typed errors, runtime checks.

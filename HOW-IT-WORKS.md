@@ -121,7 +121,7 @@ This is proven, not asserted. The differential harness ([`harness/diff`](harness
 
 ## Where the code lives
 
-The layer is organised around explicit, provable **invariants** — a functional core (pure, property-tested) behind an imperative shell. See [`portal/INVARIANTS.md`](portal/INVARIANTS.md) for the catalog (INV-1…INV-14) that ties doc ⟷ code ⟷ test together.
+The layer is organised around explicit, provable **invariants** — a functional core (pure, property-tested) behind an imperative shell. See [`portal/INVARIANTS.md`](portal/INVARIANTS.md) for the catalog (INV-1…INV-15) that ties doc ⟷ code ⟷ test together.
 
 | File | What it holds |
 |---|---|

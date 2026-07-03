@@ -13,7 +13,7 @@
  *   assemble→ portal-assemble    metrics  → portal-metrics     transforms   → portal-transform
  *
  * The public seam is FROZEN: `createPortalHistoricalSync({common, chain, rpc, childAddresses,
- * eventCallbacks}) : HistoricalSync`. See portal/INVARIANTS.md for the invariant catalog (INV-1…INV-14).
+ * eventCallbacks}) : HistoricalSync`. See portal/INVARIANTS.md for the invariant catalog (INV-1…INV-15).
  */
 import type { Common } from '@/internal/common.js';
 import type {
