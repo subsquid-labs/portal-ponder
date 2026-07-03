@@ -1,7 +1,7 @@
-import http from "node:http";
-import type { AddressInfo } from "node:net";
-import { afterEach, beforeEach, expect, test } from "vitest";
-import { createPortalHistoricalSync } from "./portal.js";
+import http from 'node:http';
+import type { AddressInfo } from 'node:net';
+import { afterEach, beforeEach, expect, test } from 'vitest';
+import { createPortalHistoricalSync } from './portal.js';
 
 /**
  * Fixture: one Portal `/finalized-stream` NDJSON block carrying an Euler EVault
@@ -13,42 +13,42 @@ import { createPortalHistoricalSync } from "./portal.js";
  * the matched log's transaction is fetched, transformed, and inserted.
  */
 const TX_HASH =
-  "0x62684e3dab102ad2e626d9121dba1d9915f238b2dd0316cdf8d4860751305071";
+  '0x62684e3dab102ad2e626d9121dba1d9915f238b2dd0316cdf8d4860751305071';
 const BLOCK_HASH =
-  "0xdce7daa5236cc31d94a3313648f2c0b2dbbb8a5fa26e10fb2edd26a4c45e7240";
-const VAULT = "0x44b3c96db2caf61167a9eab82901139a404cdb6f";
+  '0xdce7daa5236cc31d94a3313648f2c0b2dbbb8a5fa26e10fb2edd26a4c45e7240';
+const VAULT = '0x44b3c96db2caf61167a9eab82901139a404cdb6f';
 const DEPOSIT_TOPIC0 =
-  "0xdcbc1c05240f31ff3ad067ef1ee35ce4997762752e3a095284754544f4c709d7";
+  '0xdcbc1c05240f31ff3ad067ef1ee35ce4997762752e3a095284754544f4c709d7';
 
 const FIXTURE_BLOCK = {
   header: {
     number: 20558652,
     hash: BLOCK_HASH,
     parentHash:
-      "0x1111111111111111111111111111111111111111111111111111111111111111",
+      '0x1111111111111111111111111111111111111111111111111111111111111111',
     timestamp: 1724000000,
-    logsBloom: "0x" + "00".repeat(256),
-    miner: "0x95222290dd7278aa3ddd389cc1e1d165cc4bafe5",
-    gasUsed: "0xabc",
-    gasLimit: "0x1c9c380",
-    stateRoot: "0x" + "22".repeat(32),
-    receiptsRoot: "0x" + "33".repeat(32),
-    transactionsRoot: "0x" + "44".repeat(32),
-    size: "0x500",
-    difficulty: "0x0",
-    extraData: "0x",
+    logsBloom: '0x' + '00'.repeat(256),
+    miner: '0x95222290dd7278aa3ddd389cc1e1d165cc4bafe5',
+    gasUsed: '0xabc',
+    gasLimit: '0x1c9c380',
+    stateRoot: '0x' + '22'.repeat(32),
+    receiptsRoot: '0x' + '33'.repeat(32),
+    transactionsRoot: '0x' + '44'.repeat(32),
+    size: '0x500',
+    difficulty: '0x0',
+    extraData: '0x',
   },
   logs: [
     {
       address: VAULT,
       topics: [
         DEPOSIT_TOPIC0,
-        "0x0000000000000000000000004b5ccdb3b7e44475d1f0a06499f12acbd4fc0032",
-        "0x0000000000000000000000004b5ccdb3b7e44475d1f0a06499f12acbd4fc0032",
+        '0x0000000000000000000000004b5ccdb3b7e44475d1f0a06499f12acbd4fc0032',
+        '0x0000000000000000000000004b5ccdb3b7e44475d1f0a06499f12acbd4fc0032',
       ],
       data:
-        "0x00000000000000000000000000000000000000000000000000000000000f4240" +
-        "00000000000000000000000000000000000000000000000000000000000f4240",
+        '0x00000000000000000000000000000000000000000000000000000000000f4240' +
+        '00000000000000000000000000000000000000000000000000000000000f4240',
       transactionHash: TX_HASH,
       transactionIndex: 1,
       logIndex: 4,
@@ -58,20 +58,20 @@ const FIXTURE_BLOCK = {
     {
       transactionIndex: 1,
       hash: TX_HASH,
-      from: "0x4b5ccdb3b7e44475d1f0a06499f12acbd4fc0032",
+      from: '0x4b5ccdb3b7e44475d1f0a06499f12acbd4fc0032',
       to: VAULT,
-      input: "0x6e553f65",
-      value: "0x0",
+      input: '0x6e553f65',
+      value: '0x0',
       nonce: 7,
-      gas: "0x317fa",
-      gasPrice: "0xc0db32e7d",
-      maxFeePerGas: "0xc0db32e7d",
-      maxPriorityFeePerGas: "0x0",
+      gas: '0x317fa',
+      gasPrice: '0xc0db32e7d',
+      maxFeePerGas: '0xc0db32e7d',
+      maxPriorityFeePerGas: '0x0',
       type: 2,
-      r: "0x" + "ab".repeat(32),
-      s: "0x" + "cd".repeat(32),
-      v: "0x1",
-      yParity: "0x1",
+      r: '0x' + 'ab'.repeat(32),
+      s: '0x' + 'cd'.repeat(32),
+      v: '0x1',
+      yParity: '0x1',
     },
   ],
 };
@@ -80,23 +80,23 @@ let server: http.Server;
 let port: number;
 
 beforeEach(async () => {
-  process.env.PORTAL_CHUNK_FIXED = "1"; // skip head-based chunk scaling (no /finalized-head call)
-  process.env.PORTAL_FINALIZED_HEAD = "2000000000"; // valid finality head — real usage always has one (C3: unknown head → RPC fallback)
+  process.env.PORTAL_CHUNK_FIXED = '1'; // skip head-based chunk scaling (no /finalized-head call)
+  process.env.PORTAL_FINALIZED_HEAD = '2000000000'; // valid finality head — real usage always has one (C3: unknown head → RPC fallback)
   server = http.createServer((req, res) => {
-    let body = "";
-    req.on("data", (c) => {
+    let body = '';
+    req.on('data', (c) => {
       body += c;
     });
-    req.on("end", () => {
+    req.on('end', () => {
       const q = body ? JSON.parse(body) : {};
       // serve the fixture only for the request whose range covers the block
       if (
-        req.url?.includes("finalized-stream") &&
+        req.url?.includes('finalized-stream') &&
         q.fromBlock <= 20558652 &&
         (q.toBlock ?? 1e12) >= 20558652
       ) {
-        res.writeHead(200, { "content-type": "application/x-ndjson" });
-        res.end(JSON.stringify(FIXTURE_BLOCK) + "\n");
+        res.writeHead(200, { 'content-type': 'application/x-ndjson' });
+        res.end(JSON.stringify(FIXTURE_BLOCK) + '\n');
       } else {
         res.writeHead(204).end(); // above head / nothing more
       }
@@ -124,9 +124,9 @@ test("regression: matched log's transaction is fetched, transformed, and inserte
   };
 
   const filter: any = {
-    type: "log",
+    type: 'log',
     chainId: 1,
-    sourceId: "evault:deposit",
+    sourceId: 'evault:deposit',
     address: VAULT,
     topic0: DEPOSIT_TOPIC0,
     topic1: null,
@@ -145,7 +145,7 @@ test("regression: matched log's transaction is fetched, transformed, and inserte
     } as any,
     chain: {
       id: 1,
-      name: "mainnet",
+      name: 'mainnet',
       portal: `http://localhost:${port}`,
     } as any,
     childAddresses: new Map(),
@@ -171,22 +171,22 @@ test("regression: matched log's transaction is fetched, transformed, and inserte
   expect(inserted.txs[0].hash).toBe(TX_HASH);
   expect(inserted.txs[0].blockHash).toBe(BLOCK_HASH);
   expect(inserted.txs[0].from).toBe(
-    "0x4b5ccdb3b7e44475d1f0a06499f12acbd4fc0032",
+    '0x4b5ccdb3b7e44475d1f0a06499f12acbd4fc0032',
   );
-  expect(inserted.txs[0].transactionIndex).toBe("0x1");
+  expect(inserted.txs[0].transactionIndex).toBe('0x1');
 });
 
-test("regression (C1): a 2nd log filter sharing a chunk on a LATER call is still fetched — no silent gap", async () => {
+test('regression (C1): a 2nd log filter sharing a chunk on a LATER call is still fetched — no silent gap', async () => {
   // Two independent log filters whose blocks both fall in chunk 0 ([0, 499_999]) but which Ponder
   // marks "required" on DIFFERENT syncBlockRangeData calls (each call carries only the filter still
   // missing its sub-interval). The bug keyed chunk 0 by idx alone, freezing it to the FIRST call's
   // single filter → the 2nd filter's log was never streamed yet its interval was marked complete.
-  const T1 = "0x" + "11".repeat(32);
-  const T2 = "0x" + "22".repeat(32);
-  const A1 = "0x" + "aa".repeat(20);
-  const A2 = "0x" + "bb".repeat(20);
-  const TXA = "0x" + "a1".repeat(32),
-    TXB = "0x" + "b2".repeat(32);
+  const T1 = '0x' + '11'.repeat(32);
+  const T2 = '0x' + '22'.repeat(32);
+  const A1 = '0x' + 'aa'.repeat(20);
+  const A2 = '0x' + 'bb'.repeat(20);
+  const TXA = '0x' + 'a1'.repeat(32),
+    TXB = '0x' + 'b2'.repeat(32);
   const BN1 = 10,
     BN2 = 11; // both in chunk 0
 
@@ -198,25 +198,25 @@ test("regression (C1): a 2nd log filter sharing a chunk on a LATER call is still
   ) => ({
     header: {
       number: num,
-      hash: "0x" + num.toString(16).padStart(64, "0"),
-      parentHash: "0x" + "00".repeat(32),
+      hash: '0x' + num.toString(16).padStart(64, '0'),
+      parentHash: '0x' + '00'.repeat(32),
       timestamp: 1_700_000_000 + num,
-      logsBloom: "0x" + "00".repeat(256),
-      miner: "0x" + "99".repeat(20),
-      gasUsed: "0x1",
-      gasLimit: "0x1c9c380",
-      stateRoot: "0x" + "22".repeat(32),
-      receiptsRoot: "0x" + "33".repeat(32),
-      transactionsRoot: "0x" + "44".repeat(32),
-      size: "0x500",
-      difficulty: "0x0",
-      extraData: "0x",
+      logsBloom: '0x' + '00'.repeat(256),
+      miner: '0x' + '99'.repeat(20),
+      gasUsed: '0x1',
+      gasLimit: '0x1c9c380',
+      stateRoot: '0x' + '22'.repeat(32),
+      receiptsRoot: '0x' + '33'.repeat(32),
+      transactionsRoot: '0x' + '44'.repeat(32),
+      size: '0x500',
+      difficulty: '0x0',
+      extraData: '0x',
     },
     logs: [
       {
         address: addr,
         topics: [topic0],
-        data: "0x",
+        data: '0x',
         transactionHash: txHash,
         transactionIndex: 0,
         logIndex: 0,
@@ -228,11 +228,11 @@ test("regression (C1): a 2nd log filter sharing a chunk on a LATER call is still
         hash: txHash,
         from: A1,
         to: addr,
-        input: "0x",
-        value: "0x0",
+        input: '0x',
+        value: '0x0',
         nonce: 0,
-        gas: "0x1",
-        gasPrice: "0x1",
+        gas: '0x1',
+        gasPrice: '0x1',
         type: 0,
       },
     ],
@@ -253,13 +253,13 @@ test("regression (C1): a 2nd log filter sharing a chunk on a LATER call is still
     );
 
   const srv = http.createServer((req, res) => {
-    let body = "";
-    req.on("data", (c) => {
+    let body = '';
+    req.on('data', (c) => {
       body += c;
     });
-    req.on("end", () => {
-      if (req.url?.includes("finalized-head")) {
-        res.writeHead(200, { "content-type": "application/json" });
+    req.on('end', () => {
+      if (req.url?.includes('finalized-head')) {
+        res.writeHead(200, { 'content-type': 'application/json' });
         res.end(JSON.stringify({ number: 1_000_000_000 }));
         return;
       }
@@ -275,8 +275,8 @@ test("regression (C1): a 2nd log filter sharing a chunk on a LATER call is still
         res.writeHead(204).end();
         return;
       }
-      res.writeHead(200, { "content-type": "application/x-ndjson" });
-      res.end(out.map((b) => JSON.stringify(b)).join("\n") + "\n");
+      res.writeHead(200, { 'content-type': 'application/x-ndjson' });
+      res.end(out.map((b) => JSON.stringify(b)).join('\n') + '\n');
     });
   });
   const p: number = await new Promise((r) =>
@@ -292,9 +292,9 @@ test("regression (C1): a 2nd log filter sharing a chunk on a LATER call is still
       insertTraces: () => {},
     };
     const f1: any = {
-      type: "log",
+      type: 'log',
       chainId: 1,
-      sourceId: "s1",
+      sourceId: 's1',
       address: A1,
       topic0: T1,
       topic1: null,
@@ -306,9 +306,9 @@ test("regression (C1): a 2nd log filter sharing a chunk on a LATER call is still
       include: [],
     };
     const f2: any = {
-      type: "log",
+      type: 'log',
       chainId: 1,
-      sourceId: "s2",
+      sourceId: 's2',
       address: A2,
       topic0: T2,
       topic1: null,
@@ -323,7 +323,7 @@ test("regression (C1): a 2nd log filter sharing a chunk on a LATER call is still
       common: {
         logger: { debug() {}, info() {}, warn() {}, error() {}, trace() {} },
       } as any,
-      chain: { id: 1, name: "mainnet", portal: `http://localhost:${p}` } as any,
+      chain: { id: 1, name: 'mainnet', portal: `http://localhost:${p}` } as any,
       childAddresses: new Map(),
       eventCallbacks: [{ filter: f1 }, { filter: f2 }],
     } as any);
@@ -353,26 +353,26 @@ test("regression (C1): a 2nd log filter sharing a chunk on a LATER call is still
   }
 });
 
-test("regression: a dataset-unsupported field (accessList) is dropped, not crashed on", async () => {
+test('regression: a dataset-unsupported field (accessList) is dropped, not crashed on', async () => {
   // Per-dataset schema varies — e.g. Monad/plasma transactions have no accessList; the whole request
   // 400s ("column 'access_list_size' is not found in 'transactions'"). accessList is non-load-bearing
   // and NULLABLE, so the fork must drop it and retry — EVEN THOUGH Ponder's default `include` always
   // lists transaction.accessList (see `include` below). A static default include must never force a
   // crash on a droppable field; only NOT-NULL/bloom/core fields do.
   const srv = http.createServer((req, res) => {
-    let body = "";
-    req.on("data", (c) => {
+    let body = '';
+    req.on('data', (c) => {
       body += c;
     });
-    req.on("end", () => {
-      if (req.url?.includes("finalized-head")) {
-        res.writeHead(200, { "content-type": "application/json" });
+    req.on('end', () => {
+      if (req.url?.includes('finalized-head')) {
+        res.writeHead(200, { 'content-type': 'application/json' });
         res.end(JSON.stringify({ number: 2_000_000_000 }));
         return;
       }
       const q = body ? JSON.parse(body) : {};
       if (
-        req.url?.includes("finalized-stream") &&
+        req.url?.includes('finalized-stream') &&
         q.fields?.transaction?.accessList !== undefined
       ) {
         res.writeHead(400);
@@ -382,12 +382,12 @@ test("regression: a dataset-unsupported field (accessList) is dropped, not crash
         return;
       }
       if (
-        req.url?.includes("finalized-stream") &&
+        req.url?.includes('finalized-stream') &&
         q.fromBlock <= 20558652 &&
         (q.toBlock ?? 1e12) >= 20558652
       ) {
-        res.writeHead(200, { "content-type": "application/x-ndjson" });
-        res.end(JSON.stringify(FIXTURE_BLOCK) + "\n");
+        res.writeHead(200, { 'content-type': 'application/x-ndjson' });
+        res.end(JSON.stringify(FIXTURE_BLOCK) + '\n');
         return;
       }
       res.writeHead(204).end();
@@ -407,9 +407,9 @@ test("regression: a dataset-unsupported field (accessList) is dropped, not crash
     };
     // include LISTS accessList (exactly as Ponder's static default does) — the fork must still drop it.
     const filter: any = {
-      type: "log",
+      type: 'log',
       chainId: 1,
-      sourceId: "s",
+      sourceId: 's',
       address: VAULT,
       topic0: DEPOSIT_TOPIC0,
       topic1: null,
@@ -418,13 +418,13 @@ test("regression: a dataset-unsupported field (accessList) is dropped, not crash
       fromBlock: 20558652,
       toBlock: 20558652,
       hasTransactionReceipt: false,
-      include: ["transaction.accessList", "transaction.hash", "log.address"],
+      include: ['transaction.accessList', 'transaction.hash', 'log.address'],
     };
     const sync = createPortalHistoricalSync({
       common: {
         logger: { debug() {}, info() {}, warn() {}, error() {}, trace() {} },
       } as any,
-      chain: { id: 1, name: "mainnet", portal: `http://localhost:${p}` } as any,
+      chain: { id: 1, name: 'mainnet', portal: `http://localhost:${p}` } as any,
       childAddresses: new Map(),
       eventCallbacks: [{ filter }],
     } as any);
@@ -448,19 +448,19 @@ test("regression: an 'unknown field' 400 (schema doesn't know accessList) is als
   // `accessList`, expected one of `transactionIndex`, `hash`, ..." — instead of "column not found".
   // The fork must map it back to transaction.accessList (a droppable field) and retry, not crash.
   const srv = http.createServer((req, res) => {
-    let body = "";
-    req.on("data", (c) => {
+    let body = '';
+    req.on('data', (c) => {
       body += c;
     });
-    req.on("end", () => {
-      if (req.url?.includes("finalized-head")) {
-        res.writeHead(200, { "content-type": "application/json" });
+    req.on('end', () => {
+      if (req.url?.includes('finalized-head')) {
+        res.writeHead(200, { 'content-type': 'application/json' });
         res.end(JSON.stringify({ number: 2_000_000_000 }));
         return;
       }
       const q = body ? JSON.parse(body) : {};
       if (
-        req.url?.includes("finalized-stream") &&
+        req.url?.includes('finalized-stream') &&
         q.fields?.transaction?.accessList !== undefined
       ) {
         res.writeHead(400);
@@ -470,12 +470,12 @@ test("regression: an 'unknown field' 400 (schema doesn't know accessList) is als
         return;
       }
       if (
-        req.url?.includes("finalized-stream") &&
+        req.url?.includes('finalized-stream') &&
         q.fromBlock <= 20558652 &&
         (q.toBlock ?? 1e12) >= 20558652
       ) {
-        res.writeHead(200, { "content-type": "application/x-ndjson" });
-        res.end(JSON.stringify(FIXTURE_BLOCK) + "\n");
+        res.writeHead(200, { 'content-type': 'application/x-ndjson' });
+        res.end(JSON.stringify(FIXTURE_BLOCK) + '\n');
         return;
       }
       res.writeHead(204).end();
@@ -494,9 +494,9 @@ test("regression: an 'unknown field' 400 (schema doesn't know accessList) is als
       insertTraces: () => {},
     };
     const filter: any = {
-      type: "log",
+      type: 'log',
       chainId: 1,
-      sourceId: "s",
+      sourceId: 's',
       address: VAULT,
       topic0: DEPOSIT_TOPIC0,
       topic1: null,
@@ -505,13 +505,13 @@ test("regression: an 'unknown field' 400 (schema doesn't know accessList) is als
       fromBlock: 20558652,
       toBlock: 20558652,
       hasTransactionReceipt: false,
-      include: ["transaction.accessList"],
+      include: ['transaction.accessList'],
     };
     const sync = createPortalHistoricalSync({
       common: {
         logger: { debug() {}, info() {}, warn() {}, error() {}, trace() {} },
       } as any,
-      chain: { id: 1, name: "plasma", portal: `http://localhost:${p}` } as any,
+      chain: { id: 1, name: 'plasma', portal: `http://localhost:${p}` } as any,
       childAddresses: new Map(),
       eventCallbacks: [{ filter }],
     } as any);
@@ -533,19 +533,19 @@ test("regression: an 'unknown field' 400 (schema doesn't know accessList) is als
 // once it's dropped — models a dataset (e.g. Monad old chunks) that lacks the receipt logsBloom.
 const missingLogsBloomServer = (serveData: boolean) =>
   http.createServer((req, res) => {
-    let body = "";
-    req.on("data", (c) => {
+    let body = '';
+    req.on('data', (c) => {
       body += c;
     });
-    req.on("end", () => {
-      if (req.url?.includes("finalized-head")) {
-        res.writeHead(200, { "content-type": "application/json" });
+    req.on('end', () => {
+      if (req.url?.includes('finalized-head')) {
+        res.writeHead(200, { 'content-type': 'application/json' });
         res.end(JSON.stringify({ number: 2_000_000_000 }));
         return;
       }
       const q = body ? JSON.parse(body) : {};
       if (
-        req.url?.includes("finalized-stream") &&
+        req.url?.includes('finalized-stream') &&
         q.fields?.transaction?.logsBloom !== undefined
       ) {
         res.writeHead(400);
@@ -556,12 +556,12 @@ const missingLogsBloomServer = (serveData: boolean) =>
       }
       if (
         serveData &&
-        req.url?.includes("finalized-stream") &&
+        req.url?.includes('finalized-stream') &&
         q.fromBlock <= 20558652 &&
         (q.toBlock ?? 1e12) >= 20558652
       ) {
-        res.writeHead(200, { "content-type": "application/x-ndjson" });
-        res.end(JSON.stringify(FIXTURE_BLOCK) + "\n");
+        res.writeHead(200, { 'content-type': 'application/x-ndjson' });
+        res.end(JSON.stringify(FIXTURE_BLOCK) + '\n');
         return;
       }
       res.writeHead(204).end();
@@ -581,9 +581,9 @@ const runMissingLogsBloom = async (serveData: boolean) => {
     insertTraces: () => {},
   };
   const filter: any = {
-    type: "log",
+    type: 'log',
     chainId: 1,
-    sourceId: "s",
+    sourceId: 's',
     address: VAULT,
     topic0: DEPOSIT_TOPIC0,
     topic1: null,
@@ -598,7 +598,7 @@ const runMissingLogsBloom = async (serveData: boolean) => {
     common: {
       logger: { debug() {}, info() {}, warn() {}, error() {}, trace() {} },
     } as any,
-    chain: { id: 1, name: "mainnet", portal: `http://localhost:${p}` } as any,
+    chain: { id: 1, name: 'mainnet', portal: `http://localhost:${p}` } as any,
     childAddresses: new Map(),
     eventCallbacks: [{ filter }],
   } as any);
@@ -617,7 +617,7 @@ const runMissingLogsBloom = async (serveData: boolean) => {
   }
 };
 
-test("regression: a NEEDED missing field fails LOUDLY when the range has MATCHED data (no silent substitution)", async () => {
+test('regression: a NEEDED missing field fails LOUDLY when the range has MATCHED data (no silent substitution)', async () => {
   // logsBloom is NOT-NULL + bloom-load-bearing; a chunk that lacks it AND has matched events must
   // CRASH, not default (a wrong bloom silently drops logs in realtime).
   await expect(runMissingLogsBloom(true)).rejects.toThrow(
@@ -625,35 +625,35 @@ test("regression: a NEEDED missing field fails LOUDLY when the range has MATCHED
   );
 });
 
-test("regression: a NEEDED missing field on an EVENT-LESS range is tolerated (irrelevant old chunks)", async () => {
+test('regression: a NEEDED missing field on an EVENT-LESS range is tolerated (irrelevant old chunks)', async () => {
   // Same missing logsBloom, but the range yields NO matched data (e.g. Monad's pre-schema chunks
   // before any relevant events) → harmless, must NOT crash. The indexer runs fine.
   const inserted = await runMissingLogsBloom(false);
   expect(inserted.logs).toHaveLength(0);
 });
 
-test("regression: a dataset that starts after genesis (TAC starts at block 1) is clamped forward, not crashed on", async () => {
+test('regression: a dataset that starts after genesis (TAC starts at block 1) is clamped forward, not crashed on', async () => {
   // The Portal 400s "dataset starts from block N" when queried below its first block. The fork must
   // clamp the cursor to N and continue — NOT throw an unhandledRejection (which killed the whole
   // multichain app when TAC's dataset started at block 1 and startBlock was 0).
   const START = 1000;
   let clampedTo = -1;
   const srv = http.createServer((req, res) => {
-    let body = "";
-    req.on("data", (c) => {
+    let body = '';
+    req.on('data', (c) => {
       body += c;
     });
-    req.on("end", () => {
-      if (req.url?.includes("finalized-head")) {
-        res.writeHead(200, { "content-type": "application/json" });
+    req.on('end', () => {
+      if (req.url?.includes('finalized-head')) {
+        res.writeHead(200, { 'content-type': 'application/json' });
         res.end(JSON.stringify({ number: 2_000_000_000 }));
         return;
       }
       const q = body ? JSON.parse(body) : {};
-      if (req.url?.includes("finalized-stream")) {
+      if (req.url?.includes('finalized-stream')) {
         if ((q.fromBlock ?? 0) < START) {
           res.writeHead(400);
-          res.end("Bad request: dataset starts from block " + START);
+          res.end('Bad request: dataset starts from block ' + START);
           return;
         }
         clampedTo = q.fromBlock;
@@ -675,9 +675,9 @@ test("regression: a dataset that starts after genesis (TAC starts at block 1) is
       insertTraces: () => {},
     };
     const filter: any = {
-      type: "log",
+      type: 'log',
       chainId: 1,
-      sourceId: "s",
+      sourceId: 's',
       address: VAULT,
       topic0: DEPOSIT_TOPIC0,
       topic1: null,
@@ -691,7 +691,7 @@ test("regression: a dataset that starts after genesis (TAC starts at block 1) is
       common: {
         logger: { debug() {}, info() {}, warn() {}, error() {}, trace() {} },
       } as any,
-      chain: { id: 1, name: "tac", portal: `http://localhost:${p}` } as any,
+      chain: { id: 1, name: 'tac', portal: `http://localhost:${p}` } as any,
       childAddresses: new Map(),
       eventCallbacks: [{ filter }],
     } as any);
@@ -708,7 +708,7 @@ test("regression: a dataset that starts after genesis (TAC starts at block 1) is
   }
 });
 
-test("regression (C6): deep matched trace is stored at its FULL-tree pre-order index (7), not filter-local (0)", async () => {
+test('regression (C6): deep matched trace is stored at its FULL-tree pre-order index (7), not filter-local (0)', async () => {
   // Ponder's RPC sync numbers trace_index as the pre-order DFS rank over each tx's FULL call tree,
   // THEN filters — so a lone deep match keeps its true position. Portal used to push the trace
   // filter server-side and rank over the matched SUBSET (→ 0). The fake server emulates Portal's
@@ -716,28 +716,28 @@ test("regression (C6): deep matched trace is stored at its FULL-tree pre-order i
   process.env.PORTAL_FINALIZED_HEAD = String(22200011 + 1_000_000); // no finality fallback / no head call
   const BLOCK = 22200011,
     TX_INDEX = 111;
-  const TX_HASH = "0x" + "7e".repeat(32),
-    B_HASH = "0x" + "b1".repeat(32);
-  const TARGET = "0x000000000000000000000000000000000000dead";
-  const OTHER = "0x000000000000000000000000000000000000beef";
+  const TX_HASH = '0x' + '7e'.repeat(32),
+    B_HASH = '0x' + 'b1'.repeat(32);
+  const TARGET = '0x000000000000000000000000000000000000dead';
+  const OTHER = '0x000000000000000000000000000000000000beef';
   const mkTrace = (traceAddress: number[], to: string, subtraces: number) => ({
     transactionIndex: TX_INDEX,
     traceAddress,
-    type: "call",
+    type: 'call',
     subtraces,
     error: null,
     revertReason: null,
     action: {
       from: OTHER,
       to,
-      value: "0x0",
-      gas: "0x1000",
-      input: "0xabcdabcd",
-      sighash: "0xabcdabcd",
-      type: "call",
-      callType: "call",
+      value: '0x0',
+      gas: '0x1000',
+      input: '0xabcdabcd',
+      sighash: '0xabcdabcd',
+      type: 'call',
+      callType: 'call',
     },
-    result: { gasUsed: "0x10", output: "0x" },
+    result: { gasUsed: '0x10', output: '0x' },
   });
   // pre-order: [] 0 · [0] 1 · [0,0] 2 · [0,1] 3 · [0,2] 4 · [1] 5 · [1,0] 6 · [1,0,0] 7(MATCH)
   const ALL = [
@@ -765,42 +765,42 @@ test("regression (C6): deep matched trace is stored at its FULL-tree pre-order i
     hash: TX_HASH,
     from: OTHER,
     to: TARGET,
-    input: "0xabcdabcd",
-    value: "0x0",
+    input: '0xabcdabcd',
+    value: '0x0',
     nonce: 1,
-    gas: "0x100000",
-    gasPrice: "0x1",
+    gas: '0x100000',
+    gasPrice: '0x1',
     type: 0,
-    r: "0x" + "11".repeat(32),
-    s: "0x" + "22".repeat(32),
-    v: "0x1",
+    r: '0x' + '11'.repeat(32),
+    s: '0x' + '22'.repeat(32),
+    v: '0x1',
   };
   const HEADER = {
     number: BLOCK,
     hash: B_HASH,
-    parentHash: "0x" + "00".repeat(32),
+    parentHash: '0x' + '00'.repeat(32),
     timestamp: 1700000000,
-    logsBloom: "0x" + "00".repeat(256),
+    logsBloom: '0x' + '00'.repeat(256),
     miner: OTHER,
-    gasUsed: "0xabc",
-    gasLimit: "0x1c9c380",
-    stateRoot: "0x" + "22".repeat(32),
-    receiptsRoot: "0x" + "33".repeat(32),
-    transactionsRoot: "0x" + "44".repeat(32),
-    size: "0x500",
-    difficulty: "0x0",
-    extraData: "0x",
+    gasUsed: '0xabc',
+    gasLimit: '0x1c9c380',
+    stateRoot: '0x' + '22'.repeat(32),
+    receiptsRoot: '0x' + '33'.repeat(32),
+    transactionsRoot: '0x' + '44'.repeat(32),
+    size: '0x500',
+    difficulty: '0x0',
+    extraData: '0x',
   };
   const srv = http.createServer((req, res) => {
-    let body = "";
-    req.on("data", (c) => {
+    let body = '';
+    req.on('data', (c) => {
       body += c;
     });
-    req.on("end", () => {
+    req.on('end', () => {
       const q = body ? JSON.parse(body) : {};
       const covers =
         (q.fromBlock ?? 0) <= BLOCK && (q.toBlock ?? 1e12) >= BLOCK;
-      if (req.url?.includes("finalized-stream") && q.traces && covers) {
+      if (req.url?.includes('finalized-stream') && q.traces && covers) {
         const callTo = new Set(
           (q.traces as any[])
             .flatMap((r) => r.callTo ?? [])
@@ -809,9 +809,9 @@ test("regression (C6): deep matched trace is stored at its FULL-tree pre-order i
         let traces = STREAM;
         if (callTo.size)
           traces = traces.filter((t) => callTo.has(t.action.to.toLowerCase())); // emulate Portal server-side filter
-        res.writeHead(200, { "content-type": "application/x-ndjson" });
+        res.writeHead(200, { 'content-type': 'application/x-ndjson' });
         res.end(
-          JSON.stringify({ header: HEADER, traces, transactions: [TX] }) + "\n",
+          JSON.stringify({ header: HEADER, traces, transactions: [TX] }) + '\n',
         );
       } else {
         res.writeHead(204).end();
@@ -831,9 +831,9 @@ test("regression (C6): deep matched trace is stored at its FULL-tree pre-order i
       insertTraces: (x: any) => inserted.push(...x.traces),
     };
     const filter: any = {
-      type: "trace",
+      type: 'trace',
       chainId: 1,
-      sourceId: "deep:trace",
+      sourceId: 'deep:trace',
       fromAddress: undefined,
       toAddress: TARGET,
       functionSelector: undefined,
@@ -848,7 +848,7 @@ test("regression (C6): deep matched trace is stored at its FULL-tree pre-order i
       common: {
         logger: { debug() {}, info() {}, warn() {}, error() {}, trace() {} },
       } as any,
-      chain: { id: 1, name: "mainnet", portal: `http://localhost:${p}` } as any,
+      chain: { id: 1, name: 'mainnet', portal: `http://localhost:${p}` } as any,
       childAddresses: new Map(),
       eventCallbacks: [{ filter }],
     } as any);
@@ -869,21 +869,21 @@ test("regression (C6): deep matched trace is stored at its FULL-tree pre-order i
   }
 });
 
-test("merge: N same-address event filters collapse to ONE log request (unioned topic0) — keeps body small", async () => {
+test('merge: N same-address event filters collapse to ONE log request (unioned topic0) — keeps body small', async () => {
   // Ponder emits one filter per event; a 24-event EVault would otherwise repeat the child-address
   // list 24× in one body and blow past MAX_RAW_QUERY_SIZE. mergeLogRequests must fold them into one.
-  const ADDR = "0x" + "cc".repeat(20);
+  const ADDR = '0x' + 'cc'.repeat(20);
   const topic0s = Array.from(
     { length: 6 },
-    (_, i) => "0x" + (i + 1).toString(16).padStart(64, "0"),
+    (_, i) => '0x' + (i + 1).toString(16).padStart(64, '0'),
   );
   const dataQueries: any[] = [];
   const srv = http.createServer((req, res) => {
-    let body = "";
-    req.on("data", (c) => {
+    let body = '';
+    req.on('data', (c) => {
       body += c;
     });
-    req.on("end", () => {
+    req.on('end', () => {
       const q = body ? JSON.parse(body) : {};
       if (q.logs) dataQueries.push(q);
       res.writeHead(204).end();
@@ -894,7 +894,7 @@ test("merge: N same-address event filters collapse to ONE log request (unioned t
   );
   try {
     const filters = topic0s.map((t, i) => ({
-      type: "log",
+      type: 'log',
       chainId: 1,
       sourceId: `evault:e${i}`,
       address: ADDR,
@@ -911,7 +911,7 @@ test("merge: N same-address event filters collapse to ONE log request (unioned t
       common: {
         logger: { debug() {}, info() {}, warn() {}, error() {}, trace() {} },
       },
-      chain: { id: 1, name: "mainnet", portal: `http://localhost:${p}` },
+      chain: { id: 1, name: 'mainnet', portal: `http://localhost:${p}` },
       childAddresses: new Map(),
       eventCallbacks: filters.map((f) => ({ filter: f })),
     } as any);
@@ -951,29 +951,29 @@ test("merge: N same-address event filters collapse to ONE log request (unioned t
 // only mutated the in-memory map: a single run worked (the map is shared), but any restart/resume
 // loaded an EMPTY child set against already-cached factory intervals — discovery never re-ran and
 // every factory-child event was silently skipped. These tests pin the persistence invariant.
-const FACTORY_ADDR = "0x" + "fa".repeat(20);
-const PROXY_CREATED_TOPIC0 = "0x" + "01".repeat(32); // factory's creation-event selector
-const CHILD_ADDR = "0x" + "c1".repeat(20);
+const FACTORY_ADDR = '0x' + 'fa'.repeat(20);
+const PROXY_CREATED_TOPIC0 = '0x' + '01'.repeat(32); // factory's creation-event selector
+const CHILD_ADDR = '0x' + 'c1'.repeat(20);
 const CHILD_CREATED_AT = 100; // child created here (ProxyCreated log, child in topic1)
 const CHILD_EVENT_AT = 200; //  child emits its Deposit here
 const FACTORY_RANGE_END = 300;
 
 const mkFactory = (): any => ({
-  id: "factory_evault",
-  type: "log",
+  id: 'factory_evault',
+  type: 'log',
   chainId: 1,
-  sourceId: "evault",
+  sourceId: 'evault',
   address: FACTORY_ADDR,
   eventSelector: PROXY_CREATED_TOPIC0,
-  childAddressLocation: "topic1",
+  childAddressLocation: 'topic1',
   fromBlock: 0,
   toBlock: undefined,
 });
 // log filter whose address IS the factory (ponder's shape for factory sources)
 const mkFactoryFilter = (factory: any): any => ({
-  type: "log",
+  type: 'log',
   chainId: 1,
-  sourceId: "evault:deposit",
+  sourceId: 'evault:deposit',
   address: factory,
   topic0: DEPOSIT_TOPIC0,
   topic1: null,
@@ -987,19 +987,19 @@ const mkFactoryFilter = (factory: any): any => ({
 
 const mkFactoryHeader = (num: number) => ({
   number: num,
-  hash: "0x" + num.toString(16).padStart(64, "0"),
-  parentHash: "0x" + "00".repeat(32),
+  hash: '0x' + num.toString(16).padStart(64, '0'),
+  parentHash: '0x' + '00'.repeat(32),
   timestamp: 1_700_000_000 + num,
-  logsBloom: "0x" + "00".repeat(256),
-  miner: "0x" + "99".repeat(20),
-  gasUsed: "0x1",
-  gasLimit: "0x1c9c380",
-  stateRoot: "0x" + "22".repeat(32),
-  receiptsRoot: "0x" + "33".repeat(32),
-  transactionsRoot: "0x" + "44".repeat(32),
-  size: "0x500",
-  difficulty: "0x0",
-  extraData: "0x",
+  logsBloom: '0x' + '00'.repeat(256),
+  miner: '0x' + '99'.repeat(20),
+  gasUsed: '0x1',
+  gasLimit: '0x1c9c380',
+  stateRoot: '0x' + '22'.repeat(32),
+  receiptsRoot: '0x' + '33'.repeat(32),
+  transactionsRoot: '0x' + '44'.repeat(32),
+  size: '0x500',
+  difficulty: '0x0',
+  extraData: '0x',
 });
 
 /** Serves: the factory's ProxyCreated log for discovery requests, the child's Deposit log (+ parent
@@ -1007,13 +1007,13 @@ const mkFactoryHeader = (num: number) => ({
  * address filter — a data request without the child address gets nothing, exactly like production. */
 const factoryPortalServer = () =>
   http.createServer((req, res) => {
-    let body = "";
-    req.on("data", (c) => {
+    let body = '';
+    req.on('data', (c) => {
       body += c;
     });
-    req.on("end", () => {
-      if (req.url?.includes("finalized-head")) {
-        res.writeHead(200, { "content-type": "application/json" });
+    req.on('end', () => {
+      if (req.url?.includes('finalized-head')) {
+        res.writeHead(200, { 'content-type': 'application/json' });
         res.end(JSON.stringify({ number: 1_000_000_000 }));
         return;
       }
@@ -1045,10 +1045,10 @@ const factoryPortalServer = () =>
               address: FACTORY_ADDR,
               topics: [
                 PROXY_CREATED_TOPIC0,
-                "0x" + "00".repeat(12) + CHILD_ADDR.slice(2),
+                '0x' + '00'.repeat(12) + CHILD_ADDR.slice(2),
               ],
-              data: "0x",
-              transactionHash: "0x" + "f0".repeat(32),
+              data: '0x',
+              transactionHash: '0x' + 'f0'.repeat(32),
               transactionIndex: 0,
               logIndex: 0,
             },
@@ -1066,8 +1066,8 @@ const factoryPortalServer = () =>
             {
               address: CHILD_ADDR,
               topics: [DEPOSIT_TOPIC0],
-              data: "0x",
-              transactionHash: "0x" + "d1".repeat(32),
+              data: '0x',
+              transactionHash: '0x' + 'd1'.repeat(32),
               transactionIndex: 0,
               logIndex: 0,
             },
@@ -1075,14 +1075,14 @@ const factoryPortalServer = () =>
           transactions: [
             {
               transactionIndex: 0,
-              hash: "0x" + "d1".repeat(32),
-              from: "0x" + "ee".repeat(20),
+              hash: '0x' + 'd1'.repeat(32),
+              from: '0x' + 'ee'.repeat(20),
               to: CHILD_ADDR,
-              input: "0x",
-              value: "0x0",
+              input: '0x',
+              value: '0x0',
               nonce: 0,
-              gas: "0x1",
-              gasPrice: "0x1",
+              gas: '0x1',
+              gasPrice: '0x1',
               type: 0,
             },
           ],
@@ -1092,8 +1092,8 @@ const factoryPortalServer = () =>
         res.writeHead(204).end();
         return;
       }
-      res.writeHead(200, { "content-type": "application/x-ndjson" });
-      res.end(out.map((b) => JSON.stringify(b)).join("\n") + "\n");
+      res.writeHead(200, { 'content-type': 'application/x-ndjson' });
+      res.end(out.map((b) => JSON.stringify(b)).join('\n') + '\n');
     });
   });
 
@@ -1118,14 +1118,14 @@ const mkFactorySync = (
     } as any,
     chain: {
       id: 1,
-      name: "mainnet",
+      name: 'mainnet',
       portal: `http://localhost:${port}`,
     } as any,
     childAddresses: childAddresses as any,
     eventCallbacks: [{ filter }],
   } as any);
 
-test("regression: discovered factory children are persisted via insertChildAddresses in the SAME syncBlockRangeData call", async () => {
+test('regression: discovered factory children are persisted via insertChildAddresses in the SAME syncBlockRangeData call', async () => {
   const srv = factoryPortalServer();
   const p: number = await new Promise((r) =>
     srv.listen(0, () => r((srv.address() as AddressInfo).port)),
@@ -1176,7 +1176,7 @@ test("regression: discovered factory children are persisted via insertChildAddre
   }
 });
 
-test("regression: a failing insertChildAddresses fails LOUD and the children re-flush on the next call — never silently dropped", async () => {
+test('regression: a failing insertChildAddresses fails LOUD and the children re-flush on the next call — never silently dropped', async () => {
   const srv = factoryPortalServer();
   const p: number = await new Promise((r) =>
     srv.listen(0, () => r((srv.address() as AddressInfo).port)),
@@ -1187,7 +1187,7 @@ test("regression: a failing insertChildAddresses fails LOUD and the children re-
     const calls: any[] = [];
     let fail = true;
     const syncStore = mkFactorySyncStore((x) => {
-      if (fail) throw new Error("child-address insert failed");
+      if (fail) throw new Error('child-address insert failed');
       calls.push(x);
     });
     const sync = mkFactorySync(
@@ -1207,7 +1207,7 @@ test("regression: a failing insertChildAddresses fails LOUD and the children re-
         requiredFactoryIntervals: [{ interval, factory }],
         syncStore,
       }),
-    ).rejects.toThrow("child-address insert failed");
+    ).rejects.toThrow('child-address insert failed');
 
     // the retried interval re-flushes the SAME children (pending was restored, not cleared)
     fail = false;
@@ -1224,7 +1224,7 @@ test("regression: a failing insertChildAddresses fails LOUD and the children re-
   }
 });
 
-test("restart: a new sync seeded ONLY with the persisted children still fetches child logs (cached factory intervals → no re-discovery)", async () => {
+test('restart: a new sync seeded ONLY with the persisted children still fetches child logs (cached factory intervals → no re-discovery)', async () => {
   // Models the restart: factory intervals are cached (requiredFactoryIntervals = []), so discovery
   // never runs, and childAddresses contains exactly what the store returns. BEFORE the fix the store
   // was empty → the data request carried no child address → the Portal (server-side filter) returned
@@ -1278,8 +1278,8 @@ test("restart: a new sync seeded ONLY with the persisted children still fetches 
 
 // Two children created in DIFFERENT intervals — CHILD_LO@50 and CHILD_HI@150 — so the wide scan
 // discovers both up-front but each belongs to a different interval's transaction.
-const CHILD_LO = "0x" + "1c".repeat(20);
-const CHILD_HI = "0x" + "2c".repeat(20);
+const CHILD_LO = '0x' + '1c'.repeat(20);
+const CHILD_HI = '0x' + '2c'.repeat(20);
 const LO_AT = 50;
 const HI_AT = 150;
 
@@ -1288,13 +1288,13 @@ const HI_AT = 150;
  * children each interval hands to insertChildAddresses, not event extraction. */
 const twoChildFactoryServer = () =>
   http.createServer((req, res) => {
-    let body = "";
-    req.on("data", (c) => {
+    let body = '';
+    req.on('data', (c) => {
       body += c;
     });
-    req.on("end", () => {
-      if (req.url?.includes("finalized-head")) {
-        res.writeHead(200, { "content-type": "application/json" });
+    req.on('end', () => {
+      if (req.url?.includes('finalized-head')) {
+        res.writeHead(200, { 'content-type': 'application/json' });
         res.end(JSON.stringify({ number: 1_000_000_000 }));
         return;
       }
@@ -1320,10 +1320,10 @@ const twoChildFactoryServer = () =>
                   address: FACTORY_ADDR,
                   topics: [
                     PROXY_CREATED_TOPIC0,
-                    "0x" + "00".repeat(12) + child.slice(2),
+                    '0x' + '00'.repeat(12) + child.slice(2),
                   ],
-                  data: "0x",
-                  transactionHash: "0x" + "e0".repeat(32),
+                  data: '0x',
+                  transactionHash: '0x' + 'e0'.repeat(32),
                   transactionIndex: 0,
                   logIndex: 0,
                 },
@@ -1336,8 +1336,8 @@ const twoChildFactoryServer = () =>
         res.writeHead(204).end();
         return;
       }
-      res.writeHead(200, { "content-type": "application/x-ndjson" });
-      res.end(out.map((b) => JSON.stringify(b)).join("\n") + "\n");
+      res.writeHead(200, { 'content-type': 'application/x-ndjson' });
+      res.end(out.map((b) => JSON.stringify(b)).join('\n') + '\n');
     });
   });
 
@@ -1394,7 +1394,7 @@ test("regression: each syncBlockRangeData persists ONLY its interval's children,
   }
 });
 
-test("regression: a post-flush insertLogs failure fails the interval LOUD (core rolls back — never a cached interval with unpersisted children)", async () => {
+test('regression: a post-flush insertLogs failure fails the interval LOUD (core rolls back — never a cached interval with unpersisted children)', async () => {
   // The child flush happens mid-syncBlockRangeData; insertLogs (and, in core, syncBlockData +
   // insertIntervals) run AFTER it in the SAME transaction. A transient failure there MUST reject so
   // core rolls the whole interval back — otherwise the interval is marked cached with its children
@@ -1411,7 +1411,7 @@ test("regression: a post-flush insertLogs failure fails the interval LOUD (core 
     const syncStore = {
       ...mkFactorySyncStore((x) => calls.push(x)),
       insertLogs: () => {
-        throw new Error("insertLogs failed");
+        throw new Error('insertLogs failed');
       },
     };
     const sync = mkFactorySync(
@@ -1429,7 +1429,7 @@ test("regression: a post-flush insertLogs failure fails the interval LOUD (core 
         requiredFactoryIntervals: [{ interval, factory }],
         syncStore,
       }),
-    ).rejects.toThrow("insertLogs failed");
+    ).rejects.toThrow('insertLogs failed');
 
     // the child WAS handed to the store before the failure — so it's part of the same transaction
     // core rolls back; the interval is NOT marked cached, so restart re-discovery re-persists it.
@@ -1440,7 +1440,7 @@ test("regression: a post-flush insertLogs failure fails the interval LOUD (core 
   }
 });
 
-test("regression: a child already known from the store is NOT re-flushed when discovery re-runs live", async () => {
+test('regression: a child already known from the store is NOT re-flushed when discovery re-runs live', async () => {
   // On a resumed run, childAddresses is seeded from the store yet discovery can still re-run over a
   // partially-cached factory interval. A child re-found at its known creation block must NOT be
   // re-queued (prevBn === bn) — else every resume re-inserts known children. The existing
@@ -1476,30 +1476,30 @@ test("regression: a child already known from the store is NOT re-flushed when di
   }
 });
 
-test("guard: an over-limit request body fails loud with the explicit size driver (never a silent Portal 400)", async () => {
+test('guard: an over-limit request body fails loud with the explicit size driver (never a silent Portal 400)', async () => {
   // 12k filter addresses → batched bodies sum > 256KB MAX_RAW_QUERY_SIZE. The proactive guard must
   // throw a clear, actionable error BEFORE the POST, not let the Portal reject it opaquely.
   const addrs = Array.from(
     { length: 12000 },
-    (_, i) => "0x" + i.toString(16).padStart(40, "0"),
+    (_, i) => '0x' + i.toString(16).padStart(40, '0'),
   );
   const srv = http.createServer((req, res) => {
-    let b = "";
-    req.on("data", (c) => {
+    let b = '';
+    req.on('data', (c) => {
       b += c;
     });
-    req.on("end", () => res.writeHead(204).end());
+    req.on('end', () => res.writeHead(204).end());
   });
   const p = await new Promise<number>((r) =>
     srv.listen(0, () => r((srv.address() as AddressInfo).port)),
   );
   try {
     const filter = {
-      type: "log",
+      type: 'log',
       chainId: 1,
-      sourceId: "big",
+      sourceId: 'big',
       address: addrs,
-      topic0: "0x" + "11".repeat(32),
+      topic0: '0x' + '11'.repeat(32),
       topic1: null,
       topic2: null,
       topic3: null,
@@ -1512,7 +1512,7 @@ test("guard: an over-limit request body fails loud with the explicit size driver
       common: {
         logger: { debug() {}, info() {}, warn() {}, error() {}, trace() {} },
       },
-      chain: { id: 1, name: "mainnet", portal: `http://localhost:${p}` },
+      chain: { id: 1, name: 'mainnet', portal: `http://localhost:${p}` },
       childAddresses: new Map(),
       eventCallbacks: [{ filter }],
     } as any);

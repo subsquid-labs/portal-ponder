@@ -31,7 +31,7 @@ export function withPortal<
   T extends { chains?: Record<string, PortalChainConfig> },
 >(config: T): T {
   for (const chain of Object.values(config.chains ?? {})) {
-    if (chain && typeof chain.portal === "string") {
+    if (chain && typeof chain.portal === 'string') {
       portalRegistry.set(chain.id, chain.portal);
       delete chain.portal;
     }

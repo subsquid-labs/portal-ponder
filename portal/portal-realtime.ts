@@ -16,15 +16,15 @@
  * The reorg/finalize reconciliation is pure + unit-tested; the `/stream` read and `/finalized-head` poll
  * are the I/O shell.
  */
-
-import { type Hex, hexToNumber } from "viem";
-import type { SyncBlockHeader, SyncLog } from "@/internal/types.js";
+import type { SyncBlockHeader, SyncLog } from '@/internal/types.js';
+import { ndjsonLines } from './portal-client.js';
+import { invariant } from './portal-invariant.js';
 import {
-  hx,
   type RawHeader,
+  type RawLog,
   toSyncBlockHeader,
   toSyncLog,
-} from "./portal-transform.js";
+} from './portal-transform.js';
 
 // ─────────────────────────────── pure reorg / finalize core (unit-tested) ───────────────────────────────
 
@@ -37,10 +37,10 @@ export type Light = {
 };
 
 export type Reconcile =
-  | { kind: "append" } //   extends the tip (normal case)
-  | { kind: "duplicate" } // already the tip (idempotent re-delivery)
-  | { kind: "reorg"; commonAncestor: Light; reorgedBlocks: Light[] } // forks off an earlier block
-  | { kind: "gap" }; //     parent is unknown (beyond our window / a skipped block) → caller must re-sync
+  | { kind: 'append' } //   extends the tip (normal case)
+  | { kind: 'duplicate' } // already the tip (idempotent re-delivery)
+  | { kind: 'reorg'; commonAncestor: Light; reorgedBlocks: Light[] } // forks off an earlier block
+  | { kind: 'gap' }; //     parent is unknown (beyond our window / a skipped block) → caller must re-sync
 
 /**
  * Reconcile a newly-streamed block against the local unfinalized chain (oldest→newest, linked
@@ -49,14 +49,14 @@ export type Reconcile =
  * common ancestor is reorged.
  */
 export function reconcile(unfinalized: Light[], next: Light): Reconcile {
-  if (unfinalized.length === 0) return { kind: "append" };
+  if (unfinalized.length === 0) return { kind: 'append' };
   const tip = unfinalized[unfinalized.length - 1]!;
-  if (next.hash === tip.hash) return { kind: "duplicate" };
-  if (next.parentHash === tip.hash) return { kind: "append" };
+  if (next.hash === tip.hash) return { kind: 'duplicate' };
+  if (next.parentHash === tip.hash) return { kind: 'append' };
   const idx = unfinalized.findIndex((b) => b.hash === next.parentHash);
-  if (idx === -1) return { kind: "gap" };
+  if (idx === -1) return { kind: 'gap' };
   return {
-    kind: "reorg",
+    kind: 'reorg',
     commonAncestor: unfinalized[idx]!,
     reorgedBlocks: unfinalized.slice(idx + 1),
   };
@@ -76,11 +76,13 @@ export function takeFinalized(
   return { finalizedTip, remaining };
 }
 
+// Realtime headers always carry hash/parentHash/timestamp (BLOCK_FIELDS requests them); the RawHeader
+// type keeps them optional because other queries project fewer fields — assert presence here.
 export const toLight = (h: RawHeader): Light => ({
   number: h.number,
-  hash: h.hash,
-  parentHash: h.parentHash,
-  timestamp: h.timestamp,
+  hash: h.hash as string,
+  parentHash: h.parentHash as string,
+  timestamp: h.timestamp as number,
 });
 
 // ─────────────────────────────── /stream I/O shell ───────────────────────────────
@@ -106,13 +108,13 @@ export type PortalRealtimeArgs = {
  */
 export async function* streamHotBlocks(
   args: PortalRealtimeArgs,
-): AsyncGenerator<{ header: RawHeader; logs: any[] }> {
+): AsyncGenerator<{ header: RawHeader; logs: RawLog[] }> {
   const fetchImpl = args.fetchImpl ?? fetch;
   let cursor = args.fromBlock;
   for (;;) {
     if (args.signal?.aborted) return;
     const body = JSON.stringify({
-      type: "evm",
+      type: 'evm',
       fromBlock: cursor,
       includeAllBlocks: true,
       fields: {
@@ -136,8 +138,8 @@ export async function* streamHotBlocks(
     let res: Response;
     try {
       res = await fetchImpl(`${args.portalUrl}/stream`, {
-        method: "POST",
-        headers: { "content-type": "application/json", ...args.headers },
+        method: 'POST',
+        headers: { 'content-type': 'application/json', ...args.headers },
         body,
         signal: args.signal,
       });
@@ -153,27 +155,12 @@ export async function* streamHotBlocks(
       await sleep(1000, args.signal);
       continue;
     }
-    const reader = res.body.getReader();
-    const dec = new TextDecoder();
-    let buf = "";
     try {
-      for (;;) {
-        const { done, value } = await reader.read();
-        if (done) break;
-        buf += dec.decode(value, { stream: true });
-        for (;;) {
-          const nl = buf.indexOf("\n");
-          if (nl < 0) break;
-
-          const line = buf.slice(0, nl);
-          buf = buf.slice(nl + 1);
-          if (!line) continue;
-
-          const batch = JSON.parse(line);
-          if (batch?.header?.number != null) {
-            cursor = batch.header.number + 1; // resume past this block on reconnect
-            yield { header: batch.header, logs: batch.logs ?? [] };
-          }
+      for await (const line of ndjsonLines(res.body)) {
+        const batch = JSON.parse(line);
+        if (batch?.header?.number != null) {
+          cursor = batch.header.number + 1; // resume past this block on reconnect
+          yield { header: batch.header, logs: batch.logs ?? [] };
         }
       }
     } catch {
@@ -188,7 +175,7 @@ const sleep = (ms: number, signal?: AbortSignal) =>
     if (signal?.aborted) return resolve();
     const t = setTimeout(resolve, ms);
     signal?.addEventListener(
-      "abort",
+      'abort',
       () => {
         clearTimeout(t);
         resolve();
@@ -206,13 +193,13 @@ const sleep = (ms: number, signal?: AbortSignal) =>
 
 export type PortalRealtimeEvent =
   | {
-      type: "block";
+      type: 'block';
       block: SyncBlockHeader;
       logs: SyncLog[];
       hasMatchedFilter: boolean;
     }
-  | { type: "reorg"; block: Light; reorgedBlocks: Light[] }
-  | { type: "finalize"; block: Light };
+  | { type: 'reorg'; block: Light; reorgedBlocks: Light[] }
+  | { type: 'finalize'; block: Light };
 
 export async function* portalRealtimeEvents(
   args: PortalRealtimeArgs & {
@@ -227,12 +214,12 @@ export async function* portalRealtimeEvents(
   for await (const { header, logs } of streamHotBlocks(args)) {
     const light = toLight(header);
     const r = reconcile(unfinalized, light);
-    if (r.kind === "duplicate") continue;
-    if (r.kind === "gap") {
+    if (r.kind === 'duplicate') continue;
+    if (r.kind === 'gap') {
       // parent unknown: our window is behind a deeper reorg. Drop to a resync by clearing and continuing
       // from this block (the finalized floor still protects already-committed data).
       unfinalized.length = 0;
-    } else if (r.kind === "reorg") {
+    } else if (r.kind === 'reorg') {
       // trim the local chain and surface the rollback to the common ancestor
       while (
         unfinalized.length &&
@@ -240,17 +227,32 @@ export async function* portalRealtimeEvents(
       )
         unfinalized.pop();
       yield {
-        type: "reorg",
+        type: 'reorg',
         block: r.commonAncestor,
         reorgedBlocks: r.reorgedBlocks,
       };
+    }
+    // INV-10 tripwire: the unfinalized chain stays strictly increasing and parentHash-linked on every
+    // append. `reconcile` guarantees this (append/reorg/gap all restore linkage), so this O(1) check can
+    // only fire on a reconcile regression.
+    if (unfinalized.length > 0) {
+      const tip = unfinalized[unfinalized.length - 1]!;
+      invariant(
+        'INV-10',
+        light.parentHash === tip.hash && light.number > tip.number,
+        'unfinalized chain link broken on append',
+        () => ({
+          tip: { number: tip.number, hash: tip.hash },
+          next: { number: light.number, parentHash: light.parentHash },
+        }),
+      );
     }
     unfinalized.push(light);
 
     const block = toSyncBlockHeader(header);
     const syncLogs = logs.map((l) => toSyncLog(l, header));
     yield {
-      type: "block",
+      type: 'block',
       block,
       logs: syncLogs,
       hasMatchedFilter: syncLogs.length > 0,
@@ -266,12 +268,9 @@ export async function* portalRealtimeEvents(
         if (finalizedTip) {
           unfinalized.length = 0;
           unfinalized.push(...remaining);
-          yield { type: "finalize", block: finalizedTip };
+          yield { type: 'finalize', block: finalizedTip };
         }
       }
     }
   }
 }
-
-export type { Hex, SyncBlockHeader, SyncLog };
-export { hexToNumber, hx as _hx };

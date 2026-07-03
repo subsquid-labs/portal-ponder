@@ -17,14 +17,25 @@ PNPM="corepack pnpm@9.10.0"
 
 [ -f "$WIRING" ] || { echo "✗ no wiring patch for $VER at portal/wiring/$VER.patch — author it (PUBLISHING.md §'Adding a version')"; exit 1; }
 
+if [ "${2:-}" = "--test" ]; then
+  # Formatting/lint gate BEFORE anything is copied: the Portal layer must be clean under the repo's
+  # own Biome (root biome.json; version pinned to the repo devDependency). `check` fails on format
+  # drift and lint ERRORS (warnings pass) — so an unformatted file can never ship silently.
+  echo "▶ biome check (repo config, pinned 2.5.2)"
+  ( cd "$ROOT" && npx -y @biomejs/biome@2.5.2 check portal/ --diagnostic-level=error )
+fi
+
 echo "▶ cloning ponder@$VER → $WORK"
 rm -rf "$WORK"; git clone --quiet --depth 1 --branch "ponder@$VER" https://github.com/ponder-sh/ponder "$WORK"
 
 CORE="$WORK/packages/core"
 SYNC="$CORE/src/sync-historical"
 echo "▶ applying Portal layer"
-cp "$ROOT/portal/portal.ts" "$ROOT/portal/portal-transform.ts" "$ROOT/portal/realtime.ts" "$ROOT/portal/portal-realtime.ts" "$ROOT/portal/portal-realtime-wire.ts" "$SYNC/"
-cp "$ROOT/portal/portal-transform.test.ts" "$ROOT/portal/portal.test.ts" "$ROOT/portal/realtime.test.ts" "$ROOT/portal/portal-realtime.test.ts" "$ROOT/portal/portal-realtime-wire.test.ts" "$SYNC/" 2>/dev/null || true
+# Copy the whole Portal layer by GLOB (source + tests together) so a newly added portal-*.ts /
+# realtime-*.ts module can never be silently missed. `config.ts` (deleted) and `vite.portal.config.ts`
+# are intentionally excluded by the prefix. The vite include globs (portal*.test.ts, realtime*.test.ts)
+# already pick up any new test file, so they need no change.
+cp "$ROOT"/portal/portal*.ts "$ROOT"/portal/realtime*.ts "$SYNC/"
 mkdir -p "$SYNC/__fixtures__"; cp "$ROOT/portal/__fixtures__/"*.json "$SYNC/__fixtures__/"
 cp "$ROOT/portal/vite.portal.config.ts" "$CORE/"
 ( cd "$WORK" && git apply --verbose "$WIRING" )
@@ -51,6 +62,17 @@ fs.writeFileSync(pkgPath, JSON.stringify(pkg,null,2)+'\n'); console.log('  rewro
 "
 
 if [ "${2:-}" = "--test" ]; then
+  # `fast-check` (property tests) is a DEV-ONLY dep of the clone — never a runtime dep of the published
+  # package. We provision it straight into the core's node_modules rather than adding it to package.json,
+  # because renaming the core to @subsquid/ponder orphans sibling workspace packages (e.g. benchmark's
+  # `ponder@workspace:*`), so a lockfile re-resolve (which a new package.json dep would force) fails.
+  echo "▶ provisioning fast-check (dev-only, for the property tests)"
+  # OUTSIDE the clone so npm doesn't walk up into the pnpm workspace root. Pinned exactly for
+  # reproducible CI; the whole resolved tree is copied so transitive deps can never be missed.
+  FCDIR="$(mktemp -d)"
+  ( cd "$FCDIR" && npm init -y >/dev/null 2>&1 && npm install --no-audit --no-fund --silent fast-check@3.23.2 )
+  cp -R "$FCDIR/node_modules/." "$CORE/node_modules/"
+  rm -rf "$FCDIR"
   echo "▶ running Portal-layer tests"
   ( cd "$CORE" && pnpm exec vitest run --config vite.portal.config.ts )
 fi

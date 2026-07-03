@@ -3,6 +3,7 @@
   "upstream": "ponder",
   "policy": "Version = `<ponder-version>-sqd.<rev>`: @subsquid/ponder@X.Y.Z-sqd.N is built from ponder@X.Y.Z + the Portal layer (rev N). The ponder version stays visible; bump `-sqd.<rev>` for a fork-side fix on the SAME ponder version (npm permanently retires an unpublished version number, so a plain mirror like 0.16.6 can't be re-cut after a bad publish). Published with `--tag latest` so the prerelease-form version is the default `npm install`. The bin stays `ponder` (drop-in). We cut a release only for ponder versions a client needs; `compat.tested` records which versions the seam is proven against.",
   "layer": "portal/",
+  "nextFromMain": "0.16.6-sqd.2 — the invariant-first re-architecture of portal/ (functional core + imperative shell, INV-1…INV-15, portal/INVARIANTS.md; fixes G1/G2/G3). Behavior + seam frozen; all 60 pre-existing tests (incl. main's PR #2/#5 fixes) pass unchanged, plus a 72-test property/regression suite (132 total). DO NOT publish from this PR — publish is a separate, deliberate step.",
   "seam": "HistoricalSync.syncBlockRangeData / syncBlockData (interval-scoped) — identical in shape across the tested range",
   "versions": [
     {
@@ -19,7 +20,7 @@
       "rev": 1,
       "status": "verified",
       "published": true,
-      "note": "Seam identical to 0.16.6 — the 0.16.6 wiring patch applies cleanly, builds, and passes all 53 tests on ponder@0.15.17."
+      "note": "Seam identical to 0.16.6 — the 0.16.6 wiring patch applies cleanly, builds, and passes the full portal suite on ponder@0.15.17 (CI matrix)."
     }
   ],
   "compat": {

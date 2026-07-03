@@ -11,25 +11,55 @@
  * real captured fixtures.
  */
 
-import { type Address, type Hex, numberToHex, toHex } from "viem";
+import { type Address, type Hex, numberToHex, toHex } from 'viem';
 import type {
   SyncBlockHeader,
   SyncLog,
   SyncTransaction,
   SyncTransactionReceipt,
-} from "@/internal/types.js";
+} from '@/internal/types.js';
 
-export type RawHeader = Record<string, any> & { number: number };
+// Named raw-NDJSON shapes (Record<string, unknown>-based with the known fields). Used at the client /
+// assemble / shell boundaries so those exported signatures avoid `any`; the transform internals below
+// remain loosely typed (they are the intentionally-unchanged Sync* cast boundary). Fields beyond
+// `number` are optional because different queries project different field sets.
+export type RawHeader = Record<string, unknown> & {
+  number: number;
+  hash?: string;
+  parentHash?: string;
+  timestamp?: number;
+};
+export type RawLog = Record<string, unknown> & {
+  address?: string;
+  topics?: string[];
+  data?: string;
+  transactionHash?: string;
+  transactionIndex?: number;
+  logIndex?: number;
+};
+export type RawTx = Record<string, unknown> & {
+  transactionIndex?: number;
+  hash?: string;
+  from?: string;
+  to?: string | null;
+  type?: number | string;
+};
+export type RawTrace = Record<string, unknown> & {
+  transactionIndex?: number | null;
+  traceAddress?: number[];
+  type?: string;
+};
+export type RawBlock = {
+  header: RawHeader;
+  logs?: RawLog[];
+  transactions?: RawTx[];
+  traces?: RawTrace[];
+};
 
-/** Traces are ~100x denser than logs; buffering a wide chunk's worth over a busy contract OOMs.
- * For trace-index parity we fetch the FULL (unfiltered) trace set, which is denser still, so the
- * default cap is conservative. When a chain has trace sources, cap the chunk to a trace-safe width
- * (PORTAL_TRACE_CHUNK_BLOCKS, default 2k). Pure so it's unit-testable. */
-export const traceSafeChunkBlocks = (
-  base: number,
-  needTraces: boolean,
-  cap = Number(process.env.PORTAL_TRACE_CHUNK_BLOCKS ?? 2_000),
-): number => (needTraces && base > cap ? cap : base);
+// `traceSafeChunkBlocks` now lives in portal-chunks.ts (its natural home with the rest of the grid
+// math). Re-exported here for compatibility — existing call sites and tests import it from this
+// module.
+export { traceSafeChunkBlocks } from './portal-chunks.js';
 
 /** An interval reaching past Portal's finalized head must fall back to RPC for the gap.
  * (undefined head = not yet known → treat as no gap.) Pure so it's unit-testable. */
@@ -40,12 +70,12 @@ export const isFinalityGap = (
 
 /** number|decimal-string|hex → 0x-hex; passes existing hex through. */
 export const hx = (v: unknown): Hex => {
-  if (typeof v === "string") {
-    if (v === "0x" || v === "") return "0x0"; // empty quantity → 0 (never the invalid "0x")
-    return (v.startsWith("0x") ? v : toHex(BigInt(v))) as Hex;
+  if (typeof v === 'string') {
+    if (v === '0x' || v === '') return '0x0'; // empty quantity → 0 (never the invalid "0x")
+    return (v.startsWith('0x') ? v : toHex(BigInt(v))) as Hex;
   }
-  if (typeof v === "number" || typeof v === "bigint") return numberToHex(v);
-  return "0x0";
+  if (typeof v === 'number' || typeof v === 'bigint') return numberToHex(v);
+  return '0x0';
 };
 export const opt = (v: unknown): Hex | undefined =>
   v === undefined || v === null ? undefined : hx(v);
@@ -54,7 +84,7 @@ export const toSyncLog = (l: any, h: RawHeader): SyncLog =>
   ({
     address: (l.address as string).toLowerCase(),
     topics: l.topics ?? [],
-    data: l.data ?? "0x",
+    data: l.data ?? '0x',
     blockNumber: hx(h.number),
     blockHash: h.hash,
     transactionHash: l.transactionHash,
@@ -95,7 +125,7 @@ export const toSyncTransaction = (tx: any, h: RawHeader): SyncTransaction =>
     to: tx.to ? (tx.to as string).toLowerCase() : null,
     gas: hx(tx.gas),
     hash: tx.hash,
-    input: tx.input ?? "0x",
+    input: tx.input ?? '0x',
     nonce: hx(tx.nonce ?? 0),
     transactionIndex: hx(tx.transactionIndex),
     value: hx(tx.value ?? 0),
@@ -134,17 +164,17 @@ export const toSyncReceipt = (tx: any, h: RawHeader): SyncTransactionReceipt =>
     cumulativeGasUsed: hx(tx.cumulativeGasUsed),
     effectiveGasPrice: hx(tx.effectiveGasPrice),
     status:
-      tx.status === 1 || tx.status === "0x1" || tx.status === true
-        ? "0x1"
-        : "0x0",
+      tx.status === 1 || tx.status === '0x1' || tx.status === true
+        ? '0x1'
+        : '0x0',
     type: hx(tx.type ?? 0),
   }) as unknown as SyncTransactionReceipt;
 
 export const CALL_TYPE: Record<string, string> = {
-  call: "CALL",
-  delegatecall: "DELEGATECALL",
-  staticcall: "STATICCALL",
-  callcode: "CALLCODE",
+  call: 'CALL',
+  delegatecall: 'DELEGATECALL',
+  staticcall: 'STATICCALL',
+  callcode: 'CALLCODE',
 };
 
 /** lexicographic, parent-before-child: [] < [0] < [0,0] < [1] — i.e. DFS pre-order. */
@@ -167,35 +197,35 @@ export const parityToCallFrame = (t: any, index: number): any | undefined => {
     gasUsed: any,
     input: any,
     output: any;
-  if (t.type === "call") {
+  if (t.type === 'call') {
     type =
       CALL_TYPE[
         (a.callType ?? a.type ?? t.callCallType ?? t.callType) as string
-      ] ?? "CALL";
+      ] ?? 'CALL';
     from = a.from ?? t.callFrom;
     to = a.to ?? t.callTo;
     value = a.value ?? t.callValue;
     gas = a.gas ?? t.callGas;
     gasUsed = r.gasUsed ?? t.callResultGasUsed;
-    input = a.input ?? t.callInput ?? "0x";
+    input = a.input ?? t.callInput ?? '0x';
     output = r.output ?? t.callResultOutput;
-  } else if (t.type === "create") {
-    type = "CREATE";
+  } else if (t.type === 'create') {
+    type = 'CREATE';
     from = a.from ?? t.createFrom;
     to = r.address ?? t.createResultAddress;
     value = a.value ?? t.createValue;
     gas = a.gas ?? t.createGas;
     gasUsed = r.gasUsed ?? t.createResultGasUsed;
-    input = a.init ?? t.createInit ?? "0x";
+    input = a.init ?? t.createInit ?? '0x';
     output = r.code ?? t.createResultCode;
-  } else if (t.type === "suicide") {
-    type = "SELFDESTRUCT";
+  } else if (t.type === 'suicide') {
+    type = 'SELFDESTRUCT';
     from = a.address ?? t.suicideAddress;
     to = a.refundAddress ?? t.suicideRefundAddress;
     value = a.balance ?? t.suicideBalance;
     gas = 0;
     gasUsed = 0;
-    input = "0x";
+    input = '0x';
   } else return undefined; // "reward" has no callTracer equivalent
   return {
     type,
@@ -204,7 +234,7 @@ export const parityToCallFrame = (t: any, index: number): any | undefined => {
     value: opt(value),
     gas: hx(gas ?? 0),
     gasUsed: hx(gasUsed ?? 0),
-    input: input ?? "0x",
+    input: input ?? '0x',
     output: output ?? undefined,
     error: t.error ?? undefined,
     revertReason: t.revertReason ?? undefined,
@@ -219,7 +249,7 @@ export type StateDiff = {
   transactionIndex: number;
   address: Address;
   key: string;
-  kind: "=" | "+" | "*" | "-";
+  kind: '=' | '+' | '*' | '-';
   prev: Hex | null;
   next: Hex | null;
 };

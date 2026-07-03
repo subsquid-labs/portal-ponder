@@ -19,33 +19,37 @@
  * strictly ABOVE `finalized`, and every `finalize` monotonically at/above it.
  */
 
-import { type Address, hexToNumber, numberToHex } from "viem";
-import type { Common } from "@/internal/common.js";
+import { type Address, hexToNumber, numberToHex } from 'viem';
+import type { Common } from '@/internal/common.js';
 import type {
   Chain,
   EventCallback,
   Factory,
   FactoryId,
-  Filter,
   LightBlock,
-  LogFilter,
   SyncLog,
-} from "@/internal/types.js";
-import { eth_getBlockByNumber } from "@/rpc/actions.js";
-import type { Rpc } from "@/rpc/index.js";
+} from '@/internal/types.js';
+import { eth_getBlockByNumber } from '@/rpc/actions.js';
+import type { Rpc } from '@/rpc/index.js';
+import { getChildAddress, isLogFactoryMatched } from '@/runtime/filter.js';
+import type { RealtimeSyncEvent } from '@/sync-realtime/index.js';
+// Log-request construction + field projections are the SINGLE source in portal-filters — shared with the
+// historical sync so realtime and backfill fetch-specs can never drift. Re-exported for callers/tests.
 import {
-  getChildAddress,
-  getFilterFactories,
-  isAddressFactory,
-  isLogFactoryMatched,
-} from "@/runtime/filter.js";
-import type { RealtimeSyncEvent } from "@/sync-realtime/index.js";
+  BLOCK_FIELDS,
+  buildPortalLogRequests,
+  LOG_FIELDS,
+  uniqueFactories,
+} from './portal-filters.js';
 import {
   type Light,
   type PortalRealtimeEvent,
   portalRealtimeEvents,
-} from "./portal-realtime.js";
-import { hx } from "./portal-transform.js";
+} from './portal-realtime.js';
+import { hx } from './portal-transform.js';
+
+export type { PortalLogRequest } from './portal-filters.js';
+export { buildPortalLogRequests, uniqueFactories } from './portal-filters.js';
 
 // ─────────────────────────────── flag / detection ───────────────────────────────
 
@@ -53,18 +57,18 @@ import { hx } from "./portal-transform.js";
 export const isPortalRealtime = (chain: {
   portal?: string | undefined;
 }): boolean =>
-  typeof chain.portal === "string" && process.env.PORTAL_REALTIME === "stream";
+  typeof chain.portal === 'string' && process.env.PORTAL_REALTIME === 'stream';
 
 const portalHeaders = (): Record<string, string> => {
   const h: Record<string, string> = {
-    "content-type": "application/json",
-    "accept-encoding": "gzip",
+    'content-type': 'application/json',
+    'accept-encoding': 'gzip',
   };
-  if (process.env.PORTAL_API_KEY) h["x-api-key"] = process.env.PORTAL_API_KEY;
+  if (process.env.PORTAL_API_KEY) h['x-api-key'] = process.env.PORTAL_API_KEY;
   return h;
 };
 
-const cleanUrl = (portal: string): string => portal.replace(/\/$/, "");
+const cleanUrl = (portal: string): string => portal.replace(/\/$/, '');
 
 // ─────────────────────────────── Portal finalized head + finality clamp ───────────────────────────────
 
@@ -78,7 +82,7 @@ export async function portalFinalizedHead(
     const h = await fetchImpl(`${cleanUrl(portalUrl)}/finalized-head`, {
       headers,
     }).then((r) => r.json());
-    if (typeof h?.number === "number") return h.number;
+    if (typeof h?.number === 'number') return h.number;
   } catch {
     /* head unknown → caller stays conservative */
   }
@@ -116,116 +120,10 @@ export async function clampFinalizedToPortalHead(params: {
     retryNullBlockRequest: true,
   })) as unknown as LightBlock;
   params.common?.logger.debug({
-    service: "portal",
+    service: 'portal',
     msg: `Portal ${chain.name}: clamped realtime finalized ${hexToNumber(finalizedBlock.number)} → Portal head ${head} (stream mode)`,
   });
   return clamped;
-}
-
-// ─────────────────────────────── log-request construction (mirrors portal.ts) ───────────────────────────────
-
-/** Portal `/stream` log filter — same shape the historical sync uses. */
-export type PortalLogRequest = {
-  address?: string[];
-  topic0?: string[];
-  topic1?: string[];
-  topic2?: string[];
-  topic3?: string[];
-};
-
-const PORTAL_MAX_ADDRESSES = 1000;
-const asArr = <T>(v: T | T[]): T[] => (Array.isArray(v) ? v : [v]);
-const lc = (a: string): string => a.toLowerCase();
-
-/** The unique factories referenced by any filter (deduped by id). */
-export const uniqueFactories = (
-  eventCallbacks: { filter: Filter }[],
-): Factory[] => [
-  ...new Map(
-    eventCallbacks
-      .flatMap((e) => getFilterFactories(e.filter))
-      .map((f) => [f.id, f]),
-  ).values(),
-];
-
-/** Log-filter → Portal log requests. Factory-address filters expand to the currently-known children. */
-function logRequestsFor(
-  filter: LogFilter,
-  childAddresses: Map<FactoryId, Map<Address, number>>,
-): PortalLogRequest[] {
-  const base: PortalLogRequest = {};
-  if (filter.topic0) base.topic0 = asArr(filter.topic0);
-  if (filter.topic1) base.topic1 = asArr(filter.topic1 as any);
-  if (filter.topic2) base.topic2 = asArr(filter.topic2 as any);
-  if (filter.topic3) base.topic3 = asArr(filter.topic3 as any);
-  let addresses: string[] | undefined;
-  if (isAddressFactory(filter.address)) {
-    addresses = Array.from(childAddresses.get(filter.address.id)?.keys() ?? []);
-    if (addresses.length === 0) return []; // no children yet → nothing to request for this filter
-  } else if (filter.address === undefined) {
-    return [base];
-  } else {
-    addresses = asArr(filter.address).map(lc);
-  }
-  const out: PortalLogRequest[] = [];
-  for (let i = 0; i < addresses.length; i += PORTAL_MAX_ADDRESSES)
-    out.push({
-      ...base,
-      address: addresses.slice(i, i + PORTAL_MAX_ADDRESSES),
-    });
-  return out;
-}
-
-/** Collapse requests sharing the same address-set + topic1..3, unioning topic0 (keeps the body small). */
-function mergeLogRequests(reqs: PortalLogRequest[]): PortalLogRequest[] {
-  const groups = new Map<string, PortalLogRequest>();
-  for (const r of reqs) {
-    const key = JSON.stringify([
-      r.address ? [...r.address].sort() : null,
-      r.topic1 ?? null,
-      r.topic2 ?? null,
-      r.topic3 ?? null,
-    ]);
-    const g = groups.get(key);
-    if (!g) {
-      groups.set(key, {
-        ...r,
-        topic0: r.topic0 ? [...new Set(r.topic0)] : undefined,
-      });
-      continue;
-    }
-    if (g.topic0 === undefined || r.topic0 === undefined) g.topic0 = undefined;
-    else {
-      const s = new Set(g.topic0);
-      for (const t of r.topic0) s.add(t);
-      g.topic0 = [...s];
-    }
-  }
-  return [...groups.values()];
-}
-
-/**
- * Build the merged Portal `/stream` log filter for a chain's realtime: every log filter's
- * address+topics PLUS a discovery request per factory (factory address + ProxyCreated selector), so new
- * children are streamed and pruned/matched downstream. Mirrors `portal.ts` so the realtime and historical
- * fetch-specs agree.
- */
-export function buildPortalLogRequests(
-  eventCallbacks: { filter: Filter }[],
-  childAddresses: Map<FactoryId, Map<Address, number>>,
-): PortalLogRequest[] {
-  const filters = eventCallbacks.map((e) => e.filter);
-  const reqs: PortalLogRequest[] = [];
-  for (const f of filters)
-    if (f.type === "log")
-      reqs.push(...logRequestsFor(f as LogFilter, childAddresses));
-  for (const factory of uniqueFactories(eventCallbacks)) {
-    const address = factory.address
-      ? asArr(factory.address).map(lc)
-      : undefined;
-    reqs.push({ address, topic0: [factory.eventSelector.toLowerCase()] });
-  }
-  return mergeLogRequests(reqs);
 }
 
 // ─────────────────────────────── factory child discovery ───────────────────────────────
@@ -289,8 +187,8 @@ function applyDiscovered(
 /** Portal `Light` (decimal number/timestamp) → ponder `LightBlock` (hex). */
 export const lightToLightBlock = (l: Light): LightBlock => ({
   number: hx(l.number),
-  hash: l.hash as LightBlock["hash"],
-  parentHash: l.parentHash as LightBlock["parentHash"],
+  hash: l.hash as LightBlock['hash'],
+  parentHash: l.parentHash as LightBlock['parentHash'],
   timestamp: hx(l.timestamp),
 });
 
@@ -303,9 +201,9 @@ export function toRealtimeSyncEvent(
   childAddresses: Map<Factory, Set<Address>>,
 ): RealtimeSyncEvent {
   switch (ev.type) {
-    case "block":
+    case 'block':
       return {
-        type: "block",
+        type: 'block',
         hasMatchedFilter: ev.hasMatchedFilter,
         block: ev.block,
         logs: ev.logs,
@@ -315,14 +213,14 @@ export function toRealtimeSyncEvent(
         childAddresses,
         blockCallback: undefined, // no rpc.subscribe backpressure hook in the stream path (optional-chained downstream)
       };
-    case "reorg":
+    case 'reorg':
       return {
-        type: "reorg",
+        type: 'reorg',
         block: lightToLightBlock(ev.block),
         reorgedBlocks: ev.reorgedBlocks.map(lightToLightBlock),
       };
-    case "finalize":
-      return { type: "finalize", block: lightToLightBlock(ev.block) };
+    case 'finalize':
+      return { type: 'finalize', block: lightToLightBlock(ev.block) };
   }
 }
 
@@ -362,8 +260,8 @@ export async function* getPortalRealtimeEventGenerator(params: {
   let childCount = 0;
   for (const [, m] of childAddresses) childCount += m.size;
   common.logger.info({
-    service: "portal",
-    msg: "Started live indexing (Portal /stream)",
+    service: 'portal',
+    msg: 'Started live indexing (Portal /stream)',
     chain: chain.name,
     chain_id: chain.id,
     finalized_block: startupFinalized,
@@ -386,7 +284,7 @@ export async function* getPortalRealtimeEventGenerator(params: {
       signal: controller.signal,
       fetchImpl: params.fetchImpl,
     })) {
-      if (ev.type === "finalize") {
+      if (ev.type === 'finalize') {
         // Q3 safety: never regress ponder's finalized/safe checkpoints. Suppress a finalize at/below the
         // startup boundary or below one already emitted (Portal head only ever advances, so this is defensive).
         const n = ev.block.number;
@@ -396,7 +294,7 @@ export async function* getPortalRealtimeEventGenerator(params: {
         continue;
       }
 
-      if (ev.type === "reorg") {
+      if (ev.type === 'reorg') {
         yield { chain, event: toRealtimeSyncEvent(ev, new Map()) };
         continue;
       }
@@ -414,8 +312,8 @@ export async function* getPortalRealtimeEventGenerator(params: {
 
       if (endBlock !== undefined && blockNumber >= endBlock) {
         common.logger.info({
-          service: "portal",
-          msg: "Completed live indexing (chain end block has been indexed)",
+          service: 'portal',
+          msg: 'Completed live indexing (chain end block has been indexed)',
           chain: chain.name,
           chain_id: chain.id,
           end_block: endBlock,
@@ -427,35 +325,3 @@ export async function* getPortalRealtimeEventGenerator(params: {
     controller.abort();
   }
 }
-
-// Block header fields — the RPC-path-equivalent set (kept in sync with portal.ts) so stored realtime
-// blocks are byte-consistent with the historical Portal backfill.
-const BLOCK_FIELDS: Record<string, boolean> = {
-  number: true,
-  hash: true,
-  parentHash: true,
-  timestamp: true,
-  logsBloom: true,
-  miner: true,
-  gasUsed: true,
-  gasLimit: true,
-  stateRoot: true,
-  receiptsRoot: true,
-  transactionsRoot: true,
-  size: true,
-  difficulty: true,
-  extraData: true,
-  baseFeePerGas: true,
-  nonce: true,
-  mixHash: true,
-  sha3Uncles: true,
-  totalDifficulty: true,
-};
-const LOG_FIELDS: Record<string, boolean> = {
-  address: true,
-  topics: true,
-  data: true,
-  transactionHash: true,
-  transactionIndex: true,
-  logIndex: true,
-};

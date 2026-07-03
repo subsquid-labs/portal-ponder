@@ -99,6 +99,7 @@ The free public Portal is ideal for trying the fork and for development, but sha
 ## Learn more
 
 - [**How it works**](HOW-IT-WORKS.md) — the design story: why a streamed range beats per-topic RPC lookups, the historical-sync seam, the shared read-ahead controller, factory discovery over ranges, and where the single-thread ceiling honestly is. Operational reference: [`portal/INTEGRATION.md`](portal/INTEGRATION.md).
+- [**Invariants**](portal/INVARIANTS.md) — the catalog (INV-1…INV-15) the `portal/` layer is built around: each invariant's statement, how it's enforced, where it's checked at runtime, and the property test that proves it.
 - [**Observability**](portal/INTEGRATION.md) — `PORTAL_METRICS_FILE` writes a per-chain JSON metrics file (throughput, bytes, errors, RPC-fallback); `PORTAL_GATE_LOG=1` logs the adaptive controller.
 - **Portal-native realtime** (experimental) — realtime runs on your RPC by default; set `PORTAL_REALTIME=stream` to serve the tip from the Portal's fork-aware `/stream` instead of RPC.
 - [**Versioning & releases**](PUBLISHING.md) — `@subsquid/ponder@<ponder-version>-sqd.<rev>`, generated from upstream Ponder + a per-version patch.
