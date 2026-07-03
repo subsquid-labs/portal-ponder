@@ -1,0 +1,46 @@
+# Soak B — Portal-native realtime soak (mirror of Soak A, Portal /stream instead of RPC realtime).
+# RENDERED by harness/soak-ab/deploy-soak-b.sh (@@TOKENS@@ substituted); do not install by hand.
+#
+# GUARDRAILS baked in: dedicated DB euler_rt_b + dedicated port (never the euler prod DB or :9547),
+# secrets only via a chmod-600 EnvironmentFile, RSS-capped, auto-restart. The unit is enabled but
+# NOT started by the deploy script — the operator starts it deliberately.
+
+[Unit]
+Description=portal-ponder Soak B (Portal-native realtime, DB euler_rt_b)
+After=network-online.target postgresql.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=@@WORKDIR@@
+
+# All secrets + tunables live in this chmod-600 file (PORTAL_API_KEY, SQD_RPC_KEY, DATABASE_URL, …).
+EnvironmentFile=@@ENVFILE@@
+
+# Portal-native realtime + on-by-default runtime invariant checks (a violation crashes loud).
+Environment=PORTAL_REALTIME=stream
+Environment=PORTAL_CHECKS=on
+Environment=PONDER_LOG_LEVEL=info
+Environment=CI=true
+
+# The soak indexes the SAME 3 chains as Soak A; the app's ponder.config.ts reads SOAK_CHAINS.
+Environment=SOAK_CHAINS=eth,base,arbitrum
+
+ExecStart=@@WORKDIR@@/node_modules/.bin/ponder start --schema soak_b --port @@PORT@@
+
+# RSS cap — MemoryHigh throttles, MemoryMax is the hard kill ceiling (the soak asserts it holds).
+MemoryHigh=@@MEM_HIGH@@
+MemoryMax=@@MEM_MAX@@
+
+Restart=on-failure
+RestartSec=10
+# 2 planned SIGKILL+restart drills mid-soak are exercised by the operator via `systemctl kill -s KILL`.
+KillSignal=SIGTERM
+TimeoutStopSec=30
+
+NoNewPrivileges=true
+ProtectSystem=strict
+ReadWritePaths=@@WORKDIR@@
+
+[Install]
+WantedBy=multi-user.target
