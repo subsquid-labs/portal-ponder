@@ -18,48 +18,41 @@
  * (no gap, the RPC fallback never triggers) and (b) realtime streams `[portal-head+1 → tip]` — every block
  * strictly ABOVE `finalized`, and every `finalize` monotonically at/above it.
  */
-
-import { type Address, hexToNumber, numberToHex } from "viem";
 import type { Common } from "@/internal/common.js";
 import type {
   Chain,
   EventCallback,
   Factory,
   FactoryId,
-  Filter,
   LightBlock,
-  LogFilter,
   SyncLog,
 } from "@/internal/types.js";
+import { getChildAddress, isLogFactoryMatched } from "@/runtime/filter.js";
 import { eth_getBlockByNumber } from "@/rpc/actions.js";
 import type { Rpc } from "@/rpc/index.js";
-import {
-  getChildAddress,
-  getFilterFactories,
-  isAddressFactory,
-  isLogFactoryMatched,
-} from "@/runtime/filter.js";
 import type { RealtimeSyncEvent } from "@/sync-realtime/index.js";
+import { type Address, hexToNumber, numberToHex } from "viem";
 import {
   type Light,
   type PortalRealtimeEvent,
   portalRealtimeEvents,
 } from "./portal-realtime.js";
+// Log-request construction + field projections are the SINGLE source in portal-filters — shared with the
+// historical sync so realtime and backfill fetch-specs can never drift. Re-exported for callers/tests.
+import { BLOCK_FIELDS, LOG_FIELDS, buildPortalLogRequests, uniqueFactories } from "./portal-filters.js";
 import { hx } from "./portal-transform.js";
+
+export { buildPortalLogRequests, uniqueFactories } from "./portal-filters.js";
+export type { PortalLogRequest } from "./portal-filters.js";
 
 // ─────────────────────────────── flag / detection ───────────────────────────────
 
 /** True when this chain should use the Portal `/stream` for realtime instead of ponder's RPC path. */
-export const isPortalRealtime = (chain: {
-  portal?: string | undefined;
-}): boolean =>
+export const isPortalRealtime = (chain: { portal?: string | undefined }): boolean =>
   typeof chain.portal === "string" && process.env.PORTAL_REALTIME === "stream";
 
 const portalHeaders = (): Record<string, string> => {
-  const h: Record<string, string> = {
-    "content-type": "application/json",
-    "accept-encoding": "gzip",
-  };
+  const h: Record<string, string> = { "content-type": "application/json", "accept-encoding": "gzip" };
   if (process.env.PORTAL_API_KEY) h["x-api-key"] = process.env.PORTAL_API_KEY;
   return h;
 };
@@ -75,9 +68,7 @@ export async function portalFinalizedHead(
   fetchImpl: typeof fetch = fetch,
 ): Promise<number | undefined> {
   try {
-    const h = await fetchImpl(`${cleanUrl(portalUrl)}/finalized-head`, {
-      headers,
-    }).then((r) => r.json());
+    const h = await fetchImpl(`${cleanUrl(portalUrl)}/finalized-head`, { headers }).then((r) => r.json());
     if (typeof h?.number === "number") return h.number;
   } catch {
     /* head unknown → caller stays conservative */
@@ -102,15 +93,10 @@ export async function clampFinalizedToPortalHead(params: {
   if (isPortalRealtime(chain) === false) return finalizedBlock;
 
   const portalUrl = cleanUrl(chain.portal!);
-  const head = await portalFinalizedHead(
-    portalUrl,
-    portalHeaders(),
-    params.fetchImpl,
-  );
+  const head = await portalFinalizedHead(portalUrl, portalHeaders(), params.fetchImpl);
   // Head unknown → stay conservative and keep the RPC finalized block (historical's own RPC finality-gap
   // fallback remains the safety net). Portal at/ahead of RPC finalized → nothing to clamp.
-  if (head === undefined || head >= hexToNumber(finalizedBlock.number))
-    return finalizedBlock;
+  if (head === undefined || head >= hexToNumber(finalizedBlock.number)) return finalizedBlock;
 
   const clamped = (await eth_getBlockByNumber(rpc, [numberToHex(head), false], {
     retryNullBlockRequest: true,
@@ -120,112 +106,6 @@ export async function clampFinalizedToPortalHead(params: {
     msg: `Portal ${chain.name}: clamped realtime finalized ${hexToNumber(finalizedBlock.number)} → Portal head ${head} (stream mode)`,
   });
   return clamped;
-}
-
-// ─────────────────────────────── log-request construction (mirrors portal.ts) ───────────────────────────────
-
-/** Portal `/stream` log filter — same shape the historical sync uses. */
-export type PortalLogRequest = {
-  address?: string[];
-  topic0?: string[];
-  topic1?: string[];
-  topic2?: string[];
-  topic3?: string[];
-};
-
-const PORTAL_MAX_ADDRESSES = 1000;
-const asArr = <T>(v: T | T[]): T[] => (Array.isArray(v) ? v : [v]);
-const lc = (a: string): string => a.toLowerCase();
-
-/** The unique factories referenced by any filter (deduped by id). */
-export const uniqueFactories = (
-  eventCallbacks: { filter: Filter }[],
-): Factory[] => [
-  ...new Map(
-    eventCallbacks
-      .flatMap((e) => getFilterFactories(e.filter))
-      .map((f) => [f.id, f]),
-  ).values(),
-];
-
-/** Log-filter → Portal log requests. Factory-address filters expand to the currently-known children. */
-function logRequestsFor(
-  filter: LogFilter,
-  childAddresses: Map<FactoryId, Map<Address, number>>,
-): PortalLogRequest[] {
-  const base: PortalLogRequest = {};
-  if (filter.topic0) base.topic0 = asArr(filter.topic0);
-  if (filter.topic1) base.topic1 = asArr(filter.topic1 as any);
-  if (filter.topic2) base.topic2 = asArr(filter.topic2 as any);
-  if (filter.topic3) base.topic3 = asArr(filter.topic3 as any);
-  let addresses: string[] | undefined;
-  if (isAddressFactory(filter.address)) {
-    addresses = Array.from(childAddresses.get(filter.address.id)?.keys() ?? []);
-    if (addresses.length === 0) return []; // no children yet → nothing to request for this filter
-  } else if (filter.address === undefined) {
-    return [base];
-  } else {
-    addresses = asArr(filter.address).map(lc);
-  }
-  const out: PortalLogRequest[] = [];
-  for (let i = 0; i < addresses.length; i += PORTAL_MAX_ADDRESSES)
-    out.push({
-      ...base,
-      address: addresses.slice(i, i + PORTAL_MAX_ADDRESSES),
-    });
-  return out;
-}
-
-/** Collapse requests sharing the same address-set + topic1..3, unioning topic0 (keeps the body small). */
-function mergeLogRequests(reqs: PortalLogRequest[]): PortalLogRequest[] {
-  const groups = new Map<string, PortalLogRequest>();
-  for (const r of reqs) {
-    const key = JSON.stringify([
-      r.address ? [...r.address].sort() : null,
-      r.topic1 ?? null,
-      r.topic2 ?? null,
-      r.topic3 ?? null,
-    ]);
-    const g = groups.get(key);
-    if (!g) {
-      groups.set(key, {
-        ...r,
-        topic0: r.topic0 ? [...new Set(r.topic0)] : undefined,
-      });
-      continue;
-    }
-    if (g.topic0 === undefined || r.topic0 === undefined) g.topic0 = undefined;
-    else {
-      const s = new Set(g.topic0);
-      for (const t of r.topic0) s.add(t);
-      g.topic0 = [...s];
-    }
-  }
-  return [...groups.values()];
-}
-
-/**
- * Build the merged Portal `/stream` log filter for a chain's realtime: every log filter's
- * address+topics PLUS a discovery request per factory (factory address + ProxyCreated selector), so new
- * children are streamed and pruned/matched downstream. Mirrors `portal.ts` so the realtime and historical
- * fetch-specs agree.
- */
-export function buildPortalLogRequests(
-  eventCallbacks: { filter: Filter }[],
-  childAddresses: Map<FactoryId, Map<Address, number>>,
-): PortalLogRequest[] {
-  const filters = eventCallbacks.map((e) => e.filter);
-  const reqs: PortalLogRequest[] = [];
-  for (const f of filters)
-    if (f.type === "log")
-      reqs.push(...logRequestsFor(f as LogFilter, childAddresses));
-  for (const factory of uniqueFactories(eventCallbacks)) {
-    const address = factory.address
-      ? asArr(factory.address).map(lc)
-      : undefined;
-    reqs.push({ address, topic0: [factory.eventSelector.toLowerCase()] });
-  }
-  return mergeLogRequests(reqs);
 }
 
 // ─────────────────────────────── factory child discovery ───────────────────────────────
@@ -270,15 +150,9 @@ function applyDiscovered(
   let added = false;
   for (const [factory, addresses] of discovered) {
     let rec = childAddresses.get(factory.id);
-    if (rec === undefined) {
-      rec = new Map<Address, number>();
-      childAddresses.set(factory.id, rec);
-    }
+    if (rec === undefined) { rec = new Map<Address, number>(); childAddresses.set(factory.id, rec); }
     for (const address of addresses) {
-      if (rec.has(address) === false) {
-        rec.set(address, blockNumber);
-        added = true;
-      }
+      if (rec.has(address) === false) { rec.set(address, blockNumber); added = true; }
     }
   }
   return added;
@@ -316,11 +190,7 @@ export function toRealtimeSyncEvent(
         blockCallback: undefined, // no rpc.subscribe backpressure hook in the stream path (optional-chained downstream)
       };
     case "reorg":
-      return {
-        type: "reorg",
-        block: lightToLightBlock(ev.block),
-        reorgedBlocks: ev.reorgedBlocks.map(lightToLightBlock),
-      };
+      return { type: "reorg", block: lightToLightBlock(ev.block), reorgedBlocks: ev.reorgedBlocks.map(lightToLightBlock) };
     case "finalize":
       return { type: "finalize", block: lightToLightBlock(ev.block) };
   }
@@ -343,17 +213,14 @@ export async function* getPortalRealtimeEventGenerator(params: {
   fetchImpl?: typeof fetch; // injected for tests
   finalizePollMs?: number; // injected for tests (prod: portal-realtime.ts default cadence)
 }) {
-  const { common, chain, eventCallbacks, syncProgress, childAddresses } =
-    params;
+  const { common, chain, eventCallbacks, syncProgress, childAddresses } = params;
   const portalUrl = cleanUrl(chain.portal!);
   const headers = portalHeaders();
   const factories = uniqueFactories(eventCallbacks);
 
   const startupFinalized = hexToNumber(syncProgress.finalized.number);
   const fromBlock = startupFinalized + 1; // finalized == Portal head (clamped) → stream (portal-head, tip]
-  const endBlock = syncProgress.end
-    ? hexToNumber(syncProgress.end.number)
-    : undefined;
+  const endBlock = syncProgress.end ? hexToNumber(syncProgress.end.number) : undefined;
 
   // Mutable: rebuilt (in place) whenever a new child is discovered so the next stream reconnection filters
   // the new child's logs too (portal-realtime.ts re-reads this array when it re-opens the stream).
@@ -380,8 +247,7 @@ export async function* getPortalRealtimeEventGenerator(params: {
       logs,
       blockFields: BLOCK_FIELDS,
       logFields: LOG_FIELDS,
-      finalizedHead: () =>
-        portalFinalizedHead(portalUrl, headers, params.fetchImpl),
+      finalizedHead: () => portalFinalizedHead(portalUrl, headers, params.fetchImpl),
       finalizePollMs: params.finalizePollMs,
       signal: controller.signal,
       fetchImpl: params.fetchImpl,
@@ -427,35 +293,3 @@ export async function* getPortalRealtimeEventGenerator(params: {
     controller.abort();
   }
 }
-
-// Block header fields — the RPC-path-equivalent set (kept in sync with portal.ts) so stored realtime
-// blocks are byte-consistent with the historical Portal backfill.
-const BLOCK_FIELDS: Record<string, boolean> = {
-  number: true,
-  hash: true,
-  parentHash: true,
-  timestamp: true,
-  logsBloom: true,
-  miner: true,
-  gasUsed: true,
-  gasLimit: true,
-  stateRoot: true,
-  receiptsRoot: true,
-  transactionsRoot: true,
-  size: true,
-  difficulty: true,
-  extraData: true,
-  baseFeePerGas: true,
-  nonce: true,
-  mixHash: true,
-  sha3Uncles: true,
-  totalDifficulty: true,
-};
-const LOG_FIELDS: Record<string, boolean> = {
-  address: true,
-  topics: true,
-  data: true,
-  transactionHash: true,
-  transactionIndex: true,
-  logIndex: true,
-};

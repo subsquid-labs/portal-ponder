@@ -16,25 +16,14 @@
  * The reorg/finalize reconciliation is pure + unit-tested; the `/stream` read and `/finalized-head` poll
  * are the I/O shell.
  */
-
-import { type Hex, hexToNumber } from "viem";
 import type { SyncBlockHeader, SyncLog } from "@/internal/types.js";
-import {
-  hx,
-  type RawHeader,
-  toSyncBlockHeader,
-  toSyncLog,
-} from "./portal-transform.js";
+import { ndjsonLines } from "./portal-client.js";
+import { toSyncBlockHeader, toSyncLog, type RawHeader } from "./portal-transform.js";
 
 // ─────────────────────────────── pure reorg / finalize core (unit-tested) ───────────────────────────────
 
 /** The minimum a block needs for chain reconciliation. `number` is a decimal string (Portal-native). */
-export type Light = {
-  number: number;
-  hash: string;
-  parentHash: string;
-  timestamp: number;
-};
+export type Light = { number: number; hash: string; parentHash: string; timestamp: number };
 
 export type Reconcile =
   | { kind: "append" } //   extends the tip (normal case)
@@ -55,11 +44,7 @@ export function reconcile(unfinalized: Light[], next: Light): Reconcile {
   if (next.parentHash === tip.hash) return { kind: "append" };
   const idx = unfinalized.findIndex((b) => b.hash === next.parentHash);
   if (idx === -1) return { kind: "gap" };
-  return {
-    kind: "reorg",
-    commonAncestor: unfinalized[idx]!,
-    reorgedBlocks: unfinalized.slice(idx + 1),
-  };
+  return { kind: "reorg", commonAncestor: unfinalized[idx]!, reorgedBlocks: unfinalized.slice(idx + 1) };
 }
 
 /** Split the unfinalized chain at a newly-finalized block number. Pure. */
@@ -116,64 +101,26 @@ export async function* streamHotBlocks(
       fromBlock: cursor,
       includeAllBlocks: true,
       fields: {
-        block: args.blockFields ?? {
-          number: true,
-          hash: true,
-          parentHash: true,
-          timestamp: true,
-        },
-        log: args.logFields ?? {
-          address: true,
-          topics: true,
-          data: true,
-          logIndex: true,
-          transactionHash: true,
-          transactionIndex: true,
-        },
+        block: args.blockFields ?? { number: true, hash: true, parentHash: true, timestamp: true },
+        log: args.logFields ?? { address: true, topics: true, data: true, logIndex: true, transactionHash: true, transactionIndex: true },
       },
       logs: args.logs,
     });
     let res: Response;
     try {
-      res = await fetchImpl(`${args.portalUrl}/stream`, {
-        method: "POST",
-        headers: { "content-type": "application/json", ...args.headers },
-        body,
-        signal: args.signal,
-      });
+      res = await fetchImpl(`${args.portalUrl}/stream`, { method: "POST", headers: { "content-type": "application/json", ...args.headers }, body, signal: args.signal });
     } catch {
       await sleep(1000, args.signal);
       continue;
     }
-    if (res.status === 204 || !res.body) {
-      await sleep(500, args.signal);
-      continue;
-    } // no hot data yet; re-poll
-    if (!res.ok) {
-      await sleep(1000, args.signal);
-      continue;
-    }
-    const reader = res.body.getReader();
-    const dec = new TextDecoder();
-    let buf = "";
+    if (res.status === 204 || !res.body) { await sleep(500, args.signal); continue; } // no hot data yet; re-poll
+    if (!res.ok) { await sleep(1000, args.signal); continue; }
     try {
-      for (;;) {
-        const { done, value } = await reader.read();
-        if (done) break;
-        buf += dec.decode(value, { stream: true });
-        for (;;) {
-          const nl = buf.indexOf("\n");
-          if (nl < 0) break;
-
-          const line = buf.slice(0, nl);
-          buf = buf.slice(nl + 1);
-          if (!line) continue;
-
-          const batch = JSON.parse(line);
-          if (batch?.header?.number != null) {
-            cursor = batch.header.number + 1; // resume past this block on reconnect
-            yield { header: batch.header, logs: batch.logs ?? [] };
-          }
+      for await (const line of ndjsonLines(res.body)) {
+        const batch = JSON.parse(line);
+        if (batch?.header?.number != null) {
+          cursor = batch.header.number + 1; // resume past this block on reconnect
+          yield { header: batch.header, logs: batch.logs ?? [] };
         }
       }
     } catch {
@@ -187,14 +134,7 @@ const sleep = (ms: number, signal?: AbortSignal) =>
   new Promise<void>((resolve) => {
     if (signal?.aborted) return resolve();
     const t = setTimeout(resolve, ms);
-    signal?.addEventListener(
-      "abort",
-      () => {
-        clearTimeout(t);
-        resolve();
-      },
-      { once: true },
-    );
+    signal?.addEventListener("abort", () => { clearTimeout(t); resolve(); }, { once: true });
   });
 
 // ─────────────────────────────── event producer ───────────────────────────────
@@ -205,20 +145,12 @@ const sleep = (ms: number, signal?: AbortSignal) =>
 // child-address maps + buildEvents; here we surface the block header + logs + reorg/finalize control flow.
 
 export type PortalRealtimeEvent =
-  | {
-      type: "block";
-      block: SyncBlockHeader;
-      logs: SyncLog[];
-      hasMatchedFilter: boolean;
-    }
+  | { type: "block"; block: SyncBlockHeader; logs: SyncLog[]; hasMatchedFilter: boolean }
   | { type: "reorg"; block: Light; reorgedBlocks: Light[] }
   | { type: "finalize"; block: Light };
 
 export async function* portalRealtimeEvents(
-  args: PortalRealtimeArgs & {
-    finalizedHead: () => Promise<number | undefined>;
-    finalizePollMs?: number;
-  },
+  args: PortalRealtimeArgs & { finalizedHead: () => Promise<number | undefined>; finalizePollMs?: number },
 ): AsyncGenerator<PortalRealtimeEvent> {
   const unfinalized: Light[] = [];
   let lastFinalizePoll = 0;
@@ -234,27 +166,14 @@ export async function* portalRealtimeEvents(
       unfinalized.length = 0;
     } else if (r.kind === "reorg") {
       // trim the local chain and surface the rollback to the common ancestor
-      while (
-        unfinalized.length &&
-        unfinalized[unfinalized.length - 1]!.number > r.commonAncestor.number
-      )
-        unfinalized.pop();
-      yield {
-        type: "reorg",
-        block: r.commonAncestor,
-        reorgedBlocks: r.reorgedBlocks,
-      };
+      while (unfinalized.length && unfinalized[unfinalized.length - 1]!.number > r.commonAncestor.number) unfinalized.pop();
+      yield { type: "reorg", block: r.commonAncestor, reorgedBlocks: r.reorgedBlocks };
     }
     unfinalized.push(light);
 
     const block = toSyncBlockHeader(header);
     const syncLogs = logs.map((l) => toSyncLog(l, header));
-    yield {
-      type: "block",
-      block,
-      logs: syncLogs,
-      hasMatchedFilter: syncLogs.length > 0,
-    };
+    yield { type: "block", block, logs: syncLogs, hasMatchedFilter: syncLogs.length > 0 };
 
     // finalize on a cadence (cheap head probe), not every block
     const now = Date.now();
@@ -272,6 +191,3 @@ export async function* portalRealtimeEvents(
     }
   }
 }
-
-export type { Hex, SyncBlockHeader, SyncLog };
-export { hexToNumber, hx as _hx };
