@@ -12,6 +12,9 @@ import { InvariantViolation } from './portal-invariant.js';
  * stash lifecycle (INV-12), and the per-fetch row-accounting model (S1).
  */
 
+// Fixed chunk width for S1's chunk-boundary mock (matches the PORTAL_CHUNK_BLOCKS default).
+const CHUNK_BLOCKS = 500_000;
+
 const VAULT = '0x44b3c96db2caf61167a9eab82901139a404cdb6f';
 const DEPOSIT_TOPIC0 =
   '0xdcbc1c05240f31ff3ad067ef1ee35ce4997762752e3a095284754544f4c709d7';
@@ -668,6 +671,9 @@ test('S1: rows return to baseline after chunks settle and are evicted (no double
   // fetches settle: the gate's row count must equal exactly the LIVE cache's rows — here 0, because the
   // final far interval has no data and everything behind was evicted + freed via per-fetch tokens.
   process.env.PORTAL_READAHEAD = '2';
+  // Pin the chunk width so the mock's chunk-boundary math below is exact (density scaling is already
+  // off via PORTAL_CHUNK_FIXED in beforeEach; this fixes the grid to a known 500k regardless).
+  process.env.PORTAL_CHUNK_BLOCKS = String(CHUNK_BLOCKS);
   const srv = http.createServer((req, res) => {
     let body = '';
     req.on('data', (c) => {
@@ -680,11 +686,26 @@ test('S1: rows return to baseline after chunks settle and are evicted (no double
         return;
       }
       const from = q.fromBlock ?? 0;
-      // chunks below 3M have one block each at a chunk boundary; beyond → empty
-      if (from < 3_000_000) {
-        const n = from + 10;
+      const to = q.toBlock ?? 0;
+      // EXACTLY one block per chunk, positioned at the chunk boundary; a continuation request past that
+      // boundary (from = block+1, no longer chunk-aligned) or a chunk at/after 3M gets a 204 so the
+      // stream terminates. Returning a block for every `from` instead makes the client re-request one
+      // block at a time across the whole 500k-wide chunk (~45k round-trips/chunk) — the stream drains
+      // fine but takes seconds, and under full-suite contention that overran the per-test timeout.
+      const boundary = Math.ceil(from / CHUNK_BLOCKS) * CHUNK_BLOCKS;
+      if (boundary < 3_000_000 && boundary <= to) {
         res.writeHead(200, { 'content-type': 'application/x-ndjson' });
-        res.end(`${JSON.stringify(mkBlock(n))}\n`);
+        const payload = `${JSON.stringify(mkBlock(boundary + 10))}\n`;
+        // The read-ahead chunks (boundary ≥ CHUNK_BLOCKS — i.e. NOT chunk 0) respond SLOWLY so they are
+        // still in flight when the far-ahead interval evicts and frees their tokens. That is the exact
+        // race the per-fetch `token.freed` guard exists to close: a stale stream that outlives its
+        // eviction must not register orphan rows into an already-freed budget. Chunk 0 (boundary 0)
+        // answers immediately so the first interval's await returns promptly.
+        if (boundary >= CHUNK_BLOCKS) {
+          setTimeout(() => res.end(payload), 150);
+          return;
+        }
+        res.end(payload);
         return;
       }
       res.writeHead(204).end();
@@ -727,5 +748,6 @@ test('S1: rows return to baseline after chunks settle and are evicted (no double
   } finally {
     srv.close();
     delete process.env.PORTAL_READAHEAD;
+    delete process.env.PORTAL_CHUNK_BLOCKS;
   }
 });
