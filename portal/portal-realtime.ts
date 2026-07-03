@@ -161,11 +161,14 @@ export async function* streamHotBlocks(
         const { done, value } = await reader.read();
         if (done) break;
         buf += dec.decode(value, { stream: true });
-        let nl: number;
-        while ((nl = buf.indexOf("\n")) >= 0) {
+        for (;;) {
+          const nl = buf.indexOf("\n");
+          if (nl < 0) break;
+
           const line = buf.slice(0, nl);
           buf = buf.slice(nl + 1);
           if (!line) continue;
+
           const batch = JSON.parse(line);
           if (batch?.header?.number != null) {
             cursor = batch.header.number + 1; // resume past this block on reconnect
