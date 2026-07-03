@@ -116,35 +116,61 @@ async function readWithIdle<T>(
 /**
  * Read a non-OK response body to a string under a SOFT idle deadline — the error-body path's analogue of
  * `readWithIdle`. A gateway that sends non-OK HEADERS then stalls the BODY would hang the plain
- * `await res.text()` forever (fetchBatch's `finally` never runs, the gate slot never releases). We race
- * `res.text()` against `idleMs`; on a stall we RESOLVE with `''` and fire-and-forget `res.body?.cancel()`
- * — never `abort()` (issue #14: abort on an in-flight gzip body can silently kill the Node process). The
- * caller still throws the typed error with the right status; the body text only feeds optional message
- * extraction, so an empty/truncated body on timeout is acceptable — the win is that the error surfaces
- * PROMPTLY and the gate slot releases. (PR #16 review)
+ * `await res.text()` forever (fetchBatch's `finally` never runs, the gate slot never releases). So we OWN
+ * the read: acquire `res.body.getReader()` and accumulate chunks under a per-chunk idle timer (the idle
+ * deadline is the max GAP between chunks — `readWithIdle`'s semantics). On a stall we `reader.cancel()` —
+ * LEGAL because we hold the lock (we own the reader), unlike `res.body.cancel()` on a body already locked
+ * by `res.text()`, which the Web Streams spec REJECTS with a TypeError, leaking the socket — and resolve
+ * with the text accumulated SO FAR (partial error text beats '' for the optional message extraction). We
+ * never `abort()` (issue #14: abort on an in-flight gzip body can silently kill the Node process). A
+ * mid-read rejection (network drop) resolves with what we have; the caller still throws the typed error
+ * with the right status, so a truncated/empty body on timeout is acceptable — the win is that the error
+ * surfaces PROMPTLY and the gate slot releases. If `res.body` is null/undefined (empty body, or a simple
+ * test mock with only `text()`), there is nothing to lock or cancel: race `res.text()` against the timer.
+ * (PR #16 review)
  */
 async function readTextWithIdle(
-  res: { text(): Promise<string>; body?: ReadableStream | null },
+  res: { text(): Promise<string>; body?: ReadableStream<Uint8Array> | null },
   idleMs: number,
 ): Promise<string> {
-  let timer: ReturnType<typeof setTimeout> | undefined;
-  const textP = res.text();
-  textP.catch(() => {}); // if the idle timer wins we abandon this read; cancel() settles the body later
+  const stream = res.body;
+  if (!stream) {
+    // No stream to own (empty body / simple mock): race the whole text() read against one idle timer.
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const textP = res.text();
+    textP.catch(() => {}); // if the idle timer wins we abandon this read — no body to cancel
 
-  const idle = new Promise<string>((resolve) => {
-    timer = setTimeout(() => {
-      void res.body?.cancel().catch(() => {}); // graceful teardown of the stalled body — never abort()
-      resolve('');
-    }, idleMs);
-    timer.unref?.();
-  });
-  try {
-    return await Promise.race([textP, idle]);
-  } catch {
-    return ''; // a rejecting body (network drop mid-read) still yields the typed error promptly
-  } finally {
-    if (timer !== undefined) clearTimeout(timer);
+    const idle = new Promise<string>((resolve) => {
+      timer = setTimeout(() => resolve(''), idleMs);
+      timer.unref?.();
+    });
+    try {
+      return await Promise.race([textP, idle]);
+    } catch {
+      return ''; // a rejecting body still yields the typed error promptly
+    } finally {
+      if (timer !== undefined) clearTimeout(timer);
+    }
   }
+
+  const reader = stream.getReader();
+  const dec = new TextDecoder();
+  let text = '';
+  try {
+    for (;;) {
+      const { done, value } = await readWithIdle(reader, idleMs);
+      if (done) break;
+
+      if (value) text += dec.decode(value, { stream: true });
+    }
+    text += dec.decode();
+  } catch {
+    // Idle-timer stall (readWithIdle rejected) OR a network drop mid-read. We own the lock, so cancel is
+    // legal — settle the abandoned read and close the socket. Resolve with what we accumulated so far.
+    void reader.cancel().catch(() => {});
+  }
+
+  return text;
 }
 
 // Portal reports a missing COLUMN in a plural TABLE; map back to the field key we requested.
@@ -520,11 +546,14 @@ export function createPortalClient(deps: PortalClientDeps): PortalClient {
   const finalizedHead = async (): Promise<number | undefined> => {
     // Bound the probe so a hung /finalized-head can't stall the finality-gap decision — in the SAME two
     // phases as fetchBatch, and for the SAME reason (issue #14): `AbortSignal.timeout` would stay live
-    // while `r.json()` reads the body, and portal.ts sends `accept-encoding: gzip` globally, so a live
-    // abort landing on an in-flight gzip body is the exact process-kill shape. So:
+    // while we read the body, and portal.ts sends `accept-encoding: gzip` globally, so a live abort landing
+    // on an in-flight gzip body is the exact process-kill shape. So:
     //   (a) CONNECT/headers phase — a genuine AbortController.abort(), disarmed the instant headers arrive.
-    //   (b) BODY phase — a SOFT timer race on `r.json()`: on a stall we fire-and-forget `body.cancel()`
-    //       (graceful, never abort) and fall through to `undefined`.
+    //   (b) BODY phase — we OWN the read: acquire the body reader and accumulate the text under a SOFT idle
+    //       deadline (`readTextWithIdle`), then `JSON.parse` (json() ≡ text+parse, so identical on the
+    //       happy path). On a stall we `reader.cancel()` — LEGAL because we hold the lock, unlike a
+    //       `body.cancel()` on a body already locked by `r.json()`, which the Web Streams spec REJECTS,
+    //       leaking the socket — and fall through to `undefined`. Never abort() (graceful teardown).
     // Every failure collapses to `undefined`, so the caller stays conservative. (PR #16 review)
     const controller = new AbortController();
     let connectTimer: ReturnType<typeof setTimeout> | undefined = setTimeout(
@@ -538,7 +567,6 @@ export function createPortalClient(deps: PortalClientDeps): PortalClient {
         connectTimer = undefined;
       }
     };
-    let bodyTimer: ReturnType<typeof setTimeout> | undefined;
     try {
       const r = await fetchImpl(`${portalUrl}/finalized-head`, {
         headers,
@@ -546,20 +574,18 @@ export function createPortalClient(deps: PortalClientDeps): PortalClient {
       });
       disarm(); // headers arrived — never abort() once the body is streaming (issue #14)
 
-      const idle = new Promise<undefined>((resolve) => {
-        bodyTimer = setTimeout(() => {
-          void r.body?.cancel().catch(() => {});
-          resolve(undefined);
-        }, finalizedHeadTimeoutMs);
-        bodyTimer.unref?.();
-      });
-      const h = await Promise.race([r.json(), idle]);
+      // Own-read the body text under the soft deadline, then parse (json() ≡ text+parse). A simple mock or
+      // an empty body (no `.body`) falls through readTextWithIdle to `r.text()`; if it exposes neither, use
+      // `r.json()` directly. A stall yields '' → JSON.parse throws → caught → undefined.
+      const h =
+        r.body || typeof r.text === 'function'
+          ? JSON.parse(await readTextWithIdle(r, finalizedHeadTimeoutMs))
+          : await r.json();
       if (typeof h?.number === 'number') return h.number;
     } catch {
       /* head unknown (connect timed out, fetch failed, or bad JSON) → caller stays conservative */
     } finally {
       disarm();
-      if (bodyTimer !== undefined) clearTimeout(bodyTimer);
     }
 
     return undefined;

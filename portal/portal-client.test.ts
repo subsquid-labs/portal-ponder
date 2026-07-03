@@ -447,20 +447,24 @@ test('timeout: a NON-OK (400) response whose body never yields still throws Port
     gate: gate as any,
     requestTimeoutMs: 1_000, // headers arrive fine; the stall is on the non-OK error body
     idleTimeoutMs: 20,
-    // 400 headers arrive, but the error body never settles → pre-fix `await res.text()` hangs forever
-    // (finally never runs, gate slot leaks). Post-fix the SOFT idle race resolves '' and the typed error
-    // still throws promptly; the stalled body is CANCELLED (never abort()).
-    fetchImpl: (async () => ({
-      status: 400,
-      ok: false,
-      headers: { get: () => null },
-      text: () => new Promise<string>(() => {}), // never settles → the idle race must win
-      body: {
-        cancel: async () => {
-          cancelled = true; // graceful teardown = body.cancel(), never abort()
-        },
-      },
-    })) as any,
+    // 400 headers arrive, but the error body never yields a chunk. Post-fix we OWN the reader and race
+    // each read against the idle timer; on the stall we `reader.cancel()` (legal — we hold the lock) and
+    // resolve with the partial text, so the typed error still throws PROMPTLY. A REAL `Response` wrapping
+    // a real ReadableStream is required so the stream LOCKING is real: the pre-fix `res.text()` locks the
+    // body, then `res.body.cancel()` REJECTS (spec: cancel on a locked stream) and the cancel() callback
+    // never fires — the exact bug a fake `{ cancel }` mock hid (regression against 7b5791cd).
+    fetchImpl: (async () =>
+      new Response(
+        new ReadableStream<Uint8Array>({
+          start() {
+            /* never enqueue, never close → the body-idle timer must win */
+          },
+          cancel() {
+            cancelled = true; // graceful teardown = reader.cancel(), never abort()
+          },
+        }),
+        { status: 400 },
+      )) as any,
   });
   const err = await collect(client.stream(QUERY, 0, 10)).then(
     () => undefined,
@@ -468,8 +472,36 @@ test('timeout: a NON-OK (400) response whose body never yields still throws Port
   );
   expect(err).toBeInstanceOf(PortalHttpError);
   expect((err as PortalHttpError).status).toBe(400); // right status, surfaced promptly
-  expect(cancelled).toBe(true); // the stalled error body was CANCELLED, never aborted
+  expect(cancelled).toBe(true); // the stalled error body's cancel() callback actually fired
   expect(gate.snapshot().active).toBe(0); // slot released (finally ran)
+});
+
+test('non-OK (400): a REAL streamed error body is read to completion (across chunks) and its schema message extracted', async () => {
+  // The read loop must ACCUMULATE a multi-chunk body that closes normally — not just handle the stall. A
+  // real Response whose 400 body streams the column-not-found message in two chunks proves readTextWithIdle
+  // reassembles the full text (TextDecoder streaming) so the schema-field extraction still fires.
+  const client = mk({
+    idleTimeoutMs: 1_000, // the body closes promptly; no stall
+    fetchImpl: (async (_u: string, init: any) => {
+      const q = JSON.parse(init.body);
+      return q.fields?.transaction?.accessList !== undefined
+        ? new Response(
+            streamOf([
+              "column 'access_list_size' is not ",
+              "found in 'transactions'",
+            ]),
+            { status: 400 },
+          )
+        : ndjsonRes([{ header: { number: 10 } }]);
+    }) as any,
+  });
+  const neededMissing = new Set<string>();
+  const q: PortalQuery = {
+    type: 'evm',
+    fields: { transaction: { accessList: true, hash: true } },
+  };
+  await collect(client.stream(q, 0, 10, { neededMissing }));
+  expect(neededMissing.size).toBe(0); // droppable accessList → dropped silently on the retry (message read)
 });
 
 // ── G3 (INV-7): onRows fires per ARRIVING batch, not on stream completion ─────────────────────────
@@ -512,6 +544,19 @@ test('finalizedHead: parses {number}; undefined on failure', async () => {
   ).toBeUndefined();
 });
 
+test('finalizedHead: parses a REAL streamed JSON body (reader-owning read; json() ≡ text+parse)', async () => {
+  // The happy path now flows through the reader-owning readTextWithIdle → JSON.parse. Prove a genuine
+  // Response whose body streams in two chunks and CLOSES parses correctly (a body that closes must never
+  // idle-stall). json() ≡ text+parse, so this stays green on both the fixed and the old r.json() form.
+  expect(
+    await mk({
+      finalizedHeadTimeoutMs: 1_000,
+      fetchImpl: (async () =>
+        new Response(streamOf(['{"number":', '456}']))) as any,
+    }).finalizedHead(),
+  ).toBe(456);
+});
+
 test('finalizedHead: a fetch that never sends headers returns undefined at the connect deadline (PR #16 review)', async () => {
   // The head probe fetch never resolves on its own; only the connect-phase abort (signal) rejects it. If
   // disarm-on-headers or the connect-phase AbortController were removed this would hang forever.
@@ -541,19 +586,25 @@ test('finalizedHead: headers arrive but the JSON body never settles → undefine
       });
       headersDelivered = true;
 
-      return {
-        // json() never settles → the soft body-timer must win, cancel the body, and resolve undefined.
-        json: () => new Promise(() => {}),
-        body: {
-          cancel: async () => {
+      // A REAL Response wrapping a ReadableStream that never yields a chunk → the reader-owning read
+      // stalls on the idle timer, `reader.cancel()` fires (legal — we own the lock), the accumulated ''
+      // fails JSON.parse, and we fall through to undefined. A REAL Response makes the stream LOCKING real:
+      // the pre-fix `r.json()` locks the body, then `r.body.cancel()` REJECTS and the cancel() callback
+      // never fires — the exact bug a fake `{ cancel }` mock hid.
+      return new Response(
+        new ReadableStream<Uint8Array>({
+          start() {
+            /* never enqueue, never close */
+          },
+          cancel() {
             cancelled = true;
           },
-        },
-      };
+        }),
+      );
     }) as any,
   });
   expect(await client.finalizedHead()).toBeUndefined();
-  expect(cancelled).toBe(true); // the body was CANCELLED (graceful teardown)
+  expect(cancelled).toBe(true); // the body's cancel() callback actually fired (graceful teardown)
   expect(abortedAfterHeaders).toBe(false); // never aborted after headers (the #14 kill shape)
 });
 
