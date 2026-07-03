@@ -52,6 +52,15 @@ test('a valid type-0x2 tx missing only accessList → throws, message names acce
   expect(() => standardize(t)).toThrowError(/0x2/);
 });
 
+// An explicit `accessList: null` (as opposed to an omitted key) must fail the same way: encode.ts
+// treats null and undefined identically (`transaction.accessList ? … : null`), so a non-compliant
+// provider that sends `null` would still land the same permanent NULL. The guard uses `== null`.
+test('a type-0x2 tx with explicit accessList: null → throws (message names accessList)', () => {
+  const t = tx({ type: '0x2', accessList: null });
+  expect(t.accessList).toBeNull();
+  expect(() => standardize(t)).toThrowError(/transaction\.accessList/);
+});
+
 // ─────────────────────── (b) every other typed envelope missing accessList → throws ───────────────────────
 
 test('type 0x1/0x3/0x4 missing accessList → throws too (all carry accessList per spec)', () => {

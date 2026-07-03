@@ -44,7 +44,7 @@ diff --git a/packages/core/src/rpc/actions.ts b/packages/core/src/rpc/actions.ts
 index 32ba7a8..aad5401 100644
 --- a/packages/core/src/rpc/actions.ts
 +++ b/packages/core/src/rpc/actions.ts
-@@ -893,6 +893,32 @@ export const standardizeTransactions = (
+@@ -893,6 +893,33 @@ export const standardizeTransactions = (
        transaction.gas = "0x0";
      }
  
@@ -54,14 +54,15 @@ index 32ba7a8..aad5401 100644
 +    // sync store (`onConflictDoNothing`) — silent column-level data loss. Fail loud instead of
 +    // defaulting to `[]`, which would fabricate an empty list over a real one. Legacy (0x0), OP
 +    // deposit (0x7e), and unknown/system envelopes (e.g. Arbitrum internals) carry no access list
-+    // and are left untouched.
++    // and are left untouched. An explicit `accessList: null` is treated the same as an omitted key
++    // (`== null`): encode.ts maps both to the same permanent NULL, so both must fail loud.
 +    const txType: string | undefined = transaction.type;
 +    if (
 +      (txType === "0x1" ||
 +        txType === "0x2" ||
 +        txType === "0x3" ||
 +        txType === "0x4") &&
-+      (transaction as { accessList?: unknown }).accessList === undefined
++      (transaction as { accessList?: unknown }).accessList == null
 +    ) {
 +      const error = new RpcProviderError(
 +        `Invalid RPC response: 'transaction.accessList' is a required property on type ${txType} transactions`,
