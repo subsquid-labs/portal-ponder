@@ -121,11 +121,22 @@ This is proven, not asserted. The differential harness ([`harness/diff`](harness
 
 ## Where the code lives
 
+The layer is organised around explicit, provable **invariants** — a functional core (pure, property-tested) behind an imperative shell. See [`portal/INVARIANTS.md`](portal/INVARIANTS.md) for the catalog (INV-1…INV-14) that ties doc ⟷ code ⟷ test together.
+
 | File | What it holds |
 |---|---|
-| [`portal/portal.ts`](portal/portal.ts) | `createPortalHistoricalSync` — the seam implementation: chunk cache, read-ahead, the shared `portalGate` controller, factory discovery, and the finality-gap fallback. |
+| [`portal/portal.ts`](portal/portal.ts) | `createPortalHistoricalSync` — the orchestration shell: wires the modules below, owns the chunk cache, stash, delegation, and the seam methods with invariant checks. |
+| [`portal/portal-config.ts`](portal/portal-config.ts) | Parse + validate all `PORTAL_*` env once into a frozen `PortalConfig` (INV-14). |
+| [`portal/portal-errors.ts`](portal/portal-errors.ts), [`portal/portal-invariant.ts`](portal/portal-invariant.ts) | The typed error taxonomy and the runtime `invariant()` checks. |
+| [`portal/portal-client.ts`](portal/portal-client.ts) | The Portal HTTP shell: `finalizedHead()`, `stream()`, error mapping, retry, field degradation, the shared `ndjsonLines()`. |
+| [`portal/portal-gate.ts`](portal/portal-gate.ts) | The shared AIMD concurrency + row-budget controller as a pure reducer + async shell. |
+| [`portal/portal-filters.ts`](portal/portal-filters.ts) | The frozen per-chain fetch-spec — the single source of log/tx/trace requests + field projections, shared with realtime. |
+| [`portal/portal-chunks.ts`](portal/portal-chunks.ts) | Pure chunk-grid math (tiling, density scaling, read-ahead / eviction plans). |
+| [`portal/portal-discovery.ts`](portal/portal-discovery.ts) | The factory-child discovery state machine (advance-on-success). |
+| [`portal/portal-assemble.ts`](portal/portal-assemble.ts) | The pure range assembler (interval exactness, full-tree trace ranking, `closest`). |
 | [`portal/portal-transform.ts`](portal/portal-transform.ts) | Pure Portal-NDJSON → Ponder `Sync*` transforms, unit-tested against captured fixtures. |
+| [`portal/portal-metrics.ts`](portal/portal-metrics.ts) | The per-chain stats shape, metrics-file writer, and gate-log ticker. |
 | [`portal/portal-realtime.ts`](portal/portal-realtime.ts), [`portal/portal-realtime-wire.ts`](portal/portal-realtime-wire.ts) | The opt-in Portal `/stream` realtime path and its adapter into Ponder's realtime runtime. |
 | [`portal/wiring/`](portal/wiring/) | The short per-version upstream patch — the `portal` config field and the one-line selector. |
 
-For the tuning knobs, metrics fields, and defaults, see [`portal/INTEGRATION.md`](portal/INTEGRATION.md). For the full measured run, see [`harness/euler-multichain/REPORT.md`](harness/euler-multichain/REPORT.md).
+For the invariant catalog, see [`portal/INVARIANTS.md`](portal/INVARIANTS.md). For the tuning knobs, metrics fields, and defaults, see [`portal/INTEGRATION.md`](portal/INTEGRATION.md). For the full measured run, see [`harness/euler-multichain/REPORT.md`](harness/euler-multichain/REPORT.md).

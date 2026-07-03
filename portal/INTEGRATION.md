@@ -44,7 +44,7 @@ Historical sync owns `[start, finalized]`; realtime owns `(finalized, tip]`. The
 
 ## The shared controller
 
-Every chain streams from the **same** Portal endpoint, so request concurrency and buffered memory are one shared budget, not a per-chain one. A 15-chain app that gave each chain its own private read-ahead is exactly what exhausts memory and trips rate limits. The fork therefore routes all chains through a single module-scope controller (`portalGate`) that governs two things, both self-tuning and zero-config:
+Every chain streams from the **same** Portal endpoint, so request concurrency and buffered memory are one shared budget, not a per-chain one. A 15-chain app that gave each chain its own private read-ahead is exactly what exhausts memory and trips rate limits. The fork therefore routes all chains through a single shared controller (`portal-gate.ts` — a pure AIMD/row-budget reducer behind a lazily-created process-shared shell) that governs two things, both self-tuning and zero-config:
 
 ### Adaptive concurrency (AIMD)
 
@@ -148,3 +148,16 @@ The A/B in that run is the useful lesson. A modest, well-tuned configuration bea
 | Avg throughput | 7,024 ev/s | **10,513 ev/s** |
 
 Both runs indexed the identical 28.4M events; only the configuration differed. The lever for going faster is not a bigger heap — it is **sharding chains across processes** to lift the single-thread indexing ceiling (for example, running the event-heaviest chain on its own). The full write-up is in [`harness/euler-multichain/REPORT.md`](../harness/euler-multichain/REPORT.md).
+
+## Where the code lives
+
+The `portal/` layer is a functional core behind an imperative shell, organised around explicit invariants (see [`INVARIANTS.md`](INVARIANTS.md), INV-1…INV-14):
+
+- `portal.ts` — orchestration shell (`createPortalHistoricalSync`): chunk cache, stash, delegation, seam methods.
+- `portal-config.ts` / `portal-errors.ts` / `portal-invariant.ts` — frozen config (INV-14), typed errors, runtime checks.
+- `portal-client.ts` — HTTP: `finalizedHead()`, `stream()`, error mapping, retry, field degradation, `ndjsonLines()`.
+- `portal-gate.ts` — the shared AIMD + row-budget controller (pure reducer + shell).
+- `portal-filters.ts` — the frozen per-chain fetch-spec (log/tx/trace requests + field projections), shared with realtime.
+- `portal-chunks.ts` — pure chunk-grid math; `portal-discovery.ts` — factory-child discovery; `portal-assemble.ts` — the pure range assembler.
+- `portal-transform.ts` — Portal-NDJSON → Ponder `Sync*` transforms; `portal-metrics.ts` — stats + metrics file.
+- `portal-realtime.ts` / `portal-realtime-wire.ts` — the opt-in Portal `/stream` realtime path.
