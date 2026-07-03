@@ -1,5 +1,5 @@
 # Soak B — Portal-native realtime soak (mirror of Soak A, Portal /stream instead of RPC realtime).
-# RENDERED by harness/soak-ab/deploy-soak-b.sh (@@TOKENS@@ substituted); do not install by hand.
+# RENDERED by harness/soak-ab/deploy-soak-b.sh (the @@…@@ tokens are substituted); do not install by hand.
 #
 # GUARDRAILS baked in: dedicated DB euler_rt_b + dedicated port (never the euler prod DB or :9547),
 # secrets only via a chmod-600 EnvironmentFile, RSS-capped, auto-restart. The unit is enabled but
@@ -29,8 +29,10 @@ Environment=PORTAL_CHECKS=on
 Environment=PONDER_LOG_LEVEL=info
 Environment=CI=true
 
-# The soak indexes the SAME 3 chains as Soak A; the app's ponder.config.ts reads SOAK_CHAINS.
-Environment=SOAK_CHAINS=eth,base,arbitrum
+# The soak indexes the SAME chains as Soak A. The app's ponder.config.ts reads EULER_CHAINS (full
+# chains.json names, e.g. ethereum,base,arbitrum) — written into the EnvironmentFile above by
+# deploy-soak-b.sh from the SOAK_CHAINS/EULER_CHAINS knob (validated against chains.json). It is NOT
+# hard-coded here so a redeploy against a differently-scoped soak stays consistent from the env file.
 
 # Restart counting is a first-class soak signal. Each (re)start appends a UTC timestamp to the
 # restart log; ab-diff.mjs reads it into restartCount / lastRestartAt and alerts on >3 restarts/hour
@@ -40,7 +42,10 @@ Environment=SOAK_CHAINS=eth,base,arbitrum
 Environment=SOAK_B_RESTART_LOG=@@RESTART_LOG@@
 ExecStartPre=/bin/sh -c 'echo "$(date -u +%%Y-%%m-%%dT%%H:%%M:%%SZ) restart" >> "$SOAK_B_RESTART_LOG"'
 
-ExecStart=@@WORKDIR@@/node_modules/.bin/ponder start --schema soak_b --port @@PORT@@
+# --schema is rendered from the single SOAK_B_SCHEMA knob (default soak_b) so it stays consistent
+# with DATABASE_SCHEMA in the EnvironmentFile — a redeploy over an existing soak using a different
+# schema must not silently point the app at soak_b. Never hard-code the schema here.
+ExecStart=@@WORKDIR@@/node_modules/.bin/ponder start --schema @@SCHEMA@@ --port @@PORT@@
 
 # RSS cap — MemoryHigh throttles, MemoryMax is the hard kill ceiling (the soak asserts it holds).
 MemoryHigh=@@MEM_HIGH@@

@@ -27,24 +27,51 @@ MEM_MAX="${SOAK_B_MEM_MAX:-8G}"
 UNIT_DIR="${SYSTEMD_DIR:-/etc/systemd/system}"
 RESTART_LOG="${SOAK_B_RESTART_LOG:-$HOME/soak-b-restarts.log}"
 RESTART_LOG_DIR="$(dirname "$RESTART_LOG")"
+# The app schema. Rendered into BOTH the env file (DATABASE_SCHEMA) and the unit's `ponder start
+# --schema` from this single knob, so a redeploy over an existing soak on a different schema stays
+# consistent instead of silently pointing the app at soak_b. Default: soak_b.
+RUN_SCHEMA="${SOAK_B_SCHEMA:-soak_b}"
+# The indexed chains. The app (harness/euler-multichain/ponder.config.ts) reads EULER_CHAINS with the
+# FULL chains.json names. Accept either SOAK_CHAINS or EULER_CHAINS as the knob; resolve+validate to
+# full names below (fail loud on any unknown name). Default: the Soak-A trio.
+RUN_CHAINS="${EULER_CHAINS:-${SOAK_CHAINS:-ethereum,base,arbitrum}}"
 # The unit runs UNPRIVILEGED. Default to the invoking operator's own account (resolved live), never
 # root and never a name baked into the committed unit template.
 RUN_USER="${SOAK_B_USER:-$(id -un)}"
 RUN_GROUP="${SOAK_B_GROUP:-$(id -gn)}"
 
 HERE="$(cd "$(dirname "$0")" && pwd)"
+HELPERS="$HERE/deploy-helpers.mjs"
+# chains.json is the app's single source of truth for valid chain names (the `name` field).
+CHAINS_JSON="${SOAK_B_CHAINS_JSON:-$HERE/../euler-multichain/chains.json}"
 
 # ── GUARDRAILS ── absolute refusals, checked before anything is created ──
 [ "$DB_NAME" = "euler_rt_b" ] || { echo "✗ GUARDRAIL: DB name must be euler_rt_b (got $DB_NAME)"; exit 1; }
 [ "$PORT" != "9547" ] || { echo "✗ GUARDRAIL: :9547 is the euler prod port — refusing"; exit 1; }
 [ "$RUN_USER" != "root" ] || { echo "✗ GUARDRAIL: refusing to run the soak as root — set SOAK_B_USER"; exit 1; }
+case "$RUN_SCHEMA" in
+  [A-Za-z_]*) : ;;
+  *) echo "✗ SOAK_B_SCHEMA is not a valid SQL identifier: $RUN_SCHEMA"; exit 1 ;;
+esac
+case "$RUN_SCHEMA" in *[!A-Za-z0-9_]*) echo "✗ SOAK_B_SCHEMA is not a valid SQL identifier: $RUN_SCHEMA"; exit 1 ;; esac
 case "$SOAK_A_ENV" in *euler-rt.env|*.env) : ;; *) echo "✗ SOAK_A_ENV must be an .env file"; exit 1 ;; esac
+
+# Resolve + validate the chains knob to full EULER_CHAINS names NOW (fail loud before creating the DB
+# or writing files). The pure resolver lives in deploy-helpers.mjs (node --test covered).
+if command -v node >/dev/null; then
+  RUN_CHAINS="$(node "$HELPERS" resolve-chains "$RUN_CHAINS" "$CHAINS_JSON")" || {
+    echo "✗ GUARDRAIL: invalid chains knob (SOAK_CHAINS/EULER_CHAINS) — see message above"; exit 1;
+  }
+else
+  echo "⚠ node not found — cannot validate chain names; writing EULER_CHAINS=$RUN_CHAINS as given"
+fi
 if grep -qiE 'DATABASE_URL=.*/euler(\b|["'\'' ])' "$SOAK_A_ENV" 2>/dev/null; then
   : # Soak A's env legitimately references its own DB; we DERIVE a new one below and never reuse it.
 fi
 
 echo "▶ Soak B deploy (BUILD-ONLY, will not start)"
-echo "  db=$DB_NAME port=$PORT workdir=$WORKDIR user=$RUN_USER unit=$UNIT_DIR/soak-b.service"
+echo "  db=$DB_NAME schema=$RUN_SCHEMA port=$PORT workdir=$WORKDIR user=$RUN_USER unit=$UNIT_DIR/soak-b.service"
+echo "  chains=$RUN_CHAINS"
 
 # ── 1. workspace: copy Soak A's app config, swap in the pinned tarball ──
 mkdir -p "$WORKDIR"
@@ -84,11 +111,24 @@ fi
 umask 077
 {
   echo "# Soak B env — chmod 600, generated $(date -u +%FT%TZ). DO NOT COMMIT."
-  # carry only the secrets/tunables Soak B needs from Soak A's env
+  # Carry the operative env vars from the source env file: PRESERVE-ALL-THEN-OVERRIDE. Every
+  # well-formed KEY=value is carried EXCEPT the small set this script re-derives below (see
+  # OVERRIDDEN_KEYS in deploy-helpers.mjs) — so PORTAL_URL (no underscore), EULER_CHAINS,
+  # DATABASE_SCHEMA, NODE_OPTIONS, PORTAL_* tunables, keys and per-chain URLs are all preserved,
+  # not silently dropped, while the vars we author below always win. Pure + node --test covered.
   if [ -f "$SOAK_A_ENV" ]; then
-    grep -E '^(PORTAL_API_KEY|SQD_RPC_KEY|PORTAL_URL_|PONDER_RPC_URL_)' "$SOAK_A_ENV" || true
+    if command -v node >/dev/null; then
+      node "$HELPERS" carry-env "$SOAK_A_ENV" || true
+    else
+      # Fallback when node is unavailable: widened allowlist covering the operative variables.
+      grep -E '^(export[[:space:]]+)?(PORTAL_API_KEY|SQD_RPC_KEY|PORTAL_URL|PONDER_RPC_URL_|EULER_CHAINS|DATABASE_SCHEMA|NODE_OPTIONS|PORTAL_)' "$SOAK_A_ENV" || true
+    fi
   fi
+  # Authoritative overrides (these always win over any carried value; keep in sync with
+  # OVERRIDDEN_KEYS in deploy-helpers.mjs).
   echo "DATABASE_URL=postgresql:///${DB_NAME}"
+  echo "DATABASE_SCHEMA=${RUN_SCHEMA}"
+  echo "EULER_CHAINS=${RUN_CHAINS}"
   echo "PORTAL_REALTIME=stream"
   echo "PORTAL_CHECKS=on"
 } > "$ENVFILE"
@@ -101,6 +141,7 @@ RENDER="$(mktemp)"
 sed -e "s#@@WORKDIR@@#${WORKDIR}#g" \
     -e "s#@@ENVFILE@@#${ENVFILE}#g" \
     -e "s#@@PORT@@#${PORT}#g" \
+    -e "s#@@SCHEMA@@#${RUN_SCHEMA}#g" \
     -e "s#@@USER@@#${RUN_USER}#g" \
     -e "s#@@GROUP@@#${RUN_GROUP}#g" \
     -e "s#@@MEM_HIGH@@#${MEM_HIGH}#g" \
@@ -115,10 +156,12 @@ if [ -w "$UNIT_DIR" ] || [ "$(id -u)" = 0 ]; then
   systemctl enable soak-b.service
   echo "✅ installed + enabled soak-b.service (NOT started)."
   echo "   start it deliberately with:  sudo systemctl start soak-b.service"
+  # Only clean up the temp render once it has been installed. On the non-root path below the
+  # operator still needs this file to copy into place, so it MUST outlive the script there.
+  rm -f "$RENDER"
 else
-  echo "▶ rendered unit (install manually — no write access to $UNIT_DIR):"
+  echo "▶ rendered unit at $RENDER (install manually — no write access to $UNIT_DIR):"
   echo "   sudo cp $RENDER $UNIT_DIR/soak-b.service && sudo systemctl daemon-reload && sudo systemctl enable soak-b.service"
 fi
-rm -f "$RENDER"
 echo "▶ Soak B provisioned. Start manually; then run harness/soak-ab/ab-diff.mjs hourly."
 echo "   restart log: $RESTART_LOG (ab-diff.mjs reads restartCount/lastRestartAt; >3/h = crash-loop alert)"
