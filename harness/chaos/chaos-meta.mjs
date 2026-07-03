@@ -9,21 +9,39 @@
 //
 // The comparison core (metaMatch) is pure + exported for unit tests.
 
+import { createHash } from 'node:crypto';
 import { readFileSync, writeFileSync } from 'node:fs';
 import { basename } from 'node:path';
 
 // The fields that MUST match for a baseline to be a valid comparison target. `scenario` is NOT here:
 // a baseline is by definition the clean (no-fault, no-kill) build of the same app/range, so it will
 // differ in scenario/kills by design — matching on those would wrongly reject every baseline.
+// `tarballHash` (sha256 of the tarball CONTENT) is included alongside the basename: a re-packed fork
+// tarball keeps the same version/filename (0.16.6-sqd.N) but can carry different bytes, so a basename
+// match alone would let a baseline built from a DIFFERENT build be reused as "identical" — a false
+// pass. Both stores must have been built from byte-identical @subsquid/ponder.
 export const MATCH_FIELDS = [
   'app',
   'from',
   'to',
   'portal',
   'tarball',
+  'tarballHash',
   'chainId',
   'factory',
 ];
+
+// sha256 of a file's bytes (hex), or a stable sentinel when there is no file (the published
+// @subsquid/ponder — a versioned npm artifact whose identity travels in the version, not a local
+// tarball). A read error is a HARD failure, not a silent 'unknown': a metadata record that cannot
+// prove which build produced a store must never validate as matching.
+export function tarballHash(path) {
+  if (!path) {
+    return 'published';
+  }
+
+  return `sha256:${createHash('sha256').update(readFileSync(path)).digest('hex')}`;
+}
 
 // Pure compatibility check: every MATCH_FIELDS value must be equal (compared as strings). Returns
 // { ok, mismatches:[{field,baseline,chaos}] }.
@@ -53,12 +71,35 @@ export function metaFromEnv(env = process.env) {
     to: Number(env.CHAOS_META_TO ?? 0),
     portal: env.CHAOS_META_PORTAL ?? '',
     tarball,
+    // sha256 of the tarball CONTENT — proves both stores were built from the same fork bytes, not
+    // merely a same-named re-pack (see MATCH_FIELDS / tarballHash).
+    tarballHash: tarballHash(env.CHAOS_META_TARBALL),
     chainId: Number(env.CHAOS_META_CHAIN_ID ?? 0),
     factory: env.CHAOS_META_FACTORY ?? '',
     scenario: env.CHAOS_META_SCENARIO ?? 'none',
     kills: Number(env.CHAOS_META_KILLS ?? 0),
     writtenAt: env.CHAOS_META_NOW ?? new Date().toISOString(),
   };
+}
+
+// The chaos run's `kills` count must clear the acceptance floor — a store that "completed" without
+// being killed enough proves nothing about resume. Enforced at VERIFY time too (not only in
+// kill-loop), so a hand-built or under-killed chaos store cannot pass verification. A non-integer /
+// negative / missing kills is treated as unproven → not satisfied.
+export function killsSatisfied(kills, minKills) {
+  const k = Number(kills);
+  const min = Number(minKills);
+  if (!Number.isInteger(k) || k < 0) {
+    return { ok: false, reason: `kills is not a valid count (${kills})` };
+  }
+  if (k < min) {
+    return {
+      ok: false,
+      reason: `kills=${k} < MIN_KILLS=${min} — a resume run must be killed at least MIN_KILLS times`,
+    };
+  }
+
+  return { ok: true };
 }
 
 function main() {
@@ -111,7 +152,35 @@ function main() {
     return;
   }
 
-  console.error('usage: chaos-meta.mjs write|match ...');
+  if (cmd === 'kills') {
+    // node chaos-meta.mjs kills <chaosMetaFile> <minKills> — exit 0 if kills >= minKills, else 1.
+    if (!a || b === undefined) {
+      console.error('usage: chaos-meta.mjs kills <chaosMeta> <minKills>');
+      process.exit(2);
+    }
+
+    let chaos;
+    try {
+      chaos = JSON.parse(readFileSync(a, 'utf8'));
+    } catch (e) {
+      console.error(
+        `chaos-meta: cannot read chaos metadata (${e.message}) — cannot verify kills`,
+      );
+      process.exit(1);
+    }
+
+    const verdict = killsSatisfied(chaos.kills, b);
+    if (!verdict.ok) {
+      console.error(`chaos-meta: ${verdict.reason}`);
+      process.exit(1);
+    }
+
+    console.log(`chaos-meta: kills=${chaos.kills} ≥ MIN_KILLS=${b}`);
+
+    return;
+  }
+
+  console.error('usage: chaos-meta.mjs write|match|kills ...');
   process.exit(2);
 }
 

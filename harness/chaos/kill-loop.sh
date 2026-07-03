@@ -47,13 +47,17 @@ case "$TRIGGER" in
 esac
 
 WORK="$(mktemp -d)"
+# NPM_CACHE tracks the throwaway npm cache dir (local-tarball install only) so the trap removes it
+# too — the old trap leaked the mktemp -d cache each run.
+NPM_CACHE=""
 # Cleanup on ANY exit (completion, interrupt, InvariantViolation-stop): remove the throwaway install
-# workspace and the per-attempt run logs. The chaos store ($DB) is intentionally kept (verify-resume
-# reads it). Set KEEP_WORKSPACES=1 to retain the workspace + logs for debugging.
+# workspace, the npm cache, and the per-attempt run logs. The chaos store ($DB) is intentionally kept
+# (verify-resume reads it). Set KEEP_WORKSPACES=1 to retain the workspace + logs for debugging.
 ATTEMPT_LOG_GLOB="/tmp/chaos-attempt-*.log"
 cleanup () {
   [ -n "${KEEP_WORKSPACES:-}" ] && return
   rm -rf "$WORK"
+  [ -n "$NPM_CACHE" ] && rm -rf "$NPM_CACHE"
   rm -f $ATTEMPT_LOG_GLOB
 }
 trap cleanup EXIT INT TERM
@@ -61,7 +65,8 @@ cp -r "$APP/." "$WORK/"
 cd "$WORK"
 [ -n "${SQD_PONDER_TARBALL:-}" ] && node -e "const p=require('./package.json');p.dependencies['@subsquid/ponder']='file:'+process.env.SQD_PONDER_TARBALL;require('fs').writeFileSync('package.json',JSON.stringify(p,null,2))"
 echo "▶ installing @subsquid/ponder (chaos workspace $WORK)"
-npm install --no-audit --no-fund --silent ${SQD_PONDER_TARBALL:+--cache "$(mktemp -d)"} || { echo "✗ install failed"; exit 1; }
+[ -n "${SQD_PONDER_TARBALL:-}" ] && NPM_CACHE="$(mktemp -d)"
+npm install --no-audit --no-fund --silent ${NPM_CACHE:+--cache "$NPM_CACHE"} || { echo "✗ install failed"; exit 1; }
 
 export PONDER_START="$FROM" PONDER_END="$TO" PGLITE_DIR="$DB"
 export PORTAL_URL_1="$PORTAL" PONDER_RPC_URL_1="$RPC" CHAIN_ID="$CHAIN_ID" EULER_FACTORY="$FACTORY"
