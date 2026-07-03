@@ -39,12 +39,25 @@ if [ -n "${WINDOW_OVERRIDE:-}" ]; then
   echo "▶ WINDOW_OVERRIDE → single window [$ov_from,$ov_to]"
 fi
 
+# Frontier / full-range windows resolve against a head. For REPRODUCIBILITY the pinned per-chain head
+# in cells.json (CELL_PINNED_HEAD) is preferred — a live /finalized-head fetch makes the same cell
+# resolve to different windows on every run, defeating "pinned head". Override with:
+#   HEAD_OVERRIDE=<number>  → use that exact head        HEAD_OVERRIDE=live → force a live fetch
+RESOLVED_HEAD=""
 if [ -n "$CELL_NEEDS_HEAD" ]; then
-  echo "▶ resolving Portal head for frontier/full-range windows: $CELL_PORTAL_URL/finalized-head"
-  HEAD="$(curl -sf "$CELL_PORTAL_URL/finalized-head" | node -e 'let d="";process.stdin.on("data",c=>d+=c).on("end",()=>{try{process.stdout.write(String(JSON.parse(d).number))}catch{process.exit(1)}})')" \
-    || { echo "✗ could not fetch Portal head"; exit 1; }
-  echo "  head=$HEAD"
-  eval "$(node "$VDIR/resolve-cell.mjs" "$CELL" --head "$HEAD" --sh)"
+  if [ -n "${HEAD_OVERRIDE:-}" ] && [ "${HEAD_OVERRIDE}" != "live" ]; then
+    RESOLVED_HEAD="$HEAD_OVERRIDE"
+    echo "▶ using HEAD_OVERRIDE=$RESOLVED_HEAD for frontier/full-range windows"
+  elif [ "${HEAD_OVERRIDE:-}" != "live" ] && [ -n "$CELL_PINNED_HEAD" ]; then
+    RESOLVED_HEAD="$CELL_PINNED_HEAD"
+    echo "▶ using PINNED head $RESOLVED_HEAD (cells.json) for frontier/full-range windows — reproducible"
+  else
+    echo "▶ fetching LIVE Portal head for frontier/full-range windows: $CELL_PORTAL_URL/finalized-head"
+    RESOLVED_HEAD="$(curl -sf "$CELL_PORTAL_URL/finalized-head" | node -e 'let d="";process.stdin.on("data",c=>d+=c).on("end",()=>{try{process.stdout.write(String(JSON.parse(d).number))}catch{process.exit(1)}})')" \
+      || { echo "✗ could not fetch Portal head"; exit 1; }
+  fi
+  echo "  resolved head=$RESOLVED_HEAD"
+  eval "$(node "$VDIR/resolve-cell.mjs" "$CELL" --head "$RESOLVED_HEAD" --sh)"
 fi
 
 [ -n "$CELL_WINDOWS" ] || { echo "✗ cell $CELL resolved to zero windows"; exit 1; }
@@ -82,7 +95,14 @@ for _ in $(seq 1 40); do curl -sf "http://127.0.0.1:$METER_PORT/__count" >/dev/n
 curl -sf "http://127.0.0.1:$METER_PORT/__count" >/dev/null 2>&1 || { echo "✗ meter did not start on :$METER_PORT"; exit 1; }
 echo "▶ cell $CELL  app=$CELL_APP_NAME chain=$CELL_CHAIN_ID  meter :$METER_PORT → $CELL_RPC_SLUG"
 
-meter_total () { curl -sf "http://127.0.0.1:$METER_PORT/__count" | node -e 'let d="";process.stdin.on("data",c=>d+=c).on("end",()=>process.stdout.write(String(JSON.parse(d).total)))'; }
+# meter_total prints the current count, or NOTHING (empty) if the meter is unreachable / returns
+# non-JSON — the node reader exits non-zero on a parse failure so a dead meter yields "" not "0".
+# NOTE: no `set -e` here — the window loop relies on many idioms that legitimately return non-zero
+# (grep -q ||, arithmetic that evaluates to 0, run_window returning the window verdict, kill 2>/dev/null),
+# so set -e would abort mid-cell instead of recording every window. Instead each money-critical step
+# (budget precheck, meter reset, meter count) is checked explicitly and fails the WINDOW, never
+# silently records requests=0 from an unreachable meter.
+meter_total () { curl -sf "http://127.0.0.1:$METER_PORT/__count" | node -e 'let d="";process.stdin.on("data",c=>d+=c).on("end",()=>{try{const t=JSON.parse(d).total;if(!Number.isFinite(Number(t)))process.exit(1);process.stdout.write(String(t))}catch{process.exit(1)}})'; }
 
 # run one window; args: from to tag shrunkFlag
 run_window () {
@@ -90,10 +110,13 @@ run_window () {
   local wlog; wlog="$(mktemp)"
   WINDOW_TMP="$wlog $wlog.tail"
 
-  # budget guard — refuse to START a window once the campaign has met the ceiling
+  # budget guard — refuse to START a window once the campaign has met the ceiling (fails closed on a
+  # corrupt/unreadable results file too, per budget-sum.mjs)
   node "$VDIR/budget-sum.mjs" --check >/dev/null || { echo "✗ BUDGET: refusing to start $CELL/$tag"; return 3; }
 
-  curl -sf -X POST "http://127.0.0.1:$METER_PORT/__reset" >/dev/null
+  # reset the meter — a dead/unreachable meter here MUST fail the window: without a working meter we
+  # cannot count spend, so we must never proceed and record requests=0 (silently free real spend).
+  curl -sf -X POST "http://127.0.0.1:$METER_PORT/__reset" >/dev/null || { echo "✗ METER: reset failed (meter down?) — failing $CELL/$tag"; return 4; }
 
   export DIFF_APP="$CELL_APP_PATH"
   export PONDER_RPC_URL_1="http://127.0.0.1:$METER_PORT"
@@ -112,14 +135,28 @@ run_window () {
   echo "  ▷ window $tag  [$from,$to]"
   bash "$ROOT/harness/diff/run.sh" "$from" "$to" >"$wlog" 2>&1 || rc=$?
   local dur=$(( SECONDS - t0 ))
+
+  # read the metered request count. An empty result = the meter died mid-window; we CANNOT record
+  # requests=0 (that hides real spend from the budget guard), so the window fails outright.
   local requests; requests="$(meter_total)"
+  if [ -z "$requests" ]; then
+    echo "    ✗ METER: no request count after window (meter down?) — failing $CELL/$tag"
+    [ -n "${KEEP_WORKSPACES:-}" ] || rm -f "$wlog" "$wlog.tail"
+
+    return 4
+  fi
+
   local matched; matched="$(sed -nE 's/.*logs[[:space:]]+portal=[[:space:]]*([0-9]+).*/\1/p' "$wlog" | head -1)"
   [ -n "$matched" ] || matched="nan"
 
   local pass=0
   [ "$rc" -eq 0 ] && pass=1
   tail -30 "$wlog" > "$wlog.tail"
-  node "$VDIR/record-result.mjs" "$CELL" "$tag" "$from" "$to" "$pass" "$requests" "$dur" "$matched" "$shrunk" "$wlog.tail"
+
+  # persisting the result IS the budget record — if the write fails, the spend went untracked, so the
+  # window must fail (never let a metered window's requests silently escape the running total).
+  node "$VDIR/record-result.mjs" "$CELL" "$tag" "$from" "$to" "$pass" "$requests" "$dur" "$matched" "$shrunk" "$wlog.tail" \
+    || { echo "    ✗ RECORD: failed to persist $CELL/$tag ($requests requests untracked) — failing"; [ -n "${KEEP_WORKSPACES:-}" ] || rm -f "$wlog" "$wlog.tail"; return 5; }
   echo "    $([ $pass = 1 ] && echo PASS || echo FAIL)  requests=$requests  ${dur}s  matched=$matched"
   [ $pass = 1 ] || { echo "    ── diff/run tail ──"; sed 's/^/    /' "$wlog.tail"; }
 
@@ -140,6 +177,9 @@ run_window () {
   [ -n "${KEEP_WORKSPACES:-}" ] || rm -f "$wlog" "$wlog.tail"
   return $wstatus
 }
+
+# record-result.mjs stamps the results doc with the head its windows were cut from (reproducibility).
+[ -n "$RESOLVED_HEAD" ] && export RESOLVED_HEAD
 
 fail=0
 for spec in $CELL_WINDOWS; do

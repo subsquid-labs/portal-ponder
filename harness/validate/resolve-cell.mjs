@@ -54,6 +54,9 @@ function buildPlan(cellId, head) {
     rpcSlug: chain?.rpcSlug ?? '',
     eulerFactory: cell.app === 'euler' ? (chain?.eulerFactory ?? '') : '',
     erc20: cell.app === 'erc20' ? (chain?.erc20 ?? '') : '',
+    // Pinned per-chain head from cells.json — run-cell.sh prefers this for frontier/full-range
+    // windows (reproducibility) over a live /finalized-head fetch, unless explicitly overridden.
+    pinnedHead: chain?.head ?? '',
     receipts: cell.receipts !== false,
     differ: cell.differ ?? '',
     appHash: cell.appHash === true,
@@ -77,6 +80,7 @@ function emitSh(plan) {
     line('CELL_RPC_SLUG', plan.rpcSlug),
     line('CELL_EULER_FACTORY', plan.eulerFactory),
     line('CELL_ERC20', plan.erc20),
+    line('CELL_PINNED_HEAD', plan.pinnedHead),
     line('CELL_RECEIPTS', plan.receipts ? 'true' : 'false'),
     line('CELL_DIFFER', plan.differ),
     line('CELL_APP_HASH', plan.appHash ? '1' : ''),

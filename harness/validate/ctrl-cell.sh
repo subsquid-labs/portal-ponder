@@ -48,7 +48,15 @@ cleanup () {
   [ -n "$wlog" ] && rm -f "$wlog" "$wlog.tail"
 }
 trap cleanup EXIT INT TERM
+# The meter MUST be ready before any metered window — otherwise both backfills would run with an
+# untracked meter and the campaign would spend real requests it never counted. Hard-fail if it never
+# came up (the loop below is best-effort; the assertion after it is the guarantee).
 for _ in $(seq 1 40); do curl -sf "http://127.0.0.1:$METER_PORT/__count" >/dev/null 2>&1 && break; sleep 0.25; done
+curl -sf "http://127.0.0.1:$METER_PORT/__count" >/dev/null 2>&1 || { echo "✗ meter did not start on :$METER_PORT — refusing to run metered CTRL windows"; exit 1; }
+
+# budget precheck — share run-cell's guard so CTRL cannot start a metered window once the campaign has
+# met the ceiling (fails closed on a corrupt results file too, per budget-sum.mjs).
+node "$VDIR/budget-sum.mjs" --check >/dev/null || { echo "✗ BUDGET: refusing to start CTRL windows"; exit 3; }
 
 # install a workspace whose @subsquid/ponder resolves to $2 (a file: tarball or npm:ponder alias)
 install_ws () { # $1=dir  $2=dep-spec
@@ -80,7 +88,10 @@ fail=0
 for spec in $CELL_WINDOWS; do
   IFS='|' read -r FROM TO tag <<<"$spec"
   echo "▶ CTRL window $tag [$FROM,$TO]"
-  curl -sf -X POST "http://127.0.0.1:$METER_PORT/__reset" >/dev/null
+  # per-window budget precheck — refuse to START a window once the ceiling is met (fails closed)
+  node "$VDIR/budget-sum.mjs" --check >/dev/null || { echo "✗ BUDGET: refusing CTRL/$tag"; fail=1; break; }
+  # reset the meter — a dead meter must fail the window, never record requests=0 (untracked spend)
+  curl -sf -X POST "http://127.0.0.1:$METER_PORT/__reset" >/dev/null || { echo "✗ METER: reset failed — failing CTRL/$tag"; fail=1; continue; }
   WORK="$(mktemp -d)"
   install_ws "$WORK/fork" "file:$SQD_PONDER_TARBALL"   || { fail=1; rm -rf "$WORK"; continue; }
   install_ws "$WORK/up"   "npm:ponder@$UPSTREAM"       || { fail=1; rm -rf "$WORK"; continue; }
@@ -94,7 +105,9 @@ for spec in $CELL_WINDOWS; do
     ( cd "$WORK/fork" && node diff.mjs "$WORK/fork/db" "$WORK/up/db" ) >"$wlog" 2>&1 || rc=1
     cat "$wlog"
   fi
-  requests="$(curl -sf "http://127.0.0.1:$METER_PORT/__count" | node -e 'let d="";process.stdin.on("data",c=>d+=c).on("end",()=>process.stdout.write(String(JSON.parse(d).total)))')"
+  # read the metered count; empty = meter died → fail the window, never record requests=0
+  requests="$(curl -sf "http://127.0.0.1:$METER_PORT/__count" | node -e 'let d="";process.stdin.on("data",c=>d+=c).on("end",()=>{try{const t=JSON.parse(d).total;if(!Number.isFinite(Number(t)))process.exit(1);process.stdout.write(String(t))}catch{process.exit(1)}})')"
+  if [ -z "$requests" ]; then echo "  ✗ METER: no request count (meter down?) — failing CTRL/$tag"; fail=1; [ -n "${KEEP_WORKSPACES:-}" ] || rm -rf "$WORK" "$wlog" "$wlog.tail"; continue; fi
   matched="$(sed -nE 's/.*logs[[:space:]]+portal=[[:space:]]*([0-9]+).*/\1/p' "$wlog" | head -1)"; [ -n "$matched" ] || matched="nan"
   pass=0; [ $rc -eq 0 ] && pass=1; [ $pass = 1 ] || fail=1
   tail -30 "$wlog" > "$wlog.tail"
