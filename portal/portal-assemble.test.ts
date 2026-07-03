@@ -106,6 +106,67 @@ test('seenTx dedupe: two logs sharing a tx insert the tx once', () => {
   expect(out.txs).toHaveLength(1); // deduped
 });
 
+// ── tx-filter receipts: every matched account tx carries its receipt ─────────────────────────────────
+
+const receiptTx = (hash: string) => ({
+  ...rawTx(hash),
+  // receipt fields (the tx query always projects RECEIPT_FIELDS) — toSyncReceipt reads these
+  status: '0x1',
+  cumulativeGasUsed: '0x5208',
+  gasUsed: '0x5208',
+  effectiveGasPrice: '0x1',
+  logsBloom: '0x' + '00'.repeat(256),
+  contractAddress: null,
+});
+
+// `hasTransactionReceipt: false` is unconstructible upstream (literal-true type, always set by the
+// build) — the `any`-forced shape pins the HARDENED contract: receipts must flow even if upstream
+// ever relaxes that invariant.
+const txFilter: any = {
+  type: 'transaction',
+  chainId: 1,
+  sourceId: 'acct',
+  fromAddress: '0xfrom',
+  toAddress: undefined,
+  includeReverted: false,
+  fromBlock: undefined,
+  toBlock: undefined,
+  hasTransactionReceipt: false, // ← receipts must be emitted anyway
+  include: [],
+};
+
+test('a tx-filter-matched tx yields its receipt even without hasTransactionReceipt', () => {
+  // ponder's buildEvents dereferences `transactionReceipt.status` on EVERY transaction event to apply
+  // `includeReverted` (positional cursor, no identity check) — a matched tx stored without its receipt
+  // would crash buildEvents, or with a sparse receipt set silently consult a NEIGHBOR's receipt.
+  const cd = createChunkData();
+  cd.txBlocks.set(5, { header: header(5), txs: [receiptTx('0xACCT')] });
+  const spec = compileFetchSpec([{ filter: txFilter }], new Map());
+  const out = assembleRange([cd], [0, 10], spec, new Map());
+  expect(out.txs).toHaveLength(1);
+  expect(out.receipts).toHaveLength(1);
+  expect((out.receipts[0] as any).transactionHash).toBe('0xACCT');
+});
+
+test('a tx matched by BOTH a log filter and a tx filter keeps one tx row AND gets its receipt', () => {
+  // the log branch wins the seenTx dedupe (its raw row lacks receipt columns unless needReceipts), so
+  // the tx-filter branch must push the receipt BEFORE its seenTx skip — from ITS raw row, which always
+  // carries the receipt fields.
+  const cd = createChunkData();
+  cd.headers.set(5, header(5));
+  cd.logs.set(5, [rawLog('0xV', '0xBOTH')]);
+  cd.txs.set(5, [rawTx('0xBOTH')]);
+  cd.txBlocks.set(5, { header: header(5), txs: [receiptTx('0xBOTH')] });
+  const spec = compileFetchSpec(
+    [{ filter: logFilter }, { filter: txFilter }],
+    new Map(),
+  );
+  const out = assembleRange([cd], [0, 10], spec, new Map());
+  expect(out.txs).toHaveLength(1); // still deduped
+  expect(out.receipts).toHaveLength(1); // but the receipt survives the dedupe
+  expect((out.receipts[0] as any).transactionHash).toBe('0xBOTH');
+});
+
 // ── INV-5: trace ranking = index in the cmpTraceAddr-sorted full list ────────────────────────────────
 
 const arbTraceAddr = fc.array(fc.integer({ min: 0, max: 3 }), { maxLength: 4 });

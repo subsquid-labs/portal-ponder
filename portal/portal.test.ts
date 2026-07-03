@@ -1394,6 +1394,136 @@ test('regression (FIX 4): a TRANSFER filter with hasTransactionReceipt inserts a
   }
 });
 
+test('regression: an account source WITHOUT hasTransactionReceipt still inserts a receipt for every matched tx', async () => {
+  // Pins the HARDENED contract end-to-end, not a production repro: upstream guarantees
+  // hasTransactionReceipt: true on every account tx filter (literal type + build), so the `any`-forced
+  // `false` below is unconstructible there today. The Portal path must not depend on that invariant —
+  // ponder's buildEvents reads `transactionReceipt.status` on EVERY transaction event to apply
+  // `includeReverted` (positional cursor over the stored receipts, no identity check) and the RPC path
+  // adds every tx-filter-matched tx to requiredTransactionReceipts UNCONDITIONALLY (sync-historical).
+  // Were tx-filter receipts still gated on hasTransactionReceipt and upstream relaxed it: ZERO receipts
+  // → `undefined.status` TypeError in buildEvents; a SPARSE receipt set (receipt-bearing log source +
+  // account source) → the cursor lands on a NEIGHBOR's receipt and events are silently dropped or
+  // emitted for reverted txs, with the intervals marked synced (permanent).
+  process.env.PORTAL_FINALIZED_HEAD = String(22200011 + 1_000_000); // no finality fallback / no head call
+  const BLOCK = 22200011;
+  const TX_INDEX = 111;
+  const TXH = '0x' + 'ac'.repeat(32);
+  const B_HASH = '0x' + 'd3'.repeat(32);
+  const SENDER = '0x000000000000000000000000000000000000beef';
+  const HEADER = {
+    number: BLOCK,
+    hash: B_HASH,
+    parentHash: '0x' + '00'.repeat(32),
+    timestamp: 1700000000,
+    logsBloom: '0x' + '00'.repeat(256),
+    miner: SENDER,
+    gasUsed: '0xabc',
+    gasLimit: '0x1c9c380',
+    stateRoot: '0x' + '22'.repeat(32),
+    receiptsRoot: '0x' + '33'.repeat(32),
+    transactionsRoot: '0x' + '44'.repeat(32),
+    size: '0x500',
+    difficulty: '0x0',
+    extraData: '0x',
+  };
+  const TX = {
+    transactionIndex: TX_INDEX,
+    hash: TXH,
+    from: SENDER,
+    to: '0x000000000000000000000000000000000000dead',
+    input: '0x',
+    value: '0x1',
+    nonce: 1,
+    gas: '0x100000',
+    gasPrice: '0x1',
+    type: 0,
+    r: '0x' + '11'.repeat(32),
+    s: '0x' + '22'.repeat(32),
+    v: '0x1',
+    // receipt fields (the tx query ALWAYS projects RECEIPT_FIELDS) — toSyncReceipt reads these
+    status: '0x1',
+    cumulativeGasUsed: '0x5208',
+    gasUsed: '0x5208',
+    effectiveGasPrice: '0x1',
+    logsBloom: '0x' + '00'.repeat(256),
+    contractAddress: null,
+  };
+  const txQueries: any[] = [];
+  const srv = http.createServer((req, res) => {
+    let body = '';
+    req.on('data', (c) => {
+      body += c;
+    });
+    req.on('end', () => {
+      const q = body ? JSON.parse(body) : {};
+      const covers =
+        (q.fromBlock ?? 0) <= BLOCK && (q.toBlock ?? 1e12) >= BLOCK;
+      if (req.url?.includes('finalized-stream') && q.transactions && covers) {
+        txQueries.push(q);
+        res.writeHead(200, { 'content-type': 'application/x-ndjson' });
+        res.end(JSON.stringify({ header: HEADER, transactions: [TX] }) + '\n');
+      } else {
+        res.writeHead(204).end();
+      }
+    });
+  });
+  const p: number = await new Promise((r) =>
+    srv.listen(0, () => r((srv.address() as AddressInfo).port)),
+  );
+  try {
+    const inserted = { txs: [] as any[], receipts: [] as any[] };
+    const syncStore: any = {
+      insertLogs: () => {},
+      insertBlocks: () => {},
+      insertTransactions: (x: any) => inserted.txs.push(...x.transactions),
+      insertTransactionReceipts: (x: any) =>
+        inserted.receipts.push(...x.transactionReceipts),
+      insertTraces: () => {},
+    };
+    const filter: any = {
+      type: 'transaction',
+      chainId: 1,
+      sourceId: 'acct:no-receipt-flag',
+      fromAddress: SENDER,
+      toAddress: undefined,
+      includeReverted: false,
+      fromBlock: BLOCK,
+      toBlock: BLOCK,
+      hasTransactionReceipt: false, // ← NO source asks for receipts, yet buildEvents needs one per matched tx
+      include: [],
+    };
+    const sync = createPortalHistoricalSync({
+      common: {
+        logger: { debug() {}, info() {}, warn() {}, error() {}, trace() {} },
+      } as any,
+      chain: { id: 1, name: 'mainnet', portal: `http://localhost:${p}` } as any,
+      childAddresses: new Map(),
+      eventCallbacks: [{ filter }],
+    } as any);
+    const interval: [number, number] = [BLOCK, BLOCK];
+    await sync.syncBlockRangeData({
+      interval,
+      requiredIntervals: [{ interval, filter }],
+      requiredFactoryIntervals: [],
+      syncStore,
+    });
+    await sync.syncBlockData({ interval, logs: [], syncStore } as any);
+
+    expect(inserted.txs).toHaveLength(1); // the matched account tx is stored
+    // THE HARDENED CONTRACT: its receipt is inserted despite hasTransactionReceipt:false everywhere
+    expect(inserted.receipts).toHaveLength(1);
+    expect(inserted.receipts[0].transactionHash).toBe(TXH);
+    expect(inserted.receipts[0].blockHash).toBe(B_HASH);
+    // and the tx query itself projected the receipt columns
+    expect(txQueries[0].fields.transaction.status).toBe(true);
+    expect(txQueries[0].fields.transaction.gasUsed).toBe(true);
+  } finally {
+    srv.close();
+    delete process.env.PORTAL_FINALIZED_HEAD;
+  }
+});
+
 test('merge: N same-address event filters collapse to ONE log request (unioned topic0) — keeps body small', async () => {
   // Ponder emits one filter per event; a 24-event EVault would otherwise repeat the child-address
   // list 24× in one body and blow past MAX_RAW_QUERY_SIZE. mergeLogRequests must fold them into one.

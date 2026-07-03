@@ -262,3 +262,37 @@ test('txQuery: account from/to filters pushed server-side; match-all skipped', (
   expect(spec.needReceipts).toBe(true); // hasTransactionReceipt: true
   expect(spec.txQuery()!.transactions).toEqual([{ from: ['0xfrom'] }]);
 });
+
+test('the tx query ALWAYS projects receipt fields — even without hasTransactionReceipt', () => {
+  // Pins the HARDENED contract, not a production repro: upstream types hasTransactionReceipt as the
+  // literal `true` (every account tx filter is built with it), so the `any`-forced `false` below is
+  // unconstructible there today. The query must not depend on that upstream invariant — ponder's
+  // buildEvents reads `transactionReceipt.status` (positional cursor) on EVERY transaction event to
+  // apply `includeReverted`, and the RPC path collects a receipt for every tx-filter-matched tx
+  // unconditionally; a tx query without receipt columns would leave the store receipt-less →
+  // buildEvents crashes (no receipts) or silently consults a NEIGHBOR's receipt (sparse receipts).
+  const txf: any = {
+    type: 'transaction',
+    chainId: 1,
+    sourceId: 'x',
+    fromAddress: '0xfrom',
+    toAddress: undefined,
+    includeReverted: false,
+    fromBlock: 0,
+    toBlock: 100,
+    hasTransactionReceipt: false, // ← NO filter asks for receipts, yet the query must carry them
+    include: [],
+  };
+  const spec = compileFetchSpec([{ filter: txf }], new Map());
+  expect(spec.needReceipts).toBe(false);
+  const fields = spec.txQuery()!.fields.transaction!;
+  for (const f of [
+    'status',
+    'cumulativeGasUsed',
+    'effectiveGasPrice',
+    'gasUsed',
+    'contractAddress',
+    'logsBloom',
+  ])
+    expect(fields[f], `receipt field ${f}`).toBe(true);
+});
