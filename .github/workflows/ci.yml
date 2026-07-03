@@ -41,3 +41,5 @@ jobs:
       - uses: actions/setup-node@v4
         with: { node-version: 22 }
       - run: node --experimental-strip-types --test harness/compat/*.test.ts
+      # validation-campaign pure cores (window generation, batched differ, intervals tiling, A/B classes)
+      - run: node --test harness/validate/*.test.mjs harness/chaos/*.test.mjs harness/soak-ab/*.test.mjs
