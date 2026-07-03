@@ -541,6 +541,96 @@ test('INV-9: stream-realtime mode with an UNKNOWN head is FATAL — refuses to m
   }
 }, 20_000); // the head probe retries with real backoff before giving up
 
+test('INV-9 (FIX 5): a PORTAL_FINALIZED_HEAD pin survives ensureChunkSize probing the live head — an interval above the pin (but below the live head) still DELEGATES to RPC', async () => {
+  // The pin is authoritative for the finality/delegation decision. But chunk scaling (unless
+  // PORTAL_CHUNK_FIXED) still probes the LIVE head via ensureChunkSize. The bug assigned `portalHead = h`
+  // (the live head) unconditionally in ensureChunkSize, CLOBBERING the pin — so once a sub-pin interval
+  // triggered scaling, a later interval above the pin but below the live head was SERVED by the Portal
+  // instead of delegated to RPC (a finality-safety violation: the Portal only has finalized data ≤ pin).
+  // FIX 5 adopts the probe as `portalHead` only when there is no pin (`cfg.finalizedHead === undefined`);
+  // scaling still uses the live `h`. Here: pin=100, live head=1e9, chunk scaling ON.
+  const PIN = 100;
+  const LIVE = 1_000_000_000;
+  process.env.PORTAL_FINALIZED_HEAD = String(PIN); // the pin
+  delete process.env.PORTAL_CHUNK_FIXED; // chunk scaling ON → ensureChunkSize probes the LIVE head
+
+  const srv = http.createServer((req, res) => {
+    let body = '';
+    req.on('data', (c) => {
+      body += c;
+    });
+    req.on('end', () => {
+      if (req.url?.includes('finalized-head')) {
+        res.writeHead(200, { 'content-type': 'application/json' });
+        res.end(JSON.stringify({ number: LIVE })); // live head far past the pin
+        return;
+      }
+      const q = body ? JSON.parse(body) : {};
+      // serve one block for the sub-pin interval A (block 10), nothing else
+      if (
+        req.url?.includes('finalized-stream') &&
+        (q.fromBlock ?? 0) <= 10 &&
+        (q.toBlock ?? 1e12) >= 10
+      ) {
+        res.writeHead(200, { 'content-type': 'application/x-ndjson' });
+        res.end(`${JSON.stringify(mkBlock(10))}\n`);
+        return;
+      }
+      res.writeHead(204).end();
+    });
+  });
+  const port = await listen(srv);
+  try {
+    const rpcCalls: string[] = [];
+    const rpc: any = {
+      request: async (req: any) => {
+        rpcCalls.push(req.method);
+        if (req.method === 'eth_getLogs') return [];
+        throw new Error(`unexpected rpc ${req.method}`);
+      },
+    };
+    // one bounded source spanning both intervals; its toBlock past the pin does NOT relax the pin.
+    const filter = mkFilter({ fromBlock: 0, toBlock: 200 });
+    const sync = createPortalHistoricalSync({
+      common: { logger: stubLogger() } as any,
+      chain: {
+        id: 1,
+        name: 'mainnet',
+        portal: `http://localhost:${port}`,
+        finalityBlockCount: 10,
+      } as any,
+      rpc,
+      childAddresses: new Map(),
+      eventCallbacks: [{ filter }],
+    } as any);
+
+    // interval A [0,50] ≤ pin → served by the Portal; this call runs ensureChunkSize, which probes the
+    // LIVE head. Under the bug that probe clobbers portalHead = LIVE.
+    const iA: [number, number] = [0, 50];
+    await sync.syncBlockRangeData({
+      interval: iA,
+      requiredIntervals: [{ interval: iA, filter }],
+      requiredFactoryIntervals: [],
+      syncStore: mkSyncStore(),
+    });
+    expect(rpcCalls).not.toContain('eth_getLogs'); // A was served by the Portal, not delegated
+
+    // interval B [150,200] > pin(100) but ≤ live(1e9). With the pin intact it delegates; under the bug
+    // portalHead was clobbered to LIVE so isFinalityGap(200, LIVE) is false → the Portal SERVED it.
+    const iB: [number, number] = [150, 200];
+    const logs = await sync.syncBlockRangeData({
+      interval: iB,
+      requiredIntervals: [{ interval: iB, filter }],
+      requiredFactoryIntervals: [],
+      syncStore: mkSyncStore(),
+    });
+    expect(logs).toEqual([]);
+    expect(rpcCalls).toContain('eth_getLogs'); // FIX 5: the pin governs delegation → B went to RPC
+  } finally {
+    srv.close();
+  }
+});
+
 // ── INV-12 stash lifecycle ──────────────────────────────────────────────────────────────────────────
 
 const oneBlockServer = () =>

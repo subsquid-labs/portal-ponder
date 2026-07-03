@@ -632,6 +632,233 @@ test('regression: a NEEDED missing field on an EVENT-LESS range is tolerated (ir
   expect(inserted.logs).toHaveLength(0);
 });
 
+// ── FIX 3: the needed-field crash check is EXTEND-LOCAL — it counts only the rows THIS call adds ──────
+// On a frontier EXTEND `cd` already carries the base chunk's matched data. The old check inspected the
+// WHOLE accumulated `cd`, so an event-less EXTEND tail whose dataset lacks a needed column threw fatally
+// (the base's matched data satisfied the "has matched data" test) → the chunk evicted → crash-loop on
+// retry. The fix compares the matched-map size BEFORE/AFTER this runStreams call, so only the tail's own
+// matched rows arm the crash. This server serves the base block (with logsBloom) at H1, then over the
+// newly-finalized tail (after the head advances) 400s the logsBloom column; `tailBlock` controls whether
+// the tail — once logsBloom is dropped — yields a MATCHED block or nothing.
+const extendFieldDegradeServer = (opts: {
+  headFn: () => number;
+  baseBlock: number;
+  tailBlock: number | undefined;
+  tailFrom: number; // the extend tail starts here (coveredTo+1 = H1+1); only this region degrades
+}) =>
+  http.createServer((req, res) => {
+    let body = '';
+    req.on('data', (c) => {
+      body += c;
+    });
+    req.on('end', () => {
+      if (req.url?.includes('finalized-head')) {
+        res.writeHead(200, { 'content-type': 'application/json' });
+        res.end(JSON.stringify({ number: opts.headFn() }));
+        return;
+      }
+      const q = body ? JSON.parse(body) : {};
+      const from = q.fromBlock ?? 0;
+      const to = Math.min(q.toBlock ?? 1e12, opts.headFn()); // Portal serves nothing above its head
+      const wantsBloom = q.fields?.transaction?.logsBloom !== undefined;
+      const isTail = from >= opts.tailFrom; // requests into the newly-finalized EXTEND tail
+      // The EXTEND tail 400s while logsBloom is requested (the tail dataset lacks it); the BASE region
+      // ([0, H1]) never degrades, so its continuation requests 204 cleanly and no needed-field fires there.
+      if (isTail && wantsBloom) {
+        res.writeHead(400);
+        res.end(
+          "Bad request: couldn't parse request: column 'logs_bloom' is not found in 'transactions'",
+        );
+        return;
+      }
+      // The BASE request serves the base block (matched data cached under the base fetch).
+      if (!isTail && from <= opts.baseBlock && to >= opts.baseBlock) {
+        res.writeHead(200, { 'content-type': 'application/x-ndjson' });
+        res.end(JSON.stringify(mkExtendBlock(opts.baseBlock)) + '\n');
+        return;
+      }
+      // Tail with logsBloom already dropped: yield a MATCHED block only when `tailBlock` is set (fatal case).
+      if (
+        isTail &&
+        opts.tailBlock !== undefined &&
+        from <= opts.tailBlock &&
+        to >= opts.tailBlock
+      ) {
+        res.writeHead(200, { 'content-type': 'application/x-ndjson' });
+        res.end(JSON.stringify(mkExtendBlock(opts.tailBlock)) + '\n');
+        return;
+      }
+      res.writeHead(204).end();
+    });
+  });
+const mkExtendBlock = (n: number) => ({
+  ...FIXTURE_BLOCK,
+  header: {
+    ...FIXTURE_BLOCK.header,
+    number: n,
+    hash: `0x${n.toString(16).padStart(64, '0')}`,
+  },
+  logs: [
+    {
+      ...FIXTURE_BLOCK.logs[0],
+      transactionHash: `0x${(n + 3_000_000).toString(16).padStart(64, '0')}`,
+    },
+  ],
+  transactions: [
+    {
+      ...FIXTURE_BLOCK.transactions[0],
+      hash: `0x${(n + 3_000_000).toString(16).padStart(64, '0')}`,
+    },
+  ],
+});
+
+test('regression (FIX 3): an EVENT-LESS extend tail lacking a needed field over a data-bearing base is TOLERATED (not crash-looped)', async () => {
+  // Base block 50 (with logsBloom, matched) is cached truncated at head H1=100. The head advances to
+  // H2=200 and interval B extends chunk 0 over (100, 200]. The tail dataset lacks logsBloom (400s) and,
+  // once dropped, yields NO matched block. BEFORE FIX: runStreams saw neededMissing={logsBloom} AND the
+  // whole cd still held block 50's matched data → threw "missing … matched data" → evict → crash-loop.
+  // AFTER FIX: the extend's matchedSize delta is 0 (the tail added nothing) → tolerated, no throw.
+  delete process.env.PORTAL_FINALIZED_HEAD; // probe the mock so the head advances
+  let head = 100;
+  const srv = extendFieldDegradeServer({
+    headFn: () => head,
+    baseBlock: 50,
+    tailBlock: undefined, // tail yields nothing matched → event-less
+    tailFrom: 101, // the extend tail is (H1=100, H2]; only it degrades logsBloom
+  });
+  const p: number = await new Promise((r) =>
+    srv.listen(0, () => r((srv.address() as AddressInfo).port)),
+  );
+  try {
+    const inserted = { logs: [] as any[] };
+    const syncStore: any = {
+      insertLogs: (x: any) => inserted.logs.push(...x.logs),
+      insertBlocks: () => {},
+      insertTransactions: () => {},
+      insertTransactionReceipts: () => {},
+      insertTraces: () => {},
+    };
+    const filter: any = {
+      type: 'log',
+      chainId: 1,
+      sourceId: 's',
+      address: VAULT,
+      topic0: DEPOSIT_TOPIC0,
+      topic1: null,
+      topic2: null,
+      topic3: null,
+      fromBlock: 0,
+      toBlock: undefined, // unbounded → chunk end clamps to the head (frontier chunk)
+      hasTransactionReceipt: true, // ← makes logsBloom a NEEDED field
+      include: [],
+    };
+    const sync = createPortalHistoricalSync({
+      common: {
+        logger: { debug() {}, info() {}, warn() {}, error() {}, trace() {} },
+      } as any,
+      chain: { id: 1, name: 'mainnet', portal: `http://localhost:${p}` } as any,
+      childAddresses: new Map(),
+      eventCallbacks: [{ filter }],
+    } as any);
+
+    const iA: [number, number] = [50, 50];
+    await sync.syncBlockRangeData({
+      interval: iA,
+      requiredIntervals: [{ interval: iA, filter }],
+      requiredFactoryIntervals: [],
+      syncStore,
+    });
+    expect(inserted.logs).toHaveLength(1); // base block 50 cached
+
+    head = 200; // Portal advances → interval B extends chunk 0 over the event-less tail
+
+    const iB: [number, number] = [150, 150];
+    // MUST NOT throw — the tail added no matched rows, so the missing logsBloom is tolerated.
+    await sync.syncBlockRangeData({
+      interval: iB,
+      requiredIntervals: [{ interval: iB, filter }],
+      requiredFactoryIntervals: [],
+      syncStore,
+    });
+    // no crash; the event-less tail simply contributed nothing new
+    expect(inserted.logs).toHaveLength(1);
+  } finally {
+    srv.close();
+  }
+});
+
+test('regression (FIX 3): an extend tail that DOES add matched rows while lacking a needed field STILL fails LOUD (the crash is not lost)', async () => {
+  // The pair-semantics companion: same base + extend, but the tail — once logsBloom is dropped — yields a
+  // MATCHED block (150). Now the extend's matchedSize delta is > 0 with a needed field absent, so the
+  // indexer would process an incomplete event: it MUST crash. This pins that FIX 3 narrows the check to
+  // the tail's own rows WITHOUT muting a genuinely-incomplete tail.
+  delete process.env.PORTAL_FINALIZED_HEAD;
+  let head = 100;
+  const srv = extendFieldDegradeServer({
+    headFn: () => head,
+    baseBlock: 50,
+    tailBlock: 150, // tail yields a MATCHED block lacking logsBloom → still fatal
+    tailFrom: 101, // the extend tail is (H1=100, H2]; only it degrades logsBloom
+  });
+  const p: number = await new Promise((r) =>
+    srv.listen(0, () => r((srv.address() as AddressInfo).port)),
+  );
+  try {
+    const inserted = { logs: [] as any[] };
+    const syncStore: any = {
+      insertLogs: (x: any) => inserted.logs.push(...x.logs),
+      insertBlocks: () => {},
+      insertTransactions: () => {},
+      insertTransactionReceipts: () => {},
+      insertTraces: () => {},
+    };
+    const filter: any = {
+      type: 'log',
+      chainId: 1,
+      sourceId: 's',
+      address: VAULT,
+      topic0: DEPOSIT_TOPIC0,
+      topic1: null,
+      topic2: null,
+      topic3: null,
+      fromBlock: 0,
+      toBlock: undefined,
+      hasTransactionReceipt: true,
+      include: [],
+    };
+    const sync = createPortalHistoricalSync({
+      common: {
+        logger: { debug() {}, info() {}, warn() {}, error() {}, trace() {} },
+      } as any,
+      chain: { id: 1, name: 'mainnet', portal: `http://localhost:${p}` } as any,
+      childAddresses: new Map(),
+      eventCallbacks: [{ filter }],
+    } as any);
+
+    const iA: [number, number] = [50, 50];
+    await sync.syncBlockRangeData({
+      interval: iA,
+      requiredIntervals: [{ interval: iA, filter }],
+      requiredFactoryIntervals: [],
+      syncStore,
+    });
+
+    head = 200;
+
+    const iB: [number, number] = [150, 150];
+    await expect(
+      sync.syncBlockRangeData({
+        interval: iB,
+        requiredIntervals: [{ interval: iB, filter }],
+        requiredFactoryIntervals: [],
+        syncStore,
+      }),
+    ).rejects.toThrow(/logs_bloom.*matched data|matched data.*logs_bloom/);
+  } finally {
+    srv.close();
+  }
+});
+
 test('regression: a dataset that starts after genesis (TAC starts at block 1) is clamped forward, not crashed on', async () => {
   // The Portal 400s "dataset starts from block N" when queried below its first block. The fork must
   // clamp the cursor to N and continue — NOT throw an unhandledRejection (which killed the whole
@@ -863,6 +1090,155 @@ test('regression (C6): deep matched trace is stored at its FULL-tree pre-order i
     expect(inserted).toHaveLength(1); // count parity: only the matched trace is stored (like RPC)
     expect(inserted[0].trace.trace.index).toBe(7); // INDEX parity: full-tree position, not filter-local 0
     expect((inserted[0].trace.trace.to as string)?.toLowerCase()).toBe(TARGET);
+  } finally {
+    srv.close();
+    delete process.env.PORTAL_FINALIZED_HEAD;
+  }
+});
+
+test('regression (FIX 4): a trace filter with hasTransactionReceipt inserts a receipt for every matched trace tx (no "Missing transaction receipt")', async () => {
+  // A trace/transfer source with hasTransactionReceipt needs a receipt row for each matched trace's
+  // parent tx. Those txs ride ONLY on the trace query (no log/tx-filter branch sees them), so before
+  // FIX 4 assembleRange emitted the trace + its transaction but NO receipt → downstream buildEvents
+  // throws "Missing transaction receipt" on a legit trace-receipt config. The mock projects the receipt
+  // fields onto the tx (needReceipts ⇒ RECEIPT_FIELDS) and this test asserts the receipt is inserted.
+  process.env.PORTAL_FINALIZED_HEAD = String(22200011 + 1_000_000); // no finality fallback / no head call
+  const BLOCK = 22200011;
+  const TX_INDEX = 111;
+  const TXH = '0x' + '7e'.repeat(32);
+  const B_HASH = '0x' + 'b1'.repeat(32);
+  const TARGET = '0x000000000000000000000000000000000000dead';
+  const OTHER = '0x000000000000000000000000000000000000beef';
+  const HEADER = {
+    number: BLOCK,
+    hash: B_HASH,
+    parentHash: '0x' + '00'.repeat(32),
+    timestamp: 1700000000,
+    logsBloom: '0x' + '00'.repeat(256),
+    miner: OTHER,
+    gasUsed: '0xabc',
+    gasLimit: '0x1c9c380',
+    stateRoot: '0x' + '22'.repeat(32),
+    receiptsRoot: '0x' + '33'.repeat(32),
+    transactionsRoot: '0x' + '44'.repeat(32),
+    size: '0x500',
+    difficulty: '0x0',
+    extraData: '0x',
+  };
+  // matched trace: a top-level call to TARGET; its parent tx carries the receipt fields.
+  const TRACE = {
+    transactionIndex: TX_INDEX,
+    traceAddress: [],
+    type: 'call',
+    subtraces: 0,
+    error: null,
+    revertReason: null,
+    action: {
+      from: OTHER,
+      to: TARGET,
+      value: '0x0',
+      gas: '0x1000',
+      input: '0xabcdabcd',
+      sighash: '0xabcdabcd',
+      type: 'call',
+      callType: 'call',
+    },
+    result: { gasUsed: '0x10', output: '0x' },
+  };
+  const TX = {
+    transactionIndex: TX_INDEX,
+    hash: TXH,
+    from: OTHER,
+    to: TARGET,
+    input: '0xabcdabcd',
+    value: '0x0',
+    nonce: 1,
+    gas: '0x100000',
+    gasPrice: '0x1',
+    type: 0,
+    r: '0x' + '11'.repeat(32),
+    s: '0x' + '22'.repeat(32),
+    v: '0x1',
+    // receipt fields (the trace query projects RECEIPT_FIELDS when needReceipts) — toSyncReceipt reads these
+    status: '0x1',
+    cumulativeGasUsed: '0x5208',
+    gasUsed: '0x5208',
+    effectiveGasPrice: '0x1',
+    logsBloom: '0x' + '00'.repeat(256),
+    contractAddress: null,
+  };
+  const srv = http.createServer((req, res) => {
+    let body = '';
+    req.on('data', (c) => {
+      body += c;
+    });
+    req.on('end', () => {
+      const q = body ? JSON.parse(body) : {};
+      const covers =
+        (q.fromBlock ?? 0) <= BLOCK && (q.toBlock ?? 1e12) >= BLOCK;
+      if (req.url?.includes('finalized-stream') && q.traces && covers) {
+        res.writeHead(200, { 'content-type': 'application/x-ndjson' });
+        res.end(
+          JSON.stringify({
+            header: HEADER,
+            traces: [TRACE],
+            transactions: [TX],
+          }) + '\n',
+        );
+      } else {
+        res.writeHead(204).end();
+      }
+    });
+  });
+  const p: number = await new Promise((r) =>
+    srv.listen(0, () => r((srv.address() as AddressInfo).port)),
+  );
+  try {
+    const inserted = { traces: [] as any[], receipts: [] as any[] };
+    const syncStore: any = {
+      insertLogs: () => {},
+      insertBlocks: () => {},
+      insertTransactions: () => {},
+      insertTransactionReceipts: (x: any) =>
+        inserted.receipts.push(...x.transactionReceipts),
+      insertTraces: (x: any) => inserted.traces.push(...x.traces),
+    };
+    const filter: any = {
+      type: 'trace',
+      chainId: 1,
+      sourceId: 'trace:receipt',
+      fromAddress: undefined,
+      toAddress: TARGET,
+      functionSelector: undefined,
+      callType: undefined,
+      includeReverted: false,
+      fromBlock: BLOCK,
+      toBlock: BLOCK,
+      hasTransactionReceipt: true, // ← the trace-receipt config the fix must honor
+      include: [],
+    };
+    const sync = createPortalHistoricalSync({
+      common: {
+        logger: { debug() {}, info() {}, warn() {}, error() {}, trace() {} },
+      } as any,
+      chain: { id: 1, name: 'mainnet', portal: `http://localhost:${p}` } as any,
+      childAddresses: new Map(),
+      eventCallbacks: [{ filter }],
+    } as any);
+    const interval: [number, number] = [BLOCK, BLOCK];
+    await sync.syncBlockRangeData({
+      interval,
+      requiredIntervals: [{ interval, filter }],
+      requiredFactoryIntervals: [],
+      syncStore,
+    });
+    await sync.syncBlockData({ interval, logs: [], syncStore } as any);
+
+    expect(inserted.traces).toHaveLength(1); // the matched trace is stored
+    // THE REGRESSION: its parent tx's receipt is inserted (before FIX 4: zero receipts → downstream throws)
+    expect(inserted.receipts).toHaveLength(1);
+    expect(inserted.receipts[0].transactionHash).toBe(TXH);
+    expect(inserted.receipts[0].blockHash).toBe(B_HASH);
   } finally {
     srv.close();
     delete process.env.PORTAL_FINALIZED_HEAD;
@@ -1476,6 +1852,65 @@ test('regression: a child already known from the store is NOT re-flushed when di
   }
 });
 
+test('regression (FIX 2, BUG-A): an EARLY spanning-chunk fetch with requiredFactoryIntervals=[] still runs discovery — the child log is fetched AND its address flushed (no silent factory gap)', async () => {
+  // BUG-A: the discovery floor used to be pinned ONLY when ponder handed over requiredFactoryIntervals
+  // (`discStartIdx` set inside `if (requiredFactoryIntervals.length > 0)`), and both INV-3 asserts had a
+  // `discStartIdx === undefined` ESCAPE. So the very first syncBlockRangeData whose chunk spans the
+  // factory range but which ponder issued WITHOUT requiredFactoryIntervals (a real pipeline ordering:
+  // another filter's interval fetches the shared chunk first) ran with floor unset → discovery.ensure()
+  // no-op'd (planDiscovery returns null when floor < 0) → NO scan → the child was never discovered → its
+  // data request carried no child address → the Portal returned nothing AND pendingChildren stayed empty
+  // → insertChildAddresses never fired. FIX 2 pins the floor from spec.factories at CONSTRUCTION (and
+  // re-pins per call), so discovery runs on this early fetch regardless of requiredFactoryIntervals.
+  const srv = factoryPortalServer();
+  const p: number = await new Promise((r) =>
+    srv.listen(0, () => r((srv.address() as AddressInfo).port)),
+  );
+  try {
+    const factory = mkFactory();
+    const filter = mkFactoryFilter(factory);
+    const calls: any[] = [];
+    const inserted = { logs: [] as any[] };
+    const syncStore = {
+      ...mkFactorySyncStore((x) => calls.push(x)),
+      insertLogs: (x: any) => inserted.logs.push(...x.logs),
+    };
+    const sync = mkFactorySync(
+      p,
+      factory,
+      filter,
+      new Map([[factory.id, new Map()]]),
+    );
+    // interval spans the child creation (100) AND its event (200); ponder issues it with NO
+    // requiredFactoryIntervals — the early-fetch race that the construction-time floor now covers.
+    const interval: [number, number] = [0, FACTORY_RANGE_END];
+    const logs = await sync.syncBlockRangeData({
+      interval,
+      requiredIntervals: [{ interval, filter }],
+      requiredFactoryIntervals: [], // ← the crux: no factory intervals on this early spanning fetch
+      syncStore,
+    });
+
+    // BEFORE FIX: floor unset → no discovery → child@100 unknown → its Deposit@200 never fetched.
+    // AFTER FIX:  floor pinned from the spec at construction → discovery finds child@100 → log fetched.
+    const childLog = logs.find(
+      (l: any) => (l.address as string).toLowerCase() === CHILD_ADDR,
+    );
+    expect(childLog).toBeDefined();
+    expect(
+      inserted.logs.some(
+        (l: any) => (l.address as string).toLowerCase() === CHILD_ADDR,
+      ),
+    ).toBe(true);
+    // AND the discovered child is persisted (its creation block ∈ this interval) — before the fix the
+    // pending queue was empty because discovery never ran, so insertChildAddresses was never called.
+    expect(calls).toHaveLength(1);
+    expect(calls[0].childAddresses.get(CHILD_ADDR)).toBe(CHILD_CREATED_AT);
+  } finally {
+    srv.close();
+  }
+});
+
 test('guard: an over-limit request body fails loud with the explicit size driver (never a silent Portal 400)', async () => {
   // 12k filter addresses → batched bodies sum > 256KB MAX_RAW_QUERY_SIZE. The proactive guard must
   // throw a clear, actionable error BEFORE the POST, not let the Portal reject it opaquely.
@@ -1649,6 +2084,342 @@ test('regression: frontier chunk truncated at a lagging Portal head is EXTENDED 
     const b150 = inserted.logs.find((l) => l.blockHash === hashOf(B_BLOCK));
     expect(b150).toBeDefined();
     expect(inserted.logs).toHaveLength(2);
+  } finally {
+    srv.close();
+  }
+});
+
+test('regression (FIX 1, BUG-B): a BOUNDED backfill whose toBlock is PAST the head is head-clamped — a later interval over the newly-finalized tail is fetched, not blind-cache-hit (silent gap)', async () => {
+  // The distinct BUG-B shape vs the unbounded frontier-extend test above: EVERY source is BOUNDED
+  // (toBlock defined) and its toBlock sits PAST the current Portal head. The old dataEnd() =
+  // `spec.backfillEnd ?? portalHead` returned backfillEnd (the toBlock) and IGNORED the head, so
+  // chunk 0's desiredTo/coveredTo extended to the toBlock (300) — past head H1 (100). The Portal serves
+  // nothing above its head, so block 150 wasn't streamed on interval A, yet coveredTo was recorded as
+  // 300 (phantom coverage). When the head later advanced to H2 (200), interval B at block 150 saw
+  // desiredTo(300) ≤ coveredTo(300) → a BLIND cache hit → block 150's log never streamed, its interval
+  // marked synced EMPTY: a permanent silent gap. FIX 1 clamps dataEnd() to min(backfillEnd, head), so
+  // coveredTo tracks the head and the INV-13 extend re-arms as the head advances.
+  delete process.env.PORTAL_FINALIZED_HEAD; // let refreshPortalHead PROBE the mock so the head can advance
+  // PORTAL_CHUNK_FIXED stays "1" (beforeEach) → chunkBlocks = 500k, so blocks 50 & 150 share chunk 0.
+
+  const A_BLOCK = 50; // ≤ head H1 → interval A caches chunk 0 truncated at [0, H1]
+  const H1 = 100;
+  const B_BLOCK = 150; // ∈ (H1, H2] → interval B needs the newly-finalized tail of chunk 0
+  const H2 = 200;
+  const TO_BLOCK = 300; // BOUNDED backfill end, PAST both heads — the crux of BUG-B
+  let head = H1;
+
+  const hashOf = (n: number) => `0x${n.toString(16).padStart(64, '0')}`;
+  const txHashOf = (n: number) =>
+    `0x${(n + 2_000_000).toString(16).padStart(64, '0')}`;
+  const mkBlock = (n: number) => ({
+    ...FIXTURE_BLOCK,
+    header: { ...FIXTURE_BLOCK.header, number: n, hash: hashOf(n) },
+    logs: [{ ...FIXTURE_BLOCK.logs[0], transactionHash: txHashOf(n) }],
+    transactions: [{ ...FIXTURE_BLOCK.transactions[0], hash: txHashOf(n) }],
+  });
+
+  const srv = http.createServer((req, res) => {
+    let body = '';
+    req.on('data', (c) => {
+      body += c;
+    });
+    req.on('end', () => {
+      if (req.url?.includes('finalized-head')) {
+        res.writeHead(200, { 'content-type': 'application/json' });
+        res.end(JSON.stringify({ number: head }));
+        return;
+      }
+      const q = body ? JSON.parse(body) : {};
+      const from = q.fromBlock ?? 0;
+      // a real Portal serves nothing ABOVE its finalized head — CLAMP the served range to `head`
+      const to = Math.min(q.toBlock ?? 1e12, head);
+      const out = [A_BLOCK, B_BLOCK]
+        .filter((n) => from <= n && to >= n)
+        .map(mkBlock);
+      if (out.length === 0) {
+        res.writeHead(204).end();
+        return;
+      }
+      res.writeHead(200, { 'content-type': 'application/x-ndjson' });
+      res.end(out.map((b) => JSON.stringify(b)).join('\n') + '\n');
+    });
+  });
+  const p: number = await new Promise((r) =>
+    srv.listen(0, () => r((srv.address() as AddressInfo).port)),
+  );
+
+  try {
+    const inserted = { logs: [] as any[] };
+    const syncStore: any = {
+      insertLogs: (x: any) => inserted.logs.push(...x.logs),
+      insertBlocks: () => {},
+      insertTransactions: () => {},
+      insertTransactionReceipts: () => {},
+      insertTraces: () => {},
+    };
+    const filter: any = {
+      type: 'log',
+      chainId: 1,
+      sourceId: 's',
+      address: VAULT,
+      topic0: DEPOSIT_TOPIC0,
+      topic1: null,
+      topic2: null,
+      topic3: null,
+      fromBlock: 0,
+      toBlock: TO_BLOCK, // BOUNDED, past the head → old `backfillEnd ?? head` ignored the head
+      hasTransactionReceipt: false,
+      include: [],
+    };
+    const sync = createPortalHistoricalSync({
+      common: {
+        logger: { debug() {}, info() {}, warn() {}, error() {}, trace() {} },
+      } as any,
+      chain: { id: 1, name: 'mainnet', portal: `http://localhost:${p}` } as any,
+      childAddresses: new Map(),
+      eventCallbacks: [{ filter }],
+    } as any);
+
+    // interval A ends at block 50 ≤ head H1 → chunk 0 fetched, clamped to the head at [0, 100].
+    const iA: [number, number] = [A_BLOCK, A_BLOCK];
+    await sync.syncBlockRangeData({
+      interval: iA,
+      requiredIntervals: [{ interval: iA, filter }],
+      requiredFactoryIntervals: [],
+      syncStore,
+    });
+
+    head = H2; // Portal advances mid-run (H1 → H2), finalizing block 150
+
+    // interval B ends at block 150 ∈ (H1, H2] → same chunk 0. Under the bug coveredTo was already 300
+    // (backfillEnd) → blind cache hit → block 150 never streamed. Fixed: coveredTo tracked the head → EXTEND.
+    const iB: [number, number] = [B_BLOCK, B_BLOCK];
+    await sync.syncBlockRangeData({
+      interval: iB,
+      requiredIntervals: [{ interval: iB, filter }],
+      requiredFactoryIntervals: [],
+      syncStore,
+    });
+
+    // BEFORE FIX: coveredTo(300) ≥ desiredTo → blind hit → block-150 log never streamed → only 1 log.
+    // AFTER FIX:  coveredTo tracked the head(100) → extend over (100, 200] → block 150 present.
+    const b150 = inserted.logs.find((l) => l.blockHash === hashOf(B_BLOCK));
+    expect(b150).toBeDefined();
+    expect(inserted.logs).toHaveLength(2);
+  } finally {
+    srv.close();
+  }
+});
+
+test('regression (FIX 1 discovery variant): a factory child CREATED in the newly-finalized tail is discovered + its log fetched once the head advances (bounded backfill, head-clamped discovery)', async () => {
+  // FIX 1 flows the head clamp into discovery too (endHint via dataEnd()). BUG-B's silent gap also hides
+  // factory children: with a BOUNDED backfill past the head, the old dataEnd() ran discovery to the
+  // toBlock in ONE pass while the Portal served nothing above its head, so a child created in the tail
+  // (> head at first pass) was never discovered — and once the head advanced, the blind cache hit meant
+  // the tail was never re-scanned. Here CHILD is created at block 150 (in the tail finalized only at H2)
+  // and emits its own Deposit at block 160. The child's event must be fetched after the head advances.
+  delete process.env.PORTAL_FINALIZED_HEAD; // probe the mock so the head can advance
+  const CREATE_LO = 40; // a first child created below H1 (drives interval A + initial discovery)
+  const CHILD_LO_ADDR = '0x' + '3c'.repeat(20);
+  const CHILD_TAIL_ADDR = '0x' + '4c'.repeat(20);
+  const CREATE_TAIL = 150; // the tail child, created only once the head reaches H2
+  const EVENT_TAIL = 160; // the tail child emits its Deposit here
+  const H1 = 100;
+  const H2 = 200;
+  const TO_BLOCK = 300; // bounded backfill past both heads
+  let head = H1;
+
+  const FACTORY_ADDR2 = '0x' + 'fb'.repeat(20);
+  const PROXY_TOPIC0 = '0x' + '01'.repeat(32);
+  const factory2: any = {
+    id: 'factory2',
+    type: 'log',
+    chainId: 1,
+    sourceId: 'ev2',
+    address: FACTORY_ADDR2,
+    eventSelector: PROXY_TOPIC0,
+    childAddressLocation: 'topic1',
+    fromBlock: 0,
+    toBlock: undefined,
+  };
+  const filter: any = {
+    type: 'log',
+    chainId: 1,
+    sourceId: 'ev2:deposit',
+    address: factory2,
+    topic0: DEPOSIT_TOPIC0,
+    topic1: null,
+    topic2: null,
+    topic3: null,
+    fromBlock: 0,
+    toBlock: TO_BLOCK,
+    hasTransactionReceipt: false,
+    include: [],
+  };
+
+  const mkHeader = (num: number) => ({
+    number: num,
+    hash: '0x' + num.toString(16).padStart(64, '0'),
+    parentHash: '0x' + '00'.repeat(32),
+    timestamp: 1_700_000_000 + num,
+    logsBloom: '0x' + '00'.repeat(256),
+    miner: '0x' + '99'.repeat(20),
+    gasUsed: '0x1',
+    gasLimit: '0x1c9c380',
+    stateRoot: '0x' + '22'.repeat(32),
+    receiptsRoot: '0x' + '33'.repeat(32),
+    transactionsRoot: '0x' + '44'.repeat(32),
+    size: '0x500',
+    difficulty: '0x0',
+    extraData: '0x',
+  });
+  const proxyBlock = (at: number, child: string) => ({
+    header: mkHeader(at),
+    logs: [
+      {
+        address: FACTORY_ADDR2,
+        topics: [PROXY_TOPIC0, '0x' + '00'.repeat(12) + child.slice(2)],
+        data: '0x',
+        transactionHash: '0x' + 'aa'.repeat(32),
+        transactionIndex: 0,
+        logIndex: 0,
+      },
+    ],
+  });
+  const childEventBlock = (at: number, child: string) => ({
+    header: mkHeader(at),
+    logs: [
+      {
+        address: child,
+        topics: [DEPOSIT_TOPIC0],
+        data: '0x',
+        transactionHash: '0x' + 'bb'.repeat(32),
+        transactionIndex: 0,
+        logIndex: 0,
+      },
+    ],
+    transactions: [
+      {
+        transactionIndex: 0,
+        hash: '0x' + 'bb'.repeat(32),
+        from: '0x' + 'ee'.repeat(20),
+        to: child,
+        input: '0x',
+        value: '0x0',
+        nonce: 0,
+        gas: '0x1',
+        gasPrice: '0x1',
+        type: 0,
+      },
+    ],
+  });
+
+  const srv = http.createServer((req, res) => {
+    let body = '';
+    req.on('data', (c) => {
+      body += c;
+    });
+    req.on('end', () => {
+      if (req.url?.includes('finalized-head')) {
+        res.writeHead(200, { 'content-type': 'application/json' });
+        res.end(JSON.stringify({ number: head }));
+        return;
+      }
+      const q = body ? JSON.parse(body) : {};
+      const from = q.fromBlock ?? 0;
+      const to = Math.min(q.toBlock ?? 1e12, head); // Portal serves nothing above its head
+      const wants = (topic0: string, addr: string) =>
+        ((q.logs ?? []) as any[]).some(
+          (s) =>
+            (!s.topic0 ||
+              s.topic0
+                .map((x: string) => x.toLowerCase())
+                .includes(topic0.toLowerCase())) &&
+            (!s.address ||
+              s.address
+                .map((x: string) => x.toLowerCase())
+                .includes(addr.toLowerCase())),
+        );
+      const out: any[] = [];
+      // discovery requests (factory address + ProxyCreated selector)
+      if (
+        from <= CREATE_LO &&
+        to >= CREATE_LO &&
+        wants(PROXY_TOPIC0, FACTORY_ADDR2)
+      )
+        out.push(proxyBlock(CREATE_LO, CHILD_LO_ADDR));
+      if (
+        from <= CREATE_TAIL &&
+        to >= CREATE_TAIL &&
+        wants(PROXY_TOPIC0, FACTORY_ADDR2)
+      )
+        out.push(proxyBlock(CREATE_TAIL, CHILD_TAIL_ADDR));
+      // data requests carrying a DISCOVERED child address
+      if (
+        from <= EVENT_TAIL &&
+        to >= EVENT_TAIL &&
+        wants(DEPOSIT_TOPIC0, CHILD_TAIL_ADDR)
+      )
+        out.push(childEventBlock(EVENT_TAIL, CHILD_TAIL_ADDR));
+      if (out.length === 0) {
+        res.writeHead(204).end();
+        return;
+      }
+      res.writeHead(200, { 'content-type': 'application/x-ndjson' });
+      res.end(out.map((b) => JSON.stringify(b)).join('\n') + '\n');
+    });
+  });
+  const p: number = await new Promise((r) =>
+    srv.listen(0, () => r((srv.address() as AddressInfo).port)),
+  );
+
+  try {
+    const inserted = { logs: [] as any[] };
+    const syncStore: any = {
+      insertLogs: (x: any) => inserted.logs.push(...x.logs),
+      insertBlocks: () => {},
+      insertTransactions: () => {},
+      insertTransactionReceipts: () => {},
+      insertTraces: () => {},
+      insertChildAddresses: () => {},
+    };
+    const sync = createPortalHistoricalSync({
+      common: {
+        logger: { debug() {}, info() {}, warn() {}, error() {}, trace() {} },
+      } as any,
+      chain: { id: 1, name: 'mainnet', portal: `http://localhost:${p}` } as any,
+      childAddresses: new Map([[factory2.id, new Map()]]) as any,
+      eventCallbacks: [{ filter }],
+    } as any);
+
+    // interval A ends ≤ H1 → chunk 0 fetched clamped to the head at [0, 100]; discovery runs to the head.
+    const iA: [number, number] = [CREATE_LO, CREATE_LO];
+    await sync.syncBlockRangeData({
+      interval: iA,
+      requiredIntervals: [{ interval: iA, filter }],
+      requiredFactoryIntervals: [{ interval: iA, factory: factory2 }],
+      syncStore,
+    });
+
+    head = H2; // Portal advances, finalizing the tail (CREATE_TAIL@150, EVENT_TAIL@160)
+
+    // interval B reaches into the newly-finalized tail → chunk 0 must EXTEND: re-scan discovery over
+    // (100, 200] (finds CHILD_TAIL@150) THEN stream its Deposit@160. Under the bug the blind cache hit
+    // skipped both → the tail child's event was silently lost.
+    const iB: [number, number] = [EVENT_TAIL, EVENT_TAIL];
+    await sync.syncBlockRangeData({
+      interval: iB,
+      requiredIntervals: [{ interval: iB, filter }],
+      requiredFactoryIntervals: [{ interval: iB, factory: factory2 }],
+      syncStore,
+    });
+
+    // AFTER FIX: the tail child discovered post-advance → its Deposit@160 fetched via the discovered addr.
+    const tailLog = inserted.logs.find(
+      (l) => (l.address as string).toLowerCase() === CHILD_TAIL_ADDR,
+    );
+    expect(tailLog).toBeDefined();
   } finally {
     srv.close();
   }
