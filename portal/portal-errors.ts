@@ -21,7 +21,7 @@ export class PortalHttpError extends Error {
   readonly body: string;
   constructor(status: number, cursor: number, body: string) {
     super(`Portal ${status} @ ${cursor}: ${body}`);
-    this.name = "PortalHttpError";
+    this.name = 'PortalHttpError';
     this.status = status;
     this.cursor = cursor;
     this.body = body;
@@ -39,8 +39,8 @@ export class PortalThrottleError extends Error {
   readonly status: number | undefined;
   readonly retryAfterMs: number | undefined;
   constructor(status: number | undefined, retryAfterMs: number | undefined) {
-    super(`Portal ${status ?? "throttle"}`);
-    this.name = "PortalThrottleError";
+    super(`Portal ${status ?? 'throttle'}`);
+    this.name = 'PortalThrottleError';
     this.status = status;
     this.retryAfterMs = retryAfterMs;
   }
@@ -59,7 +59,7 @@ export class PortalSchemaFieldError extends Error {
   readonly tag: string;
   constructor(fieldKey: string, tableKey: string, tag: string) {
     super(`Portal 400: dataset cannot serve ${fieldKey} (${tag})`);
-    this.name = "PortalSchemaFieldError";
+    this.name = 'PortalSchemaFieldError';
     this.fieldKey = fieldKey;
     this.tableKey = tableKey;
     this.tag = tag;
@@ -71,7 +71,7 @@ export class PortalDatasetStartError extends Error {
   readonly startsAt: number;
   constructor(startsAt: number) {
     super(`Portal 400: dataset starts at block ${startsAt}`);
-    this.name = "PortalDatasetStartError";
+    this.name = 'PortalDatasetStartError';
     this.startsAt = startsAt;
   }
 }
@@ -81,7 +81,7 @@ export class PortalQueryTooLargeError extends Error {
   readonly cursor: number;
   constructor(cursor: number, detail?: string) {
     super(detail ?? `Portal 400: query too large @ ${cursor}`);
-    this.name = "PortalQueryTooLargeError";
+    this.name = 'PortalQueryTooLargeError';
     this.cursor = cursor;
   }
 }
@@ -96,10 +96,10 @@ export class InvariantViolation extends Error {
   readonly context: Record<string, unknown> | undefined;
   constructor(id: string, msg: string, context?: Record<string, unknown>) {
     super(
-      `Invariant ${id} violated: ${msg}${context ? ` — ${safeJson(context)}` : ""} ` +
+      `Invariant ${id} violated: ${msg}${context ? ` — ${safeJson(context)}` : ''} ` +
         `(see portal/INVARIANTS.md ${id}; set PORTAL_CHECKS=off to bypass runtime checks)`,
     );
-    this.name = "InvariantViolation";
+    this.name = 'InvariantViolation';
     this.id = id;
     this.context = context;
   }
@@ -119,9 +119,20 @@ const safeJson = (v: unknown): string => {
  * `cause` chain — Node wraps low-level errors in a `cause`.
  */
 export function isNetworkError(err: unknown): boolean {
-  const e = err as { message?: string; name?: string; cause?: { message?: string; code?: string } } | undefined;
-  const m = `${e?.message ?? ""} ${e?.cause?.message ?? ""} ${e?.cause?.code ?? ""}`.toLowerCase();
-  return /socket|closed|econnreset|fetch failed|terminated|timeout|network|epipe|und_err/.test(m) || e?.name === "AbortError";
+  const e = err as
+    | {
+        message?: string;
+        name?: string;
+        cause?: { message?: string; code?: string };
+      }
+    | undefined;
+  const m =
+    `${e?.message ?? ''} ${e?.cause?.message ?? ''} ${e?.cause?.code ?? ''}`.toLowerCase();
+  return (
+    /socket|closed|econnreset|fetch failed|terminated|timeout|network|epipe|und_err/.test(
+      m,
+    ) || e?.name === 'AbortError'
+  );
 }
 
 /** The full retryable set: network noise plus throttle responses carrying a concrete back-off. */

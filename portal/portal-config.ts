@@ -13,13 +13,13 @@
  * Pure: the only impurity is the default argument `process.env`; pass an explicit `env` for
  * deterministic tests.
  */
-import type { CheckMode } from "./portal-invariant.js";
+import type { CheckMode } from './portal-invariant.js';
 
 /** Thrown when a `PORTAL_*` value is malformed or out of range. */
 export class PortalConfigError extends Error {
   constructor(msg: string) {
     super(`Invalid Portal configuration: ${msg}`);
-    this.name = "PortalConfigError";
+    this.name = 'PortalConfigError';
   }
 }
 
@@ -65,7 +65,10 @@ const intKnob = (
   env: Env,
   name: string,
   def: number,
-  { min = Number.MIN_SAFE_INTEGER, max = Number.MAX_SAFE_INTEGER }: { min?: number; max?: number } = {},
+  {
+    min = Number.MIN_SAFE_INTEGER,
+    max = Number.MAX_SAFE_INTEGER,
+  }: { min?: number; max?: number } = {},
 ): number => {
   const raw = env[name];
   if (raw === undefined) return def;
@@ -74,38 +77,50 @@ const intKnob = (
     throw new PortalConfigError(`${name}="${raw}" must be an integer`);
   }
   if (n < min || n > max) {
-    throw new PortalConfigError(`${name}=${n} out of range [${min}, ${max === Number.MAX_SAFE_INTEGER ? "∞" : max}]`);
+    throw new PortalConfigError(
+      `${name}=${n} out of range [${min}, ${max === Number.MAX_SAFE_INTEGER ? '∞' : max}]`,
+    );
   }
   return n;
 };
 
 const parseChecks = (raw: string | undefined): CheckMode => {
-  if (raw === undefined || raw === "") return "on";
-  if (raw === "off" || raw === "on" || raw === "strict") return raw;
-  throw new PortalConfigError(`PORTAL_CHECKS="${raw}" must be one of off|on|strict`);
+  if (raw === undefined || raw === '') return 'on';
+  if (raw === 'off' || raw === 'on' || raw === 'strict') return raw;
+  throw new PortalConfigError(
+    `PORTAL_CHECKS="${raw}" must be one of off|on|strict`,
+  );
 };
 
 /** Load + validate the frozen `PortalConfig` from `env` (defaults to `process.env`). */
 export function loadPortalConfig(env: Env = process.env): PortalConfig {
-  const minConcurrency = intKnob(env, "PORTAL_MIN_CONCURRENCY", 8, { min: 1 });
-  const maxConcurrency = intKnob(env, "PORTAL_MAX_CONCURRENCY", 48, { min: minConcurrency });
-  const startConcurrency = intKnob(env, "PORTAL_START_CONCURRENCY", 16, { min: 1 });
+  const minConcurrency = intKnob(env, 'PORTAL_MIN_CONCURRENCY', 8, { min: 1 });
+  const maxConcurrency = intKnob(env, 'PORTAL_MAX_CONCURRENCY', 48, {
+    min: minConcurrency,
+  });
+  const startConcurrency = intKnob(env, 'PORTAL_START_CONCURRENCY', 16, {
+    min: 1,
+  });
 
   const finalizedRaw = env.PORTAL_FINALIZED_HEAD;
 
   const cfg: PortalConfig = {
     apiKey: env.PORTAL_API_KEY || undefined,
-    chunkBlocks: intKnob(env, "PORTAL_CHUNK_BLOCKS", 500_000, { min: 1 }),
-    readahead: intKnob(env, "PORTAL_READAHEAD", 6, { min: 0 }),
-    bufferSize: intKnob(env, "PORTAL_BUFFER_SIZE", 100, { min: 1 }),
-    discoveryWindows: intKnob(env, "PORTAL_DISCOVERY_WINDOWS", 8, { min: 1 }),
+    chunkBlocks: intKnob(env, 'PORTAL_CHUNK_BLOCKS', 500_000, { min: 1 }),
+    readahead: intKnob(env, 'PORTAL_READAHEAD', 6, { min: 0 }),
+    bufferSize: intKnob(env, 'PORTAL_BUFFER_SIZE', 100, { min: 1 }),
+    discoveryWindows: intKnob(env, 'PORTAL_DISCOVERY_WINDOWS', 8, { min: 1 }),
     minConcurrency,
     maxConcurrency,
     startConcurrency,
-    maxRowsInMem: intKnob(env, "PORTAL_MAX_ROWS_IN_MEM", 250_000, { min: 1 }),
+    maxRowsInMem: intKnob(env, 'PORTAL_MAX_ROWS_IN_MEM', 250_000, { min: 1 }),
     chunkFixed: Boolean(env.PORTAL_CHUNK_FIXED),
-    traceChunkBlocks: intKnob(env, "PORTAL_TRACE_CHUNK_BLOCKS", 2_000, { min: 1 }),
-    finalizedHead: finalizedRaw ? intKnob(env, "PORTAL_FINALIZED_HEAD", 0, { min: 0 }) : undefined,
+    traceChunkBlocks: intKnob(env, 'PORTAL_TRACE_CHUNK_BLOCKS', 2_000, {
+      min: 1,
+    }),
+    finalizedHead: finalizedRaw
+      ? intKnob(env, 'PORTAL_FINALIZED_HEAD', 0, { min: 0 })
+      : undefined,
     realtime: env.PORTAL_REALTIME,
     metricsFile: env.PORTAL_METRICS_FILE || undefined,
     gateLog: Boolean(env.PORTAL_GATE_LOG),

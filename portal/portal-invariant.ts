@@ -2,11 +2,11 @@
  * portal-invariant.ts — runtime invariant checks.
  *
  * The Portal layer is organised around explicit, provable invariants (portal/INVARIANTS.md,
- * INV-1…INV-14). This module lets the code ASSERT them at runtime and cross-reference the
+ * INV-1…INV-15). This module lets the code ASSERT them at runtime and cross-reference the
  * catalog by id, so a violated assumption is a loud, attributable crash rather than silent
  * data corruption.
  *
- * Modes (set once from PortalConfig.checks / PORTAL_CHUNK ⟶ PORTAL_CHECKS):
+ * Modes (set once by the shell from `PortalConfig.checks`, i.e. the PORTAL_CHECKS env knob):
  *   - "off":    all checks disabled (perf escape hatch).
  *   - "on":     O(1) checks run (default). A loud crash beats silent corruption.
  *   - "strict": additionally enables O(n) whole-structure checks (tests/CI).
@@ -14,11 +14,11 @@
  * Pure w.r.t. I/O and env: the mode is injected by the shell via `setCheckMode`, never read
  * from `process.env` here — so the functional core stays testable and side-effect-free.
  */
-import { InvariantViolation } from "./portal-errors.js";
+import { InvariantViolation } from './portal-errors.js';
 
-export type CheckMode = "off" | "on" | "strict";
+export type CheckMode = 'off' | 'on' | 'strict';
 
-let mode: CheckMode = "on";
+let mode: CheckMode = 'on';
 
 /** Set the active check mode (called once by the shell after loading PortalConfig). */
 export const setCheckMode = (m: CheckMode): void => {
@@ -28,10 +28,10 @@ export const setCheckMode = (m: CheckMode): void => {
 export const getCheckMode = (): CheckMode => mode;
 
 /** True when any check should run (mode ≠ "off"). */
-export const checksEnabled = (): boolean => mode !== "off";
+export const checksEnabled = (): boolean => mode !== 'off';
 
 /** True when O(n) whole-structure checks should run (mode === "strict"). */
-export const checksStrict = (): boolean => mode === "strict";
+export const checksStrict = (): boolean => mode === 'strict';
 
 /**
  * Assert an O(1) invariant. Throws `InvariantViolation` (carrying `id` + `ctx`) when `cond`
@@ -44,7 +44,7 @@ export function invariant(
   msg: string,
   ctx?: () => Record<string, unknown>,
 ): void {
-  if (mode === "off") return;
+  if (mode === 'off') return;
   if (!cond) throw new InvariantViolation(id, msg, ctx?.());
 }
 
@@ -58,7 +58,7 @@ export function invariantStrict(
   msg: string,
   ctx?: () => Record<string, unknown>,
 ): void {
-  if (mode !== "strict") return;
+  if (mode !== 'strict') return;
   if (!cond()) throw new InvariantViolation(id, msg, ctx?.());
 }
 

@@ -14,10 +14,14 @@
  * FIFO waiter queue and pumps it. No module-scope side effects (the PORTAL_GATE_LOG ticker lives in
  * portal-metrics and is started/stopped by the shell).
  */
-import type { PortalConfig } from "./portal-config.js";
-import { invariant } from "./portal-invariant.js";
+import type { PortalConfig } from './portal-config.js';
+import { invariant } from './portal-invariant.js';
 
-export type GateLimits = Readonly<{ min: number; max: number; maxRows: number }>;
+export type GateLimits = Readonly<{
+  min: number;
+  max: number;
+  maxRows: number;
+}>;
 
 export type GateState = Readonly<{
   limit: number; // current AIMD concurrency limit
@@ -28,12 +32,12 @@ export type GateState = Readonly<{
 }>;
 
 export type GateEvent =
-  | { type: "admit" } //           a waiter is granted a slot (active++)
-  | { type: "release" } //         an in-flight request finished (active--)
-  | { type: "ok" } //              a clean full response (ramp toward MAX)
-  | { type: "throttle" } //        429/5xx/timeout (halve toward MIN)
-  | { type: "addRows"; n: number } // NDJSON batch arrived
-  | { type: "freeRows"; n: number }; // chunk evicted / failed
+  | { type: 'admit' } //           a waiter is granted a slot (active++)
+  | { type: 'release' } //         an in-flight request finished (active--)
+  | { type: 'ok' } //              a clean full response (ramp toward MAX)
+  | { type: 'throttle' } //        429/5xx/timeout (halve toward MIN)
+  | { type: 'addRows'; n: number } // NDJSON batch arrived
+  | { type: 'freeRows'; n: number }; // chunk evicted / failed
 
 /** Initial state; `start` is clamped into [min, max] so INV-8 holds from the first event. */
 export const gateInit = (limits: GateLimits, start: number): GateState => ({
@@ -58,31 +62,41 @@ export const gateReduce = (s: GateState, e: GateEvent): GateState => {
   const { min, max } = s.limits;
   let next: GateState;
   switch (e.type) {
-    case "admit":
+    case 'admit':
       next = { ...s, active: s.active + 1 };
       break;
-    case "release":
+    case 'release':
       next = { ...s, active: Math.max(0, s.active - 1) };
       break;
-    case "ok": {
+    case 'ok': {
       const ok = s.ok + 1;
-      if (ok >= RAMP_EVERY && s.limit < max) next = { ...s, limit: Math.min(max, s.limit + RAMP_STEP), ok: 0 };
+      if (ok >= RAMP_EVERY && s.limit < max)
+        next = { ...s, limit: Math.min(max, s.limit + RAMP_STEP), ok: 0 };
       else next = { ...s, ok };
       break;
     }
-    case "throttle":
+    case 'throttle':
       next = { ...s, limit: Math.max(min, Math.floor(s.limit / 2)), ok: 0 };
       break;
-    case "addRows":
+    case 'addRows':
       next = { ...s, rows: s.rows + e.n };
       break;
-    case "freeRows":
+    case 'freeRows':
       next = { ...s, rows: Math.max(0, s.rows - e.n) };
       break;
   }
-  invariant("INV-8", next.limit >= min && next.limit <= max, "AIMD limit out of [MIN, MAX]", () => ({ limit: next.limit, min, max }));
-  invariant("INV-8", next.active >= 0, "AIMD active went negative", () => ({ active: next.active }));
-  invariant("INV-7", next.rows >= 0, "buffered rows went negative", () => ({ rows: next.rows }));
+  invariant(
+    'INV-8',
+    next.limit >= min && next.limit <= max,
+    'AIMD limit out of [MIN, MAX]',
+    () => ({ limit: next.limit, min, max }),
+  );
+  invariant('INV-8', next.active >= 0, 'AIMD active went negative', () => ({
+    active: next.active,
+  }));
+  invariant('INV-7', next.rows >= 0, 'buffered rows went negative', () => ({
+    rows: next.rows,
+  }));
   return next;
 };
 
@@ -111,24 +125,48 @@ export interface Gate {
  * capacity exists, INV-8).
  */
 export const createGate = (cfg: PortalConfig): Gate => {
-  const limits: GateLimits = { min: cfg.minConcurrency, max: cfg.maxConcurrency, maxRows: cfg.maxRowsInMem };
+  const limits: GateLimits = {
+    min: cfg.minConcurrency,
+    max: cfg.maxConcurrency,
+    maxRows: cfg.maxRowsInMem,
+  };
   let state = gateInit(limits, cfg.startConcurrency);
   const waiters: Array<() => void> = [];
   const pump = (): void => {
     while (canAdmit(state) && waiters.length > 0) {
-      state = gateReduce(state, { type: "admit" });
+      state = gateReduce(state, { type: 'admit' });
       waiters.shift()!();
     }
   };
   return {
-    acquire: () => new Promise<void>((resolve) => { waiters.push(resolve); pump(); }),
-    release: () => { state = gateReduce(state, { type: "release" }); pump(); },
-    onOk: () => { state = gateReduce(state, { type: "ok" }); pump(); },
-    onThrottle: () => { state = gateReduce(state, { type: "throttle" }); },
-    addRows: (n) => { state = gateReduce(state, { type: "addRows", n }); },
-    freeRows: (n) => { state = gateReduce(state, { type: "freeRows", n }); },
+    acquire: () =>
+      new Promise<void>((resolve) => {
+        waiters.push(resolve);
+        pump();
+      }),
+    release: () => {
+      state = gateReduce(state, { type: 'release' });
+      pump();
+    },
+    onOk: () => {
+      state = gateReduce(state, { type: 'ok' });
+      pump();
+    },
+    onThrottle: () => {
+      state = gateReduce(state, { type: 'throttle' });
+    },
+    addRows: (n) => {
+      state = gateReduce(state, { type: 'addRows', n });
+    },
+    freeRows: (n) => {
+      state = gateReduce(state, { type: 'freeRows', n });
+    },
     saturated: () => state.rows >= state.limits.maxRows,
-    snapshot: () => ({ limit: state.limit, active: state.active, rows: state.rows }),
+    snapshot: () => ({
+      limit: state.limit,
+      active: state.active,
+      rows: state.rows,
+    }),
   };
 };
 
@@ -136,5 +174,10 @@ export const createGate = (cfg: PortalConfig): Gate => {
 // All per-chain syncs share ONE gate (the endpoint is shared). Lazily created from the first sync's
 // config — no module-scope construction/side effects. `__resetSharedGate` is test-only.
 let shared: Gate | undefined;
-export const sharedGate = (cfg: PortalConfig): Gate => (shared ??= createGate(cfg));
-export const __resetSharedGate = (): void => { shared = undefined; };
+export const sharedGate = (cfg: PortalConfig): Gate => {
+  shared ??= createGate(cfg);
+  return shared;
+};
+export const __resetSharedGate = (): void => {
+  shared = undefined;
+};

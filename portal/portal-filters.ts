@@ -17,6 +17,8 @@
  * (INV-1). The spec's request builders read the LIVE `childAddresses` map (discovery grows it over
  * time); its filter set + field projections are immutable.
  */
+
+import type { Address, Hex } from 'viem';
 import type {
   BlockFilter,
   Factory,
@@ -26,9 +28,8 @@ import type {
   TraceFilter,
   TransactionFilter,
   TransferFilter,
-} from "@/internal/types.js";
-import { getFilterFactories, isAddressFactory } from "@/runtime/filter.js";
-import type { Address, Hex } from "viem";
+} from '@/internal/types.js';
+import { getFilterFactories, isAddressFactory } from '@/runtime/filter.js';
 
 export type ChildAddresses = Map<FactoryId, Map<Address, number>>;
 
@@ -45,7 +46,7 @@ export type TraceRequest = { transaction?: boolean };
 
 type FieldMap = Record<string, boolean>;
 export type PortalQuery = {
-  type: "evm";
+  type: 'evm';
   includeAllBlocks?: boolean;
   fields: Record<string, FieldMap>;
   logs?: PortalLogRequest[];
@@ -60,42 +61,130 @@ export type PortalQuery = {
 export const MAX_RAW_QUERY_SIZE = 256 * 1024;
 export const PORTAL_MAX_ADDRESSES = 1000;
 
-const REQUIRED_BLOCK_FIELDS = ["number", "hash", "parentHash", "timestamp", "logsBloom", "miner", "gasUsed", "gasLimit", "stateRoot", "receiptsRoot", "transactionsRoot", "size", "difficulty", "extraData"];
-const NULLABLE_BLOCK_FIELDS = ["baseFeePerGas", "nonce", "mixHash", "sha3Uncles", "totalDifficulty"];
-export const LOG_FIELDS: FieldMap = { address: true, topics: true, data: true, transactionHash: true, transactionIndex: true, logIndex: true };
+const REQUIRED_BLOCK_FIELDS = [
+  'number',
+  'hash',
+  'parentHash',
+  'timestamp',
+  'logsBloom',
+  'miner',
+  'gasUsed',
+  'gasLimit',
+  'stateRoot',
+  'receiptsRoot',
+  'transactionsRoot',
+  'size',
+  'difficulty',
+  'extraData',
+];
+const NULLABLE_BLOCK_FIELDS = [
+  'baseFeePerGas',
+  'nonce',
+  'mixHash',
+  'sha3Uncles',
+  'totalDifficulty',
+];
+export const LOG_FIELDS: FieldMap = {
+  address: true,
+  topics: true,
+  data: true,
+  transactionHash: true,
+  transactionIndex: true,
+  logIndex: true,
+};
 // Ponder's event profiler probes event.transaction.hash, so we pull each matched log's parent
 // transaction (Portal `transaction` relation) and store it.
-export const TX_FIELDS: FieldMap = { transactionIndex: true, hash: true, from: true, to: true, input: true, value: true, nonce: true, gas: true, gasPrice: true, maxFeePerGas: true, maxPriorityFeePerGas: true, type: true, r: true, s: true, v: true, yParity: true, accessList: true };
+export const TX_FIELDS: FieldMap = {
+  transactionIndex: true,
+  hash: true,
+  from: true,
+  to: true,
+  input: true,
+  value: true,
+  nonce: true,
+  gas: true,
+  gasPrice: true,
+  maxFeePerGas: true,
+  maxPriorityFeePerGas: true,
+  type: true,
+  r: true,
+  s: true,
+  v: true,
+  yParity: true,
+  accessList: true,
+};
 // receipt fields ride on Portal's transaction object (no separate receipt entity)
-export const RECEIPT_FIELDS: FieldMap = { status: true, cumulativeGasUsed: true, effectiveGasPrice: true, gasUsed: true, contractAddress: true, logsBloom: true };
+export const RECEIPT_FIELDS: FieldMap = {
+  status: true,
+  cumulativeGasUsed: true,
+  effectiveGasPrice: true,
+  gasUsed: true,
+  contractAddress: true,
+  logsBloom: true,
+};
 // trace fields: request both flattened selectors (some Portal builds) AND rely on nested action/result
 // in the response — the transform reads whichever is present.
 export const TRACE_FIELDS: FieldMap = {
-  transactionIndex: true, traceAddress: true, type: true, subtraces: true, error: true, revertReason: true,
-  callFrom: true, callTo: true, callValue: true, callGas: true, callInput: true, callSighash: true, callCallType: true, callResultGasUsed: true, callResultOutput: true,
-  createFrom: true, createValue: true, createGas: true, createInit: true, createResultGasUsed: true, createResultCode: true, createResultAddress: true,
-  suicideAddress: true, suicideRefundAddress: true, suicideBalance: true,
+  transactionIndex: true,
+  traceAddress: true,
+  type: true,
+  subtraces: true,
+  error: true,
+  revertReason: true,
+  callFrom: true,
+  callTo: true,
+  callValue: true,
+  callGas: true,
+  callInput: true,
+  callSighash: true,
+  callCallType: true,
+  callResultGasUsed: true,
+  callResultOutput: true,
+  createFrom: true,
+  createValue: true,
+  createGas: true,
+  createInit: true,
+  createResultGasUsed: true,
+  createResultCode: true,
+  createResultAddress: true,
+  suicideAddress: true,
+  suicideRefundAddress: true,
+  suicideBalance: true,
 };
 // Block header field set requested on EVERY query: the RPC-path-equivalent columns, so stored blocks
 // are byte-identical with the RPC path (which always has nonce/mixHash/sha3Uncles/totalDifficulty).
 // Shared by the historical queries and the realtime wire.
-export const BLOCK_FIELDS: FieldMap = Object.fromEntries([...REQUIRED_BLOCK_FIELDS, ...NULLABLE_BLOCK_FIELDS].map((k) => [k, true]));
+export const BLOCK_FIELDS: FieldMap = Object.fromEntries(
+  [...REQUIRED_BLOCK_FIELDS, ...NULLABLE_BLOCK_FIELDS].map((k) => [k, true]),
+);
 
 // Fields that are NULLABLE in Ponder's sync-store AND non-load-bearing — Ponder never uses them
 // internally and they're legitimately absent on some chains (accessList on non-typed txs; nonce/
 // mixHash on PoS; baseFeePerGas pre-1559; totalDifficulty post-merge). Safe to store as null when a
 // dataset lacks them. Anything NOT here, missing ⇒ crash (a NOT-NULL / bloom-load-bearing / core
 // column whose absence would corrupt or silently gut data).
-export const DROPPABLE_FIELDS = new Set(["transaction.accessList", "block.baseFeePerGas", "block.nonce", "block.mixHash", "block.sha3Uncles", "block.totalDifficulty"]);
+export const DROPPABLE_FIELDS = new Set([
+  'transaction.accessList',
+  'block.baseFeePerGas',
+  'block.nonce',
+  'block.mixHash',
+  'block.sha3Uncles',
+  'block.totalDifficulty',
+]);
 
-const asArr = (t: Hex | readonly Hex[] | null | undefined): string[] | undefined => {
+const asArr = (
+  t: Hex | readonly Hex[] | null | undefined,
+): string[] | undefined => {
   if (t === null || t === undefined) return undefined;
   return (Array.isArray(t) ? t : [t]).map((x) => (x as string).toLowerCase());
 };
 
 /** Log-filter → Portal log requests. Factory-address filters expand to the currently-known children
  * (empty ⇒ [], never a match-all); plain-address filters batch by PORTAL_MAX_ADDRESSES. */
-export function logRequestsFor(filter: LogFilter, childAddresses: ChildAddresses): PortalLogRequest[] {
+export function logRequestsFor(
+  filter: LogFilter,
+  childAddresses: ChildAddresses,
+): PortalLogRequest[] {
   const base: PortalLogRequest = {};
   if (filter.topic0) base.topic0 = asArr(filter.topic0);
   if (filter.topic1) base.topic1 = asArr(filter.topic1);
@@ -108,10 +197,16 @@ export function logRequestsFor(filter: LogFilter, childAddresses: ChildAddresses
   } else if (filter.address === undefined) {
     return [base];
   } else {
-    addresses = (Array.isArray(filter.address) ? filter.address : [filter.address]).map((a) => a.toLowerCase());
+    addresses = (
+      Array.isArray(filter.address) ? filter.address : [filter.address]
+    ).map((a) => a.toLowerCase());
   }
   const out: PortalLogRequest[] = [];
-  for (let i = 0; i < addresses.length; i += PORTAL_MAX_ADDRESSES) out.push({ ...base, address: addresses.slice(i, i + PORTAL_MAX_ADDRESSES) });
+  for (let i = 0; i < addresses.length; i += PORTAL_MAX_ADDRESSES)
+    out.push({
+      ...base,
+      address: addresses.slice(i, i + PORTAL_MAX_ADDRESSES),
+    });
   return out;
 }
 
@@ -124,29 +219,60 @@ export function logRequestsFor(filter: LogFilter, childAddresses: ChildAddresses
 export function mergeLogRequests(reqs: PortalLogRequest[]): PortalLogRequest[] {
   const groups = new Map<string, PortalLogRequest>();
   for (const r of reqs) {
-    const key = JSON.stringify([r.address ? [...r.address].sort() : null, r.topic1 ?? null, r.topic2 ?? null, r.topic3 ?? null]);
+    const key = JSON.stringify([
+      r.address ? [...r.address].sort() : null,
+      r.topic1 ?? null,
+      r.topic2 ?? null,
+      r.topic3 ?? null,
+    ]);
     const g = groups.get(key);
-    if (!g) { groups.set(key, { ...r, topic0: r.topic0 ? [...new Set(r.topic0)] : undefined }); continue; }
-    if (g.topic0 === undefined || r.topic0 === undefined) g.topic0 = undefined; // one wants ALL topic0 → keep the broadest
-    else { const s = new Set(g.topic0); for (const t of r.topic0) s.add(t); g.topic0 = [...s]; }
+    if (!g) {
+      groups.set(key, {
+        ...r,
+        topic0: r.topic0 ? [...new Set(r.topic0)] : undefined,
+      });
+      continue;
+    }
+    if (g.topic0 === undefined || r.topic0 === undefined)
+      g.topic0 = undefined; // one wants ALL topic0 → keep the broadest
+    else {
+      const s = new Set(g.topic0);
+      for (const t of r.topic0) s.add(t);
+      g.topic0 = [...s];
+    }
   }
   return [...groups.values()];
 }
 
 /** The unique factories referenced by any filter (deduped by id). */
-export const uniqueFactories = (eventCallbacks: { filter: Filter }[]): Factory[] =>
-  [...new Map(eventCallbacks.flatMap((e) => getFilterFactories(e.filter)).map((f) => [f.id, f])).values()];
+export const uniqueFactories = (
+  eventCallbacks: { filter: Filter }[],
+): Factory[] => [
+  ...new Map(
+    eventCallbacks
+      .flatMap((e) => getFilterFactories(e.filter))
+      .map((f) => [f.id, f]),
+  ).values(),
+];
 
 /**
  * Build the merged Portal `/stream` log filter for a chain's REALTIME: every log filter's
  * address+topics PLUS a discovery request per factory (factory address + child-event selector), so new
  * children are streamed and pruned/matched downstream. Historical discovery is separate (portal-discovery).
  */
-export function buildPortalLogRequests(eventCallbacks: { filter: Filter }[], childAddresses: ChildAddresses): PortalLogRequest[] {
+export function buildPortalLogRequests(
+  eventCallbacks: { filter: Filter }[],
+  childAddresses: ChildAddresses,
+): PortalLogRequest[] {
   const reqs: PortalLogRequest[] = [];
-  for (const e of eventCallbacks) if (e.filter.type === "log") reqs.push(...logRequestsFor(e.filter, childAddresses));
+  for (const e of eventCallbacks)
+    if (e.filter.type === 'log')
+      reqs.push(...logRequestsFor(e.filter, childAddresses));
   for (const factory of uniqueFactories(eventCallbacks)) {
-    reqs.push({ address: asArr(factory.address), topic0: [factory.eventSelector.toLowerCase()] });
+    reqs.push({
+      address: asArr(factory.address),
+      topic0: [factory.eventSelector.toLowerCase()],
+    });
   }
   return mergeLogRequests(reqs);
 }
@@ -184,46 +310,67 @@ export type FetchSpec = Readonly<{
  * the FULL tree, THEN client-filters — a matched trace keeps its true DFS position. */
 const traceRequests = (): TraceRequest[] => [{ transaction: true }];
 
-const txRequestsFor = (transactionFilters: readonly TransactionFilter[], childAddresses: ChildAddresses): TxRequest[] => {
-  const addrsOf = (a: TransactionFilter["fromAddress"]): string[] | undefined => {
+const txRequestsFor = (
+  transactionFilters: readonly TransactionFilter[],
+  childAddresses: ChildAddresses,
+): TxRequest[] => {
+  const addrsOf = (
+    a: TransactionFilter['fromAddress'],
+  ): string[] | undefined => {
     if (a === undefined) return undefined;
-    if (isAddressFactory(a)) return Array.from(childAddresses.get(a.id)?.keys() ?? []);
+    if (isAddressFactory(a))
+      return Array.from(childAddresses.get(a.id)?.keys() ?? []);
     return (Array.isArray(a) ? a : [a]).map((x) => x.toLowerCase());
   };
   const reqs: TxRequest[] = [];
   for (const f of transactionFilters) {
     const req: TxRequest = {};
-    const from = addrsOf(f.fromAddress); if (from?.length) req.from = from;
-    const to = addrsOf(f.toAddress); if (to?.length) req.to = to;
+    const from = addrsOf(f.fromAddress);
+    if (from?.length) req.from = from;
+    const to = addrsOf(f.toAddress);
+    if (to?.length) req.to = to;
     if (req.from || req.to) reqs.push(req); // skip match-all (never fetch every tx)
   }
   return reqs;
 };
 
-export function compileFetchSpec(eventCallbacks: { filter: Filter }[], childAddresses: ChildAddresses): FetchSpec {
+export function compileFetchSpec(
+  eventCallbacks: { filter: Filter }[],
+  childAddresses: ChildAddresses,
+): FetchSpec {
   const fs = eventCallbacks.map((e) => e.filter);
-  const logFilters = fs.filter((f): f is LogFilter => f.type === "log");
+  const logFilters = fs.filter((f): f is LogFilter => f.type === 'log');
   const factories = uniqueFactories(eventCallbacks);
   const needReceipts = fs.some((f) => f.hasTransactionReceipt === true);
-  const blockFilters = fs.filter((f): f is BlockFilter => f.type === "block");
-  const transactionFilters = fs.filter((f): f is TransactionFilter => f.type === "transaction");
-  const traceFilters = fs.filter((f): f is TraceFilter => f.type === "trace");
-  const transferFilters = fs.filter((f): f is TransferFilter => f.type === "transfer");
+  const blockFilters = fs.filter((f): f is BlockFilter => f.type === 'block');
+  const transactionFilters = fs.filter(
+    (f): f is TransactionFilter => f.type === 'transaction',
+  );
+  const traceFilters = fs.filter((f): f is TraceFilter => f.type === 'trace');
+  const transferFilters = fs.filter(
+    (f): f is TransferFilter => f.type === 'transfer',
+  );
   const needBlocks = blockFilters.length > 0;
   const needTxFilter = transactionFilters.length > 0;
   const needTraces = traceFilters.length + transferFilters.length > 0;
 
   // the chain's actual backfill window, from the filters — used to bound chunk fetches so a bounded
   // backfill (or the tail) never over-fetches. Fully automatic; no client tuning.
-  const froms = fs.map((f) => f.fromBlock).filter((b): b is number => b != null);
+  const froms = fs
+    .map((f) => f.fromBlock)
+    .filter((b): b is number => b != null);
   const backfillStart = froms.length ? Math.min(...froms) : 0;
   const tos = fs.map((f) => f.toBlock);
-  const backfillEnd = tos.length && tos.every((t) => t != null) ? Math.max(...(tos as number[])) : undefined;
+  const backfillEnd =
+    tos.length && tos.every((t) => t != null)
+      ? Math.max(...(tos as number[]))
+      : undefined;
 
-  const txFields = (): FieldMap => (needReceipts ? { ...TX_FIELDS, ...RECEIPT_FIELDS } : TX_FIELDS);
+  const txFields = (): FieldMap =>
+    needReceipts ? { ...TX_FIELDS, ...RECEIPT_FIELDS } : TX_FIELDS;
 
   const spec: FetchSpec = {
-    id: Symbol("portal-fetch-spec"),
+    id: Symbol('portal-fetch-spec'),
     logFilters,
     factories,
     traceFilters,
@@ -237,23 +384,49 @@ export function compileFetchSpec(eventCallbacks: { filter: Filter }[], childAddr
     backfillStart,
     backfillEnd,
     logQuery: () => {
-      const logs = mergeLogRequests(logFilters.flatMap((f) => logRequestsFor(f, childAddresses))).map((r) => ({ ...r, transaction: true }));
+      const logs = mergeLogRequests(
+        logFilters.flatMap((f) => logRequestsFor(f, childAddresses)),
+      ).map((r) => ({ ...r, transaction: true }));
       if (logs.length === 0) return undefined;
-      return { type: "evm", fields: { block: BLOCK_FIELDS, log: LOG_FIELDS, transaction: txFields() }, logs };
+      return {
+        type: 'evm',
+        fields: {
+          block: BLOCK_FIELDS,
+          log: LOG_FIELDS,
+          transaction: txFields(),
+        },
+        logs,
+      };
     },
     traceQuery: () => {
       if (!needTraces) return undefined;
-      return { type: "evm", fields: { block: BLOCK_FIELDS, trace: TRACE_FIELDS, transaction: txFields() }, traces: traceRequests() };
+      return {
+        type: 'evm',
+        fields: {
+          block: BLOCK_FIELDS,
+          trace: TRACE_FIELDS,
+          transaction: txFields(),
+        },
+        traces: traceRequests(),
+      };
     },
     blockQuery: () => {
       if (!needBlocks) return undefined;
-      return { type: "evm", includeAllBlocks: true, fields: { block: BLOCK_FIELDS } };
+      return {
+        type: 'evm',
+        includeAllBlocks: true,
+        fields: { block: BLOCK_FIELDS },
+      };
     },
     txQuery: () => {
       if (!needTxFilter) return undefined;
       const transactions = txRequestsFor(transactionFilters, childAddresses);
       if (transactions.length === 0) return undefined;
-      return { type: "evm", fields: { block: BLOCK_FIELDS, transaction: txFields() }, transactions };
+      return {
+        type: 'evm',
+        fields: { block: BLOCK_FIELDS, transaction: txFields() },
+        transactions,
+      };
     },
   };
   return Object.freeze(spec);

@@ -83,6 +83,7 @@ export const evictionPlan = (
   intervalStart: number,
 ): number[] => {
   const out: number[] = [];
-  for (const idx of cachedIdxs) if ((idx + 1) * chunkBlocks <= intervalStart) out.push(idx);
+  for (const idx of cachedIdxs)
+    if ((idx + 1) * chunkBlocks <= intervalStart) out.push(idx);
   return out;
 };

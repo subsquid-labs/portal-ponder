@@ -12,6 +12,8 @@
  *   • closest includes trace-only and tx-only blocks; computed by a LOOP (not Math.max(...spread), which
  *     RangeErrors on ~100k+ keys — was C9).
  */
+
+import type { Address } from 'viem';
 import type {
   SyncBlock,
   SyncBlockHeader,
@@ -19,31 +21,30 @@ import type {
   SyncTrace,
   SyncTransaction,
   SyncTransactionReceipt,
-} from "@/internal/types.js";
+} from '@/internal/types.js';
 import {
   isAddressFactory,
   isAddressMatched,
   isTraceFilterMatched,
   isTransactionFilterMatched,
   isTransferFilterMatched,
-} from "@/runtime/filter.js";
-import type { Interval } from "@/utils/interval.js";
-import type { Address } from "viem";
-import type { FetchSpec, ChildAddresses } from "./portal-filters.js";
-import { invariant, invariantStrict } from "./portal-invariant.js";
+} from '@/runtime/filter.js';
+import type { Interval } from '@/utils/interval.js';
+import type { ChildAddresses, FetchSpec } from './portal-filters.js';
+import { invariantStrict } from './portal-invariant.js';
 import {
+  cmpTraceAddr,
+  hx,
+  parityToCallFrame,
   type RawHeader,
   type RawLog,
   type RawTrace,
   type RawTx,
-  cmpTraceAddr,
-  hx,
-  parityToCallFrame,
   toSyncBlockHeader,
   toSyncLog,
   toSyncReceipt,
   toSyncTransaction,
-} from "./portal-transform.js";
+} from './portal-transform.js';
 
 /** The per-chunk buffered wire data assembled from the Portal streams (built by the shell's dataChunk). */
 export type ChunkData = {
@@ -51,7 +52,10 @@ export type ChunkData = {
   logs: Map<number, RawLog[]>;
   txs: Map<number, RawTx[]>;
   // for trace/transfer sources: full block + all its traces + its txs, by block number
-  traceBlocks: Map<number, { header: RawHeader; traces: RawTrace[]; txs: RawTx[] }>;
+  traceBlocks: Map<
+    number,
+    { header: RawHeader; traces: RawTrace[]; txs: RawTx[] }
+  >;
   // for block-interval sources: headers of blocks matching a BlockFilter (interval/offset)
   blockHeaders: Map<number, RawHeader>;
   // for account transaction sources: blocks + their from/to-matched txs, by block number
@@ -59,21 +63,21 @@ export type ChunkData = {
 };
 
 export const createChunkData = (): ChunkData => ({
-  headers: new Map(), logs: new Map(), txs: new Map(), traceBlocks: new Map(), blockHeaders: new Map(), txBlocks: new Map(),
+  headers: new Map(),
+  logs: new Map(),
+  txs: new Map(),
+  traceBlocks: new Map(),
+  blockHeaders: new Map(),
+  txBlocks: new Map(),
 });
 
-/** Count the buffered records held by a chunk (for the row budget). */
-export const chunkRowCount = (cd: ChunkData): number => {
-  let rc = cd.blockHeaders.size;
-  for (const a of cd.logs.values()) rc += a.length;
-  for (const a of cd.txs.values()) rc += a.length;
-  for (const b of cd.traceBlocks.values()) rc += b.traces.length + b.txs.length;
-  for (const b of cd.txBlocks.values()) rc += b.txs.length;
-  return rc;
-};
-
 /** A geth-style CallFrame produced by parityToCallFrame (index = its DFS rank). */
-type CallFrame = { index: number; from: string; to?: string; type: string } & Record<string, unknown>;
+type CallFrame = {
+  index: number;
+  from: string;
+  to?: string;
+  type: string;
+} & Record<string, unknown>;
 export type RankedTrace = { frame: CallFrame; index: number };
 
 /**
@@ -83,16 +87,18 @@ export type RankedTrace = { frame: CallFrame; index: number };
  * filter-local one.
  */
 export function rankTraces(traces: RawTrace[]): RankedTrace[] {
-  const sorted = [...traces].sort((x, y) => cmpTraceAddr(x.traceAddress ?? [], y.traceAddress ?? []));
+  const sorted = [...traces].sort((x, y) =>
+    cmpTraceAddr(x.traceAddress ?? [], y.traceAddress ?? []),
+  );
   const out: RankedTrace[] = [];
   sorted.forEach((t, i) => {
     const frame = parityToCallFrame(t, i) as CallFrame | undefined;
     if (frame) out.push({ frame, index: i });
   });
   invariantStrict(
-    "INV-5",
+    'INV-5',
     () => out.every((r, i) => i === 0 || r.index > out[i - 1]!.index),
-    "trace ranks not strictly increasing",
+    'trace ranks not strictly increasing',
     () => ({ ranks: out.map((r) => r.index) }),
   );
   return out;
@@ -103,19 +109,59 @@ type Matchers = {
   txFilterMatched: (tx: SyncTransaction, bn: number) => boolean;
 };
 
-const buildMatchers = (spec: FetchSpec, childAddresses: ChildAddresses): Matchers => {
-  const factoryAddrOk = (filterAddr: unknown, addr: string | undefined, bn: number): boolean =>
+const buildMatchers = (
+  spec: FetchSpec,
+  childAddresses: ChildAddresses,
+): Matchers => {
+  const factoryAddrOk = (
+    filterAddr: unknown,
+    addr: string | undefined,
+    bn: number,
+  ): boolean =>
     !isAddressFactory(filterAddr as never) ||
-    isAddressMatched({ address: addr as Address, blockNumber: bn, childAddresses: childAddresses.get((filterAddr as { id: string }).id)! });
+    isAddressMatched({
+      address: addr as Address,
+      blockNumber: bn,
+      childAddresses: childAddresses.get((filterAddr as { id: string }).id)!,
+    });
   return {
     traceMatched: (frame, bn) => {
       const blk = { number: BigInt(bn) } as never;
-      for (const f of spec.transferFilters) if (isTransferFilterMatched({ filter: f, trace: frame as never, block: blk }) && factoryAddrOk(f.fromAddress, frame.from, bn) && factoryAddrOk(f.toAddress, frame.to, bn)) return true;
-      for (const f of spec.traceFilters) if (isTraceFilterMatched({ filter: f, trace: frame as never, block: blk }) && factoryAddrOk(f.fromAddress, frame.from, bn) && factoryAddrOk(f.toAddress, frame.to, bn)) return true;
+      for (const f of spec.transferFilters)
+        if (
+          isTransferFilterMatched({
+            filter: f,
+            trace: frame as never,
+            block: blk,
+          }) &&
+          factoryAddrOk(f.fromAddress, frame.from, bn) &&
+          factoryAddrOk(f.toAddress, frame.to, bn)
+        )
+          return true;
+      for (const f of spec.traceFilters)
+        if (
+          isTraceFilterMatched({
+            filter: f,
+            trace: frame as never,
+            block: blk,
+          }) &&
+          factoryAddrOk(f.fromAddress, frame.from, bn) &&
+          factoryAddrOk(f.toAddress, frame.to, bn)
+        )
+          return true;
       return false;
     },
     txFilterMatched: (tx, bn) =>
-      spec.transactionFilters.some((f) => isTransactionFilterMatched({ filter: f, transaction: tx }) && factoryAddrOk(f.fromAddress, tx.from, bn) && factoryAddrOk(f.toAddress, (tx.to ?? undefined) as string | undefined, bn)),
+      spec.transactionFilters.some(
+        (f) =>
+          isTransactionFilterMatched({ filter: f, transaction: tx }) &&
+          factoryAddrOk(f.fromAddress, tx.from, bn) &&
+          factoryAddrOk(
+            f.toAddress,
+            (tx.to ?? undefined) as string | undefined,
+            bn,
+          ),
+      ),
   };
 };
 
@@ -126,7 +172,11 @@ const buildTraces = (
   hi: number,
   matchers: Matchers,
 ): { trace: SyncTrace; block: SyncBlock; transaction: SyncTransaction }[] => {
-  const out: { trace: SyncTrace; block: SyncBlock; transaction: SyncTransaction }[] = [];
+  const out: {
+    trace: SyncTrace;
+    block: SyncBlock;
+    transaction: SyncTransaction;
+  }[] = [];
   for (const [bn, tb] of cd.traceBlocks) {
     if (bn < lo || bn > hi || !tb.traces?.length) continue;
     const block = toSyncBlockHeader(tb.header) as unknown as SyncBlock; // encodeTrace only reads block.number
@@ -135,15 +185,25 @@ const buildTraces = (
     const byTx = new Map<number, RawTrace[]>();
     // callTracer has no block-reward frames; skip reward/no-tx traces so `?? 0` can't fold them into tx 0
     // and shift its DFS ranks (now that we fetch the full, unfiltered trace set).
-    for (const t of tb.traces) { if (t.transactionIndex == null || t.type === "reward") continue; const k = t.transactionIndex; if (!byTx.has(k)) byTx.set(k, []); byTx.get(k)!.push(t); }
+    for (const t of tb.traces) {
+      if (t.transactionIndex == null || t.type === 'reward') continue;
+      const k = t.transactionIndex;
+      if (!byTx.has(k)) byTx.set(k, []);
+      byTx.get(k)!.push(t);
+    }
     for (const [txIndex, traces] of byTx) {
       const rawTx = txByIdx.get(txIndex);
       for (const { frame } of rankTraces(traces)) {
         if (!matchers.traceMatched(frame, bn)) continue;
         out.push({
-          trace: { trace: frame, transactionHash: rawTx?.hash } as unknown as SyncTrace,
+          trace: {
+            trace: frame,
+            transactionHash: rawTx?.hash,
+          } as unknown as SyncTrace,
           block,
-          transaction: rawTx ? toSyncTransaction(rawTx, tb.header) : ({ transactionIndex: hx(txIndex) } as unknown as SyncTransaction),
+          transaction: rawTx
+            ? toSyncTransaction(rawTx, tb.header)
+            : ({ transactionIndex: hx(txIndex) } as unknown as SyncTransaction),
         });
       }
     }
@@ -156,7 +216,11 @@ export type AssembledRange = {
   blocks: SyncBlockHeader[];
   txs: SyncTransaction[];
   receipts: SyncTransactionReceipt[];
-  traces: { trace: SyncTrace; block: SyncBlock; transaction: SyncTransaction }[];
+  traces: {
+    trace: SyncTrace;
+    block: SyncBlock;
+    transaction: SyncTransaction;
+  }[];
   closest: SyncBlock | undefined;
 };
 
@@ -180,50 +244,79 @@ export function assembleRange(
   const syncReceipts: SyncTransactionReceipt[] = [];
   const seenTx = new Set<string>();
 
-  for (const cd of chunks) for (const [bn, hdr] of cd.headers) {
-    if (!inRange(bn)) continue;
-    const logs = cd.logs.get(bn) ?? [];
-    if (logs.length) {
-      invariant("INV-2", inRange(bn), "assembled log block outside interval", () => ({ bn, lo, hi }));
-      blocksByNumber.set(bn, toSyncBlockHeader(hdr));
-      for (const raw of logs) syncLogs.push(toSyncLog(raw, hdr));
-      for (const tx of cd.txs.get(bn) ?? []) if (tx.hash && !seenTx.has(tx.hash)) {
-        seenTx.add(tx.hash);
-        syncTxs.push(toSyncTransaction(tx, hdr));
-        if (spec.needReceipts) syncReceipts.push(toSyncReceipt(tx, hdr));
+  // INV-2 is enforced BY CONSTRUCTION here: every emitting branch below sits behind the single
+  // `inRange` predicate (there is deliberately no redundant per-row assert — it could never fire),
+  // and the exactness property is proven against a brute-force model in portal-assemble.test.ts.
+  for (const cd of chunks)
+    for (const [bn, hdr] of cd.headers) {
+      if (!inRange(bn)) continue;
+      const logs = cd.logs.get(bn) ?? [];
+      if (logs.length) {
+        blocksByNumber.set(bn, toSyncBlockHeader(hdr));
+        for (const raw of logs) syncLogs.push(toSyncLog(raw, hdr));
+        for (const tx of cd.txs.get(bn) ?? [])
+          if (tx.hash && !seenTx.has(tx.hash)) {
+            seenTx.add(tx.hash);
+            syncTxs.push(toSyncTransaction(tx, hdr));
+            if (spec.needReceipts) syncReceipts.push(toSyncReceipt(tx, hdr));
+          }
       }
     }
-  }
 
   // block-interval sources: ensure each matched block is in the blocks table (cd.blockHeaders already
   // holds ONLY the BlockFilter-matched headers — the shell filters at fetch time to avoid buffering the
   // whole includeAllBlocks scan).
-  if (spec.needBlocks) for (const cd of chunks) for (const [bn, hdr] of cd.blockHeaders) {
-    if (inRange(bn) && !blocksByNumber.has(bn)) blocksByNumber.set(bn, toSyncBlockHeader(hdr));
-  }
+  if (spec.needBlocks)
+    for (const cd of chunks)
+      for (const [bn, hdr] of cd.blockHeaders) {
+        if (inRange(bn) && !blocksByNumber.has(bn))
+          blocksByNumber.set(bn, toSyncBlockHeader(hdr));
+      }
 
   // account transaction sources: re-match Portal's from/to-filtered txs (+ factory + range), insert tx/receipt/block
-  if (spec.needTxFilter) for (const cd of chunks) for (const [bn, tb] of cd.txBlocks) {
-    if (!inRange(bn)) continue;
-    for (const raw of tb.txs) {
-      if (raw.hash && seenTx.has(raw.hash)) continue;
-      const tx = toSyncTransaction(raw, tb.header);
-      if (!matchers.txFilterMatched(tx, bn)) continue;
-      if (raw.hash) seenTx.add(raw.hash);
-      blocksByNumber.set(bn, toSyncBlockHeader(tb.header));
-      syncTxs.push(tx);
-      if (spec.needReceipts) syncReceipts.push(toSyncReceipt(raw, tb.header));
-    }
-  }
+  if (spec.needTxFilter)
+    for (const cd of chunks)
+      for (const [bn, tb] of cd.txBlocks) {
+        if (!inRange(bn)) continue;
+        for (const raw of tb.txs) {
+          if (raw.hash && seenTx.has(raw.hash)) continue;
+          const tx = toSyncTransaction(raw, tb.header);
+          if (!matchers.txFilterMatched(tx, bn)) continue;
+          if (raw.hash) seenTx.add(raw.hash);
+          blocksByNumber.set(bn, toSyncBlockHeader(tb.header));
+          syncTxs.push(tx);
+          if (spec.needReceipts)
+            syncReceipts.push(toSyncReceipt(raw, tb.header));
+        }
+      }
 
-  const traces = spec.needTraces ? chunks.flatMap((cd) => buildTraces(cd, lo, hi, matchers)) : [];
+  const traces = spec.needTraces
+    ? chunks.flatMap((cd) => buildTraces(cd, lo, hi, matchers))
+    : [];
 
   // C9: highest block with data — a LOOP (Math.max(...spread) RangeErrors on ~100k+ keys) — INCLUDING
   // trace-only blocks so `closest` doesn't understate the synced tip.
   let closest: SyncBlock | undefined;
   let maxBn = -1;
-  for (const [bn, hdr] of blocksByNumber) if (bn > maxBn) { maxBn = bn; closest = hdr as unknown as SyncBlock; }
-  for (const t of traces) { const bn = Number((t.block as { number: unknown }).number); if (bn > maxBn) { maxBn = bn; closest = t.block; } }
+  for (const [bn, hdr] of blocksByNumber)
+    if (bn > maxBn) {
+      maxBn = bn;
+      closest = hdr as unknown as SyncBlock;
+    }
+  for (const t of traces) {
+    const bn = Number((t.block as { number: unknown }).number);
+    if (bn > maxBn) {
+      maxBn = bn;
+      closest = t.block;
+    }
+  }
 
-  return { logs: syncLogs, blocks: [...blocksByNumber.values()], txs: syncTxs, receipts: syncReceipts, traces, closest };
+  return {
+    logs: syncLogs,
+    blocks: [...blocksByNumber.values()],
+    txs: syncTxs,
+    receipts: syncReceipts,
+    traces,
+    closest,
+  };
 }

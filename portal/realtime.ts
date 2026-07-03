@@ -17,7 +17,7 @@
  * `fallback` gives smooth failover; `{ rank: true }` probes latency and routes to the fastest tip. Either
  * way ponder's reorg safety comes for free.
  */
-import { fallback, http, type Transport } from "viem";
+import { fallback, http, type Transport } from 'viem';
 
 /**
  * Compose realtime RPC(s) into a latency-ranked fallback so the fastest tip lands. Accepts URL strings or
@@ -28,7 +28,7 @@ export function rpcRealtime(
   opts?: { rank?: boolean },
 ): Transport {
   return fallback(
-    rpcs.map((r) => (typeof r === "string" ? http(r) : r)),
+    rpcs.map((r) => (typeof r === 'string' ? http(r) : r)),
     { rank: opts?.rank ?? true },
   );
 }
@@ -69,15 +69,15 @@ export async function probeOnce(
         const t0 = Date.now();
         try {
           const res = await fetchImpl(e.url, {
-            method: "POST",
+            method: 'POST',
             headers: {
-              "content-type": "application/json",
+              'content-type': 'application/json',
               ...(e.headers ?? {}),
             },
             body: JSON.stringify({
-              jsonrpc: "2.0",
+              jsonrpc: '2.0',
               id: 1,
-              method: "eth_blockNumber",
+              method: 'eth_blockNumber',
               params: [],
             }),
             signal: AbortSignal.timeout(timeoutMs),
@@ -95,7 +95,7 @@ export async function probeOnce(
             return;
           }
           const j = await res.json();
-          const tip = typeof j?.result === "string" ? Number(j.result) : null;
+          const tip = typeof j?.result === 'string' ? Number(j.result) : null;
           out.push({
             chainId: c.chainId,
             name: e.name,
@@ -163,14 +163,22 @@ export function summarize(window: ProbeSample[]): Record<
   }
 > {
   const byKey: Record<string, ProbeSample[]> = {};
-  for (const s of window) (byKey[`${s.chainId}:${s.name}`] ??= []).push(s);
+  for (const s of window) {
+    const key = `${s.chainId}:${s.name}`;
+    let bucket = byKey[key];
+    if (bucket === undefined) {
+      bucket = [];
+      byKey[key] = bucket;
+    }
+    bucket.push(s);
+  }
   const res: Record<string, any> = {};
   for (const [key, ss] of Object.entries(byKey)) {
     const ok = ss.filter((s) => s.ok);
     const lats = ok.map((s) => s.latencyMs);
     const lags = ok
       .map((s) => s.lag)
-      .filter((x): x is number => typeof x === "number");
+      .filter((x): x is number => typeof x === 'number');
     res[key] = {
       chainId: ss[0]!.chainId,
       name: ss[0]!.name,
@@ -224,7 +232,7 @@ export function startEndpointProbe(
     opts.onSummary?.(summary);
     if (opts.metricsFile) {
       try {
-        (await import("node:fs")).writeFileSync(
+        (await import('node:fs')).writeFileSync(
           opts.metricsFile,
           JSON.stringify(
             { ts: Date.now(), intervalMs, endpoints: summary },
@@ -239,7 +247,7 @@ export function startEndpointProbe(
     if (opts.log)
       for (const v of Object.values(summary))
         opts.log(
-          `[probe] ${v.chainId}:${v.name} lat p50=${v.latP50}ms p95=${v.latP95}ms ok=${(v.okRate * 100).toFixed(0)}% lag=${v.avgLag ?? "?"}blk`,
+          `[probe] ${v.chainId}:${v.name} lat p50=${v.latP50}ms p95=${v.latP95}ms ok=${(v.okRate * 100).toFixed(0)}% lag=${v.avgLag ?? '?'}blk`,
         );
   };
   const timer = setInterval(tick, intervalMs);
