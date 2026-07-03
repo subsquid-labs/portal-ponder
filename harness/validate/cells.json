@@ -418,7 +418,8 @@
       "app": "traces",
       "chain": "eth",
       "chainId": 1,
-      "sourceTypes": ["logs", "receipts", "traces", "accounts", "blocks"],
+      "sourceTypes": ["logs", "receipts", "traces"],
+      "sourceTypesNotCovered": ["accounts", "blocks"],
       "receipts": true,
       "windows": [
         {
@@ -431,14 +432,15 @@
         }
       ],
       "expectedRequestEstimate": 120000,
-      "notes": "All-source-types cell. NOTE: harness/diff/app exercises logs+receipts+traces; a purpose-built app adding account (tx from/to) + block-interval sources is still needed for full 5-type coverage (spec deviation — see README)."
+      "notes": "Multi-source cell — the traces app (harness/diff/app) exercises logs + receipts + traces (V3 pool + V2 router, eth). It does NOT yet cover account (tx from/to) or block-interval sources; those two are a KNOWN, DOCUMENTED spec deviation (see harness/diff/README.md 'A-cell source coverage' and sourceTypesNotCovered). The app is CHAIN_ID/POOL_ADDRESS/ROUTER_ADDRESS env-driven; eth addresses are the defaults."
     },
     {
       "id": "A-base",
       "app": "traces",
       "chain": "base",
       "chainId": 8453,
-      "sourceTypes": ["logs", "receipts", "traces", "accounts", "blocks"],
+      "sourceTypes": ["logs", "receipts", "traces"],
+      "sourceTypesNotCovered": ["accounts", "blocks"],
       "receipts": true,
       "windows": [
         {
@@ -451,7 +453,7 @@
         }
       ],
       "expectedRequestEstimate": 120000,
-      "notes": "All-source-types cell on base. Same all-5-app caveat as A-eth. Uses base V3 pool/router addresses in the app — VERIFY against the capability report."
+      "notes": "Multi-source cell on base — same logs+receipts+traces coverage and the same accounts/blocks deviation as A-eth. The traces app defaults to eth V3-pool/V2-router addresses; a base run MUST set CHAIN_ID + POOL_ADDRESS + ROUTER_ADDRESS to base contracts that emit the V3 Swap event / V2 router call-traces (VERIFY against the capability report) — it is not yet wired to per-chain addresses in cells.json."
     },
     {
       "id": "U-eth",

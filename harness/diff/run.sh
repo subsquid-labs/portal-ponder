@@ -16,7 +16,18 @@ PORTAL="${PORTAL_URL_1:-https://portal.sqd.dev/datasets/ethereum-mainnet}"
 : "${PONDER_RPC_URL_1:?set PONDER_RPC_URL_1 to an eth archive RPC that supports debug_traceBlockByNumber}"
 
 pkill -f 'ponder start --schema diff_' 2>/dev/null
-WORK="$(mktemp -d)"; trap 'pkill -f "ponder start --schema diff_" 2>/dev/null' EXIT
+WORK="$(mktemp -d)"
+# Cleanup on ANY exit (completion, failure, interrupt mid-run): kill the backfills AND remove the
+# throwaway install/diff workspace + per-run logs — the old trap only killed the process and leaked
+# the mktemp -d workspace every run. Set KEEP_WORKSPACES=1 to retain them for debugging.
+cleanup () {
+  pkill -f 'ponder start --schema diff_' 2>/dev/null
+  [ -n "${KEEP_WORKSPACES:-}" ] && return
+  cd / 2>/dev/null
+  rm -rf "$WORK"
+  rm -f /tmp/diff-portal.log /tmp/diff-rpc.log
+}
+trap cleanup EXIT INT TERM
 cp -r "$APP/." "$WORK/"; cd "$WORK"
 echo "▶ workspace $WORK  range [$START,$END]"
 [ -n "${SQD_PONDER_TARBALL:-}" ] && node -e "const p=require('./package.json');p.dependencies['@subsquid/ponder']='file:$SQD_PONDER_TARBALL';require('fs').writeFileSync('package.json',JSON.stringify(p,null,2))"

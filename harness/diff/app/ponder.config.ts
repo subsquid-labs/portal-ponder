@@ -29,7 +29,10 @@ export default createConfig({
   },
   chains: {
     mainnet: {
-      id: 1,
+      // CHAIN_ID / POOL_ADDRESS / ROUTER_ADDRESS let the validation harness (harness/validate) reuse
+      // this logs+receipts+traces shape on any chain the capability report clears for traces;
+      // defaults keep the standalone eth run unchanged.
+      id: Number(process.env.CHAIN_ID ?? 1),
       rpc: process.env.PONDER_RPC_URL_1,
       portal: process.env.PORTAL_URL_1 || undefined,
     },
@@ -38,7 +41,8 @@ export default createConfig({
     Pool: {
       chain: "mainnet",
       abi: v3Pool,
-      address: "0x88e6A0c2dDD26FEEb64F039a2c41296FcB3f5640",
+      address: (process.env.POOL_ADDRESS ??
+        "0x88e6A0c2dDD26FEEb64F039a2c41296FcB3f5640") as `0x${string}`,
       includeTransactionReceipts: true,
       startBlock: Number(process.env.PONDER_START),
       endBlock: Number(process.env.PONDER_END),
@@ -46,7 +50,8 @@ export default createConfig({
     Router: {
       chain: "mainnet",
       abi: v2Router,
-      address: "0x7a250d5630B4cF539739dF2C5dAcb4c659F2488D",
+      address: (process.env.ROUTER_ADDRESS ??
+        "0x7a250d5630B4cF539739dF2C5dAcb4c659F2488D") as `0x${string}`,
       includeCallTraces: true,
       startBlock: Number(process.env.PONDER_START),
       endBlock: Number(process.env.PONDER_END),

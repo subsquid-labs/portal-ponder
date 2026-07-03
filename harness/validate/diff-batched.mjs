@@ -17,6 +17,11 @@ import { createHash } from 'node:crypto';
 
 // ── pure core (exported, tested on fixtures) ───────────────────────────────────────────────────
 
+// A JSON.stringify replacer so a bigint ANYWHERE (top-level column OR nested, e.g. a composite
+// {key:[bigint]} sample row) serializes to its decimal string instead of throwing. DB rows carry
+// only scalar columns, so this is a no-op there; it just makes the sampler total.
+const bigintSafe = (_k, v) => (typeof v === 'bigint' ? v.toString() : v);
+
 // Normalize a row to a stable JSON string: sorted keys, bigint→decimal, bytes→hex, dropped columns
 // removed. Identical logical rows across the two pglite engines produce identical strings.
 export function normRow(row, drop) {
@@ -36,7 +41,7 @@ export function normRow(row, drop) {
     }
   }
 
-  return JSON.stringify(o);
+  return JSON.stringify(o, bigintSafe);
 }
 
 // Lexicographic compare of two composite keys (arrays of bigint|number|string).
@@ -300,8 +305,9 @@ async function appHash(dir, schema, { PGlite }) {
     [resolvedSchema],
   );
 
-  const out = { schema: resolvedSchema, tables: {} };
+  const out = { schema: resolvedSchema, tables: {}, rowCounts: {} };
   const combined = createHash('md5');
+  let nonEmptyTables = 0;
   for (const { table_name: t } of tables) {
     const { rows: cols } = await db.query(
       `select column_name from information_schema.columns
@@ -316,18 +322,50 @@ async function appHash(dir, schema, { PGlite }) {
       .map((c) => `coalesce("${c.column_name}"::text,'∅')`)
       .join(`||'|'||`);
     const { rows } = await db.query(
-      `select coalesce(md5(string_agg(r, chr(10) order by r)), 'empty') as h
+      `select count(*)::int as n, coalesce(md5(string_agg(r, chr(10) order by r)), 'empty') as h
          from (select ${repr} as r from "${resolvedSchema}"."${t}") s`,
     );
     const h = rows[0].h;
+    const n = rows[0].n;
     out.tables[t] = h;
+    out.rowCounts[t] = n;
+    if (n > 0) {
+      nonEmptyTables += 1;
+    }
+
     combined.update(`${t}:${h}\n`);
   }
 
   await db.close();
   out.combined = combined.digest('hex');
+  // The determinism checkpoint is only meaningful over tables the app actually WROTE. The diff apps
+  // ship a no-op `noop` table (they exist to populate ponder_sync, not user tables), so an app hash
+  // over zero nonempty user tables is VACUOUS — it must not read as a meaningful PASS.
+  out.nonEmptyTables = nonEmptyTables;
 
   return out;
+}
+
+// Verdict for the two-store --app-hash comparison. A meaningful PASS requires BOTH sides to have at
+// least one nonempty user table AND identical combined hashes. Zero nonempty user tables on either
+// side is NOT a pass — it is an explicit NO-USER-TABLES verdict (the diff apps write no user rows),
+// so the determinism checkpoint can never be silently vacuous. Pure + exported for unit tests.
+export function appHashVerdict(ha, hb) {
+  if (ha.nonEmptyTables === 0 || hb.nonEmptyTables === 0) {
+    return {
+      ok: false,
+      verdict: 'NO-USER-TABLES',
+      reason:
+        'app hash is vacuous — no nonempty user tables to compare (the diff apps write only ' +
+        'ponder_sync, no user rows). Use an app that writes deterministic rows for a real checkpoint.',
+    };
+  }
+
+  if (ha.combined !== hb.combined) {
+    return { ok: false, verdict: 'DIVERGE', reason: 'app-table hashes differ' };
+  }
+
+  return { ok: true, verdict: 'PASS', reason: 'app tables identical' };
 }
 
 // The app schema = the one non-system, non-ponder_sync schema ponder created for this instance.
@@ -381,12 +419,14 @@ async function main() {
       appHash(dirA, undefined, { PGlite }),
       appHash(dirB, undefined, { PGlite }),
     ]);
-    const same = ha.combined === hb.combined;
+    const v = appHashVerdict(ha, hb);
     console.log(
-      `\napp-table determinism hash  portal=${ha.combined}  rpc=${hb.combined}`,
+      `\napp-table determinism hash  portal=${ha.combined} (${ha.nonEmptyTables} nonempty)  rpc=${hb.combined} (${hb.nonEmptyTables} nonempty)`,
     );
-    console.log(same ? '✅ app tables identical' : '❌ app tables DIVERGE');
-    if (!same) {
+    console.log(v.ok ? `✅ ${v.reason}` : `❌ ${v.verdict}: ${v.reason}`);
+    if (!v.ok) {
+      // a vacuous (NO-USER-TABLES) or divergent app hash is a non-zero exit: the determinism
+      // checkpoint must never silently pass on zero user rows.
       process.exit(1);
     }
   }

@@ -1,6 +1,12 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
-import { cmpKey, hashRows, mergeCompare, normRow } from './diff-batched.mjs';
+import {
+  appHashVerdict,
+  cmpKey,
+  hashRows,
+  mergeCompare,
+  normRow,
+} from './diff-batched.mjs';
 
 // key by (block_number, log_index) as the real logs table would be ordered
 const logKey = (r) => [BigInt(r.block_number), BigInt(r.log_index)];
@@ -95,6 +101,38 @@ test('blocks mode: total_difficulty is excluded, real field mismatch still fails
   assert.equal(badRes.mismatch, 1);
 });
 
+// ab-diff.mjs feeds streamingDiff single-field {key,hash} rows (the SQL-computed block/log md5). In
+// the FINALIZED overlap a one-sided block is a real gap, so ab-diff now runs its block diff in
+// 'strict' (not the 'blocks' tolerance). This locks that shape: a B-missing block FAILs under strict.
+test('strict mode over {key,hash} rows: a one-sided block FAILS (ab-diff finalized-overlap)', async () => {
+  const hashRow = (n, h) => ({ key: [BigInt(n)], hash: h });
+  const keyOfHashRow = (r) => r.key;
+  const a = [hashRow(100, 'h100'), hashRow(101, 'h101'), hashRow(102, 'h102')];
+  const b = [hashRow(100, 'h100'), hashRow(102, 'h102')]; // B missing block 101
+
+  const strict = await mergeCompare(a, b, {
+    keyFn: keyOfHashRow,
+    mode: 'strict',
+  });
+  assert.equal(
+    strict.fail,
+    true,
+    'a one-sided finalized block must FAIL under strict',
+  );
+  assert.equal(strict.onlyA, 1);
+
+  // proof this is the mode that matters: the old 'blocks' tolerance would NOT have failed it
+  const tolerant = await mergeCompare(a, b, {
+    keyFn: keyOfHashRow,
+    mode: 'blocks',
+  });
+  assert.equal(
+    tolerant.fail,
+    false,
+    "'blocks' mode tolerates the one-sided block (the pre-fix bug)",
+  );
+});
+
 test('hashRows: order-independent, field-sensitive, deterministic', () => {
   const rows = [log(101, 0), log(100, 1), log(100, 0)];
   const shuffled = [log(100, 0), log(101, 0), log(100, 1)];
@@ -113,4 +151,36 @@ test('hashRows: order-independent, field-sensitive, deterministic', () => {
     changed,
     'a field change changes the hash',
   );
+});
+
+// #15 — --app-hash must NOT report a meaningful PASS when there are no nonempty user tables (the diff
+// apps ship a no-op `noop` table and write no user rows, so the checkpoint would be vacuous).
+test('appHashVerdict: zero nonempty user tables is NO-USER-TABLES, not a PASS', () => {
+  const empty = { combined: 'abc', nonEmptyTables: 0 };
+  const v = appHashVerdict(empty, { combined: 'abc', nonEmptyTables: 0 });
+  assert.equal(v.ok, false, 'identical-but-vacuous app hashes must NOT pass');
+  assert.equal(v.verdict, 'NO-USER-TABLES');
+
+  // one side nonempty, the other empty → still not a meaningful checkpoint
+  const oneSide = appHashVerdict(
+    { combined: 'x', nonEmptyTables: 3 },
+    { combined: 'x', nonEmptyTables: 0 },
+  );
+  assert.equal(oneSide.ok, false);
+});
+
+test('appHashVerdict: with nonempty tables, PASS on identical / DIVERGE on different hashes', () => {
+  const pass = appHashVerdict(
+    { combined: 'same', nonEmptyTables: 2 },
+    { combined: 'same', nonEmptyTables: 2 },
+  );
+  assert.equal(pass.ok, true);
+  assert.equal(pass.verdict, 'PASS');
+
+  const diverge = appHashVerdict(
+    { combined: 'aaa', nonEmptyTables: 2 },
+    { combined: 'bbb', nonEmptyTables: 2 },
+  );
+  assert.equal(diverge.ok, false);
+  assert.equal(diverge.verdict, 'DIVERGE');
 });
