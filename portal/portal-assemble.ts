@@ -165,12 +165,15 @@ const buildMatchers = (
   };
 };
 
-/** Per-chunk trace assembly: full-tree ranking then client-side filtering (INV-5). */
+/** Per-chunk trace assembly: full-tree ranking then client-side filtering (INV-5). `onReceipt` (FIX 4)
+ * is invoked with each MATCHED trace's parent transaction so the caller can emit a receipt when a
+ * trace/transfer filter has `hasTransactionReceipt` — the log/tx branches never see these txs. */
 const buildTraces = (
   cd: ChunkData,
   lo: number,
   hi: number,
   matchers: Matchers,
+  onReceipt?: (rawTx: RawTx, header: RawHeader) => void,
 ): { trace: SyncTrace; block: SyncBlock; transaction: SyncTransaction }[] => {
   const out: {
     trace: SyncTrace;
@@ -195,6 +198,7 @@ const buildTraces = (
       const rawTx = txByIdx.get(txIndex);
       for (const { frame } of rankTraces(traces)) {
         if (!matchers.traceMatched(frame, bn)) continue;
+        if (rawTx) onReceipt?.(rawTx, tb.header); // FIX 4: receipt for the matched trace's tx
         out.push({
           trace: {
             trace: frame,
@@ -243,6 +247,15 @@ export function assembleRange(
   const syncTxs: SyncTransaction[] = [];
   const syncReceipts: SyncTransactionReceipt[] = [];
   const seenTx = new Set<string>();
+  // FIX 4: receipts are deduped by tx hash across ALL branches (log, tx-filter, trace/transfer) — a tx
+  // matched by more than one source must yield exactly one receipt row.
+  const seenReceipt = new Set<string>();
+  const pushReceipt = (raw: RawTx, hdr: RawHeader): void => {
+    if (!raw.hash || seenReceipt.has(raw.hash)) return;
+
+    seenReceipt.add(raw.hash);
+    syncReceipts.push(toSyncReceipt(raw, hdr));
+  };
 
   // INV-2 is enforced BY CONSTRUCTION here: every emitting branch below sits behind the single
   // `inRange` predicate (there is deliberately no redundant per-row assert — it could never fire),
@@ -258,7 +271,7 @@ export function assembleRange(
           if (tx.hash && !seenTx.has(tx.hash)) {
             seenTx.add(tx.hash);
             syncTxs.push(toSyncTransaction(tx, hdr));
-            if (spec.needReceipts) syncReceipts.push(toSyncReceipt(tx, hdr));
+            if (spec.needReceipts) pushReceipt(tx, hdr);
           }
       }
     }
@@ -285,13 +298,20 @@ export function assembleRange(
           if (raw.hash) seenTx.add(raw.hash);
           blocksByNumber.set(bn, toSyncBlockHeader(tb.header));
           syncTxs.push(tx);
-          if (spec.needReceipts)
-            syncReceipts.push(toSyncReceipt(raw, tb.header));
+          if (spec.needReceipts) pushReceipt(raw, tb.header);
         }
       }
 
+  // FIX 4: a trace/transfer filter with hasTransactionReceipt needs a receipt for every matched trace tx;
+  // those txs ride on the trace query (fields include RECEIPT_FIELDS when needReceipts) and are seen by no
+  // other branch, so emit them here (deduped via pushReceipt). Without this, buildEvents throws
+  // "Missing transaction receipt" on a legit trace-receipt config.
+  const needTraceReceipts =
+    spec.traceFilters.some((f) => f.hasTransactionReceipt) ||
+    spec.transferFilters.some((f) => f.hasTransactionReceipt);
+  const onTraceReceipt = needTraceReceipts ? pushReceipt : undefined;
   const traces = spec.needTraces
-    ? chunks.flatMap((cd) => buildTraces(cd, lo, hi, matchers))
+    ? chunks.flatMap((cd) => buildTraces(cd, lo, hi, matchers, onTraceReceipt))
     : [];
 
   // C9: highest block with data — a LOOP (Math.max(...spread) RangeErrors on ~100k+ keys) — INCLUDING

@@ -126,13 +126,42 @@ export const createPortalHistoricalSync = (
   const delegated = new Set<string>(); //        interval keys routed to RPC (finality gap)
   let chunkBlocks = cfg.chunkBlocks;
   let chunkSizeP: Promise<void> | undefined;
-  let discStartIdx: number | undefined; // factory-deploy chunk = discovery floor (C4: clamps DOWNWARD)
   let portalHead: number | undefined = cfg.finalizedHead;
   let startTime = 0;
 
+  // FIX 2 (INV-3/INV-15): the discovery floor is the earliest block ANY factory could create a child —
+  // `min` over the compiled spec's factories of `fromBlock ?? 0` (undefined ⇒ genesis). It is a property
+  // of the SPEC, not of the intervals ponder happens to still need, so it is pinned at CONSTRUCTION (and
+  // re-pinned per call, since chunkBlocks can scale) — see `pinDiscoveryFloor`. `discFloorBlock` is the
+  // downward-clamped floor BLOCK (grid-independent, so it survives a rescale); requiredFactoryIntervals /
+  // the interval start only REFINE it downward (C4/INV-4).
+  const specFloorBlock =
+    spec.factories.length > 0
+      ? Math.min(...spec.factories.map((f) => f.fromBlock ?? 0))
+      : undefined;
+  let discFloorBlock = specFloorBlock;
+
   const ikey = (i: Interval): string => `${i[0]}-${i[1]}`;
+  // FIX 1 (INV-9/INV-13): the data ceiling is the LOWER of the configured backfill end and the live Portal
+  // head — clamp BOTH. With every source bounded (`backfillEnd` defined) the old `backfillEnd ?? portalHead`
+  // ignored the head, so a frontier chunk's `desiredTo`/`coveredTo` extended PAST the head; the Portal
+  // 204s/truncates above its head, `coveredTo` recorded phantom coverage, and once the head advanced later
+  // intervals blind-hit the stale cache and were marked synced EMPTY (permanent silent gap). Clamping here
+  // flows to desiredTo, coveredTo, endHint and raEnd, and re-arms the INV-13 extend as the head advances.
   const dataEnd = (): number =>
-    spec.backfillEnd ?? portalHead ?? Number.POSITIVE_INFINITY;
+    Math.min(
+      spec.backfillEnd ?? Number.POSITIVE_INFINITY,
+      portalHead ?? Number.POSITIVE_INFINITY,
+    );
+
+  // FIX 2: snap `discFloorBlock` to the current grid and install it as the discovery floor. Idempotent —
+  // called at construction and again on every syncBlockRangeData before any fetch (chunkBlocks may have
+  // scaled since). No-op when there are no factories.
+  const pinDiscoveryFloor = (): void => {
+    if (discFloorBlock === undefined) return;
+
+    discovery.setFloor(idxOf(discFloorBlock, chunkBlocks) * chunkBlocks);
+  };
 
   // finality-gap fallback: Portal serves only finalized data, and its finalized head can (rarely) lag
   // Ponder's target. Any interval reaching past the head is delegated whole to the stock RPC sync.
@@ -163,7 +192,12 @@ export const createPortalHistoricalSync = (
 
       const h = await client.finalizedHead();
       if (h !== undefined) {
-        portalHead = h;
+        // FIX 5: a live probe drives chunk SCALING, but it must NOT overwrite an explicit
+        // PORTAL_FINALIZED_HEAD pin — the pin is authoritative for the finality/delegation decision, and
+        // clobbering it here (which happened whenever the pin was set but PORTAL_CHUNK_FIXED was not) let
+        // intervals above the pin but below the live head be served instead of delegated. Only adopt the
+        // probe as the head when there is no pin; scaling may still use the live `h`.
+        if (cfg.finalizedHead === undefined) portalHead = h;
         chunkBlocks = scaleChunkBlocks(cfg.chunkBlocks, h);
         log.debug({
           service: 'portal',
@@ -186,6 +220,17 @@ export const createPortalHistoricalSync = (
     token: RowToken,
   ): Promise<void> => {
     const neededMissing = new Set<string>();
+    // FIX 3: the needed-field crash check must consider ONLY the rows THIS call adds. On a frontier EXTEND
+    // `cd` already carries the base chunk's data; the tail streams the disjoint range (coveredTo, desiredTo]
+    // whose block numbers are all > coveredTo (new map keys), so a size delta captures exactly the tail's
+    // matched rows. Inspecting the whole accumulated `cd` (as before) let a data-bearing base + an
+    // event-less tail whose dataset lacks a needed column throw fatally → evict → crash-loop on retry.
+    const matchedSize = (): number =>
+      cd.logs.size +
+      cd.traceBlocks.size +
+      cd.txBlocks.size +
+      cd.blockHeaders.size;
+    const matchedBefore = matchedSize();
     const onRows = (n: number): void => {
       if (token.freed) return;
 
@@ -270,15 +315,10 @@ export const createPortalHistoricalSync = (
               });
           }
       }
-    // A NEEDED field the dataset lacked on THIS range: crash ONLY IF the chunk yielded MATCHED data —
-    // an event the indexer processes would be incomplete. Event-less (old/irrelevant) ranges proceed.
-    if (
-      neededMissing.size &&
-      (cd.logs.size ||
-        cd.traceBlocks.size ||
-        cd.txBlocks.size ||
-        cd.blockHeaders.size)
-    ) {
+    // A NEEDED field the dataset lacked on THIS range: crash ONLY IF this call added MATCHED data — an
+    // event the indexer processes would be incomplete. An event-less (old/irrelevant) range — or an
+    // event-less EXTEND tail over a data-bearing base (FIX 3) — proceeds.
+    if (neededMissing.size && matchedSize() > matchedBefore) {
       throw new Error(
         `Portal dataset for ${chain.name} is missing [${[...neededMissing].join(', ')}] on blocks [${from},${to}], which contain matched data your indexer needs — a Portal dataset-completeness gap. Failing fast rather than serving incomplete data; report the gap to SQD, or start your indexer past the affected range.`,
       );
@@ -296,19 +336,21 @@ export const createPortalHistoricalSync = (
       spec.backfillStart,
       dataEnd(),
     );
-    // INV-9: a Portal data request never targets past the known finalized head (an explicit backfill
-    // toBlock may exceed it by configuration — the delegation branch already guards served intervals).
+    // INV-9: a Portal data request never targets past the known finalized head. `dataEnd()` now clamps to
+    // the head (FIX 1), so `desiredTo <= portalHead` holds BY CONSTRUCTION whenever the head is known — the
+    // former `spec.backfillEnd !== undefined` escape (which let a bounded backfill over-reach) is gone and
+    // this assert is a strictly stronger tripwire. Intervals past the head are already delegated to RPC.
     invariant(
       'INV-9',
-      portalHead === undefined ||
-        desiredTo <= portalHead ||
-        spec.backfillEnd !== undefined,
+      portalHead === undefined || desiredTo <= portalHead,
       'data request targets past the Portal finalized head',
       () => ({ idx, desiredTo, portalHead }),
     );
+    // Discovery scans as far as the backfill will need in one pass; head-clamped (FIX 1) via dataEnd().
+    const de = dataEnd();
     const ensureOpts = {
       chunkBlocks,
-      endHint: spec.backfillEnd ?? portalHead ?? desiredTo,
+      endHint: Number.isFinite(de) ? de : desiredTo,
     };
 
     const cached = dataCache.get(idx);
@@ -334,11 +376,12 @@ export const createPortalHistoricalSync = (
       const extended = (async (): Promise<ChunkData> => {
         const cd = await prev;
         await discovery.ensure(desiredTo, ensureOpts); // discovery must reach the extended tail too
+        // FIX 2: the floor is pinned from the spec at construction, so a factory sync always has a floor —
+        // the former `discStartIdx === undefined` escape (which silently disabled this check on the very
+        // chunks that fetched before requiredFactoryIntervals arrived) is gone.
         invariant(
           'INV-3',
-          spec.factories.length === 0 ||
-            discStartIdx === undefined ||
-            discovery.through() >= desiredTo,
+          spec.factories.length === 0 || discovery.through() >= desiredTo,
           'chunk extend under a stale discovery watermark',
           () => ({ idx, through: discovery.through(), desiredTo }),
         );
@@ -360,11 +403,10 @@ export const createPortalHistoricalSync = (
     const token: RowToken = { rows: 0, freed: false };
     const p = (async (): Promise<ChunkData> => {
       await discovery.ensure(desiredTo, ensureOpts); // children ≤ this chunk are known (INV-3)
+      // FIX 2: floor pinned from the spec at construction ⇒ no `discStartIdx === undefined` escape (see extend).
       invariant(
         'INV-3',
-        spec.factories.length === 0 ||
-          discStartIdx === undefined ||
-          discovery.through() >= desiredTo,
+        spec.factories.length === 0 || discovery.through() >= desiredTo,
         'data fetch under a stale discovery watermark',
         () => ({ idx, through: discovery.through(), desiredTo }),
       );
@@ -401,6 +443,10 @@ export const createPortalHistoricalSync = (
       freeToken(entry.token);
     }
   };
+
+  // FIX 2: pin the discovery floor from the spec NOW, before the first fetch (re-pinned per call once
+  // chunkBlocks is finalized). A no-op when there are no factory sources.
+  pinDiscoveryFloor();
 
   return {
     async syncBlockRangeData(params) {
@@ -456,28 +502,25 @@ export const createPortalHistoricalSync = (
         chunkBlocks = capped;
         for (const entry of dataCache.values()) freeToken(entry.token);
         dataCache.clear();
-        discStartIdx = undefined;
-        discovery.reset();
+        discovery.reset(); // discFloorBlock (block-space) survives; re-pinned to the new grid just below
         log.debug({
           service: 'portal',
           msg: `Portal ${chain.name}: dense sources → chunkBlocks capped to ${chunkBlocks} (grid reset)`,
         });
       }
 
-      // pin the discovery floor at the factory's real start (NOT block 0). C4: clamp DOWNWARD only.
-      if (requiredFactoryIntervals.length > 0) {
-        const floor = idxOf(
-          Math.min(
-            ...requiredFactoryIntervals
-              .map((r) => r.interval[0])
-              .concat(interval[0]),
-          ),
-          chunkBlocks,
+      // FIX 2: (re-)pin the discovery floor BEFORE any fetch. Base floor = the spec's earliest factory
+      // start (`discFloorBlock`, seeded at construction); requiredFactoryIntervals and the interval start
+      // only REFINE it downward (C4/INV-4). Applied on EVERY call (not just when ponder hands over
+      // requiredFactoryIntervals) so an early spanning-chunk fetch never runs without discovery.
+      if (discFloorBlock !== undefined) {
+        discFloorBlock = Math.min(
+          discFloorBlock,
+          interval[0],
+          ...requiredFactoryIntervals.map((r) => r.interval[0]),
         );
-        discStartIdx =
-          discStartIdx === undefined ? floor : Math.min(discStartIdx, floor);
-        discovery.setFloor(discStartIdx * chunkBlocks);
       }
+      pinDiscoveryFloor();
 
       const startIdx = idxOf(interval[0], chunkBlocks);
       const endIdx = idxOf(interval[1], chunkBlocks);
