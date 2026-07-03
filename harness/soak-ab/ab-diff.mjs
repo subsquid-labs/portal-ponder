@@ -148,6 +148,31 @@ export function extractCheckpointBlock(raw) {
   return String(BigInt(seg));
 }
 
+// Decide whether the `_ponder_checkpoint` query yielded a REPORTABLE progress value, given the row
+// COUNT for the chain and the extracted max block. The count is what distinguishes the three states a
+// bare `coalesce(max(...),0)` conflates:
+//   • rowCount === 0 → NO checkpoint row for this chain → not usable; the caller falls back to the
+//     sync-store block max (an older store, or the chain never committed a checkpoint).
+//   • rowCount > 0 → a REAL committed checkpoint exists → usable, and value = maxBlock EVEN IF 0. A
+//     valid checkpoint whose blockNumber field is exactly 0 is a real, reportable progress value —
+//     the strongest form of the rewind this guard exists to catch (a resume that rewound the
+//     committed checkpoint to block 0 while the sync store still holds a high block max). Reporting 0
+//     lets monotonicity FAIL it against prior real progress; falling back to the (still-high) block
+//     max would silently PASS that rewind. So a zero max with rows present is usable, NOT a fallback.
+// Pure + exported so the rows-present-with-zero-max case is mutation-verified directly.
+export function checkpointDecision(rowCount, maxBlock) {
+  if (!(Number.isFinite(rowCount) && rowCount > 0)) {
+    return { usable: false, value: null };
+  }
+
+  const value = Number(maxBlock);
+
+  return {
+    usable: Number.isFinite(value),
+    value: Number.isFinite(value) ? value : null,
+  };
+}
+
 // A schema name goes verbatim into `"<schema>"._ponder_checkpoint` — reject anything that is not a
 // bare SQL identifier so it can never carry an injection payload. Empty ⇒ null (caller emits the
 // unqualified table name, the legacy default-search_path behavior). Pure + exported.
@@ -331,25 +356,46 @@ async function overlapBound(url, chain) {
 async function checkpointProgress(url, chain, schema) {
   // `_ponder_checkpoint` lives in Soak B's APP schema (ponder start --schema <schema>), which is NOT
   // on psql's default search_path — so we QUALIFY the table with the (sanitized) schema. Empty schema
-  // ⇒ unqualified (legacy default-search_path stores). We select the blockNumber SUBSTRING of the
-  // encoded checkpoint (position CHECKPOINT_BLOCK_SQL_POS, length CHECKPOINT_BLOCK_LEN) cast to numeric
-  // — a Number-safe height on the SAME scale as the overlapBound fallback, so the monotonicity series
-  // stays coherent even when a run flaps between the two sources. On ANY error (missing table/column —
-  // an older store, or the schema truly absent) we fall back to the sync-store block max rather than
-  // disabling the guard.
+  // ⇒ unqualified (legacy default-search_path stores). One query returns TWO values: the ROW COUNT for
+  // this chain and the blockNumber SUBSTRING of the encoded checkpoint (position CHECKPOINT_BLOCK_SQL_POS,
+  // length CHECKPOINT_BLOCK_LEN) cast to numeric — a Number-safe height on the SAME scale as the
+  // overlapBound fallback, so the monotonicity series stays coherent even when a run flaps between the
+  // two sources.
+  //
+  // Why BOTH values: a bare `coalesce(max(...),0)` cannot tell a chain with NO checkpoint row (max is
+  // NULL → 0) apart from a VALID checkpoint whose blockNumber field is exactly 0 (a resume that rewound
+  // the committed checkpoint to block 0 while the sync store still holds a high block max). The zero-max
+  // rewind is the STRONGEST form of the rewind this guard exists to catch — the row count distinguishes
+  // it (checkpointDecision): rows present ⇒ report the value even if 0, so monotonicity FAILs it; zero
+  // rows ⇒ fall back.
   const table = schema
     ? `"${schema}"._ponder_checkpoint`
     : '_ponder_checkpoint';
   try {
-    const v = await psqlScalar(
+    let row = null;
+    for await (const r of psqlRows(
       url,
-      `select coalesce(max(substring(latest_checkpoint from ${CHECKPOINT_BLOCK_SQL_POS} for ${CHECKPOINT_BLOCK_LEN})::numeric),0)::text ` +
+      `select count(*)::text, ` +
+        `coalesce(max(substring(latest_checkpoint from ${CHECKPOINT_BLOCK_SQL_POS} for ${CHECKPOINT_BLOCK_LEN})::numeric),0)::text ` +
         `from ${table} where chain_id=${chain}`,
-    );
-    const n = Number(v ?? 0);
-    if (Number.isFinite(n) && n > 0) {
-      return n;
+    )) {
+      row = r;
+      break;
     }
+
+    const rowCount = Number(row?.[0] ?? 0);
+    const maxBlock = row?.[1] ?? '0';
+    const decision = checkpointDecision(rowCount, maxBlock);
+    if (decision.usable) {
+      return decision.value;
+    }
+    // rows === 0 for this chain: NO committed checkpoint (older store, or the chain never committed).
+    // We fall back to the sync-store block max below rather than disabling the guard. CANDID RESIDUAL:
+    // an APP-schema FULL RESET that leaves ZERO checkpoint rows (e.g. the table truncated/re-created)
+    // is INDISTINGUISHABLE here from a store that never had a checkpoint — both read rows===0, so we
+    // fall back to the (still-high) sync-store block max and monotonicity can PASS silently, masking
+    // that rewind. This is the guard's remaining blind spot; detecting a zero-ROW reset needs
+    // cross-run source tracking (was there a checkpoint row last run that is gone now?) — out of scope.
   } catch {
     // _ponder_checkpoint not resolvable (older store / different schema) — fall through to the
     // sync-store block max below rather than disabling the guard.

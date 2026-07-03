@@ -6,6 +6,7 @@ import { test } from 'node:test';
 import {
   CHECKPOINT_BLOCK_LEN,
   CHECKPOINT_BLOCK_OFFSET_0,
+  checkpointDecision,
   checkpointMonotonic,
   chunk,
   classifyTxDiff,
@@ -313,6 +314,53 @@ test('extractCheckpointBlock: reads the blockNumber field of a real 0.16.6 check
   assert.equal(extractCheckpointBlock('too-short'), null);
   assert.equal(extractCheckpointBlock(null), null);
   assert.equal(extractCheckpointBlock(undefined), null);
+});
+
+// The checkpoint query returns a ROW COUNT alongside the max block so checkpointDecision can tell a
+// chain with NO checkpoint row (rows===0 → fall back) apart from a VALID checkpoint whose blockNumber
+// field is exactly 0 (rows>0 → REPORT 0). The rows-present-zero-max case is the strongest form of the
+// rewind the guard exists to catch: a resume that rewound the committed checkpoint to block 0 while
+// the sync store still holds a high block max. Reporting 0 lets monotonicity FAIL it against prior
+// real progress; a fallback to the block max would silently PASS the rewind.
+// MUTATION: gate the value on `maxBlock > 0` (the old `n > 0` behavior) instead of on row presence
+// → the rows-present-zero-max case reads not-usable and the guard falls back, silently passing the
+// zero-checkpoint rewind. The `usable === true, value === 0` assertion below then fails.
+test('checkpointDecision: rows present with a ZERO max block is usable, value 0 (a real committed rewind, not a fallback)', () => {
+  // (iii) — the bug: a VALID checkpoint row whose blockNumber is exactly 0. Rows are present, so this
+  // is REPORTABLE progress of 0, NOT a reason to fall back. Monotonicity will fail 0 against any prior
+  // real progress — which is the whole point of the guard.
+  const zeroWithRows = checkpointDecision(1, '0');
+  assert.equal(
+    zeroWithRows.usable,
+    true,
+    'a committed checkpoint row is usable even at block 0',
+  );
+  assert.equal(
+    zeroWithRows.value,
+    0,
+    'the reportable progress value is 0, not a fallback',
+  );
+
+  // rows present with a real height → usable, that height
+  const real = checkpointDecision(3, '12345678');
+  assert.equal(real.usable, true);
+  assert.equal(real.value, 12_345_678);
+
+  // (ii) — NO rows for the chain (max NULL → coalesce 0 in SQL, count 0 here) → NOT usable; the caller
+  // falls back to the sync-store block max. This is what stops the zero-max fallback conflation.
+  const noRows = checkpointDecision(0, '0');
+  assert.equal(
+    noRows.usable,
+    false,
+    'zero rows → fall back to the sync-store block max',
+  );
+  assert.equal(noRows.value, null);
+
+  // a NaN / unparseable row count is treated as not-usable (fall back), never as a phantom progress
+  assert.equal(checkpointDecision(Number.NaN, '5').usable, false);
+
+  // a non-numeric max with rows present cannot yield a coherent progress value → not usable
+  assert.equal(checkpointDecision(1, 'not-a-number').usable, false);
 });
 
 // AB_SCHEMA_B is interpolated verbatim into `"<schema>"._ponder_checkpoint`, so it MUST be a bare SQL
