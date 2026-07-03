@@ -107,6 +107,17 @@ satisfy the ≥200-kills acceptance.
 `check-intervals.mjs` (every `ponder_sync.intervals` fragment must have coalesced into a single range
 covering `[from,to]` — a Postgres multirange with >1 range means a gap).
 
+**Soundness guards.** `kill-loop.sh` FAILs if it completes with `kills < MIN_KILLS` (default 1) — a
+run that finished without being killed proves nothing about resume. It writes a `<CHAOS_DB>.meta.json`
+(app · range · portal · tarball basename · chain · factory · scenario · kills). `verify-resume.sh`
+writes the same metadata for the baseline it builds and, when REUSING an existing baseline, refuses it
+unless its metadata matches the chaos run's app/range/portal/tarball — a byte-diff against a stale or
+mismatched baseline would be a silent false pass. The fault `proxy.mjs` deep-merges scenario overrides
+(a partial `{"faults":{"pReset":1}}` no longer NaNs-out the other probabilities) and, for the
+reset/NDJSON cut faults, clamps the cut point into the observed body so the fault always fires; if the
+upstream body is empty it counts a `missedReset`/`missedNdjson` in `/__stats` so chaos acceptance can
+require every configured fault actually fired (`missed==0`).
+
 ## Soak B + A/B
 
 ```bash
@@ -121,10 +132,12 @@ CHAINS=1,8453,42161 CUTOVER=<block> STATUS_FILE=soak-ab-status.json \
 ```
 
 `ab-diff.mjs` uses two `psql` processes (no npm driver) and streams each side ordered, constant
-memory. It asserts: **logs** strict row-set + field identity (PRIMARY, must be 0); **blocks** field
-identity (total_difficulty excluded); **transactions** are EXACTLY the expected class — B may be
-missing parent txs for realtime-ingested spans, each referenced by an A-side log; anything else FAILS;
-per-1000-block checkpoint hashes match; `_ponder_checkpoint` is monotonic. It writes
+memory. It asserts: **logs** strict row-set + field identity (PRIMARY, must be 0); **blocks** STRICT
+row-set + field identity (total_difficulty excluded) — in the finalized overlap a one-sided block is a
+real gap and FAILS; **transactions** are EXACTLY the expected class — B may be missing parent txs for
+realtime-ingested spans, each referenced by an A-side log, and any tx present on BOTH sides must be
+byte-identical (full-row md5); anything else FAILS; per-1000-block checkpoint hashes match;
+`_ponder_checkpoint` is monotonic. It writes
 `soak-ab-status.json` (`verdict`, `restartCount`, `lastRestartAt`, `restartsLastHour`, `alerts`,
 `diffClasses`, `lagA`/`lagB`, `counters`) for the hourly monitor.
 

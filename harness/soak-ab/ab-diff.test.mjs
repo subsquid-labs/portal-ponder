@@ -34,6 +34,21 @@ test('classifyTxDiff: perfect identity (no diff at all) → PASS', () => {
   const r = classifyTxDiff([], [], new Set());
   assert.equal(r.fail, false);
   assert.equal(r.expectedMissing, 0);
+  assert.equal(r.sharedMismatch, 0);
+});
+
+test('classifyTxDiff: a SHARED tx whose full-row fields diverge → FAIL', () => {
+  // both stores have the tx (no onlyA/onlyB), but its normalized full-row hash differs on one field
+  // — the same finalized transaction is NOT byte-identical, which must FAIL. The old code selected
+  // only "hash", so a shared tx with a divergent field silently passed.
+  const r = classifyTxDiff([], [], new Set(), 1);
+  assert.equal(r.fail, true);
+  assert.equal(r.sharedMismatch, 1);
+  assert.equal(r.class, 'UNEXPECTED');
+
+  // zero shared mismatches with an otherwise-clean diff still passes (the expected realtime gap)
+  const ok = classifyTxDiff(['0xaa'], [], new Set(['0xaa']), 0);
+  assert.equal(ok.fail, false);
 });
 
 test('checkpointMonotonic: non-decreasing passes, a regression fails at the point', () => {

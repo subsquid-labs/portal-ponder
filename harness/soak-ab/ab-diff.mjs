@@ -1,7 +1,9 @@
 // ab-diff.mjs — hourly finalized-overlap differ for Soak A (RPC realtime) vs Soak B (Portal-native
 // realtime, PORTAL_REALTIME=stream). Over [cutover, min(finalizedA, finalizedB) - margin] per chain:
 //   • logs         : strict row-set + field identity (PRIMARY — must be 0)
-//   • blocks       : field identity, total_difficulty excluded
+//   • blocks       : STRICT row-set + field identity (total_difficulty excluded) — in the finalized
+//     overlap a one-sided block is a real gap, not a tolerated inert block, so it FAILS
+//   • transactions (shared): full-row identity — a tx in BOTH stores must be byte-identical
 //   • transactions : asserted to be EXACTLY the expected class — B may be MISSING parent txs for
 //     realtime-ingested spans (the verified stream wire gap), and every such tx must be referenced
 //     by an A-side log. Any B-extra tx, or an A-only tx no log references, is a FAIL.
@@ -20,12 +22,15 @@ import { streamingDiff } from '../validate/diff-batched.mjs';
 // ── pure, unit-tested core ─────────────────────────────────────────────────────────────────────
 
 // The expected-class assertion for the transactions table. `onlyA` = txs A has but B lacks; `onlyB`
-// = txs B has but A lacks; `referenced` = the subset of onlyA that an A-side log points at.
-export function classifyTxDiff(onlyA, onlyB, referenced) {
+// = txs B has but A lacks; `referenced` = the subset of onlyA that an A-side log points at;
+// `sharedMismatch` = txs present on BOTH sides whose full-row hash diverges (default 0). A tx that
+// EXISTS in both A and B must be byte-identical — the same finalized transaction indexed two ways.
+export function classifyTxDiff(onlyA, onlyB, referenced, sharedMismatch = 0) {
   const ref = referenced instanceof Set ? referenced : new Set(referenced);
   const unexpectedB = [...onlyB];
   const unreferencedA = onlyA.filter((h) => !ref.has(h));
-  const fail = unexpectedB.length > 0 || unreferencedA.length > 0;
+  const fail =
+    unexpectedB.length > 0 || unreferencedA.length > 0 || sharedMismatch > 0;
 
   return {
     fail,
@@ -33,6 +38,7 @@ export function classifyTxDiff(onlyA, onlyB, referenced) {
     expectedMissing: onlyA.length,
     unexpectedB,
     unreferencedA,
+    sharedMismatch,
   };
 }
 
@@ -242,6 +248,11 @@ async function diffLogs(urlA, urlB, chain, lo, hi) {
 }
 
 async function diffBlocks(urlA, urlB, chain, lo, hi) {
+  // total_difficulty is excluded in SQL (meaningless post-Merge, RPC-dependent). In the FINALIZED
+  // overlap [cutover, min(finalizedA,finalizedB)-margin] both realtime paths must have every block:
+  // a one-sided block here is a real gap (a block one store missed), so this is STRICT, not the
+  // 'blocks' tolerance harness/diff/diff.mjs uses for the stock RPC path's inert event-less blocks
+  // — those never appear in the realtime A/B stores, which only persist event-bearing blocks.
   const sql = () =>
     `select number, md5((to_jsonb(t)-'total_difficulty')::text) from ponder_sync.blocks t ` +
     `where chain_id=${chain} and number between ${lo} and ${hi} order by number`;
@@ -251,16 +262,25 @@ async function diffBlocks(urlA, urlB, chain, lo, hi) {
     hashRowsIter(urlB, sql(), [0]),
     {
       keyFn,
-      mode: 'blocks',
+      mode: 'strict',
     },
   );
 }
 
-// tx class: merge tx-hash streams to onlyA/onlyB, then ask A which onlyA hashes a log references.
+// tx class: merge the two tx streams (each row = [hash, md5(full row)]) to onlyA/onlyB AND to a
+// SHARED set whose row hashes must be byte-identical, then ask A which onlyA hashes a log references.
+// A tx present on both sides is the SAME finalized transaction indexed two ways — every field must
+// match. The full-row md5 mirrors the strict transactions identity diff-batched.mjs already asserts:
+// no column is excluded (unlike blocks' total_difficulty, no transactions column legitimately differs
+// between the RPC-sourced A store and the Portal-sourced B store — both write the same ponder_sync
+// schema from the same finalized chain data).
 async function diffTx(urlA, urlB, chain, lo, hi) {
-  const txSql = `select "hash" from ponder_sync.transactions where chain_id=${chain} and block_number between ${lo} and ${hi} order by "hash"`;
+  const txSql =
+    `select "hash", md5(to_jsonb(t)::text) from ponder_sync.transactions t ` +
+    `where chain_id=${chain} and block_number between ${lo} and ${hi} order by "hash"`;
   const onlyA = [];
   const onlyB = [];
+  let sharedMismatch = 0;
   const ia = psqlRows(urlA, txSql)[Symbol.asyncIterator]();
   const ib = psqlRows(urlB, txSql)[Symbol.asyncIterator]();
   let a = await ia.next();
@@ -275,6 +295,11 @@ async function diffTx(urlA, urlB, chain, lo, hi) {
       onlyB.push(hb);
       b = await ib.next();
     } else {
+      // shared tx (same hash on both sides) — the full-row md5 must be identical.
+      if (a.value[1] !== b.value[1]) {
+        sharedMismatch += 1;
+      }
+
       a = await ia.next();
       b = await ib.next();
     }
@@ -289,7 +314,7 @@ async function diffTx(urlA, urlB, chain, lo, hi) {
     );
   }
 
-  return classifyTxDiff(onlyA, onlyB, referenced);
+  return classifyTxDiff(onlyA, onlyB, referenced, sharedMismatch);
 }
 
 async function bucketHashes(url, chain, lo, hi, bucket) {
