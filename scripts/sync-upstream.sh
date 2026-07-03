@@ -23,8 +23,11 @@ rm -rf "$WORK"; git clone --quiet --depth 1 --branch "ponder@$VER" https://githu
 CORE="$WORK/packages/core"
 SYNC="$CORE/src/sync-historical"
 echo "▶ applying Portal layer"
-cp "$ROOT/portal/portal.ts" "$ROOT/portal/portal-transform.ts" "$ROOT/portal/realtime.ts" "$ROOT/portal/portal-realtime.ts" "$ROOT/portal/portal-realtime-wire.ts" "$SYNC/"
-cp "$ROOT/portal/portal-transform.test.ts" "$ROOT/portal/portal.test.ts" "$ROOT/portal/realtime.test.ts" "$ROOT/portal/portal-realtime.test.ts" "$ROOT/portal/portal-realtime-wire.test.ts" "$SYNC/" 2>/dev/null || true
+# Copy the whole Portal layer by GLOB (source + tests together) so a newly added portal-*.ts /
+# realtime-*.ts module can never be silently missed. `config.ts` (deleted) and `vite.portal.config.ts`
+# are intentionally excluded by the prefix. The vite include globs (portal*.test.ts, realtime*.test.ts)
+# already pick up any new test file, so they need no change.
+cp "$ROOT"/portal/portal*.ts "$ROOT"/portal/realtime*.ts "$SYNC/"
 mkdir -p "$SYNC/__fixtures__"; cp "$ROOT/portal/__fixtures__/"*.json "$SYNC/__fixtures__/"
 cp "$ROOT/portal/vite.portal.config.ts" "$CORE/"
 ( cd "$WORK" && git apply --verbose "$WIRING" )
@@ -51,6 +54,14 @@ fs.writeFileSync(pkgPath, JSON.stringify(pkg,null,2)+'\n'); console.log('  rewro
 "
 
 if [ "${2:-}" = "--test" ]; then
+  # `fast-check` (property tests) is a DEV-ONLY dep of the clone — never a runtime dep of the published
+  # package. We provision it straight into the core's node_modules rather than adding it to package.json,
+  # because renaming the core to @subsquid/ponder orphans sibling workspace packages (e.g. benchmark's
+  # `ponder@workspace:*`), so a lockfile re-resolve (which a new package.json dep would force) fails.
+  echo "▶ provisioning fast-check (dev-only, for the property tests)"
+  FCDIR="$WORK/.fastcheck"; mkdir -p "$FCDIR"
+  ( cd "$FCDIR" && npm install --no-audit --no-fund --silent fast-check@^3 )
+  cp -R "$FCDIR/node_modules/fast-check" "$FCDIR/node_modules/pure-rand" "$CORE/node_modules/"
   echo "▶ running Portal-layer tests"
   ( cd "$CORE" && pnpm exec vitest run --config vite.portal.config.ts )
 fi
