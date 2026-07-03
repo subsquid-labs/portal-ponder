@@ -1,7 +1,10 @@
 #!/usr/bin/env bash
 # Build @subsquid/ponder@<ver> = ponder@<ver> + the Portal layer (portal/).
 #
-#   scripts/sync-upstream.sh <ponder-version> [--test]
+#   scripts/sync-upstream.sh <ponder-version> [--test | --coverage]
+#
+# --test runs the Portal-layer vitest suite; --coverage runs it with v8 coverage scoped to the
+# Portal source (installs a matching provider, writes portal-coverage/coverage-summary.json).
 #
 # The fork is GENERATED, not hand-maintained: we clone ponder at the version tag (the
 # monorepo carries the build tooling the npm tarball omits), drop in the 2 Portal modules,
@@ -9,7 +12,7 @@
 # new ponder version = author one wiring patch + run this. See PUBLISHING.md + versions.json.
 set -euo pipefail
 
-VER="${1:?usage: sync-upstream.sh <ponder-version> [--test]}"
+VER="${1:?usage: sync-upstream.sh <ponder-version> [--test | --coverage]}"
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 WORK="${SYNC_WORKDIR:-/tmp/sqd-ponder-fork}/$VER"
 WIRING="$ROOT/portal/wiring/$VER.patch"
@@ -53,6 +56,22 @@ fs.writeFileSync(pkgPath, JSON.stringify(pkg,null,2)+'\n'); console.log('  rewro
 if [ "${2:-}" = "--test" ]; then
   echo "▶ running Portal-layer tests"
   ( cd "$CORE" && pnpm exec vitest run --config vite.portal.config.ts )
+fi
+
+# --coverage: run the same suite with v8 coverage scoped to the Portal source (see the `coverage`
+# block in vite.portal.config.ts). The provider version must EXACTLY match the installed vitest
+# (vitest errors on a mismatch), so we resolve the concrete installed version from node_modules
+# rather than the package.json spec (which may be a range like ^2.1.9 that floats to a newer patch).
+# The renamed core breaks a workspace-wide `pnpm add` (benchmark still deps ponder@workspace:*), so
+# install it standalone with --ignore-workspace. Writes portal-coverage/coverage-summary.json under $CORE.
+if [ "${2:-}" = "--coverage" ]; then
+  VITEST_VER="$(node -e "console.log(require('$CORE/node_modules/vitest/package.json').version)")"
+  echo "▶ installing @vitest/coverage-v8@$VITEST_VER (matching installed vitest)"
+  ( cd "$CORE" && $PNPM add -D "@vitest/coverage-v8@$VITEST_VER" --ignore-workspace )
+
+  echo "▶ running Portal-layer tests with coverage"
+  ( cd "$CORE" && pnpm exec vitest run --config vite.portal.config.ts --coverage )
+  echo "✓ coverage summary → $CORE/portal-coverage/coverage-summary.json"
 fi
 
 echo "✓ built @subsquid/ponder@$VER-sqd.$REV → $CORE"
