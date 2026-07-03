@@ -292,13 +292,22 @@ export function assembleRange(
       for (const [bn, tb] of cd.txBlocks) {
         if (!inRange(bn)) continue;
         for (const raw of tb.txs) {
-          if (raw.hash && seenTx.has(raw.hash)) continue;
           const tx = toSyncTransaction(raw, tb.header);
           if (!matchers.txFilterMatched(tx, bn)) continue;
+          // EVERY tx-filter-matched tx gets a receipt, independent of hasTransactionReceipt.
+          // Hardening, not a reachable bug today — upstream guarantees hasTransactionReceipt: true
+          // on every tx filter (literal type + build), so needReceipts covered this. But ponder's
+          // buildEvents reads `transactionReceipt.status` (positional cursor, NO identity check) on
+          // every transaction event to apply `includeReverted`, and the RPC path collects these
+          // receipts unconditionally; pushing unconditionally removes the dependence on that
+          // upstream invariant. Pushed BEFORE the seenTx skip: a tx also matched by a log filter got
+          // its tx row from the log branch, whose raw row lacks receipt columns unless needReceipts —
+          // THIS branch's raw row always carries them (txQuery projects RECEIPT_FIELDS).
+          pushReceipt(raw, tb.header);
+          if (raw.hash && seenTx.has(raw.hash)) continue;
           if (raw.hash) seenTx.add(raw.hash);
           blocksByNumber.set(bn, toSyncBlockHeader(tb.header));
           syncTxs.push(tx);
-          if (spec.needReceipts) pushReceipt(raw, tb.header);
         }
       }
 

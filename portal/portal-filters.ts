@@ -428,9 +428,22 @@ export function compileFetchSpec(
       if (!needTxFilter) return undefined;
       const transactions = txRequestsFor(transactionFilters, childAddresses);
       if (transactions.length === 0) return undefined;
+      // Receipt columns ALWAYS ride the tx query, regardless of hasTransactionReceipt — hardening,
+      // not a reachable bug today: upstream types TransactionFilter.hasTransactionReceipt as the
+      // literal `true` and builds every account tx filter with it set, so needReceipts already
+      // projected these columns whenever a tx filter existed. But ponder's buildEvents dereferences
+      // `transactionReceipt.status` (a positional cursor over the stored receipts, NO identity
+      // check) on EVERY transaction event to apply `includeReverted`, and the RPC path collects
+      // these receipts unconditionally — if upstream ever relaxed that literal-true invariant, a tx
+      // row without its receipt row would crash buildEvents (no receipts at all) or silently
+      // mis-match a neighbor's receipt (sparse receipts). Projecting unconditionally makes the tx
+      // query correct on its own, without depending on that upstream invariant.
       return {
         type: 'evm',
-        fields: { block: BLOCK_FIELDS, transaction: txFields() },
+        fields: {
+          block: BLOCK_FIELDS,
+          transaction: { ...TX_FIELDS, ...RECEIPT_FIELDS },
+        },
         transactions,
       };
     },
