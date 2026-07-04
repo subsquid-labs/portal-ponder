@@ -739,9 +739,12 @@ test('CLI derive-database-url: a single-quoted source DATABASE_URL also derives 
   assert.equal(out.trim(), 'postgresql://u:p@h/euler_rt_b');
 });
 
-// F5 (survivor S6): the source-scan documents "last one wins" (shell env semantics) but nothing pinned
-// it — a first-wins mutation survived. Two DATABASE_URL lines: the LAST must be the one derived from.
-test('CLI derive-database-url: with TWO DATABASE_URL lines the LAST one wins (F5)', () => {
+// F5 (survivor S6): the `derive-database-url` extraction loop in runCli scans the source env and lets
+// the LAST DATABASE_URL line win (mirroring shell env semantics), but nothing pinned THAT loop — a
+// first-wins mutation of it survived. (This is a SEPARATE loop from filterCarriedEnv, whose own
+// last-assignment-wins dedupe is pinned independently by "filterCarriedEnv: last assignment wins …"
+// above.) Two DATABASE_URL lines: the LAST must be the one the CLI derives from.
+test('CLI derive-database-url: with TWO DATABASE_URL lines the derive loop takes the LAST (F5)', () => {
   const dir = mkdtempSync(join(tmpdir(), 'deploy-helpers-'));
   const envFile = join(dir, 'src.env');
   writeFileSync(

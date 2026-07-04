@@ -29,6 +29,8 @@ import {
   classifyBucketMismatches,
   classifyOnlyBDiff,
   classifyOnlyBRow,
+  classifyOnlyBTx,
+  classifyOnlyBTxDiff,
   classifySharedTx,
   classifyTxDiff,
   collectOnlyB,
@@ -50,6 +52,7 @@ import {
   sanitizeSchemaIdent,
   stagnationAlerts,
   stagnationDecision,
+  stripTxOnlyBRows,
   TOLERATED_CLASSES,
   TOLERATED_ONLYB_CLASSES,
   TOLERATED_SAMPLE_SIZE,
@@ -1178,6 +1181,166 @@ test('classifyOnlyBDiff: no divergence at all → PASS (fail=false, zero tolerat
   assert.equal(r.toleratedOnlyB.count, 0);
 });
 
+// ── classifyOnlyBTx — the issue #36 TRANSACTION facet (wholly-A-absent-block predicate) ──────────────
+//
+// The 12:22Z hourly cross-validation proved onlyB txs are the SAME leg-A loss the logs/blocks class
+// tolerates, one table deeper: 30 B-only chain-1 txs, ALL in blocks WHOLLY ABSENT from leg A. The tx
+// predicate is STRICTER than classifyOnlyBRow by ONE extra conjunct — the tx's block must be in the
+// wholly-A-absent set (the blocks-onlyB set) — so a tx-level-only loss (leg A HAS the block, misses just
+// the tx) is a genuinely NEW divergence class and stays a HARD FAIL.
+
+test('classifyOnlyBTx: a tolerated case — onlyB tx whose block is WHOLLY absent from A, at/above floor → tolerated', () => {
+  const absent = new Set([ISSUE_36_FLOOR_1, ISSUE_36_FLOOR_1 + 5]);
+  assert.equal(
+    classifyOnlyBTx({ blockNumber: ISSUE_36_FLOOR_1 }, 1, absent),
+    'tolerated',
+  );
+  assert.equal(
+    classifyOnlyBTx({ blockNumber: ISSUE_36_FLOOR_1 + 5 }, 1, absent),
+    'tolerated',
+  );
+});
+
+test('classifyOnlyBTx: the STRICTNESS case — onlyB tx whose block EXISTS in A (not in the absent set) → mismatch (HARD FAIL)', () => {
+  // The extra conjunct over classifyOnlyBRow: the block is at/above the floor AND would be tolerated as a
+  // bare row, but it is NOT wholly A-absent (absent set does not contain it) → a tx-level-only loss → the
+  // NEW divergence class that MUST keep failing loudly. MUTATION (loosen the predicate to tolerate ALL
+  // onlyB txs / drop the absent-set gate) → this assertion fails.
+  const absent = new Set([ISSUE_36_FLOOR_1 + 999]); // some OTHER block is A-absent, not this one
+  assert.equal(
+    classifyOnlyBTx({ blockNumber: ISSUE_36_FLOOR_1 }, 1, absent),
+    'mismatch',
+  );
+  // and with an empty absent set (no block wholly absent) NOTHING is tolerated, even at/above floor.
+  assert.equal(
+    classifyOnlyBTx({ blockNumber: ISSUE_36_FLOOR_1 + 100 }, 1, new Set()),
+    'mismatch',
+  );
+});
+
+test('classifyOnlyBTx: a wholly-A-absent block BELOW the floor → mismatch (the floor conjunct still bites)', () => {
+  // Below the floor leg A came from the complete-by-construction historical backfill, so even a
+  // wholly-absent block there is a real gap, never this class. Reuses classifyOnlyBRow's floor logic.
+  const absent = new Set([ISSUE_36_FLOOR_1 - 1]);
+  assert.equal(
+    classifyOnlyBTx({ blockNumber: ISSUE_36_FLOOR_1 - 1 }, 1, absent),
+    'mismatch',
+  );
+});
+
+test('classifyOnlyBTx: an unconfigured chain (no floor) → mismatch even for a wholly-absent block (the #30 missing-floor semantic)', () => {
+  const absent = new Set([ISSUE_36_FLOOR_1]);
+  assert.equal(
+    classifyOnlyBTx({ blockNumber: ISSUE_36_FLOOR_1 }, 8453, absent),
+    'mismatch',
+  );
+});
+
+test('classifyOnlyBTx: a deleted/absent config entry → mismatch for all (full strictness restored)', () => {
+  const absent = new Set([ISSUE_36_FLOOR_1]);
+  assert.equal(
+    classifyOnlyBTx({ blockNumber: ISSUE_36_FLOOR_1 }, 1, absent, {}),
+    'mismatch',
+  );
+});
+
+test('classifyOnlyBTx: accepts an array absentBlocks too (coerced to a Set)', () => {
+  assert.equal(
+    classifyOnlyBTx({ blockNumber: ISSUE_36_FLOOR_1 }, 1, [ISSUE_36_FLOOR_1]),
+    'tolerated',
+  );
+});
+
+// ── classifyOnlyBTxDiff — folding the tolerance into a classifyTxDiff result ─────────────────────────
+
+test('classifyOnlyBTxDiff: a tolerated onlyB tx (wholly-A-absent block) is removed from unexpectedB and folded into toleratedIssue36 → no FAIL', () => {
+  // classifyTxDiff over one onlyB tx (bare hash) reads UNEXPECTED/fail. Once we know its block is wholly
+  // A-absent (in the absent set), the fold tolerates it: unexpectedB empties, fail flips false, and the
+  // tolerated count surfaces. MUTATION (drop the tolerance entirely) → this fails.
+  const base = classifyTxDiff([], ['0xtol'], new Set());
+  assert.equal(base.fail, true, 'pre-tolerance: an onlyB tx fails');
+  const rows = [{ hash: '0xtol', blockNumber: ISSUE_36_FLOOR_1 }];
+  const absent = new Set([ISSUE_36_FLOOR_1]);
+  const r = classifyOnlyBTxDiff(base, rows, 1, absent);
+  assert.equal(
+    r.fail,
+    false,
+    'a wholly-A-absent-block onlyB tx no longer fails',
+  );
+  assert.equal(r.class, 'realtime-parent-tx-gap');
+  assert.deepEqual(r.unexpectedB, []);
+  assert.equal(r.toleratedIssue36.count, 1);
+  assert.deepEqual(r.toleratedIssue36.perChain, { 1: 1 });
+});
+
+test('classifyOnlyBTxDiff: the STRICTNESS case — an onlyB tx whose block EXISTS in A stays in unexpectedB → still UNEXPECTED FAIL', () => {
+  // The tx-level-only-loss shape: block present in A (not in the absent set), tx onlyB. This is a NEW
+  // divergence class and MUST keep failing. MUTATION (tolerate ALL onlyB txs regardless of block
+  // absence) → this assertion fails: unexpectedB would empty and fail would flip false.
+  const base = classifyTxDiff([], ['0xnew'], new Set());
+  const rows = [{ hash: '0xnew', blockNumber: ISSUE_36_FLOOR_1 }];
+  const absent = new Set(); // A HAS the block — it is not wholly absent
+  const r = classifyOnlyBTxDiff(base, rows, 1, absent);
+  assert.equal(r.fail, true, 'a B-only tx in an A-present block still FAILs');
+  assert.equal(r.class, 'UNEXPECTED');
+  assert.deepEqual(r.unexpectedB, ['0xnew']);
+  assert.equal(r.toleratedIssue36.count, 0);
+});
+
+test('classifyOnlyBTxDiff: a MIX — one tolerated (A-absent block) + one hard (A-present block) → still FAIL, only the hard one in unexpectedB', () => {
+  const base = classifyTxDiff([], ['0xtol', '0xhard'], new Set());
+  const rows = [
+    { hash: '0xtol', blockNumber: ISSUE_36_FLOOR_1 }, // wholly A-absent
+    { hash: '0xhard', blockNumber: ISSUE_36_FLOOR_1 + 1 }, // A HAS this block
+  ];
+  const absent = new Set([ISSUE_36_FLOOR_1]); // only the first block is A-absent
+  const r = classifyOnlyBTxDiff(base, rows, 1, absent);
+  assert.equal(
+    r.fail,
+    true,
+    'the hard onlyB tx is not masked by its tolerated sibling',
+  );
+  assert.deepEqual(r.unexpectedB, ['0xhard']);
+  assert.equal(r.toleratedIssue36.count, 1);
+});
+
+test('classifyOnlyBTxDiff: does NOT touch onlyA (unreferencedA) or sharedMismatch — a run failing on those keeps failing', () => {
+  // An A-only tx no log references → unreferencedA; the fold must leave that FAIL cause intact even when
+  // every onlyB tx is tolerated.
+  const base = classifyTxDiff(['0xorphan'], ['0xtol'], new Set());
+  const rows = [{ hash: '0xtol', blockNumber: ISSUE_36_FLOOR_1 }];
+  const r = classifyOnlyBTxDiff(base, rows, 1, new Set([ISSUE_36_FLOOR_1]));
+  assert.equal(r.fail, true, 'the unreferenced onlyA tx still fails the run');
+  assert.deepEqual(r.unreferencedA, ['0xorphan']);
+  // and a sharedMismatch is likewise untouched
+  const base2 = classifyTxDiff([], ['0xtol'], new Set(), 1);
+  const r2 = classifyOnlyBTxDiff(base2, rows, 1, new Set([ISSUE_36_FLOOR_1]));
+  assert.equal(r2.fail, true, 'the shared-row mismatch still fails the run');
+  assert.equal(r2.sharedMismatch, 1);
+});
+
+test('classifyOnlyBTxDiff: empty / missing onlyBTxRows → the class is returned UNCHANGED', () => {
+  const base = classifyTxDiff([], [], new Set());
+  assert.equal(classifyOnlyBTxDiff(base, [], 1, new Set()), base);
+  assert.equal(classifyOnlyBTxDiff(base, undefined, 1, new Set()), base);
+});
+
+test('stripTxOnlyBRows: drops the internal onlyBTxRows carrier, keeps every other field', () => {
+  const withRows = {
+    fail: false,
+    class: 'realtime-parent-tx-gap',
+    unexpectedB: [],
+    onlyBTxRows: [{ hash: '0xa', blockNumber: 1 }],
+  };
+  const stripped = stripTxOnlyBRows(withRows);
+  assert.equal('onlyBTxRows' in stripped, false);
+  assert.equal(stripped.fail, false);
+  assert.equal(stripped.class, 'realtime-parent-tx-gap');
+  // a class with no onlyBTxRows is returned as-is
+  const plain = { fail: false };
+  assert.equal(stripTxOnlyBRows(plain), plain);
+});
+
 // classifyBucketMismatches: the checkpointBuckets knock-on. A bucket md5 mismatch is EXPLAINED only when
 // removing the tolerated onlyB rows from leg B's bucket makes it byte-identical to leg A's bucket — EXACT
 // attribution, never a count heuristic. A bucket with any OTHER cause stays a hard FAIL.
@@ -1303,29 +1466,55 @@ test('aggregateToleratedIssue36: sums logs + blocks per table and per chain into
   assert.deepEqual(agg.perChain, { 1: 107 });
 });
 
-test('aggregateToleratedIssue36: a run with no issue #36 rows → zeros', () => {
+test('aggregateToleratedIssue36: the REPORTING case — tolerated tx counts surface in a transactions sub-object and the grand total', () => {
+  // The 12:22Z instance: 30 tolerated onlyB txs on chain 1, alongside the logs/blocks facets. The tx
+  // count rolls into its own transactions sub-object, the per-chain total, and the grand total.
+  const results = [
+    {
+      chain: 1,
+      classes: {
+        logs: { toleratedIssue36: { count: 238, perChain: { 1: 238 } } },
+        blocks: { toleratedIssue36: { count: 27, perChain: { 1: 27 } } },
+        transactions: { toleratedIssue36: { count: 30, perChain: { 1: 30 } } },
+      },
+    },
+  ];
+  const agg = aggregateToleratedIssue36(results);
+  assert.equal(
+    agg.transactions.count,
+    30,
+    'the tx facet surfaces its own count',
+  );
+  assert.deepEqual(agg.transactions.perChain, { 1: 30 });
+  assert.equal(agg.count, 295, 'grand total = 238 logs + 27 blocks + 30 txs');
+  assert.deepEqual(agg.perChain, { 1: 295 });
+});
+
+test('aggregateToleratedIssue36: a run with no issue #36 rows → zeros (transactions facet included)', () => {
   const agg = aggregateToleratedIssue36([
-    { chain: 1, classes: { logs: {}, blocks: {} } },
+    { chain: 1, classes: { logs: {}, blocks: {}, transactions: {} } },
   ]);
   assert.equal(agg.count, 0);
+  assert.equal(agg.transactions.count, 0);
   assert.deepEqual(agg.perChain, {});
 });
 
-test('formatToleratedIssue36Line: loud REMOVE line naming issue #36 + removal condition when count>0', () => {
+test('formatToleratedIssue36Line: loud REMOVE line naming issue #36 + removal condition when count>0, including the transactions facet', () => {
   const line = formatToleratedIssue36Line({
-    count: 107,
-    logs: { count: 89 },
-    blocks: { count: 18 },
-    perChain: { 1: 107 },
+    count: 295,
+    logs: { count: 238 },
+    blocks: { count: 27 },
+    transactions: { count: 30 },
+    perChain: { 1: 295 },
   });
   assert.match(line, /^TOLERATED \(known issue #36 — REMOVE/);
   assert.match(
     line,
     /REMOVE when issue #36 is resolved \(A repaired or leg retired\)/,
   );
-  assert.match(line, /107 onlyB rows leg A lost/);
-  assert.match(line, /logs:89 blocks:18/);
-  assert.match(line, /1:107/);
+  assert.match(line, /295 onlyB rows leg A lost/);
+  assert.match(line, /logs:238 blocks:27 transactions:30/);
+  assert.match(line, /1:295/);
 });
 
 test('formatToleratedIssue36Line: empty string when nothing tolerated (never a noisy zero line)', () => {
@@ -3780,6 +3969,146 @@ test('D1: compareChain — a WINDOWED hard-fail AND a fired guard compose to one
     'the windowed hard-fail is ALSO reported',
   );
   assert.equal(out.classes.logs.onlyA, 3);
+});
+
+// ── E2E: the issue #36 TRANSACTION tolerance through the REAL compareChain fold (blocks-onlyB → tx) ───
+//
+// These drive the REAL compareChain wiring: diffBlocks yields the wholly-A-absent block set, diffTx
+// yields the onlyB txs (with block numbers), and compareChain folds classifyOnlyBTxDiff over the two.
+// A non-stagnating (skew 0) window isolates the tx signal as the ONLY verdict driver.
+
+// A NON-stagnating deps stub (both legs same ts → skew 0 → PASS on the stagnation axis) with injectable
+// block/tx diffs, so the tx tolerance is the ONLY thing that can move the verdict. Chain 1 (has a floor).
+const txToleranceDeps = (overrides = {}) => {
+  const ts = 1_700_000_000;
+
+  return {
+    overlapBound: async () => 200_000,
+    checkpointProgress: async () => 200_000,
+    legNewestRow: async () => ({ maxBlock: '200000', ts: String(ts) }),
+    diffLogs: async () => cleanTableRes,
+    diffBlocks: async () => cleanTableRes,
+    diffTx: async () => cleanTx,
+    bucketHashes: async () => new Map(),
+    bucketHashesExcluding: async () => new Map(),
+    ...overrides,
+  };
+};
+const ISSUE_36_FLOOR_1_E2E = 25445239;
+const runTxToleranceChain = (deps) =>
+  compareChain('a', 'b', 1, 0, 64, 1000, '', 7200, null, Date.now(), deps);
+
+test('E2E compareChain: the TOLERATED case — an onlyB tx in a wholly-A-absent block ⇒ transactions do NOT fail, verdict PASS', async () => {
+  // diffBlocks reports the block wholly absent from A (onlyB block row) → the block is in the absent set;
+  // diffTx reports one onlyB tx in that same block. The fold tolerates it: transactions.fail=false,
+  // toleratedIssue36 surfaces, and with no other divergence the verdict is PASS.
+  const block = ISSUE_36_FLOOR_1_E2E + 10;
+  const deps = txToleranceDeps({
+    diffBlocks: async () => ({
+      diff: { onlyA: 0, onlyB: 1, mismatch: 0, shared: 5 },
+      onlyBRows: [{ blockNumber: block }],
+      capped: false,
+    }),
+    diffTx: async () => ({
+      ...cleanTx,
+      onlyBTxRows: [{ hash: '0xdeadbeef', blockNumber: block }],
+    }),
+  });
+  const out = await runTxToleranceChain(deps);
+  assert.equal(
+    out.verdict,
+    'PASS',
+    'a tolerated tx facet does not fail the run',
+  );
+  assert.equal(out.classes.transactions.fail, false);
+  assert.deepEqual(out.classes.transactions.unexpectedB, []);
+  assert.equal(out.classes.transactions.toleratedIssue36.count, 1);
+  assert.deepEqual(out.classes.transactions.toleratedIssue36.perChain, {
+    1: 1,
+  });
+  // the internal carrier is stripped from the status class
+  assert.equal('onlyBTxRows' in out.classes.transactions, false);
+  // the block facet is itself tolerated (its onlyB block row is at/above the floor)
+  assert.equal(out.classes.blocks.fail, false);
+});
+
+test('E2E compareChain: the STRICTNESS case — an onlyB tx whose block EXISTS in A ⇒ transactions still UNEXPECTED, verdict FAIL', async () => {
+  // diffBlocks reports NO onlyB block (leg A has every block) → the absent set is empty; diffTx reports
+  // one onlyB tx. That is a tx-level-only loss → a NEW divergence class → it MUST keep failing loudly.
+  const block = ISSUE_36_FLOOR_1_E2E + 20;
+  const deps = txToleranceDeps({
+    diffBlocks: async () => cleanTableRes, // no onlyB block → A HAS the block
+    diffTx: async () => ({
+      ...cleanTx,
+      onlyBTxRows: [{ hash: '0xnewclass', blockNumber: block }],
+    }),
+  });
+  const out = await runTxToleranceChain(deps);
+  assert.equal(
+    out.verdict,
+    'FAIL',
+    'a B-only tx in an A-present block still FAILs loudly',
+  );
+  assert.equal(out.classes.transactions.fail, true);
+  assert.equal(out.classes.transactions.class, 'UNEXPECTED');
+  assert.deepEqual(out.classes.transactions.unexpectedB, ['0xnewclass']);
+  assert.equal(out.classes.transactions.toleratedIssue36.count, 0);
+});
+
+test('E2E compareChain: FAIL-CLOSED — an onlyB tx in an A-absent block is NOT tolerated when the blocks onlyB stream was CAPPED', async () => {
+  // The absent set is only authoritative when the blocks onlyB collector saw every row. If blocks CAPPED,
+  // compareChain passes an EMPTY absent set → the tx is NOT tolerated even though its block genuinely
+  // appears in the (truncated) onlyB set. An untrustworthy evidence source must never widen tolerance.
+  // MUTATION (build the absent set regardless of blocksRes.capped) → this assertion fails.
+  const block = ISSUE_36_FLOOR_1_E2E + 30;
+  const deps = txToleranceDeps({
+    diffBlocks: async () => ({
+      diff: { onlyA: 0, onlyB: 1, mismatch: 0, shared: 5 },
+      onlyBRows: [{ blockNumber: block }],
+      capped: true, // the blocks onlyB stream was truncated → absent set not authoritative
+    }),
+    diffTx: async () => ({
+      ...cleanTx,
+      onlyBTxRows: [{ hash: '0xcapped', blockNumber: block }],
+    }),
+  });
+  const out = await runTxToleranceChain(deps);
+  assert.equal(out.verdict, 'FAIL', 'blocks capped ⇒ tx tolerance is disabled');
+  assert.equal(out.classes.transactions.fail, true);
+  assert.deepEqual(out.classes.transactions.unexpectedB, ['0xcapped']);
+  assert.equal(out.classes.transactions.toleratedIssue36.count, 0);
+});
+
+test('E2E compareChain: FAIL-CLOSED — an onlyB tx in an A-absent block is NOT tolerated when the blocks onlyB collector cross-check fails (!blocksCollector.ok)', async () => {
+  // The absent set is only authoritative when the blocks onlyB collector received EVERY row the diff
+  // counted. If the diff reports onlyB=2 but the collector only has 1 row (not capped — a silent wiring
+  // drop), crossCheckOnlyBCollector returns {ok:false}: the set is incomplete and MUST NOT widen
+  // tolerance. compareChain passes an EMPTY absent set → the otherwise-tolerable onlyB tx stays in
+  // unexpectedB and the run FAILs.
+  // MUTATION (drop `!blocksCollector.ok` from the absentBlocks guard) → this assertion fails: the
+  // tx would be tolerated via the partial set even though the collector is incomplete.
+  const block = ISSUE_36_FLOOR_1_E2E + 40;
+  const deps = txToleranceDeps({
+    diffBlocks: async () => ({
+      // diff reports 2 onlyB rows — but the collector only received 1 (silent wiring drop, not capped)
+      diff: { onlyA: 0, onlyB: 2, mismatch: 0, shared: 5 },
+      onlyBRows: [{ blockNumber: block }], // only 1 row collected → cross-check fails
+      capped: false, // NOT capped: the gap is a real collector wiring bug, not an expected cap stop
+    }),
+    diffTx: async () => ({
+      ...cleanTx,
+      onlyBTxRows: [{ hash: '0xcollectorfail', blockNumber: block }],
+    }),
+  });
+  const out = await runTxToleranceChain(deps);
+  assert.equal(
+    out.verdict,
+    'FAIL',
+    'blocks collector cross-check fails ⇒ tx tolerance is disabled',
+  );
+  assert.equal(out.classes.transactions.fail, true);
+  assert.deepEqual(out.classes.transactions.unexpectedB, ['0xcollectorfail']);
+  assert.equal(out.classes.transactions.toleratedIssue36.count, 0);
 });
 
 // ── D3: default deps wiring — the production call path uses the REAL module functions ─────────────────

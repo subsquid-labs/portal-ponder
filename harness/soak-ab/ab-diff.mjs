@@ -6,7 +6,9 @@
 //   • transactions (shared): full-row identity — a tx in BOTH stores must be byte-identical
 //   • transactions : asserted to be EXACTLY the expected class — B may be MISSING parent txs for
 //     realtime-ingested spans (the verified stream wire gap), and every such tx must be referenced
-//     by an A-side log. Any B-extra tx, or an A-only tx no log references, is a FAIL.
+//     by an A-side log. Any B-extra tx, or an A-only tx no log references, is a FAIL — EXCEPT a B-extra
+//     tx whose block is WHOLLY ABSENT from leg A (issue #36 tx facet): the same leg-A block loss the
+//     logs/blocks class tolerates, one table deeper, reported + PASS-compatible (classifyOnlyBTx).
 //   • per-1000-block ordered md5 checkpoint hashes both sides (persisted for drift tracking)
 //   • _ponder_checkpoint monotonicity across runs
 //   • persist-stagnation guard (issue #38): a one-sided freeze of the newest-persisted-row block
@@ -173,6 +175,49 @@ export function classifyOnlyBRow(
   return tolerated ? 'tolerated' : 'mismatch';
 }
 
+// Classify ONE onlyB TRANSACTION (a tx present in leg B but MISSING in leg A) against the issue #36
+// class. This is the transactions facet of the SAME leg-A loss the logs/blocks classifier already
+// tolerates: when leg A dropped a whole block it dropped that block's logs AND its txs (12:22Z hourly
+// cross-validation: 30 B-only chain-1 txs, all in blocks WHOLLY ABSENT from leg A, upper span exactly
+// matching the tolerated logs/blocks span). Returns:
+//   • 'tolerated' — the exact issue #36 shape: the tx's block is WHOLLY ABSENT from leg A (no leg-A
+//     block row at that height) AND the block is at/above the per-chain realtime-era floor within the
+//     (open) window. PASS-compatible, counted SEPARATELY, loudly reported.
+//   • 'mismatch'  — ANYTHING else → a hard onlyB tx → FAIL, exactly as before the class existed.
+// STRICTER than the logs/blocks predicate by ONE extra conjunct — the wholly-absent-block gate:
+//   • `absentBlocks` is the set of block numbers WHOLLY ABSENT from leg A (leg B has the block row, leg
+//     A has none), i.e. the blocks-table onlyB set the blocks classifier already computes. A tx whose
+//     block is NOT in that set — a tx-level-only loss where leg A HAS the block but is MISSING just this
+//     tx — is a genuinely NEW divergence class and MUST keep failing loudly, so it stays 'mismatch'.
+//     This is the whole point of the strictness: tolerate only the block-loss shape we have evidenced
+//     and root-caused, never a bare tx gap in an A-present block.
+// The remaining conjuncts REUSE classifyOnlyBRow's floor/window logic verbatim (same floor config, same
+// #30 missing-floor semantic, same open-window handling) so the two facets can never drift apart: a
+// wholly-A-absent block BELOW the floor is still a HARD FAIL (below the floor leg A's store came from
+// the complete-by-construction historical backfill, so any A-missing row there is a real gap, never
+// this class). `absentBlocks` MUST be complete: a caller that could not enumerate every wholly-absent
+// block (e.g. the blocks onlyB collector was CAPPED) MUST NOT call this as tolerating — pass an empty
+// set / treat every onlyB tx as a hard FAIL, so an incomplete absent set can never widen the tolerance.
+// Pure + exported so every adversarial case is unit-tested and mutation-verified in isolation.
+export function classifyOnlyBTx(
+  { blockNumber },
+  chain,
+  absentBlocks,
+  classes = TOLERATED_ONLYB_CLASSES,
+) {
+  const absent =
+    absentBlocks instanceof Set ? absentBlocks : new Set(absentBlocks ?? []);
+  // The wholly-absent-block gate — the extra conjunct over classifyOnlyBRow. A tx whose block leg A
+  // HAS (present in A's blocks table) is a tx-level-only loss → NEW divergence class → HARD FAIL.
+  if (!absent.has(Number(blockNumber))) {
+    return 'mismatch';
+  }
+
+  // Reuse the floor/window predicate verbatim (floor config, #30 missing-floor semantic, open window):
+  // a wholly-absent block still has to clear the realtime-era floor to be this class.
+  return classifyOnlyBRow({ blockNumber }, chain, classes);
+}
+
 // Decide the FINAL verdict of a logs/blocks table diff once its onlyB rows have been classified against
 // the issue #36 class. `diff` is the streamingDiff result (onlyA/onlyB/mismatch are COUNTS). `onlyBRows`
 // is the array of that diff's onlyB rows with { blockNumber } (fetched by the bounded targeted query in
@@ -306,6 +351,83 @@ export function classifyTxDiff(
     // access_list-only divergence per exact hash. SEPARATE from toleratedIssue27; PASS-compatible.
     knownBadRows: knownBadRowsTally,
   };
+}
+
+// Fold the issue #36 onlyB-transaction tolerance into a classifyTxDiff result AFTER the wholly-A-absent
+// block set is known (it comes from the blocks-table diff, which runs in parallel with diffTx — so this
+// composition happens in compareChain, exactly as the logs/blocks onlyB tolerance does, never inside
+// diffTx). `txClass` is a classifyTxDiff result; `onlyBTxRows` are its onlyB txs carried as
+// { hash, blockNumber } (diffTx now collects the block number too); `absentBlocks` is the set of block
+// numbers WHOLLY ABSENT from leg A (the blocks onlyB set). Returns a NEW tx class with the tolerated
+// onlyB txs REMOVED from `unexpectedB` and folded into `toleratedIssue36`, and fail/class recomputed:
+//   • an onlyB tx classifyOnlyBTx → 'tolerated' (its block is wholly A-absent AND at/above the floor,
+//     within the open window) is PASS-compatible, counted SEPARATELY, no longer a fail.
+//   • any OTHER onlyB tx (block EXISTS in A → tx-level-only loss, below floor, unknown chain, past
+//     window) stays in `unexpectedB` → HARD FAIL, exactly as before the class existed.
+// The onlyA / unreferencedA (realtime-parent-tx-gap) and sharedMismatch / issue #27 / knownBadRows
+// facets are UNTOUCHED — this only reclassifies onlyB txs. Fail-closed on an incomplete absent set: if
+// the caller could not enumerate every wholly-absent block (blocks onlyB CAPPED), it passes an empty
+// `absentBlocks` and NO onlyB tx is tolerated. If `onlyBTxRows` is missing (a diffTx that didn't carry
+// them, or no onlyB txs), the class is returned unchanged. Pure + exported so the fold — the tolerated
+// partition, the fail recomputation, and the untouched-facet guarantee — is mutation-verified in isolation.
+export function classifyOnlyBTxDiff(
+  txClass,
+  onlyBTxRows,
+  chain,
+  absentBlocks,
+  classes = TOLERATED_ONLYB_CLASSES,
+) {
+  const rows = onlyBTxRows ?? [];
+  if (rows.length === 0) {
+    return txClass;
+  }
+
+  const absent =
+    absentBlocks instanceof Set ? absentBlocks : new Set(absentBlocks ?? []);
+  const perChain = {};
+  let toleratedCount = 0;
+  const hardUnexpectedB = [];
+  for (const row of rows) {
+    const verdict = classifyOnlyBTx(row, chain, absent, classes);
+    if (verdict === 'tolerated') {
+      toleratedCount += 1;
+      perChain[chain] = (perChain[chain] ?? 0) + 1;
+    } else {
+      hardUnexpectedB.push(row.hash);
+    }
+  }
+
+  // Recompute the verdict from the HARD onlyB txs only — the tolerated ones no longer fail. The onlyA
+  // (unreferencedA) and sharedMismatch causes are unchanged, read straight off the incoming class.
+  const fail =
+    hardUnexpectedB.length > 0 ||
+    txClass.unreferencedA.length > 0 ||
+    (txClass.sharedMismatch ?? 0) > 0;
+
+  return {
+    ...txClass,
+    fail,
+    class: fail ? 'UNEXPECTED' : 'realtime-parent-tx-gap',
+    unexpectedB: hardUnexpectedB,
+    // Reported, never fails: onlyB txs leg A lost with its wholly-absent blocks, tolerated per issue #36
+    // (block wholly absent from leg A AND at/above the per-chain realtime-era floor). Mirrors the
+    // logs/blocks toleratedIssue36 shape so aggregateToleratedIssue36 rolls all three tables the same way.
+    toleratedIssue36: { count: toleratedCount, perChain },
+  };
+}
+
+// Drop diffTx's internal `onlyBTxRows` carrier (the raw onlyB txs with block numbers, used only to fold
+// the issue #36 tx tolerance in compareChain) from a tx class before it goes into the status JSON, so the
+// persisted diffClasses stay bounded — only the tolerated COUNT/perChain surfaces, never the raw row list.
+// Pure + exported so the strip contract is asserted directly.
+export function stripTxOnlyBRows(txClass) {
+  if (!txClass || !('onlyBTxRows' in txClass)) {
+    return txClass;
+  }
+
+  const { onlyBTxRows: _drop, ...rest } = txClass;
+
+  return rest;
 }
 
 // Classify ONE shared tx whose FULL-row md5 diverges between side A and side B. Returns:
@@ -1479,6 +1601,10 @@ async function diffTx(urlA, urlB, chain, lo, hi) {
   const txSql = buildTxSql(chain, lo, hi);
   const onlyA = [];
   const onlyB = [];
+  // onlyB txs carried WITH their block number (issue #36 tx facet): the wholly-A-absent-block tolerance
+  // is applied in compareChain once the blocks-onlyB set is known, so diffTx must surface each onlyB
+  // tx's block, not just its hash. `onlyB` (bare hashes) stays the input to classifyTxDiff unchanged.
+  const onlyBTxRows = [];
   let sharedMismatch = 0;
   const toleratedIssue27 = { count: 0, perChain: {} };
   // perHash carries the EXACT pin identity a chain-only tally loses: which pinned hash fired, so
@@ -1497,6 +1623,7 @@ async function diffTx(urlA, urlB, chain, lo, hi) {
       a = await ia.next();
     } else if (ha === null || hb < ha) {
       onlyB.push(hb);
+      onlyBTxRows.push({ hash: hb, blockNumber: b.value[TX_COL.blockNumber] });
       b = await ib.next();
     } else {
       // shared tx (same hash on both sides) — the full-row md5 must be identical, EXCEPT for the one
@@ -1550,7 +1677,7 @@ async function diffTx(urlA, urlB, chain, lo, hi) {
     );
   });
 
-  return classifyTxDiff(
+  const txClass = classifyTxDiff(
     onlyA,
     onlyB,
     referenced,
@@ -1558,6 +1685,11 @@ async function diffTx(urlA, urlB, chain, lo, hi) {
     toleratedIssue27,
     knownBadRowsTally,
   );
+
+  // Carry the onlyB tx rows (with block numbers) so compareChain can fold the issue #36 tx tolerance
+  // once it holds the blocks-onlyB (wholly-A-absent) set — the same compose-in-compareChain pattern the
+  // logs/blocks onlyB tolerance uses. classifyTxDiff's own verdict here is the PRE-tolerance view.
+  return { ...txClass, onlyBTxRows };
 }
 
 async function bucketHashes(url, chain, lo, hi, bucket) {
@@ -1769,6 +1901,25 @@ export async function compareChain(
   const blocksFail =
     blocksClass.fail || blocksRes.capped || !blocksCollector.ok;
 
+  // Fold the issue #36 onlyB-TRANSACTION tolerance (12:22Z hourly cross-validation: 30 B-only chain-1
+  // txs, ALL in blocks WHOLLY ABSENT from leg A — the same leg-A loss the logs/blocks class already
+  // tolerates, one table deeper). An onlyB tx is tolerated IFF its block is wholly absent from leg A AND
+  // at/above the per-chain floor (see classifyOnlyBTx); any other onlyB tx (block EXISTS in A → a
+  // tx-level-only loss, a genuinely NEW divergence class) stays a HARD FAIL.
+  //
+  // The wholly-A-absent block set is the blocks-onlyB set (blocks present in B, absent in A). FAIL-CLOSED
+  // when that evidence is incomplete: if the blocks onlyB stream was CAPPED (blocksRes.capped) OR its
+  // collector cross-check failed (!blocksCollector.ok), the absent set is not authoritative, so we pass
+  // an EMPTY set and tolerate NO onlyB tx — an untrustworthy evidence source must never widen tolerance.
+  // (Same separate-snapshot residual as the logs/blocks tolerance — the finalized overlap is append-only
+  // and stable between the blocks and tx queries outside an active repair; a repair in flight surfaces as
+  // a transient that clears next run, never a false PASS. See bucketHashesExcluding's SEPARATE-SNAPSHOT note.)
+  const absentBlocks =
+    blocksRes.capped || !blocksCollector.ok
+      ? new Set()
+      : new Set(blocksRes.onlyBRows.map((r) => Number(r.blockNumber)));
+  const txClass = classifyOnlyBTxDiff(tx, tx.onlyBTxRows, chain, absentBlocks);
+
   // The tolerated onlyB LOG rows (block-table onlyB rows have no log_index and do not affect the log
   // bucket hashes) — the set to remove from leg B's buckets when attributing a bucket mismatch. Only
   // rows the class actually TOLERATED are removed; an untolerated onlyB row is NOT removed, so a bucket
@@ -1845,7 +1996,9 @@ export async function compareChain(
         ? {}
         : { collectorMismatch: blocksCollector.collectorMismatch }),
     },
-    transactions: tx,
+    // `onlyBTxRows` is diffTx's internal carrier for the tolerance fold above — stripped here so the
+    // status JSON stays bounded (only the tolerated COUNT/perChain surfaces, never the raw row list).
+    transactions: stripTxOnlyBRows(txClass),
     checkpointBuckets: {
       ok: bucketClass.ok,
       mismatches: buckets.mismatches.length,
@@ -1861,7 +2014,13 @@ export async function compareChain(
   // but NEVER suppresses a windowed failure's own reporting — a stagnation-only FAIL and a windowed FAIL
   // compose to one FAIL, each visible in its own class. classes.persistStagnation is attached in every
   // path above.
-  if (logsFail || blocksFail || tx.fail || bucketsFail || stagnation.fail) {
+  if (
+    logsFail ||
+    blocksFail ||
+    txClass.fail ||
+    bucketsFail ||
+    stagnation.fail
+  ) {
     out.verdict = 'FAIL';
   }
 
@@ -2086,16 +2245,19 @@ export function formatToleratedIssue27Line(tolerated) {
   );
 }
 
-// Sum the per-chain, per-TABLE issue #36 onlyB-row-loss tallies (logs + blocks) from every chain result
-// into one { count, logs, blocks, perChain }. `logs`/`blocks` are per-table {count, perChain} rolls;
-// `perChain` is the combined per-chain total; `count` is the grand total. Pure + exported so the status
-// JSON's top-level counter and the human line both read this, and a miscount is caught directly. Note
-// the block-table onlyB rows and the log-table onlyB rows are DISTINCT rows (a block gap is not a log
-// gap), so summing them is a true total, not double-counting.
+// Sum the per-chain, per-TABLE issue #36 onlyB-row-loss tallies (logs + blocks + transactions) from every
+// chain result into one { count, logs, blocks, transactions, perChain }. `logs`/`blocks`/`transactions`
+// are per-table {count, perChain} rolls; `perChain` is the combined per-chain total; `count` is the grand
+// total. Pure + exported so the status JSON's top-level counter and the human line both read this, and a
+// miscount is caught directly. Note the block-table, log-table and tx-table onlyB rows are DISTINCT rows
+// (a block gap is not a log gap is not a tx gap — even for the SAME wholly-absent block, its block row,
+// its log rows and its tx rows are three different rows), so summing them is a true total, not
+// double-counting.
 export function aggregateToleratedIssue36(results) {
   const perChain = {};
   const logs = { count: 0, perChain: {} };
   const blocks = { count: 0, perChain: {} };
+  const transactions = { count: 0, perChain: {} };
   const rollTable = (dst, tol) => {
     if (!tol) {
       return;
@@ -2110,9 +2272,16 @@ export function aggregateToleratedIssue36(results) {
   for (const r of results) {
     rollTable(logs, r?.classes?.logs?.toleratedIssue36);
     rollTable(blocks, r?.classes?.blocks?.toleratedIssue36);
+    rollTable(transactions, r?.classes?.transactions?.toleratedIssue36);
   }
 
-  return { count: logs.count + blocks.count, logs, blocks, perChain };
+  return {
+    count: logs.count + blocks.count + transactions.count,
+    logs,
+    blocks,
+    transactions,
+    perChain,
+  };
 }
 
 // One human-readable line for a run that carried tolerated issue #36 onlyB rows (empty string ⇒ print
@@ -2130,7 +2299,7 @@ export function formatToleratedIssue36Line(tolerated) {
 
   return (
     `TOLERATED (known issue #36 — REMOVE when issue #36 is resolved (A repaired or leg retired)): ` +
-    `${tolerated.count} onlyB rows leg A lost (logs:${tolerated.logs?.count ?? 0} blocks:${tolerated.blocks?.count ?? 0}; per-chain ${breakdown})`
+    `${tolerated.count} onlyB rows leg A lost (logs:${tolerated.logs?.count ?? 0} blocks:${tolerated.blocks?.count ?? 0} transactions:${tolerated.transactions?.count ?? 0}; per-chain ${breakdown})`
   );
 }
 
