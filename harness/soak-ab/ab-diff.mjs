@@ -706,7 +706,9 @@ export function stagnationDecision({
   // ARMING (D1 carry-forward: null baseline defers, never fails-open).
   const prevTsA = prev && Number.isFinite(prev.tsA) ? prev.tsA : null;
   const prevTsB = prev && Number.isFinite(prev.tsB) ? prev.tsB : null;
-  const prevSkew = prev && Number.isFinite(prev.skew) ? prev.skew : null;
+  // NOTE (review delta 5, finding 1): we deliberately do NOT read `prev.skew` for growth comparison.
+  // The MEASURED skew is stored in state for telemetry, but it is null after any empty-run gap, so
+  // direction is judged from the CARRIED gap (prevGap/curGap below) which persists through empty gaps.
   const prevWedgeFailedSince =
     prev && Number.isFinite(prev.wedgeFailedSince)
       ? prev.wedgeFailedSince
@@ -739,10 +741,22 @@ export function stagnationDecision({
     prev?.emptySinceB && Number.isFinite(prev.emptySinceB.atMs)
       ? prev.emptySinceB
       : null;
+  // CONSCIOUS CHOICE (review delta 5, finding 3 — SUSTAINED as fail-closed): a BOTH-empty run arms BOTH
+  // per-leg timers, so a mutual outage CONSUMES the one-sided-empty grace window before any one-sided
+  // condition exists. This is the INTENDED F5 semantic and is fail-closed: each timer factually measures
+  // THAT leg's emptiness duration, and a leg still empty past the grace window while the OTHER leg has
+  // recovered and advances genuinely SHOULD alarm — the emptiness that a downstream consumer sees is
+  // real regardless of whether the sibling was also down earlier. CAVEAT (accepted): on a bootstrap
+  // deploy where A starts first and B a few minutes later, B's timer arms during the both-empty window,
+  // so the first run after A advances can produce ONE false one-sided-empty FAIL — self-clearing once B
+  // persists a row. Fail-closed and one-shot, so this stands; the pinning test locks the behavior.
   const emptySinceA = a === null ? (prevEmptySinceA ?? { atMs: nowMs }) : null;
   const emptySinceB = b === null ? (prevEmptySinceB ?? { atMs: nowMs }) : null;
 
-  // Skew is |a − b| only when BOTH legs are populated THIS run; unmeasurable (null) with an empty leg.
+  // MEASURED skew is |a − b| only when BOTH legs are populated THIS run; unmeasurable (null) with an
+  // empty leg. This is the TELEMETRY / THRESHOLD number: it is stored in nextState and drives the
+  // skew ≤ threshold recovery check and the skew clauses. It is NOT used for growth comparison — see
+  // the CARRIED-GAP basis below (review delta 5, finding 1).
   const skew = a !== null && b !== null ? Math.abs(b - a) : null;
 
   // Did each leg's LAST-KNOWN ts strictly advance vs the prior run's last-known ts? An empty leg (ts
@@ -751,10 +765,23 @@ export function stagnationDecision({
   const aAdvanced = prevTsA !== null && carriedA !== null && carriedA > prevTsA;
   const bAdvanced = prevTsB !== null && carriedB !== null && carriedB > prevTsB;
 
-  // ONE null-safe skew-grew helper (review delta 4, F3): returns true ONLY when BOTH prev and current
-  // skew are finite and current strictly exceeds prev. A missing prev skew (e.g. after an empty-run gap
-  // where skew was unmeasurable) is NOT "growing" — it is unknown, so this defers rather than fails.
-  const skewGrew = skewGrewFrom(prevSkew, skew);
+  // CARRIED-GAP basis for growth/shrink direction (review delta 5, finding 1). Growth must be judged
+  // from the last-known gap between the CARRIED timestamps, NOT the measured `skew`: `skew` is null on
+  // any run with an empty leg, and `prev.skew` is therefore null after an empty-run gap — using it
+  // throws away a genuinely GROWN last-known gap (the carried tsA/tsB persist through empty gaps and
+  // prove the gap widened). `gap(x, y)` = |x − y| only when BOTH are finite, else null (unknown, never
+  // coerced to 0). prevGap is the gap at the END of the prior run (prev carried ts); curGap is this
+  // run's carried gap. Both persist through empty legs, so growth is visible across an empty-run gap.
+  const prevGap = gap(prevTsA, prevTsB);
+  const curGap = gap(carriedA, carriedB);
+
+  // Direction from the CARRIED gap, null-safe (review delta 5, finding 1): `gapGrew` is true ONLY when
+  // BOTH gaps are finite and the current strictly exceeds the prior — a null (unknown) gap on either
+  // side defers rather than fails/clears open. `gapShrank` is the null-safe mirror. These replace the
+  // former `skew`-based comparisons at every growth/shrink site so an empty-run gap can no longer mask
+  // a grown last-known gap (the fail-open) nor manufacture a false shrink.
+  const gapGrew = gapGrewFrom(prevGap, curGap);
+  const gapShrank = gapShrankFrom(prevGap, curGap);
 
   // Assemble the unified nextState from carried-forward evidence. The wedge fields are threaded per
   // branch (a fresh fail sets them; a recovery clears them; an unrecovered run preserves them). The
@@ -787,9 +814,13 @@ export function stagnationDecision({
           ? bAdvanced
           : false;
     const skewWithinThreshold = skew !== null && skew <= threshold;
+    // Recovery via stale-leg advance requires the CARRIED gap to NOT be growing (review delta 5,
+    // finding 1). `!gapGrew` reads the carried-timestamp gap, which survives the empty-run gap that
+    // makes `prev.skew` null — so a stale leg that ticked forward while the overall gap kept WIDENING
+    // no longer counts as recovery (the former `!skewGrew` fail-open cleared it).
     const genuinelyRecovered =
       bothPopulated &&
-      (skewWithinThreshold || (wedgeStaleAdvanced && !skewGrew));
+      (skewWithinThreshold || (wedgeStaleAdvanced && !gapGrew));
 
     if (!genuinelyRecovered) {
       // (b) still wedged — FAIL, carrying ALL evidence forward unchanged.
@@ -905,8 +936,12 @@ export function stagnationDecision({
   }
   const staleAdvanced =
     olderSide === 'A' ? aAdvanced : olderSide === 'B' ? bAdvanced : false;
-  const skewIncreased = skewGrew;
-  const skewDecreased = prevSkew !== null && skew < prevSkew;
+  // Growth/shrink from the CARRIED gap (review delta 5, finding 1), NOT the measured `skew`: `prev.skew`
+  // is null after any empty-run gap, so a genuinely GROWN last-known gap would be invisible (the former
+  // fail-open) and a shrink could be manufactured. `gapGrew`/`gapShrank` read the carried tsA/tsB gap,
+  // which persists through empty gaps, and are null-safe (unknown gap ⇒ neither grew nor shrank).
+  const skewIncreased = gapGrew;
+  const skewDecreased = gapShrank;
   const bothAdvanced = aAdvanced && bAdvanced;
   const neitherAdvanced = !aAdvanced && !bAdvanced;
 
@@ -914,6 +949,17 @@ export function stagnationDecision({
   // ground). Both fail-closed. A fresh fail sets a new wedge episode (sticky from here). N1: staleSide
   // names the leg that FAILED TO ADVANCE — the frozen one — computed from per-leg advancement, NOT
   // olderSide (which mis-names the newer-but-frozen leg).
+  //
+  // CONSCIOUS RULING (review delta 5, finding 2 — SUSTAINED as fail-closed): this `frozen` predicate
+  // fires even in the "leader frozen while the STALE leg catches up" shape — a sticky wedge can recover
+  // in the gate above and then this fresh predicate immediately names the (now-frozen) former leader.
+  // At the deployment's HOURLY cadence this is CORRECT, not laundering: a leg whose newest-row timestamp
+  // does not advance across a FULL inter-run interval has genuinely stopped persisting for that interval,
+  // so N1 names the truly-frozen leg and the recovery-then-fresh-wedge is an honest NEW episode (a fresh
+  // wedgeFailedSince). CAVEAT (accepted): back-to-back MANUAL runs seconds apart can false-alarm here —
+  // a leg that simply had no new block in those seconds reads "frozen". The timer cadence is hourly and
+  // a false FAIL is the SAFE direction for a differ, so this stands; the pinning test locks the exact
+  // behavior so any future change to it is a conscious decision.
   const fail = oneLegFrozenWhileOtherAdvanced || skewIncreased;
   let reason;
   let freshStaleSide = null;
@@ -962,17 +1008,39 @@ export function stagnationDecision({
   };
 }
 
-// One null-safe skew-grew comparison, used at EVERY comparison site (review delta 4, F3): returns true
-// ONLY when BOTH prev and current skew are finite numbers and current STRICTLY exceeds prev. A null
-// (unmeasurable) prev or current is NOT "growing" — it is unknown, so this defers rather than manufacturing
-// a false skew-growing FAIL from a null coerced to 0.
-function skewGrewFrom(prevSkew, skew) {
+// The last-known gap between two CARRIED timestamps: |x − y| ONLY when BOTH are finite, else null
+// (review delta 5, finding 1). Growth/shrink direction is judged from THIS gap, not the measured
+// `skew`, because carried timestamps persist through an empty-run gap where `skew` (and hence
+// `prev.skew`) is null. A null return means UNKNOWN — never coerced to 0 — so a comparison against it
+// defers rather than fabricating or clearing a wedge.
+function gap(x, y) {
+  return Number.isFinite(x) && Number.isFinite(y) ? Math.abs(x - y) : null;
+}
+
+// One null-safe gap-GREW comparison, used at EVERY growth site (review delta 5, finding 1): returns
+// true ONLY when BOTH the prior and current carried gap are finite numbers and the current STRICTLY
+// exceeds the prior. A null (unknown) gap on either side is NOT "growing" — this defers rather than
+// manufacturing a false skew-growing FAIL (F3) or masking a real one behind a null prev.skew.
+function gapGrewFrom(prevGap, curGap) {
   return (
-    typeof prevSkew === 'number' &&
-    Number.isFinite(prevSkew) &&
-    typeof skew === 'number' &&
-    Number.isFinite(skew) &&
-    skew > prevSkew
+    typeof prevGap === 'number' &&
+    Number.isFinite(prevGap) &&
+    typeof curGap === 'number' &&
+    Number.isFinite(curGap) &&
+    curGap > prevGap
+  );
+}
+
+// The null-safe MIRROR (review delta 5, finding 1): gap strictly SHRANK — true ONLY when BOTH carried
+// gaps are finite and the current is strictly below the prior. A null (unknown) gap on either side is
+// NOT "shrinking", so a 'catching-up' label is never inferred from an unmeasurable prior gap.
+function gapShrankFrom(prevGap, curGap) {
+  return (
+    typeof prevGap === 'number' &&
+    Number.isFinite(prevGap) &&
+    typeof curGap === 'number' &&
+    Number.isFinite(curGap) &&
+    curGap < prevGap
   );
 }
 
@@ -2102,9 +2170,13 @@ export function stagnationAlerts(results) {
       : '';
     let what;
     if (effectiveReason === 'one-sided-empty') {
+      // Review delta 5, finding 3: claim only what is KNOWN. Emptiness duration is per-leg (this leg
+      // has persisted no rows for over the window); the other leg's advancement is the CURRENT
+      // observation, not a claim about the whole window — the window may have overlapped a both-empty
+      // outage, so we do not assert the other leg advanced for its entirety.
       what =
-        `has persisted NO rows for over ${s.thresholdSeconds}s while the other leg advances ` +
-        `(empty leg, one-sided wedge)${unrecovered}`;
+        `has persisted NO rows for over ${s.thresholdSeconds}s (empty leg) and the other leg is ` +
+        `advancing (one-sided wedge)${unrecovered}`;
     } else if (effectiveReason === 'skew-growing' && hasSkew) {
       what =
         `is falling further behind — newest-row timestamp skew GROWING to ${s.skewSeconds}s ` +

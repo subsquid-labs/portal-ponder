@@ -2987,6 +2987,236 @@ test('DELTA-4 D5(f) N2: sticky originalReason is the true first-fail reason acro
   );
 });
 
+// ── review delta 5 (final round) — the three adversarial-review sequences ──────────────────────────────
+
+// DELTA-5 finding 1 (High, the only code-semantics fix): skew-growth was judged from `prev.skew`, which
+// is null after ANY empty-run gap — so a genuinely GROWN last-known gap was INVISIBLE (fail-open) in BOTH
+// the sticky-recovery gate (`skewGrew`) and the fresh-decision (`skewIncreased`). Fix: derive growth from
+// the CARRIED timestamps (which persist through empty gaps) via null-safe gap()/gapGrewFrom().
+//
+// SEQUENCE A (sticky gate, verbatim from the adversarial review): a live wedge must NOT clear when the
+// carried gap grew across an empty-run gap that nulled prev.skew, even though the stale leg ticked +1.
+// MUTATION (revert the comparison basis to prev.skew — `const gapGrew = skewGrewFrom(prevSkew, skew)`):
+// prevSkew is null → gapGrew false → wedgeStaleAdvanced && !gapGrew clears the wedge → r3 reads
+// `PASS lagging-constant` and the `r3.fail === true` / `r3.reason === 'wedge-unrecovered'` asserts fail.
+test('DELTA-5 finding 1A: sticky wedge does NOT clear when the carried gap grew across an empty-run gap (null prev.skew)', () => {
+  const t = 7200;
+  const run = runSeq(t);
+
+  // r1: A=100000, B=80000, prev=null → arm, skew 20000 (> threshold).
+  const r1 = run(100_000, 80_000, null);
+  assert.equal(r1.fail, false);
+  assert.equal(r1.reason, 'skew-above-threshold-arming');
+  assert.equal(r1.nextState.skew, 20_000);
+
+  // r2: A=200000 (advanced), B=null with emptySinceB BACKDATED past the grace window → FAIL
+  // one-sided-empty. The prior gap at the end of r2 = |carriedA 200000 − carriedB 80000| = 120000.
+  const r2prev = {
+    ...r1.nextState,
+    emptySinceB: { atMs: NOW - (t * 1000 + 60_000) },
+  };
+  const r2 = run(200_000, null, r2prev);
+  assert.equal(
+    r2.fail,
+    true,
+    'r2: B empty past grace, A advanced → one-sided-empty FAIL',
+  );
+  assert.equal(r2.reason, 'one-sided-empty');
+  assert.equal(r2.nextState.wedgeStaleSide, 'B');
+  assert.equal(r2.nextState.tsA, 200_000, 'A carried');
+  assert.equal(
+    r2.nextState.tsB,
+    80_000,
+    'B last-known carried through the empty run',
+  );
+  assert.equal(
+    r2.nextState.skew,
+    null,
+    'skew unmeasurable across the empty run → prev.skew null for r3',
+  );
+
+  // r3: A=300000, B=80001 → B (the carried wedge stale leg) advanced by ONLY 1, but the carried gap GREW
+  // from 120000 to |300000 − 80001| = 219999. prev.skew is null (from r2), so the OLD basis saw "not
+  // growing" and cleared the wedge — the fail-open. The carried-gap basis sees the gap grew → NO recovery.
+  const r3 = run(300_000, 80_001, r2.nextState);
+  assert.equal(
+    r3.fail,
+    true,
+    'r3: carried gap grew (120000→219999) despite B ticking +1 → wedge NOT recovered (finding 1 fail-open closed)',
+  );
+  assert.equal(
+    r3.reason,
+    'wedge-unrecovered',
+    'the live sticky wedge stays FAIL — it did not clear without genuine recovery',
+  );
+  assert.equal(r3.staleSide, 'B', 'the carried wedge stale leg B stays named');
+});
+
+// SEQUENCE B (fresh decision, verbatim from the adversarial review): after an empty-run gap nulls
+// prev.skew, a fresh over-threshold run whose carried gap GREW must FAIL skew-growing — the old
+// `prev.skew`-based `skewIncreased` was null-blind and read non-fail.
+// MUTATION (same revert — `const gapGrew = skewGrewFrom(prevSkew, skew)`): r3 reads `PASS
+// lagging-constant` and the `r3.fail === true` / `r3.reason === 'skew-growing'` asserts fail.
+test('DELTA-5 finding 1B: fresh run FAILs skew-growing when the carried gap grew across an empty-run gap (null prev.skew)', () => {
+  const t = 7200;
+  const run = runSeq(t);
+
+  // r1: A=100000, B=80000 → arm, skew 20000.
+  const r1 = run(100_000, 80_000, null);
+  assert.equal(r1.reason, 'skew-above-threshold-arming');
+
+  // r2: A=110000, B=null → empty-arming (no wedge). Carried last-known gap = |110000 − 80000| = 30000;
+  // skew=null (unmeasurable), the source of the null prev.skew for r3.
+  const r2 = run(110_000, null, r1.nextState);
+  assert.equal(r2.reason, 'empty-arming');
+  assert.equal(
+    r2.nextState.skew,
+    null,
+    'skew unmeasurable across the empty run',
+  );
+  assert.equal(r2.nextState.tsA, 110_000);
+  assert.equal(r2.nextState.tsB, 80_000, 'B last-known carried');
+
+  // r3: A=200000, B=81000 → both advanced, but the carried gap GREW from 30000 to |200000 − 81000| =
+  // 119000. prev.skew is null; the OLD basis coerced "no growth" and read PASS. The carried-gap basis
+  // sees the gap grew → FAIL skew-growing (the trickling wedge losing ground).
+  const r3 = run(200_000, 81_000, r2.nextState);
+  assert.equal(
+    r3.fail,
+    true,
+    'r3: carried gap grew (30000→119000) across the empty gap → FAIL (finding 1 fail-open closed)',
+  );
+  assert.equal(
+    r3.reason,
+    'skew-growing',
+    'a widening carried gap is a skew-growing wedge, not a benign lagging-constant',
+  );
+});
+
+// DELTA-5 finding 1C (regression guard): the delta-4 F3 case — a null prev.skew after an empty gap where
+// the carried gap genuinely SHRINKS — must still NOT false-FAIL skew-growing under the new carried-gap
+// basis. This pins that finding 1's fix does not reopen F3. (Mirror of D5(c) above, re-asserted against
+// the carried-gap comparison.)
+test('DELTA-5 finding 1C: null prev.skew with a SHRINKING carried gap does NOT false-FAIL (F3 preserved)', () => {
+  const t = 7200;
+  const run = runSeq(t);
+
+  const r1 = run(100_000, 80_000, null); // arm, gap 20000
+  assert.equal(r1.reason, 'skew-above-threshold-arming');
+  const r2 = run(101_000, null, r1.nextState); // B empty → carried gap 21000, skew null
+  assert.equal(r2.reason, 'empty-arming');
+  const r3 = run(102_000, 82_000, r2.nextState); // both advance, carried gap 21000→20000 (SHRANK)
+  assert.equal(
+    r3.fail,
+    false,
+    'r3: a shrinking carried gap after a null prev.skew is NOT a fail (F3 preserved)',
+  );
+  assert.notEqual(
+    r3.reason,
+    'skew-growing',
+    'a null prev.skew with a shrinking carried gap is never skew-growing',
+  );
+});
+
+// DELTA-5 finding 2 (High, SUSTAINED as fail-closed — PINNING test): a genuine catch-up run recovers a
+// sticky wedge in the gate, then the fresh predicate IMMEDIATELY names the (now-frozen) former LEADER as
+// a new `frozen` wedge. This is CONSCIOUSLY CORRECT at the hourly cadence: a leg whose newest-row ts did
+// not advance across a full inter-run interval has genuinely stopped persisting, so N1 names the truly-
+// frozen leg and this is an honest NEW episode (fresh wedgeFailedSince), not laundering. This test PINS
+// the exact behavior so any future change to it is a deliberate decision (there is no mutation — the
+// disposition is "keep as-is"; the assert IS the pin).
+test('DELTA-5 finding 2: leader frozen while the stale leg catches up FAILs frozen naming the leader (fail-closed, pinned)', () => {
+  const t = 7200;
+  const run = runSeq(t);
+
+  // r1: A=1700100000, B=1700000000, prev=null → arm (skew 100000 > threshold), A leader.
+  const r1 = run(1_700_100_000, 1_700_000_000, null);
+  assert.equal(r1.reason, 'skew-above-threshold-arming');
+
+  // r2 at NOW (episode 1 opens): A=1700150000 (advanced), B=1700000000 (FROZEN) → one-sided wedge FAIL
+  // frozen, staleSide B, skew 150000. The sticky wedge episode opens with B as the carried stale leg.
+  const r2 = run(1_700_150_000, 1_700_000_000, r1.nextState, NOW);
+  assert.equal(r2.fail, true, 'r2: B frozen while A advances → FAIL frozen');
+  assert.equal(r2.reason, 'frozen');
+  assert.equal(r2.staleSide, 'B');
+  assert.equal(r2.skew, 150_000);
+  assert.equal(r2.nextState.wedgeFailedSince, NOW, 'episode 1 opens at NOW');
+
+  // r3 ONE HOUR LATER (the deployment's cadence): A=1700150000 (now the LEADER is FROZEN),
+  // B=1700120000 (the stale leg CAUGHT UP; skew shrank 150000→30000). The sticky gate sees B advanced
+  // and the carried gap shrank → wedge recovers → falls through. The fresh predicate then sees A frozen
+  // while B advanced → FAIL frozen, staleSide A, a FRESH wedgeFailedSince (episode 2). SUSTAINED ruling.
+  const laterMs = NOW + 3_600_000;
+  const r3 = run(1_700_150_000, 1_700_120_000, r2.nextState, laterMs);
+  assert.equal(
+    r3.fail,
+    true,
+    'r3: the former leader A is now frozen across a full interval → FAIL frozen (fail-closed, honest new episode)',
+  );
+  assert.equal(r3.reason, 'frozen');
+  assert.equal(
+    r3.staleSide,
+    'A',
+    'N1: the leg that FAILED TO ADVANCE (A, the former leader) is named — not the older leg',
+  );
+  assert.equal(
+    r3.nextState.wedgeFailedSince,
+    laterMs,
+    'the fresh wedge arms a NEW wedgeFailedSince at THIS run (episode 2 restarted, not carried from episode 1)',
+  );
+  assert.notEqual(
+    r3.nextState.wedgeFailedSince,
+    r2.nextState.wedgeFailedSince,
+    'the recovery-then-fresh-wedge is a NEW episode, not the same carried wedgeFailedSince',
+  );
+});
+
+// DELTA-5 finding 3 (Med, SUSTAINED semantics — PINNING test): a both-empty run arms BOTH per-leg timers,
+// so a mutual outage consumes the one-sided-empty grace window. This is the INTENDED F5 semantic and is
+// fail-closed (the timer factually measures THAT leg's emptiness duration; a leg still empty past the
+// window while the other advances SHOULD alarm). This test PINS the sustained behavior. (The wording of
+// the alert was corrected separately to claim only what is known.) No mutation — the disposition is
+// "keep"; the assert IS the pin.
+test('DELTA-5 finding 3: both-empty arms both timers → the next one-sided-empty run FAILs (fail-closed, pinned)', () => {
+  const t = 7200;
+  const run = runSeq(t);
+
+  // r0 at NOW: A=100000, B=90000 → arm (skew 10000 > threshold). No emptiness armed.
+  const r0 = run(100_000, 90_000, null, NOW);
+  assert.equal(r0.reason, 'skew-above-threshold-arming');
+  assert.equal(r0.nextState.emptySinceA, null);
+  assert.equal(r0.nextState.emptySinceB, null);
+
+  // r1 at NOW: A=null, B=null → both-empty (benign mutual outage, non-fail). But BOTH per-leg timers arm
+  // at NOW — the sustained F5 semantic: each timer measures its own leg's emptiness from here.
+  const r1 = run(null, null, r0.nextState, NOW);
+  assert.equal(r1.fail, false);
+  assert.equal(r1.reason, 'both-empty');
+  assert.deepEqual(
+    r1.nextState.emptySinceA,
+    { atMs: NOW },
+    'the both-empty run arms A per-leg timer (sustained F5 semantic)',
+  );
+  assert.deepEqual(
+    r1.nextState.emptySinceB,
+    { atMs: NOW },
+    'the both-empty run arms B per-leg timer (sustained F5 semantic)',
+  );
+
+  // r2 at NOW + grace + 1: A=150000 (recovered, advancing), B=null (still empty past the window). B's
+  // timer, armed during the both-empty outage, is now past grace → FAIL one-sided-empty, staleSide B.
+  // SUSTAINED: the emptiness B factually exhibits is real; a downstream consumer of B sees no rows.
+  const later = NOW + t * 1000 + 1;
+  const r2 = run(150_000, null, r1.nextState, later);
+  assert.equal(
+    r2.fail,
+    true,
+    'r2: B empty past the (both-empty-consumed) grace window while A advances → FAIL one-sided-empty (fail-closed, pinned)',
+  );
+  assert.equal(r2.reason, 'one-sided-empty');
+  assert.equal(r2.staleSide, 'B', 'the empty leg B is named stalled');
+});
+
 // ── stagnationAlerts: one loud, self-describing line per stalled chain ───────────────────────────────
 //
 // The alert layer turns a fired guard into one loud line per stalled chain (naming what was PROVEN: a
@@ -3108,7 +3338,7 @@ test('stagnationAlerts: a skew-growing wedge and a one-sided-empty wedge each ge
   ]);
   assert.match(
     empty[0],
-    /leg B has persisted NO rows for over 7200s while the other leg advances/,
+    /leg B has persisted NO rows for over 7200s \(empty leg\) and the other leg is advancing/,
   );
   assert.match(empty[0], /maxA=12500 maxB=null tsA=1700050000 tsB=null/);
 });
@@ -3166,7 +3396,7 @@ test('DELTA-3 stagnationAlerts: a sticky wedge-unrecovered fail renders via its 
   ]);
   assert.match(
     emptyOrigin[0],
-    /leg B has persisted NO rows for over 7200s while the other leg advances/,
+    /leg B has persisted NO rows for over 7200s \(empty leg\) and the other leg is advancing/,
     'an empty-origin sticky wedge renders with the empty-leg wording, not the generic frozen clause',
   );
   assert.match(emptyOrigin[0], /\(still unrecovered\)/);
