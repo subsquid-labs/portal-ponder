@@ -1,3 +1,3 @@
-import { ponder } from "ponder:registry";
+import { ponder } from 'ponder:registry';
 
-ponder.on("USDC:Transfer" as any, async () => {});
+ponder.on('USDC:Transfer' as any, async () => {});

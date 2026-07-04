@@ -8,24 +8,23 @@
  * only lists which datasets a given portal serves. So we snapshot the docs here and
  * check per-portal existence live at report time.
  */
-import { writeFileSync } from "node:fs";
-import { join } from "node:path";
+import { writeFileSync } from 'node:fs';
+import { join } from 'node:path';
 
-const DOCS = "https://docs.sqd.dev/en/data/all-networks";
+const DOCS = 'https://docs.sqd.dev/en/data/all-networks';
 
 const html = await fetch(DOCS).then((r) => r.text());
 const unescaped = html
-  .replace(/\\n/g, "\n")
+  .replace(/\\n/g, '\n')
   .replace(/\\"/g, '"')
-  .replace(/\\u003e/g, ">")
-  .replace(/\\u003c/g, "<")
-  .replace(/\\\\/g, "\\");
+  .replace(/\\u003e/g, '>')
+  .replace(/\\u003c/g, '<')
+  .replace(/\\\\/g, '\\');
 
 const re = /\{[^{}]*?"slug"\s*:\s*"[^"]+"[^{}]*?\}/g;
 const out: Record<string, any> = {};
-let m: RegExpExecArray | null;
 let rows = 0;
-while ((m = re.exec(unescaped))) {
+for (let m = re.exec(unescaped); m !== null; m = re.exec(unescaped)) {
   const t = m[0];
   if (!/"traces"/.test(t) || !/"stateDiffs"/.test(t)) continue;
   let o: any;
@@ -49,18 +48,18 @@ while ((m = re.exec(unescaped))) {
   };
 }
 
-const path = join(import.meta.dirname, "networks.json");
+const path = join(import.meta.dirname, 'networks.json');
 writeFileSync(
   path,
   JSON.stringify(
     {
       _source: DOCS,
-      _generated: "run fetch-networks.ts to refresh",
+      _generated: 'run fetch-networks.ts to refresh',
       networks: out,
     },
     null,
     2,
-  ) + "\n",
+  ) + '\n',
 );
 console.log(
   `parsed ${rows} rows → wrote ${Object.keys(out).length} networks (with numeric chainId) to ${path}`,

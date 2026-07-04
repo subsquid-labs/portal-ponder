@@ -1,7 +1,7 @@
-import { onchainTable } from "@subsquid/ponder";
+import { onchainTable } from '@subsquid/ponder';
 
 // swap rows carry the receipt's gasUsed → proves RECEIPTS are synced
-export const swap = onchainTable("swap", (t) => ({
+export const swap = onchainTable('swap', (t) => ({
   id: t.text().primaryKey(),
   pool: t.hex().notNull(),
   receiptGasUsed: t.bigint(),
@@ -10,7 +10,7 @@ export const swap = onchainTable("swap", (t) => ({
 }));
 
 // router-call rows come from call traces → proves TRACES are synced
-export const routerCall = onchainTable("router_call", (t) => ({
+export const routerCall = onchainTable('router_call', (t) => ({
   id: t.text().primaryKey(),
   fn: t.text().notNull(),
   from: t.hex().notNull(),
@@ -19,13 +19,13 @@ export const routerCall = onchainTable("router_call", (t) => ({
 }));
 
 // block-interval rows → proves BlockFilter sources are synced
-export const blockTick = onchainTable("block_tick", (t) => ({
+export const blockTick = onchainTable('block_tick', (t) => ({
   number: t.bigint().primaryKey(),
   timestamp: t.bigint().notNull(),
 }));
 
 // account-transaction rows → proves TransactionFilter (from/to) sources are synced
-export const accountTx = onchainTable("account_tx", (t) => ({
+export const accountTx = onchainTable('account_tx', (t) => ({
   hash: t.hex().primaryKey(),
   dir: t.text().notNull(),
   from: t.hex().notNull(),

@@ -14,7 +14,7 @@ import type {
   PortalFieldSelection,
   PortalLogRequest,
   PortalTraceRequest,
-} from "./portal-types.ts";
+} from './portal-types.ts';
 
 export type Topic = string | string[] | null | undefined;
 
@@ -201,7 +201,7 @@ export const buildPortalQuery = (
   }
 
   const query: PortalEvmQuery = {
-    type: "evm",
+    type: 'evm',
     fromBlock: interval[0],
     toBlock: interval[1],
     fields,

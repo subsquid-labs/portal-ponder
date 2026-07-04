@@ -4,25 +4,25 @@
 // Mirrors portal/realtime.ts (unit-tested). Writes PROBE_METRICS_FILE (rolling JSON) + a .log trail.
 //
 //   REALTIME_RPC_KEY=... [SQD_RPC_KEY=...] [PROBE_INTERVAL_MS=15000] node probe.mjs
-import fs from "node:fs";
-import path from "node:path";
-import { fileURLToPath } from "node:url";
+import fs from 'node:fs';
+import path from 'node:path';
+import { fileURLToPath } from 'node:url';
 
 const dir = path.dirname(fileURLToPath(import.meta.url));
 const chains = JSON.parse(
-  fs.readFileSync(path.join(dir, "chains.json"), "utf8"),
+  fs.readFileSync(path.join(dir, 'chains.json'), 'utf8'),
 );
 const KEY = process.env.REALTIME_RPC_KEY;
 const RPC_URL = process.env.REALTIME_RPC_URL; // realtime RPC base (from env; provisioned per client)
 const REALTIME_CHAINS = new Set([1, 42161, 8453, 43114, 137, 56, 9745, 143]);
 const METRICS =
-  process.env.PROBE_METRICS_FILE || path.join(dir, "probe-metrics.json");
+  process.env.PROBE_METRICS_FILE || path.join(dir, 'probe-metrics.json');
 const INTERVAL = Number(process.env.PROBE_INTERVAL_MS || 15000);
 const WINDOW = Number(process.env.PROBE_WINDOW || 40); // rolling ticks
 
 if (!KEY || !RPC_URL) {
   console.error(
-    "REALTIME_RPC_KEY + REALTIME_RPC_URL required (the realtime RPC base + x-api-key)",
+    'REALTIME_RPC_KEY + REALTIME_RPC_URL required (the realtime RPC base + x-api-key)',
   );
   process.exit(1);
 }
@@ -36,9 +36,9 @@ const targets = chains
     chain: c.name,
     endpoints: [
       {
-        name: "realtime-rpc",
+        name: 'realtime-rpc',
         url: `${RPC_URL}/${c.id}`,
-        headers: { "x-api-key": KEY },
+        headers: { 'x-api-key': KEY },
       },
       ...(c.freeRpcs || [])
         .slice(0, 1)
@@ -56,12 +56,12 @@ async function probeOne(url, headers, timeoutMs = 8000) {
   const t0 = Date.now();
   try {
     const res = await fetch(url, {
-      method: "POST",
-      headers: { "content-type": "application/json", ...(headers || {}) },
+      method: 'POST',
+      headers: { 'content-type': 'application/json', ...(headers || {}) },
       body: JSON.stringify({
-        jsonrpc: "2.0",
+        jsonrpc: '2.0',
         id: 1,
-        method: "eth_blockNumber",
+        method: 'eth_blockNumber',
         params: [],
       }),
       signal: AbortSignal.timeout(timeoutMs),
@@ -70,7 +70,7 @@ async function probeOne(url, headers, timeoutMs = 8000) {
     if (!res.ok)
       return { ok: false, latencyMs, tip: null, error: `HTTP ${res.status}` };
     const j = await res.json();
-    const tip = typeof j?.result === "string" ? Number(j.result) : null;
+    const tip = typeof j?.result === 'string' ? Number(j.result) : null;
     return {
       ok: tip !== null && Number.isFinite(tip),
       latencyMs,
@@ -117,12 +117,16 @@ async function tick() {
   while (ring.length > WINDOW * samples.length) ring.shift();
   // roll into per-endpoint stats
   const byKey = {};
-  for (const s of ring) (byKey[`${s.chainId}:${s.name}`] ??= []).push(s);
+  for (const s of ring) {
+    const key = `${s.chainId}:${s.name}`;
+    if (!byKey[key]) byKey[key] = [];
+    byKey[key].push(s);
+  }
   const summary = {};
   for (const [k, ss] of Object.entries(byKey)) {
     const ok = ss.filter((s) => s.ok);
     const lats = ok.map((s) => s.latencyMs);
-    const lags = ok.map((s) => s.lag).filter((x) => typeof x === "number");
+    const lags = ok.map((s) => s.lag).filter((x) => typeof x === 'number');
     summary[k] = {
       chain: ss[0].chain,
       endpoint: ss[0].name,
@@ -156,15 +160,15 @@ async function tick() {
     /* best-effort */
   }
   const line = Object.values(summary)
-    .filter((v) => v.endpoint === "realtime-rpc")
+    .filter((v) => v.endpoint === 'realtime-rpc')
     .map(
       (v) =>
-        `${v.chain} p50=${v.latP50} p95=${v.latP95} ok=${(v.okRate * 100).toFixed(0)}% lag=${v.avgLagBlk ?? "?"}`,
+        `${v.chain} p50=${v.latP50} p95=${v.latP95} ok=${(v.okRate * 100).toFixed(0)}% lag=${v.avgLagBlk ?? '?'}`,
     )
-    .join(" | ");
+    .join(' | ');
   try {
     fs.appendFileSync(
-      METRICS + ".log",
+      METRICS + '.log',
       `${new Date().toISOString()} [realtime-rpc] ${line}\n`,
     );
   } catch {

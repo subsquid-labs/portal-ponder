@@ -8,20 +8,20 @@
  *
  * Env: RPC_URL (required), DATASET, ADDRESS, TOPIC0, FROM, TO.
  */
-import { createPublicClient, http, numberToHex } from "viem";
-import { PortalClient } from "../../packages/portal-sync/src/portal-client.ts";
-import { buildPortalQuery } from "../../packages/portal-sync/src/query.ts";
-import { toSyncLog } from "../../packages/portal-sync/src/transform.ts";
+import { createPublicClient, http, numberToHex } from 'viem';
+import { PortalClient } from '../../packages/portal-sync/src/portal-client.ts';
+import { buildPortalQuery } from '../../packages/portal-sync/src/query.ts';
+import { toSyncLog } from '../../packages/portal-sync/src/transform.ts';
 
-const RPC_URL = process.env.RPC_URL ?? "https://eth.llamarpc.com";
-const DATASET = process.env.DATASET ?? "ethereum-mainnet";
+const RPC_URL = process.env.RPC_URL ?? 'https://eth.llamarpc.com';
+const DATASET = process.env.DATASET ?? 'ethereum-mainnet';
 // WETH, Transfer(address,address,uint256)
 const ADDRESS = (
-  process.env.ADDRESS ?? "0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2"
+  process.env.ADDRESS ?? '0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2'
 ).toLowerCase();
 const TOPIC0 =
   process.env.TOPIC0 ??
-  "0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef";
+  '0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef';
 const FROM = Number(process.env.FROM ?? 21_000_000);
 const TO = Number(process.env.TO ?? 21_000_050);
 
@@ -41,7 +41,7 @@ for await (const batch of portal.streamFinalized(
 // --- RPC ground truth ---
 const rpc = createPublicClient({ transport: http(RPC_URL) });
 const rpcLogs = (await rpc.request({
-  method: "eth_getLogs",
+  method: 'eth_getLogs',
   params: [
     {
       address: ADDRESS as `0x${string}`,
@@ -82,19 +82,19 @@ for (const k of allKeys) {
     continue;
   }
   const fields: [string, unknown, unknown][] = [
-    ["address", p.address, r.address.toLowerCase()],
-    ["data", p.data, r.data],
-    ["topics", JSON.stringify(p.topics), JSON.stringify(r.topics)],
-    ["txHash", p.transactionHash, r.transactionHash],
-    ["blockHash", p.blockHash, r.blockHash],
+    ['address', p.address, r.address.toLowerCase()],
+    ['data', p.data, r.data],
+    ['topics', JSON.stringify(p.topics), JSON.stringify(r.topics)],
+    ['txHash', p.transactionHash, r.transactionHash],
+    ['blockHash', p.blockHash, r.blockHash],
     [
-      "blockNumber",
+      'blockNumber',
       BigInt(p.blockNumber).toString(),
       BigInt(r.blockNumber).toString(),
     ],
-    ["logIndex", BigInt(p.logIndex).toString(), BigInt(r.logIndex).toString()],
+    ['logIndex', BigInt(p.logIndex).toString(), BigInt(r.logIndex).toString()],
     [
-      "txIndex",
+      'txIndex',
       BigInt(p.transactionIndex).toString(),
       BigInt(r.transactionIndex).toString(),
     ],
@@ -109,6 +109,6 @@ for (const k of allKeys) {
 
 const pass = mismatches === 0 && portalLogs.length === rpcLogs.length;
 console.log(
-  `\n  result: ${pass ? "✅ IDENTICAL" : `❌ ${mismatches} mismatches`} (counts ${portalLogs.length === rpcLogs.length ? "match" : "DIFFER"})`,
+  `\n  result: ${pass ? '✅ IDENTICAL' : `❌ ${mismatches} mismatches`} (counts ${portalLogs.length === rpcLogs.length ? 'match' : 'DIFFER'})`,
 );
 process.exit(pass ? 0 : 1);

@@ -11,8 +11,8 @@
  * ("a small number of concurrent streams, each over a large contiguous range").
  */
 
-import type { PortalMetrics } from "./metrics.ts";
-import type { BlockRef, PortalBlock, PortalEvmQuery } from "./portal-types.ts";
+import type { PortalMetrics } from './metrics.ts';
+import type { BlockRef, PortalBlock, PortalEvmQuery } from './portal-types.ts';
 
 export type PortalClientOptions = {
   baseUrl?: string;
@@ -47,17 +47,17 @@ export class PortalClient {
   headers: Record<string, string>;
 
   constructor(opts: PortalClientOptions) {
-    this.baseUrl = (opts.baseUrl ?? "https://portal.sqd.dev/datasets").replace(
+    this.baseUrl = (opts.baseUrl ?? 'https://portal.sqd.dev/datasets').replace(
       /\/$/,
-      "",
+      '',
     );
     this.dataset = opts.dataset;
     this.metrics = opts.metrics;
     this.requestTimeoutMs = opts.requestTimeoutMs ?? 60_000;
     this.maxRetries = opts.maxRetries ?? 8;
     this.maxRetryAfterMs = opts.maxRetryAfterMs ?? 30_000;
-    this.headers = { "accept-encoding": "gzip" };
-    if (opts.apiKey) this.headers["x-api-key"] = opts.apiKey;
+    this.headers = { 'accept-encoding': 'gzip' };
+    if (opts.apiKey) this.headers['x-api-key'] = opts.apiKey;
   }
 
   private url(path: string): string {
@@ -65,10 +65,10 @@ export class PortalClient {
   }
 
   async getHead(): Promise<BlockRef | undefined> {
-    return this.getRef("head");
+    return this.getRef('head');
   }
   async getFinalizedHead(): Promise<BlockRef | undefined> {
-    return this.getRef("finalized-head");
+    return this.getRef('finalized-head');
   }
   private async getRef(path: string): Promise<BlockRef | undefined> {
     const res = await fetch(this.url(path), { headers: this.headers });
@@ -78,8 +78,8 @@ export class PortalClient {
     return (await res.json()) as BlockRef;
   }
   async getMetadata(): Promise<any> {
-    const res = await fetch(this.url("metadata"), {
-      headers: { "accept-encoding": "gzip" },
+    const res = await fetch(this.url('metadata'), {
+      headers: { 'accept-encoding': 'gzip' },
     });
     if (!res.ok) throw new Error(`Portal metadata ${res.status}`);
     return res.json();
@@ -93,14 +93,14 @@ export class PortalClient {
   async *streamFinalized(query: PortalEvmQuery): AsyncGenerator<StreamBatch> {
     const target = query.toBlock;
     if (target === undefined)
-      throw new Error("backfill stream requires toBlock");
+      throw new Error('backfill stream requires toBlock');
     this.metrics?.onLogicalStream(this.dataset, query.fromBlock, target);
 
     let cursor = query.fromBlock;
     while (cursor <= target) {
       const body = JSON.stringify({ ...query, fromBlock: cursor });
       const batch = await this.postOnce(body, cursor, target);
-      if (batch === "above-head") return; // 204
+      if (batch === 'above-head') return; // 204
       yield batch;
       if (batch.toBlock < cursor) {
         // server made no progress — guard against an infinite loop
@@ -117,16 +117,16 @@ export class PortalClient {
     body: string,
     fromBlock: number,
     target: number,
-  ): Promise<StreamBatch | "above-head"> {
+  ): Promise<StreamBatch | 'above-head'> {
     let attempt = 0;
     while (true) {
       const started = Date.now();
       const ctrl = new AbortController();
       const timer = setTimeout(() => ctrl.abort(), this.requestTimeoutMs);
       try {
-        const res = await fetch(this.url("finalized-stream"), {
-          method: "POST",
-          headers: { ...this.headers, "content-type": "application/json" },
+        const res = await fetch(this.url('finalized-stream'), {
+          method: 'POST',
+          headers: { ...this.headers, 'content-type': 'application/json' },
           body,
           signal: ctrl.signal,
         });
@@ -137,7 +137,7 @@ export class PortalClient {
             bytes: 0,
             durationMs: Date.now() - started,
           });
-          return "above-head";
+          return 'above-head';
         }
 
         if (res.status === 503 || res.status === 529 || res.status === 429) {
@@ -159,7 +159,7 @@ export class PortalClient {
         }
 
         if (!res.ok) {
-          const text = await res.text().catch(() => "");
+          const text = await res.text().catch(() => '');
           this.metrics?.onHttpResponse(this.dataset, {
             status: res.status,
             bytes: text.length,
@@ -191,7 +191,7 @@ export class PortalClient {
           traces: drained.traces,
         };
       } catch (err) {
-        const aborted = (err as Error)?.name === "AbortError";
+        const aborted = (err as Error)?.name === 'AbortError';
         if (aborted && attempt++ < this.maxRetries) {
           // a timeout is a transient, not a poison pill — back off and retry the cursor
           this.metrics?.onHttpResponse(this.dataset, {
@@ -212,7 +212,7 @@ export class PortalClient {
   }
 
   private retryAfterMs(res: Response, attempt: number): number {
-    const h = res.headers.get("retry-after");
+    const h = res.headers.get('retry-after');
     if (h) {
       const secs = Number(h);
       if (Number.isFinite(secs))
@@ -231,13 +231,13 @@ export class PortalClient {
 
     const reader = res.body!.getReader();
     const decoder = new TextDecoder();
-    let buf = "";
+    let buf = '';
     const handleLine = (line: string) => {
       if (line.length === 0) return;
       const b = JSON.parse(line) as PortalBlock;
       blocks.push(b);
       const n = b.header?.number;
-      if (typeof n === "number" && (lastBlock === undefined || n > lastBlock))
+      if (typeof n === 'number' && (lastBlock === undefined || n > lastBlock))
         lastBlock = n;
       if (b.logs) logs += b.logs.length;
       if (b.transactions) transactions += b.transactions.length;
@@ -249,10 +249,11 @@ export class PortalClient {
       if (done) break;
       bytes += value.byteLength;
       buf += decoder.decode(value, { stream: true });
-      let nl: number;
-      while ((nl = buf.indexOf("\n")) >= 0) {
+      let nl = buf.indexOf('\n');
+      while (nl >= 0) {
         handleLine(buf.slice(0, nl));
         buf = buf.slice(nl + 1);
+        nl = buf.indexOf('\n');
       }
     }
     buf += decoder.decode();

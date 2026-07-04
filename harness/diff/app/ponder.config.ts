@@ -1,5 +1,5 @@
-import { createConfig } from "@subsquid/ponder";
-import { parseAbiItem } from "abitype";
+import { createConfig } from '@subsquid/ponder';
+import { parseAbiItem } from 'abitype';
 
 // Differential app: indexes logs + receipts (V3 USDC/WETH pool) and traces (V2 Router) over a
 // bounded range. Run it twice — once with PORTAL_URL_1 set (Portal path) and once without (the
@@ -7,18 +7,18 @@ import { parseAbiItem } from "abitype";
 // Separate PGLITE_DIR per run → separate ponder_sync caches → harness/diff/diff.mjs compares them.
 const v3Pool = [
   parseAbiItem(
-    "event Swap(address indexed sender, address indexed recipient, int256 amount0, int256 amount1, uint160 sqrtPriceX96, uint128 liquidity, int24 tick)",
+    'event Swap(address indexed sender, address indexed recipient, int256 amount0, int256 amount1, uint160 sqrtPriceX96, uint128 liquidity, int24 tick)',
   ),
 ] as const;
 const v2Router = [
   parseAbiItem(
-    "function swapExactTokensForTokens(uint256 amountIn, uint256 amountOutMin, address[] path, address to, uint256 deadline) returns (uint256[])",
+    'function swapExactTokensForTokens(uint256 amountIn, uint256 amountOutMin, address[] path, address to, uint256 deadline) returns (uint256[])',
   ),
   parseAbiItem(
-    "function swapExactETHForTokens(uint256 amountOutMin, address[] path, address to, uint256 deadline) returns (uint256[])",
+    'function swapExactETHForTokens(uint256 amountOutMin, address[] path, address to, uint256 deadline) returns (uint256[])',
   ),
   parseAbiItem(
-    "function swapExactTokensForETH(uint256 amountIn, uint256 amountOutMin, address[] path, address to, uint256 deadline) returns (uint256[])",
+    'function swapExactTokensForETH(uint256 amountIn, uint256 amountOutMin, address[] path, address to, uint256 deadline) returns (uint256[])',
   ),
 ] as const;
 
@@ -29,21 +29,21 @@ const v2Router = [
 // loud at config load rather than silently backfilling cross-chain-wrong addresses (finding #7).
 const DEFAULT_CHAIN_ID = 1;
 const chainId = Number(process.env.CHAIN_ID ?? DEFAULT_CHAIN_ID);
-const DEFAULT_POOL_ADDRESS = "0x88e6A0c2dDD26FEEb64F039a2c41296FcB3f5640";
-const DEFAULT_ROUTER_ADDRESS = "0x7a250d5630B4cF539739dF2C5dAcb4c659F2488D";
+const DEFAULT_POOL_ADDRESS = '0x88e6A0c2dDD26FEEb64F039a2c41296FcB3f5640';
+const DEFAULT_ROUTER_ADDRESS = '0x7a250d5630B4cF539739dF2C5dAcb4c659F2488D';
 
 if (chainId !== DEFAULT_CHAIN_ID) {
   const missing: string[] = [];
   if (!process.env.POOL_ADDRESS) {
-    missing.push("POOL_ADDRESS");
+    missing.push('POOL_ADDRESS');
   }
   if (!process.env.ROUTER_ADDRESS) {
-    missing.push("ROUTER_ADDRESS");
+    missing.push('ROUTER_ADDRESS');
   }
   if (missing.length > 0) {
     throw new Error(
       `traces app: CHAIN_ID=${chainId} is not the address-default chain (${DEFAULT_CHAIN_ID}), but ` +
-        `${missing.join(" and ")} ${missing.length > 1 ? "are" : "is"} unset. The Pool/Router ` +
+        `${missing.join(' and ')} ${missing.length > 1 ? 'are' : 'is'} unset. The Pool/Router ` +
         `address defaults are Ethereum-mainnet contracts and would index nonexistent addresses on ` +
         `chain ${chainId}. Set explicit per-chain POOL_ADDRESS and ROUTER_ADDRESS (verify against ` +
         `the P0 capability report) before running this cell.`,
@@ -53,8 +53,8 @@ if (chainId !== DEFAULT_CHAIN_ID) {
 
 export default createConfig({
   database: {
-    kind: "pglite",
-    directory: process.env.PGLITE_DIR ?? "./.ponder/pglite",
+    kind: 'pglite',
+    directory: process.env.PGLITE_DIR ?? './.ponder/pglite',
   },
   chains: {
     mainnet: {
@@ -69,7 +69,7 @@ export default createConfig({
   },
   contracts: {
     Pool: {
-      chain: "mainnet",
+      chain: 'mainnet',
       abi: v3Pool,
       address: (process.env.POOL_ADDRESS ??
         DEFAULT_POOL_ADDRESS) as `0x${string}`,
@@ -78,7 +78,7 @@ export default createConfig({
       endBlock: Number(process.env.PONDER_END),
     },
     Router: {
-      chain: "mainnet",
+      chain: 'mainnet',
       abi: v2Router,
       address: (process.env.ROUTER_ADDRESS ??
         DEFAULT_ROUTER_ADDRESS) as `0x${string}`,

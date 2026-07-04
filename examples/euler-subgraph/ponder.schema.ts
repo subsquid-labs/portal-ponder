@@ -1,4 +1,4 @@
-import { onchainTable, relations } from "@subsquid/ponder";
+import { onchainTable, relations } from '@subsquid/ponder';
 
 /**
  * Ported from the official Euler V2 subgraph (euler-xyz/euler-subgraph).
@@ -11,7 +11,7 @@ import { onchainTable, relations } from "@subsquid/ponder";
  */
 
 // the live per-vault state — in the subgraph this is filled by ~15 eth_calls in loadOrCreateEulerVault
-export const vault = onchainTable("vault", (t) => ({
+export const vault = onchainTable('vault', (t) => ({
   id: t.hex().primaryKey(), // vault (EVault proxy) address
   asset: t.hex(),
   name: t.text(),
@@ -29,14 +29,14 @@ const logCols = (t: any) => ({
   blockNumber: t.bigint().notNull(),
   txHash: t.hex().notNull(),
 });
-export const deposit = onchainTable("deposit", (t) => ({
+export const deposit = onchainTable('deposit', (t) => ({
   ...logCols(t),
   sender: t.hex().notNull(),
   owner: t.hex().notNull(),
   assets: t.bigint().notNull(),
   shares: t.bigint().notNull(),
 }));
-export const withdraw = onchainTable("withdraw", (t) => ({
+export const withdraw = onchainTable('withdraw', (t) => ({
   ...logCols(t),
   sender: t.hex().notNull(),
   receiver: t.hex().notNull(),
@@ -44,17 +44,17 @@ export const withdraw = onchainTable("withdraw", (t) => ({
   assets: t.bigint().notNull(),
   shares: t.bigint().notNull(),
 }));
-export const borrow = onchainTable("borrow", (t) => ({
+export const borrow = onchainTable('borrow', (t) => ({
   ...logCols(t),
   account: t.hex().notNull(),
   assets: t.bigint().notNull(),
 }));
-export const repay = onchainTable("repay", (t) => ({
+export const repay = onchainTable('repay', (t) => ({
   ...logCols(t),
   account: t.hex().notNull(),
   assets: t.bigint().notNull(),
 }));
-export const liquidate = onchainTable("liquidate", (t) => ({
+export const liquidate = onchainTable('liquidate', (t) => ({
   ...logCols(t),
   liquidator: t.hex().notNull(),
   violator: t.hex().notNull(),
@@ -64,7 +64,7 @@ export const liquidate = onchainTable("liquidate", (t) => ({
 }));
 
 // VaultStatus carries the derived supply/borrow APY (computeAPYs, ported from src/utils/math.ts)
-export const vaultStatus = onchainTable("vault_status", (t) => ({
+export const vaultStatus = onchainTable('vault_status', (t) => ({
   id: t.text().primaryKey(),
   vault: t.hex().notNull(),
   totalShares: t.bigint().notNull(),
@@ -77,13 +77,13 @@ export const vaultStatus = onchainTable("vault_status", (t) => ({
 }));
 
 // the subgraph's load-or-create Counter aggregation (per action + a "global" row)
-export const counter = onchainTable("counter", (t) => ({
+export const counter = onchainTable('counter', (t) => ({
   id: t.text().primaryKey(), // "deposit" | "withdraw" | … | "global"
   value: t.bigint().notNull(),
 }));
 
 // EVC sub-account → owner; the subgraph caches this so getAccountOwner is read once per sub-account
-export const account = onchainTable("account", (t) => ({
+export const account = onchainTable('account', (t) => ({
   id: t.hex().primaryKey(),
   owner: t.hex(),
 }));

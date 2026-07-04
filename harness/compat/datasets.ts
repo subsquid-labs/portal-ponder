@@ -9,9 +9,9 @@
  *    portals serve different subsets — so we query the TARGET portal's /datasets live
  *    (fetchCatalog) rather than assume the docs list is what this portal has.
  */
-import { createRequire } from "node:module";
+import { createRequire } from 'node:module';
 
-const snapshot = createRequire(import.meta.url)("./networks.json") as {
+const snapshot = createRequire(import.meta.url)('./networks.json') as {
   _source: string;
   networks: Record<string, NetworkCaps>;
 };
@@ -49,8 +49,8 @@ export async function fetchCatalog(
   apiKey?: string,
 ): Promise<Map<string, DatasetInfo>> {
   const headers: Record<string, string> = {};
-  if (apiKey) headers["x-api-key"] = apiKey;
-  const res = await fetch(`${baseUrl.replace(/\/datasets$/, "")}/datasets`, {
+  if (apiKey) headers['x-api-key'] = apiKey;
+  const res = await fetch(`${baseUrl.replace(/\/datasets$/, '')}/datasets`, {
     headers,
   }).catch(() => null);
   const map = new Map<string, DatasetInfo>();

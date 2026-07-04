@@ -10,16 +10,16 @@
  * Env: CHAINS (csv, default "1,8453,43114,42161,143"), EULER_TS, WINDOW.
  */
 
-import { PortalMetrics } from "../packages/portal-sync/src/metrics.ts";
-import { PortalClient } from "../packages/portal-sync/src/portal-client.ts";
+import { PortalMetrics } from '../packages/portal-sync/src/metrics.ts';
+import { PortalClient } from '../packages/portal-sync/src/portal-client.ts';
 import {
   buildPortalQuery,
   type LogFilter,
-} from "../packages/portal-sync/src/query.ts";
-import { extractChild, loadEulerChain } from "./euler/load-sources.ts";
+} from '../packages/portal-sync/src/query.ts';
+import { extractChild, loadEulerChain } from './euler/load-sources.ts';
 
-const CHAINS = (process.env.CHAINS ?? "1,8453,43114,42161,143")
-  .split(",")
+const CHAINS = (process.env.CHAINS ?? '1,8453,43114,42161,143')
+  .split(',')
   .map(Number);
 const EULER_TS = Number(process.env.EULER_TS ?? 1_722_470_400); // 2024-08-01
 const WINDOW = Number(process.env.WINDOW ?? 3_000_000);
@@ -36,10 +36,10 @@ const blockAtTs = async (slug: string, ts: number): Promise<number> => {
 
 const runChain = async (chainId: number) => {
   const chain = loadEulerChain(chainId);
-  if (!chain.dataset) return { chainId, skipped: "no Portal dataset" };
+  if (!chain.dataset) return { chainId, skipped: 'no Portal dataset' };
   const client = new PortalClient({ dataset: chain.dataset, metrics });
   const head = await client.getFinalizedHead();
-  if (!head) return { chainId, skipped: "no finalized head" };
+  if (!head) return { chainId, skipped: 'no finalized head' };
 
   const start =
     chainId === 143 ? 30_858_573 : await blockAtTs(chain.dataset, EULER_TS);
@@ -86,7 +86,7 @@ console.log(
   `\n================  MULTI-CHAIN EULER DISCOVERY (concurrent)  ================`,
 );
 console.log(
-  `chains=${CHAINS.join(",")} | window=${WINDOW.toLocaleString()} blocks from ${new Date(EULER_TS * 1000).toISOString().slice(0, 10)}\n`,
+  `chains=${CHAINS.join(',')} | window=${WINDOW.toLocaleString()} blocks from ${new Date(EULER_TS * 1000).toISOString().slice(0, 10)}\n`,
 );
 
 const t0 = Date.now();
@@ -121,12 +121,12 @@ console.log(
 
 const errs = snap.totals.clientFacingErrors;
 console.log(
-  `\n=== GATE === ${errs === 0 ? "✅ PASS" : "❌ FAIL"} (client-facing 503/529 = ${errs}, expect 0)`,
+  `\n=== GATE === ${errs === 0 ? '✅ PASS' : '❌ FAIL'} (client-facing 503/529 = ${errs}, expect 0)`,
 );
 
-const fs = await import("node:fs");
+const fs = await import('node:fs');
 fs.writeFileSync(
-  "/Users/dz/Projects/portal-ponder/harness/results.multichain.json",
+  '/Users/dz/Projects/portal-ponder/harness/results.multichain.json',
   JSON.stringify(
     { chains: results, aggregate: snap, wallSeconds: +wall },
     null,

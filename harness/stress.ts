@@ -12,20 +12,20 @@
  *      DASH_PORT (8080).
  */
 
-import { appendFileSync, writeFileSync } from "node:fs";
-import http from "node:http";
-import { PortalMetrics } from "../packages/portal-sync/src/metrics.ts";
-import { PortalClient } from "../packages/portal-sync/src/portal-client.ts";
+import { appendFileSync, writeFileSync } from 'node:fs';
+import http from 'node:http';
+import { PortalMetrics } from '../packages/portal-sync/src/metrics.ts';
+import { PortalClient } from '../packages/portal-sync/src/portal-client.ts';
 import {
   buildPortalQuery,
   type LogFilter,
-} from "../packages/portal-sync/src/query.ts";
-import { DASHBOARD_HTML } from "./dashboard.ts";
-import { extractChild, loadEulerChain } from "./euler/load-sources.ts";
+} from '../packages/portal-sync/src/query.ts';
+import { DASHBOARD_HTML } from './dashboard.ts';
+import { extractChild, loadEulerChain } from './euler/load-sources.ts';
 
-const API_KEY = process.env.PORTAL_API_KEY ?? "";
-const BASE = process.env.PORTAL_BASE ?? "https://portal.sqd.dev/datasets";
-const CHAINS = (process.env.CHAINS ?? "1,8453,42161").split(",").map(Number);
+const API_KEY = process.env.PORTAL_API_KEY ?? '';
+const BASE = process.env.PORTAL_BASE ?? 'https://portal.sqd.dev/datasets';
+const CHAINS = (process.env.CHAINS ?? '1,8453,42161').split(',').map(Number);
 const DURATION_MS = Number(process.env.DURATION_MIN ?? 30) * 60_000;
 const WINDOW = Number(process.env.WINDOW ?? 1_000_000);
 const EULER_TS = Number(process.env.EULER_TS ?? 1_722_470_400); // 2024-08-01
@@ -35,12 +35,12 @@ const RAMP_STEP = Number(process.env.RAMP_STEP ?? 6);
 const RAMP_EVERY_S = Number(process.env.RAMP_EVERY_S ?? 75);
 const RAMP_MAX = Number(process.env.RAMP_MAX ?? 240);
 const DASH_PORT = Number(process.env.DASH_PORT ?? 8080);
-const JSONL = "/tmp/stress-metrics.jsonl";
+const JSONL = '/tmp/stress-metrics.jsonl';
 
 const metrics = new PortalMetrics({ assumedChunkBlocks: 50_000 });
 const blockAtTs = async (slug: string, ts: number): Promise<number> => {
   const r = await fetch(`${BASE}/${slug}/timestamps/${ts}/block`, {
-    headers: { "x-api-key": API_KEY },
+    headers: { 'x-api-key': API_KEY },
   });
   return r.ok ? ((await r.json()).block_number ?? 0) : 0;
 };
@@ -238,23 +238,23 @@ function sample() {
       statusAgg[k] = (statusAgg[k] ?? 0) + v;
   }
   err =
-    (statusAgg["503"] ?? 0) +
-    (statusAgg["529"] ?? 0) +
-    (statusAgg["429"] ?? 0) +
-    (statusAgg["500"] ?? 0);
-  ok = statusAgg["200"] ?? 0;
+    (statusAgg['503'] ?? 0) +
+    (statusAgg['529'] ?? 0) +
+    (statusAgg['429'] ?? 0) +
+    (statusAgg['500'] ?? 0);
+  ok = statusAgg['200'] ?? 0;
   const blocks = [...states.values()].reduce((a, s) => a + s.blocksScanned, 0);
 
-  const chains: Point["chains"] = {};
+  const chains: Point['chains'] = {};
   for (const s of states.values()) {
     const p = prev.perChain.get(s.chainId) ?? { blocks: 0, req: 0, err: 0 };
     const dPerDs = snap.perDataset.find((x) => x.dataset === s.dataset);
     const cReq = dPerDs?.httpRequests ?? 0;
     const cErr = dPerDs
-      ? dPerDs.status["503"] +
-        dPerDs.status["529"] +
-        dPerDs.status["429"] +
-        dPerDs.status["500"]
+      ? dPerDs.status['503'] +
+        dPerDs.status['529'] +
+        dPerDs.status['429'] +
+        dPerDs.status['500']
       : 0;
     chains[s.name] = {
       blocksPerSec: Math.round((s.blocksScanned - p.blocks) / dt),
@@ -289,7 +289,7 @@ function sample() {
     chains,
   };
   series.push(pt);
-  appendFileSync(JSONL, JSON.stringify(pt) + "\n");
+  appendFileSync(JSONL, JSON.stringify(pt) + '\n');
   if (breakingAt === undefined && errPerSec > 0.5 && pt.t > 5) {
     breakingAt = pt.t;
     console.log(
@@ -303,7 +303,7 @@ function sample() {
       c,
     )
       .map(([n, v]) => `${n}:${v.blocksPerSec}`)
-      .join(" ")}\n`,
+      .join(' ')}\n`,
   );
 }
 
@@ -311,10 +311,10 @@ function sample() {
 function serve() {
   http
     .createServer((req, res) => {
-      if (req.url === "/data") {
+      if (req.url === '/data') {
         res.writeHead(200, {
-          "content-type": "application/json",
-          "access-control-allow-origin": "*",
+          'content-type': 'application/json',
+          'access-control-allow-origin': '*',
         });
         res.end(
           JSON.stringify({
@@ -332,7 +332,7 @@ function serve() {
           }),
         );
       } else {
-        res.writeHead(200, { "content-type": "text/html" });
+        res.writeHead(200, { 'content-type': 'text/html' });
         res.end(DASHBOARD_HTML);
       }
     })
@@ -342,7 +342,7 @@ function serve() {
 }
 
 // ---------------- run ----------------
-writeFileSync(JSONL, "");
+writeFileSync(JSONL, '');
 serve(); // dashboard is up IMMEDIATELY (shows "setting up" until data flows)
 console.log(
   `[run] discovering children (DISCOVER_WINDOW=${DISCOVER_WINDOW})… load starts per-chain as each is ready`,
@@ -374,7 +374,7 @@ setTimeout(() => {
     `peak throughput: ${peak.blocksPerSec.toLocaleString()} blk/s @ conc=${peak.concurrency} (T+${peak.t}s), ${peak.mbPerSec} MB/s, ${peak.reqPerSec} req/s`,
   );
   console.log(
-    `breaking point: ${breakingAt ? `T+${breakingAt}s` : "none (no sustained errors)"}`,
+    `breaking point: ${breakingAt ? `T+${breakingAt}s` : 'none (no sustained errors)'}`,
   );
   console.log(
     `total: ${(prev.blocks / 1e6).toFixed(1)}M blocks scanned, ${prev.req.toLocaleString()} requests, ${(prev.bytes / 1e9).toFixed(1)} GB, ${prev.err} errors`,
