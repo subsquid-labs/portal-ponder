@@ -2,12 +2,15 @@ import { getEventListeners } from 'node:events';
 import { afterEach, expect, test, vi } from 'vitest';
 import { TX_FIELDS } from './portal-filters.js';
 import {
+  diagDump,
   type Light,
   portalRealtimeEvents,
   reconcile,
+  type StreamDiag,
   sleep,
   streamHotBlocks,
   takeFinalized,
+  windowDump,
 } from './portal-realtime.js';
 
 const L = (number: number, hash: string, parentHash: string): Light => ({
@@ -482,6 +485,15 @@ test('streamHotBlocks: every /stream request carries parentBlockHash — first =
   expect(second.value?.header.number).toBe(101);
   expect(bodies[1].fromBlock).toBe(101);
   expect(bodies[1].parentBlockHash).toBe('h100'); // post-reconnect carries the LAST delivered hash
+  // F3: EVERY captured /stream body must carry a parentBlockHash in armed mode — a connection dropping the
+  // key (going number-only) would silently re-open the fork-negotiation hole. Assert across ALL bodies, not
+  // just the two spot-checked above.
+  const streamed = bodies.filter((b) => b.fromBlock !== undefined);
+  expect(streamed.length).toBeGreaterThan(0);
+  for (const b of streamed) {
+    expect(typeof b.parentBlockHash).toBe('string');
+    expect(b.parentBlockHash.length).toBeGreaterThan(0);
+  }
   await gen.return(undefined);
   ac.abort();
 });
@@ -589,12 +601,14 @@ test('streamHotBlocks: a 409 whose previousBlocks match NOTHING steps the cursor
   expect(stream[4].parentBlockHash).toBe('h100'); // stepped to 101 → ring[100] (the floor/anchor)
 });
 
-test('streamHotBlocks: an unbounded 409 loop (server keeps re-409ing a rewind the ring confirms) fatals at the 10-cap (issue #33 T3 cap)', async () => {
+test('streamHotBlocks: an OSCILLATING 409 loop (server keeps re-409ing a rewind the ring confirms at the SAME height → no cursor progress) fatals at the 10 no-progress cap (issue #33 T3 cap)', async () => {
   const bodies: any[] = [];
-  // conn1 delivers 101..105 (ring holds 100..105). Then EVERY connection 409s with a previousBlocks the
-  // ring CONFIRMS ({103, ring[103]}) — so each 409 rewinds the cursor to 104 and reconnects, only to 409
-  // again at the same spot: an infinite rewind loop (the fork point never resolves). consecutive409 never
-  // resets (no 200 delivered after the first), so the 10-cap must break it rather than spin forever.
+  // conn1 delivers 101..105 (ring holds 100..105, cursor at the tip 106). Then EVERY connection 409s with a
+  // previousBlocks the ring CONFIRMS at the SAME height ({105, ring[105]}) — so each 409 rewinds the cursor
+  // to 106 (105+1), exactly where it already sits: NO cursor progress, an infinite rewind-to-the-same-spot
+  // oscillation (the fork point never resolves and never descends). consecutive409 never resets (no 200
+  // delivered after the first, and no round lowers the cursor), so the 10 no-progress cap must break it
+  // rather than spin forever. (F2: the cap counts NO-PROGRESS rounds — this is the shape it exists to stop.)
   const conns: Conn[] = [
     {
       status: 200,
@@ -606,12 +620,12 @@ test('streamHotBlocks: an unbounded 409 loop (server keeps re-409ing a rewind th
         hdr(105, 'h105', 'h104'),
       ],
     },
-    // 14 identical 409s: with the cap, only 11 negotiations fire before the fatal, well under this bound;
-    // WITHOUT the cap the loop would exhaust these and hit the sentinel throw below (a clean, distinct
-    // failure instead of an infinite hang → a cap-removal regression surfaces unambiguously).
+    // 14 identical 409s: with the cap, only 11 no-progress negotiations fire before the fatal, well under
+    // this bound; WITHOUT the cap the loop would exhaust these and hit the sentinel throw below (a clean,
+    // distinct failure instead of an infinite hang → a cap-removal regression surfaces unambiguously).
     ...Array.from({ length: 14 }, () => ({
       status: 409 as const,
-      previousBlocks: [{ number: 103, hash: 'h103' }], // a MATCH → rewind to 104, then 409 again
+      previousBlocks: [{ number: 105, hash: 'h105' }], // a MATCH at the TIP → rewind to 106 (no descent)
     })),
   ];
   let onExhausted: (() => void) | undefined;
@@ -640,19 +654,67 @@ test('streamHotBlocks: an unbounded 409 loop (server keeps re-409ing a rewind th
       })(),
       sentinel,
     ]),
-  ).rejects.toThrow(/consecutive .*409 fork-negotiations/i);
+  ).rejects.toThrow(
+    /consecutive .*409 fork-negotiations without cursor progress/i,
+  );
   expect(yielded).toEqual([101, 102, 103, 104, 105]); // only the pre-loop deliveries
-  // exactly 11 409s reach the loop (the 11th trips consecutive409 > 10). The FIRST resumed at the tip
-  // (106) and 409ed; every subsequent one rewound to 104 (just above the confirmed common ancestor 103)
-  // and re-sent the confirmed ring hash h103, only to 409 again.
+  // exactly 11 no-progress 409s reach the loop (the 11th trips consecutive409 > 10). EVERY one resumed at
+  // the tip (106): the confirmed rewind lands at 106 = 105+1, the same height the cursor already held, so no
+  // round makes progress and the cap counts from the very first — 11 identical requests before the fatal.
   const stream = bodies.filter((b) => b.fromBlock !== undefined);
   const negotiations = stream.slice(1); // drop the initial fromBlock=101 request
   expect(negotiations.length).toBe(11);
-  expect(negotiations[0]!.fromBlock).toBe(106); // first 409 was at the tip
-  for (const r of negotiations.slice(1)) {
-    expect(r.fromBlock).toBe(104); // rewound to just above the confirmed ancestor 103
-    expect(r.parentBlockHash).toBe('h103');
+  for (const r of negotiations) {
+    expect(r.fromBlock).toBe(106); // rewound to the SAME tip every time → no progress
+    expect(r.parentBlockHash).toBe('h105'); // ring[105], the confirmed tip hash
   }
+});
+
+test('streamHotBlocks: a no-match step-down descending MORE than 10 heights reaches the FLOOR fatal, NOT the no-progress cap — a deep negotiation runs "until a match or the floor" (issue #33 T3 deep step-down / F2)', async () => {
+  const bodies: any[] = [];
+  // conn1 delivers 101..115 (ring holds 100..115, cursor at the tip 116). The floor is 100. EVERY 409 names
+  // a fork point the ring CANNOT confirm (a hash it never delivered), so no rewind matches and the cursor
+  // steps DOWN one height per 409. The descent is 116 → 115 → … → 101 (15 step-downs, FAR more than the
+  // 10-cap). With a per-409 cap this would fatal at the 11th 409 (height ~106) — the bug. With the F2
+  // no-PROGRESS cap, every step-down strictly lowers the cursor (progress → reset), so the streak never
+  // accrues and the negotiation runs all the way to the floor fatal at height 101 (cursor−1 == floor 100).
+  const blocks = Array.from({ length: 15 }, (_, i) =>
+    hdr(101 + i, `h${101 + i}`, `h${100 + i}`),
+  );
+  // A no-match 409 for the request at fromBlock F names {F−1, x(F−1)} — a hash the ring never delivered — so
+  // the cursor steps down to F−1. The descent runs from the tip (116) down to 101, where cursor−1 == floor
+  // 100 fatals. That is one 409 per request at fromBlock 116,115,…,101 = 16 requests (the last one at 101
+  // fatals). 16 > 10 proves the descent is NOT prematurely cap-fataled.
+  const conns: Conn[] = [
+    { status: 200, blocks },
+    ...Array.from({ length: 16 }, (_, i) => ({
+      status: 409 as const,
+      previousBlocks: [{ number: 115 - i, hash: `x${115 - i}` }],
+    })),
+  ];
+  const gen = streamHotBlocks({
+    portalUrl: 'http://portal',
+    headers: {},
+    fromBlock: 101,
+    logs: [],
+    seedRing: { number: 100, hash: 'h100' },
+    getFinalizedFloor: () => 100,
+    fetchImpl: mockForkFetch(conns, bodies),
+  });
+  const yielded: any[] = [];
+  await expect(
+    (async () => {
+      for await (const b of gen) yielded.push(b.header.number);
+    })(),
+  ).rejects.toThrow(/fork point is at or below the finalized floor/i);
+  expect(yielded.length).toBe(15); // all pre-fork deliveries 101..115; nothing accepted past the fork
+  // the cursor stepped down every single height from the tip to the floor — 15 descents + the floor-fatal
+  // request at 101 = 16 negotiations, none cap-fataled (a per-409 cap would have fataled at the 11th)
+  const stream = bodies.filter((b) => b.fromBlock !== undefined);
+  const negotiations = stream.slice(1); // drop the initial fromBlock=101 request
+  expect(negotiations.map((r) => r.fromBlock)).toEqual(
+    Array.from({ length: 16 }, (_, i) => 116 - i), // 116,115,…,101 (the 101 request hits the floor fatal)
+  );
 });
 
 test('streamHotBlocks: a 409 fork point BELOW the finalized floor is FATAL with no rewind (issue #33 T4 below-finality)', async () => {
@@ -675,6 +737,207 @@ test('streamHotBlocks: a 409 fork point BELOW the finalized floor is FATAL with 
   // exactly ONE request went out — no step-down below finality
   const stream = bodies.filter((b) => b.fromBlock !== undefined);
   expect(stream).toHaveLength(1);
+});
+
+test('streamHotBlocks: a BODYLESS 409 (res.body === null) still DRIVES the fork negotiation — it does NOT silently re-poll forever (issue #33 F1)', async () => {
+  // F1: the pre-existing `if (res.status === 204 || !res.body)` re-poll ran BEFORE the 409 branch, so a
+  // bodyless 409 (a `new Response(null, {status:409})` shape — headers-only, no body) short-circuited to a
+  // 500ms sleep + re-poll and NEVER reached the negotiation: a quiet permanent stall. The fix makes only a
+  // 204 re-poll there; a bodyless 409 now flows into the 409 branch, where parsePreviousBlocks reads '' from
+  // the null body (res.text() → '' → JSON.parse throws → caught → prev=[]), no rewind matches, and the
+  // step-down hits the floor fatal. A bounded mock + sentinel proves it TERMINATES (fatal), not spins.
+  const bodies: any[] = [];
+  let served409 = false;
+  let onExhausted: (() => void) | undefined;
+  const sentinel = new Promise<never>((_, reject) => {
+    onExhausted = () =>
+      reject(
+        new Error(
+          'NEVER-NEGOTIATED: the bodyless 409 was re-polled instead of driving the fork negotiation (F1 regression)',
+        ),
+      );
+  });
+  // The floor sits at the resume parent (cursor−1 = 700 → floor 700), so the FIRST bodyless 409 that reaches
+  // the negotiation immediately hits the floor fatal (cursor−1 <= floor). If the fix regressed, the bodyless
+  // 409 would be re-polled: served409 flips true on the first call, so the SECOND call (a genuine re-poll,
+  // not a negotiation step) exhausts the mock → the sentinel fires with a distinct, unambiguous failure.
+  const fetchImpl = (async (_url: string, init: any) => {
+    bodies.push(JSON.parse(init.body));
+    if (!served409) {
+      served409 = true;
+
+      // headers-only 409: null body, and res.text() resolves to '' exactly like a real bodyless Response.
+      return { status: 409, ok: false, body: null, text: async () => '' };
+    }
+    onExhausted?.();
+
+    return { status: 204, ok: false, body: null };
+  }) as any;
+  const gen = streamHotBlocks({
+    portalUrl: 'http://portal',
+    headers: {},
+    fromBlock: 701,
+    logs: [],
+    seedRing: { number: 700, hash: 'h700' },
+    getFinalizedFloor: () => 700, // floor at cursor−1 → the first negotiated 409 hits the floor fatal
+    fetchImpl,
+  });
+  await expect(Promise.race([gen.next(), sentinel])).rejects.toThrow(
+    /at or below the finalized floor/i,
+  );
+  // exactly ONE /stream request went out and it was the bodyless 409 — no silent re-poll past it
+  const stream = bodies.filter((b) => b.fromBlock !== undefined);
+  expect(stream).toHaveLength(1);
+  expect(stream[0]!.fromBlock).toBe(701);
+});
+
+// ─────────────────────────────── diagnostic dumps (issue #33 F4) ───────────────────────────────
+
+test('windowDump: renders the window size, first/tip, the entry at the parent height, and the anchor (issue #33 F4)', () => {
+  // A direct unit test of the dump string so gutting windowDump() to '' fails LOUDLY — the fatal-message
+  // integration tests below assert the SAME fields flow through, but this pins the exact format.
+  const window: Light[] = [
+    L(674, 'h674', 'h673'),
+    L(675, 'h675', 'h674'),
+    L(676, 'h676', 'h675'),
+  ];
+  const anchor = L(673, 'h673', 'h672');
+  const dump = windowDump(window, anchor, 676); // parentHeight 676 is present in the window
+  expect(dump).toMatch(/window: size=3/);
+  expect(dump).toContain('first=674:h674');
+  expect(dump).toContain('tip=676:h676');
+  expect(dump).toContain('at(676)=present h676'); // the entry at the parent height, with its hash
+  expect(dump).toContain('anchor=673:h673'); // the anchor number:hash
+
+  // an ABSENT parent height renders `absent` (pins whether an orphaned sibling occupied the local N−1)
+  expect(windowDump(window, anchor, 999)).toContain('at(999)=absent');
+  // no anchor renders `anchor=none`
+  expect(windowDump(window, undefined, 674)).toContain('anchor=none');
+});
+
+test('diagDump: renders the cursor, parentBlockHash sent, blocks delivered, the ring tail, and the last 409 (issue #33 F4)', () => {
+  // Direct unit test of the 409/gap diagnostic string — gutting diagDump() to '' fails here.
+  const diag: StreamDiag = {
+    ring: [
+      { number: 100, hash: 'h100' },
+      { number: 101, hash: 'h101' },
+    ],
+    cursor: 102,
+    parentBlockHashSent: 'h101',
+    blocksDeliveredThisConn: 2,
+    lastPreviousBlocks: [{ number: 101, hash: 'x101' }],
+  };
+  const dump = diagDump(diag);
+  expect(dump).toMatch(/diag: cursor=102/);
+  expect(dump).toContain('parentBlockHashSent=h101');
+  expect(dump).toContain('blocksDeliveredThisConn=2');
+  expect(dump).toContain('ring(last8)=[100:h100, 101:h101]'); // the ring fragment
+  expect(dump).toContain('last409.previousBlocks=[101:x101]');
+
+  // an absent lastPreviousBlocks renders `none`; a wholly-absent diag renders '' (no dump wired)
+  const bare: StreamDiag = {
+    ring: [],
+    cursor: 5,
+    parentBlockHashSent: undefined,
+    blocksDeliveredThisConn: 0,
+    lastPreviousBlocks: undefined,
+  };
+  expect(diagDump(bare)).toContain('last409.previousBlocks=none');
+  expect(diagDump(bare)).toContain('parentBlockHashSent=none');
+  expect(diagDump(undefined)).toBe('');
+});
+
+test('portalRealtimeEvents: the unknown-parent gap fatal MESSAGE carries the window + anchor diagnostic (issue #33 F4)', async () => {
+  // The gap fatal must be self-identifying: its message embeds windowDump (size + anchor number:hash) and
+  // diagDump (cursor). Gutting either dump to '' would leave the whole suite green without this assertion.
+  const anchor: Light = L(673, 'h673', 'h672');
+  const batches = [
+    {
+      header: { number: 674, hash: 'h674', parentHash: 'h673', timestamp: 674 },
+      logs: [],
+    },
+    // block 676's parent is unknown to the window ([674]) — a gap fatal, with a wired anchor to dump
+    {
+      header: {
+        number: 676,
+        hash: 'h676',
+        parentHash: 'unknown',
+        timestamp: 676,
+      },
+      logs: [],
+    },
+  ];
+  const ac = new AbortController();
+  const iter = portalRealtimeEvents({
+    portalUrl: 'http://portal',
+    headers: {},
+    fromBlock: 674,
+    logs: [],
+    anchor,
+    fetchImpl: mockFetch(batches, () => ac.abort()),
+    signal: ac.signal,
+    finalizedHead: async () => 673,
+    finalizePollMs: 999999,
+  });
+  let msg = '';
+  try {
+    for await (const _ of iter) {
+      /* drain until the gap throws */
+    }
+  } catch (e) {
+    msg = (e as Error).message;
+  }
+  expect(msg).toMatch(/unknown parent/i);
+  expect(msg).toMatch(/window: size=\d+/); // the window dump is present in the fatal
+  expect(msg).toContain('anchor=673:h673'); // the anchor number:hash (armed via the wired anchor)
+  expect(msg).toMatch(/diag: cursor=\d+/); // the shell's connection diagnostic is present too
+});
+
+test('streamHotBlocks: the 409-exhausted (oscillation-cap) fatal MESSAGE carries the diag cursor + ring fragment (issue #33 F4)', async () => {
+  // The 409-exhausted fatal must dump the ring/cursor state. Gutting diagDump() to '' leaves the cap fatal
+  // firing but strips its diagnostic — this assertion kills that mutant.
+  const bodies: any[] = [];
+  const conns: Conn[] = [
+    {
+      status: 200,
+      blocks: [hdr(101, 'h101', 'h100'), hdr(102, 'h102', 'h101')],
+    },
+    // oscillate: rewind to the SAME tip (102) every time → no progress → the no-progress cap fatals at 10
+    ...Array.from({ length: 14 }, () => ({
+      status: 409 as const,
+      previousBlocks: [{ number: 102, hash: 'h102' }],
+    })),
+  ];
+  const gen = streamHotBlocks({
+    portalUrl: 'http://portal',
+    headers: {},
+    fromBlock: 101,
+    logs: [],
+    seedRing: { number: 100, hash: 'h100' },
+    getFinalizedFloor: () => 0, // floor far below so only the cap can fire
+    // wire a live diag mirror so the shell keeps it current and the fatal can dump it
+    diag: {
+      ring: [],
+      cursor: 101,
+      parentBlockHashSent: undefined,
+      blocksDeliveredThisConn: 0,
+      lastPreviousBlocks: undefined,
+    },
+    fetchImpl: mockForkFetch(conns, bodies),
+  });
+  let msg = '';
+  try {
+    for await (const _ of gen) {
+      /* drain until the cap throws */
+    }
+  } catch (e) {
+    msg = (e as Error).message;
+  }
+  expect(msg).toMatch(
+    /consecutive .*409 fork-negotiations without cursor progress/i,
+  );
+  expect(msg).toMatch(/diag: cursor=\d+/); // the diag cursor is present
+  expect(msg).toMatch(/ring\(last8\)=\[.*102:h102.*\]/); // the ring fragment carries the delivered tip
 });
 
 // ─────────────────────────────── reconcile anchor (finality boundary) ───────────────────────────────

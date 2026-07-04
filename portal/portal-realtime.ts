@@ -209,9 +209,24 @@ export type PortalRealtimeArgs = {
   fetchImpl?: typeof fetch;
 };
 
-/** Max delivered-hash ring entries kept (per height). ~2048 covers far more than any unfinalized window. */
+/**
+ * Max delivered-hash ring entries kept (per height). ~2048 covers far more than any unfinalized window.
+ * CANDOR (F5): with an unfinalized window DEEPER than RING_CAP — a fast chain under a max finalize-defer
+ * streak, so the anchor (and thus the pruning floor) hasn't advanced while the tip has climbed >2048 blocks
+ * above it — a deep 409 step-down could reach an EVICTED ring height and find no confirming entry, ending at
+ * the floor fatal. That is an availability edge (a loud restart, never wrong data): the step-down simply
+ * fails to confirm a fork point whose ring hash was capped out, exactly as a fresh restart would re-derive
+ * the window from the finalized head. The B1 finalize-defer watchdog bounds how long that window can grow.
+ */
 export const RING_CAP = 2048;
-/** Max consecutive 409 fork-negotiation responses before failing loud (a runaway negotiation is a bug). */
+/**
+ * Max consecutive 409 fork-negotiation rounds WITHOUT cursor progress before failing loud (F2). This is an
+ * OSCILLATION guard, NOT a per-409 counter: a legitimate no-match negotiation steps the cursor DOWN one
+ * height per 409 (SQD's docs describe the 409 `previousBlocks` as a SAMPLE and warn clients to expect
+ * several repeated 409s), and a deep fork can descend far more than 10 heights — that monotonic descent is
+ * bounded separately by the floor fatal (cursor − floor is finite). Only rounds that make NO progress (the
+ * cursor did not strictly decrease — a rewind/re-409 stuck at the same spot) count toward this cap.
+ */
 export const MAX_CONSECUTIVE_409 = 10;
 
 /**
@@ -354,10 +369,16 @@ export async function* streamHotBlocks(
       await sleep(1000, args.signal);
       continue;
     }
-    if (res.status === 204 || !res.body) {
+    if (res.status === 204) {
       await sleep(500, args.signal);
       continue;
     } // no hot data yet; re-poll
+    // NB: only a 204 short-circuits to a re-poll here. The old guard ALSO re-polled on `!res.body` BEFORE
+    // the 409/4xx branches below — so a bodyless 409 (or 4xx) silently re-polled forever, a quiet permanent
+    // negotiation stall / tip outage. The bodyless re-poll now applies only to a bodyless 200 (its original
+    // intent — a "no hot data yet" empty OK), gated just before ndjsonLines consumes res.body. 409 and 4xx
+    // tolerate a null body: parsePreviousBlocks / readTextWithIdle read '' from a bodyless response, which
+    // drives the 409 step-down/floor path and the 4xx not-a-droppable-400 fatal respectively. (F1)
     // 409 fork negotiation (BEFORE the deterministic-4xx branch, which would otherwise treat it as a fatal
     // config). The server saw our parentBlockHash orphaned and returned the canonical replacement chain in
     // `previousBlocks` (ending at fromBlock−1). Rewind the cursor to the highest previousBlocks entry that
@@ -365,16 +386,21 @@ export async function* streamHotBlocks(
     // the canonical chain, which reconcile() surfaces as a normal reorg + appends. If nothing matches, step
     // DOWN one block per 409 (each retry re-sends the ring hash at the new cursor−1) until a match or the
     // floor. A fork point below the finalized floor has no safe recovery (finalized data can't be rolled
-    // back) → fatal. A runaway 409 loop → fatal. (issue #33)
+    // back) → fatal. An OSCILLATING 409 loop that never lowers the cursor → fatal (the no-progress cap
+    // below); a monotonic descent is bounded by the floor, not the cap. (issue #33)
     if (res.status === 409) {
       const prev = await parsePreviousBlocks(res).catch(() => undefined);
-      consecutive409 += 1;
       syncDiag(parentBlockHash, 0, prev ?? []);
-      if (consecutive409 > MAX_CONSECUTIVE_409) {
-        throw new Error(
-          `Portal realtime: ${consecutive409} consecutive /stream 409 fork-negotiations without resolving (cursor ${cursor}, floor ${floor()}) — the Portal keeps rejecting the chain the ring believes canonical. ${diagDump(args.diag)} Restart to re-sync from the finalized head.`,
-        );
-      }
+      // OSCILLATION guard (NOT a per-409 counter). A legitimate no-match negotiation steps the cursor DOWN
+      // one height per 409, and a deep fork can sit far more than 10 heights above the floor — SQD's public
+      // docs describe the 409 `previousBlocks` as a SAMPLE and warn clients to expect several repeated 409s.
+      // Counting every 409 would fatal such a descent BEFORE it reached the floor, contradicting the
+      // "until a match or the floor" contract. So we count only consecutive 409 rounds that made NO cursor
+      // PROGRESS (progress = the cursor STRICTLY DECREASED this round, via a rewind that lands lower or a
+      // step-down). Monotonic descent is separately bounded by the floor fatal below (cursor − floor is
+      // finite), so termination and loudness are preserved: a genuine oscillation (a rewind/re-409 that
+      // never lowers the cursor) trips this cap; a real descent reaches the floor. (F2)
+      const cursorBefore = cursor;
       const lo = floor();
       // Highest previousBlocks entry whose {number,hash} matches our ring, at/above the floor.
       let rewindTo: number | undefined;
@@ -386,18 +412,32 @@ export async function* streamHotBlocks(
       }
       if (rewindTo !== undefined) {
         cursor = rewindTo + 1; // re-open just above the confirmed common ancestor
-        continue;
+      } else {
+        // No previousBlocks entry matches the ring. If the server named a fork point below the floor, or the
+        // step-down has reached the floor, recovery is unsafe (below finality) → fatal. Otherwise step the
+        // cursor down one block and re-negotiate with the ring hash at the new cursor−1.
+        const belowFloor = (prev ?? []).some((pb) => pb.number < lo);
+        if (belowFloor || cursor - 1 <= lo) {
+          throw new Error(
+            `Portal realtime: /stream fork point is at or below the finalized floor ${lo} (cursor ${cursor}) — no safe recovery below finality. ${diagDump(args.diag)} Restart to re-sync from the finalized head.`,
+          );
+        }
+        cursor -= 1;
       }
-      // No previousBlocks entry matches the ring. If the server named a fork point below the floor, or the
-      // step-down has reached the floor, recovery is unsafe (below finality) → fatal. Otherwise step the
-      // cursor down one block and re-negotiate with the ring hash at the new cursor−1.
-      const belowFloor = (prev ?? []).some((pb) => pb.number < lo);
-      if (belowFloor || cursor - 1 <= lo) {
-        throw new Error(
-          `Portal realtime: /stream fork point is at or below the finalized floor ${lo} (cursor ${cursor}) — no safe recovery below finality. ${diagDump(args.diag)} Restart to re-sync from the finalized head.`,
-        );
+      // Did this round make progress? A rewind that lands the cursor at the same height or HIGHER (the server
+      // named a confirmed block at/above where we already are) is NOT progress — it's the shape a stuck
+      // oscillation takes (re-open, get the same 409, rewind to the same spot). Only a strict decrease resets.
+      if (cursor < cursorBefore) {
+        consecutive409 = 0;
+      } else {
+        consecutive409 += 1;
+        if (consecutive409 > MAX_CONSECUTIVE_409) {
+          throw new Error(
+            `Portal realtime: ${consecutive409} consecutive /stream 409 fork-negotiations without cursor progress (cursor ${cursor}, floor ${lo}) — the Portal keeps rejecting the chain the ring believes canonical without the negotiation descending. ${diagDump(args.diag)} Restart to re-sync from the finalized head.`,
+          );
+        }
       }
-      cursor -= 1;
+
       continue;
     }
     if (!res.ok) {
@@ -435,6 +475,12 @@ export async function* streamHotBlocks(
     // A 200 means the fork negotiation (if any) resolved — the chain from `cursor` links to our ring. Clear
     // the streak so a later, unrelated fork negotiates fresh from the 10-cap. (issue #33)
     consecutive409 = 0;
+    // A bodyless 200 (empty OK — "no hot data yet") re-polls, preserving the old `!res.body` semantics but
+    // now ONLY on the OK path, after the 409/4xx branches have had their turn. (F1)
+    if (!res.body) {
+      await sleep(500, args.signal);
+      continue;
+    }
     // Snapshot the filter revision at open; if it advances while streaming (a child was discovered), break
     // to re-open with the widened server-side filter NOW rather than waiting for an unrelated reconnect.
     // Breaking early cancels the ndjsonLines reader (its finally), closing this connection. (finding 4)

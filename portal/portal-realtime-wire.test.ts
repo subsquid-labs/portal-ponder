@@ -1115,4 +1115,12 @@ test('getPortalRealtimeEventGenerator: a 1-block orphan at tip HEALS via 409 for
     (b) => b.fromBlock === 675 && b.parentBlockHash === 'h674',
   );
   expect(rewind675).toBeDefined(); // the rewound reconnect after the 409 carried the ancestor hash
+  // F3: in armed (production) mode EVERY /stream request must carry a parentBlockHash — a later connection
+  // silently going number-only (dropping the key) would re-open the fork-negotiation hole this fix closes,
+  // and a find()-based spot check would miss it. Assert the invariant over ALL captured stream bodies.
+  expect(stream.length).toBeGreaterThan(0);
+  for (const b of stream) {
+    expect(typeof b.parentBlockHash).toBe('string');
+    expect(b.parentBlockHash.length).toBeGreaterThan(0);
+  }
 });
