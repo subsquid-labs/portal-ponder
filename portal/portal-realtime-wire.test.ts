@@ -74,9 +74,12 @@ const proxyLog = (proxy: string, over: Record<string, any> = {}): any => ({
 });
 
 const savedEnv = process.env.PORTAL_REALTIME;
+const savedPin = process.env.PORTAL_FINALIZED_HEAD;
 afterEach(() => {
   if (savedEnv === undefined) delete process.env.PORTAL_REALTIME;
   else process.env.PORTAL_REALTIME = savedEnv;
+  if (savedPin === undefined) delete process.env.PORTAL_FINALIZED_HEAD;
+  else process.env.PORTAL_FINALIZED_HEAD = savedPin;
 });
 
 // ─────────────────────────────── flag gating ───────────────────────────────
@@ -389,6 +392,65 @@ test('clampFinalizedToPortalHead: Portal head BELOW RPC finalized → refetch th
   expect(hexToNumber(out.number)).toBe(900);
 });
 
+test('clampFinalizedToPortalHead: an explicit PORTAL_FINALIZED_HEAD pin below the live head is AUTHORITATIVE — the clamp honors it with NO /finalized-head probe (review B5a / fix 4)', async () => {
+  // FIX 5 made the pin authoritative for the finality boundary in portal.ts (the historical seam). This
+  // clamp MUST agree: if it re-probed the LIVE head while portal.ts honored the pin, intervals in
+  // (pin, liveHead] would be marked synced EMPTY while realtime streamed from liveHead+1 — the exact
+  // G4/C11 silent gap. So with the pin set, the clamp returns the block at the PIN and never hits the
+  // network. (Zero-coverage before: making the clamp ignore the pin and probe the live head left the whole
+  // suite green.)
+  process.env.PORTAL_REALTIME = 'stream';
+  process.env.PORTAL_FINALIZED_HEAD = '900'; // pin 900 < RPC finalized 1000
+  let probed = false;
+  const fetchImpl = (async () => {
+    probed = true; // any /finalized-head probe flips this — the pin path must NOT
+    return { json: async () => ({ number: 5000 }) }; // a live head that, if probed, would NOT clamp
+  }) as any;
+  let requested: any;
+  const pinBlock = {
+    number: '0x384', // block at the pin (900)
+    hash: '0xpinhead',
+    parentHash: '0xpp',
+    timestamp: '0x2',
+    logsBloom: `0x${'0'.repeat(512)}`,
+    sha3Uncles: '0x0',
+    miner: '0x0',
+    stateRoot: '0x0',
+    transactionsRoot: '0x0',
+    receiptsRoot: '0x0',
+    gasUsed: '0x0',
+    gasLimit: '0x0',
+    extraData: '0x',
+    nonce: '0x0',
+    mixHash: '0x0',
+    difficulty: '0x0',
+    size: '0x0',
+    transactions: [],
+  };
+  const rpc = {
+    request: async (req: any) => {
+      requested = req;
+      return pinBlock;
+    },
+  } as any;
+  const finalized = {
+    number: '0x3e8', // 1000
+    hash: '0xh',
+    parentHash: '0xp',
+    timestamp: '0x1',
+  } as LightBlock;
+  const out = await clampFinalizedToPortalHead({
+    chain: { portal: 'http://p', name: 'c' } as any,
+    rpc,
+    finalizedBlock: finalized,
+    fetchImpl,
+  });
+  expect(probed).toBe(false); // the pin is authoritative — NO live-head probe
+  expect(requested.method).toBe('eth_getBlockByNumber');
+  expect(requested.params[0]).toBe('0x384'); // clamped to the PIN (900), not the un-probed live head
+  expect(hexToNumber(out.number)).toBe(900);
+});
+
 // ─────────────────────────────── end-to-end generator ───────────────────────────────
 
 // mock the Portal /stream — one NDJSON connection per entry in `connections` (then 204) — and
@@ -512,6 +574,15 @@ test('getPortalRealtimeEventGenerator: a child discovered in block N gets N RE-D
   expect(reopened.fromBlock).toBe(101);
   expect(JSON.stringify(reopened.logs)).toContain(child);
   expect(blocks[1].blockCallback).toBeUndefined();
+  // FIX 5 request side (review B5b): EVERY outgoing /stream body must project the parent transaction — the
+  // `transaction: true` relation on each log request PLUS the TX_FIELDS `fields.transaction` map. Dropping
+  // either would silently leave `event.transaction` undefined and store logs without tx rows (only mocks
+  // that inject `transactions` directly would still pass). So assert the projection on the wire.
+  for (const b of bodies) {
+    expect(b.fields.transaction).toBeDefined();
+    expect(b.fields.transaction.hash).toBe(true); // a TX_FIELDS column
+    for (const r of b.logs) expect(r.transaction).toBe(true); // the parent-tx relation per log request
+  }
 });
 
 test('getPortalRealtimeEventGenerator: a reorg PRUNES reorged-out children from the running map and narrows the filter', async () => {
