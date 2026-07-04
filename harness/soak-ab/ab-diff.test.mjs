@@ -4079,6 +4079,38 @@ test('E2E compareChain: FAIL-CLOSED — an onlyB tx in an A-absent block is NOT 
   assert.equal(out.classes.transactions.toleratedIssue36.count, 0);
 });
 
+test('E2E compareChain: FAIL-CLOSED — an onlyB tx in an A-absent block is NOT tolerated when the blocks onlyB collector cross-check fails (!blocksCollector.ok)', async () => {
+  // The absent set is only authoritative when the blocks onlyB collector received EVERY row the diff
+  // counted. If the diff reports onlyB=2 but the collector only has 1 row (not capped — a silent wiring
+  // drop), crossCheckOnlyBCollector returns {ok:false}: the set is incomplete and MUST NOT widen
+  // tolerance. compareChain passes an EMPTY absent set → the otherwise-tolerable onlyB tx stays in
+  // unexpectedB and the run FAILs.
+  // MUTATION (drop `!blocksCollector.ok` from the absentBlocks guard) → this assertion fails: the
+  // tx would be tolerated via the partial set even though the collector is incomplete.
+  const block = ISSUE_36_FLOOR_1_E2E + 40;
+  const deps = txToleranceDeps({
+    diffBlocks: async () => ({
+      // diff reports 2 onlyB rows — but the collector only received 1 (silent wiring drop, not capped)
+      diff: { onlyA: 0, onlyB: 2, mismatch: 0, shared: 5 },
+      onlyBRows: [{ blockNumber: block }], // only 1 row collected → cross-check fails
+      capped: false, // NOT capped: the gap is a real collector wiring bug, not an expected cap stop
+    }),
+    diffTx: async () => ({
+      ...cleanTx,
+      onlyBTxRows: [{ hash: '0xcollectorfail', blockNumber: block }],
+    }),
+  });
+  const out = await runTxToleranceChain(deps);
+  assert.equal(
+    out.verdict,
+    'FAIL',
+    'blocks collector cross-check fails ⇒ tx tolerance is disabled',
+  );
+  assert.equal(out.classes.transactions.fail, true);
+  assert.deepEqual(out.classes.transactions.unexpectedB, ['0xcollectorfail']);
+  assert.equal(out.classes.transactions.toleratedIssue36.count, 0);
+});
+
 // ── D3: default deps wiring — the production call path uses the REAL module functions ─────────────────
 // COMPARE_CHAIN_DEPS is the default; a test override swaps only the seams it needs, and the default
 // binds every real adapter. MUTATION: drop a key from COMPARE_CHAIN_DEPS (e.g. remove legNewestRow) →
