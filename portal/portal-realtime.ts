@@ -26,7 +26,11 @@ import {
   parseSchemaFieldError,
   readTextWithIdle,
 } from './portal-client.js';
-import { DROPPABLE_FIELDS } from './portal-filters.js';
+import {
+  BLOCK_FIELDS,
+  DROPPABLE_FIELDS,
+  LOG_FIELDS,
+} from './portal-filters.js';
 import { invariant } from './portal-invariant.js';
 import {
   type RawHeader,
@@ -59,8 +63,9 @@ export type Reconcile =
  * from the fork point, so the new block's `parentHash` matches an EARLIER block — everything after that
  * common ancestor is reorged.
  *
- * `anchor` is the last FINALIZED block (startup boundary, then each finalize's tip). It closes two holes
- * the bare window had:
+ * `anchor` is the last FINALIZED block (startup boundary, then each finalize's tip) and is REQUIRED
+ * (wave 4 — the optional legacy mode preserved exactly the blind-append hole this closes; production
+ * always had an anchor). It closes two holes the bare window had:
  *   • An EMPTY window (routine right after a finalize, and at startup) used to blind-`append` ANYTHING —
  *     a skipped block or a wrong-fork block at exactly that boundary was undetectable. With the anchor,
  *     only a block extending it appends; the anchor block itself re-delivered is a `duplicate`; anything
@@ -68,15 +73,13 @@ export type Reconcile =
  *   • A depth-1 fork at the boundary (new tip whose parent IS the finalized block, forking off the sole
  *     window entry) used to read as a fatal `gap` even though the common ancestor is known-safe. With the
  *     anchor it reconciles as a normal `reorg` off the anchor, reorging the whole window.
- * `anchor === undefined` (unknown at startup) keeps the old blind-append behavior.
  */
 export function reconcile(
   unfinalized: Light[],
   next: Light,
-  anchor?: Light,
+  anchor: Light,
 ): Reconcile {
   if (unfinalized.length === 0) {
-    if (anchor === undefined) return { kind: 'append' };
     if (next.hash === anchor.hash) return { kind: 'duplicate' };
     if (next.parentHash === anchor.hash) return { kind: 'append' };
 
@@ -89,7 +92,7 @@ export function reconcile(
   if (idx === -1) {
     // fork at the finality boundary: the parent is the last-finalized anchor, so the common ancestor is
     // known-safe and the WHOLE window is the reorged suffix — a normal reorg, not a fatal gap.
-    if (anchor !== undefined && next.parentHash === anchor.hash)
+    if (next.parentHash === anchor.hash)
       return {
         kind: 'reorg',
         commonAncestor: anchor,
@@ -329,13 +332,11 @@ export async function* streamHotBlocks(
   for (;;) {
     if (args.signal?.aborted) return;
     const txFields = projectFields(args.txFields, 'transaction');
+    // Defaults are the SHARED portal-filters projections — the wire passes the same constants, so a
+    // caller omitting them can no longer drift from the single source (wave 4; the old inline literals
+    // were a second copy of exactly what the module header disclaims).
     const blockFields = projectFields(
-      args.blockFields ?? {
-        number: true,
-        hash: true,
-        parentHash: true,
-        timestamp: true,
-      },
+      args.blockFields ?? BLOCK_FIELDS,
       'block',
     );
 
@@ -362,14 +363,7 @@ export async function* streamHotBlocks(
       includeAllBlocks: true,
       fields: {
         block: blockFields,
-        log: args.logFields ?? {
-          address: true,
-          topics: true,
-          data: true,
-          logIndex: true,
-          transactionHash: true,
-          transactionIndex: true,
-        },
+        log: args.logFields ?? LOG_FIELDS,
         ...(txFields ? { transaction: txFields } : {}),
       },
       logs: args.txFields
@@ -645,8 +639,8 @@ export type PortalRealtimeEvent =
   | { type: 'finalize'; block: Light };
 
 /** The finalized-head poll result: the canonical hash (when the endpoint carries one) arms the
- * wrong-fork finalize guard below. A bare number keeps the old behavior (no hash check). */
-export type FinalizedHead = number | { number: number; hash?: string };
+ * wrong-fork finalize guard below. Absent hash ⇒ number-only finality (no hash check). */
+export type FinalizedHead = { number: number; hash?: string };
 
 export async function* portalRealtimeEvents(
   args: PortalRealtimeArgs & {
@@ -664,9 +658,9 @@ export async function* portalRealtimeEvents(
     finalizeDeferMaxMs?: number;
     /**
      * The last FINALIZED block at startup (syncProgress.finalized as a Light) — the reconcile anchor.
-     * Advanced to each finalize's tip. Absent ⇒ the empty-window blind-append behavior (legacy).
+     * Advanced to each finalize's tip. REQUIRED (wave 4): startup is always anchored.
      */
-    anchor?: Light;
+    anchor: Light;
     /**
      * Redelivery handshake (same-block child discovery): when the consumer discovers a factory child in
      * block N, it suppresses N's incomplete event, widens the filter, and streamHotBlocks re-opens FROM
@@ -796,8 +790,8 @@ export async function* portalRealtimeEvents(
     if (now - lastFinalizePoll >= pollMs) {
       lastFinalizePoll = now;
       const fh = await args.finalizedHead().catch(() => undefined);
-      const fhNumber = typeof fh === 'number' ? fh : fh?.number;
-      const fhHash = typeof fh === 'object' ? fh?.hash : undefined;
+      const fhNumber = fh?.number;
+      const fhHash = fh?.hash;
       // No probe result this poll: the streak of deferrals (if any) is broken — clear it so a later,
       // hash-unverifiable deferral times its OWN run, not a run interleaved with probe outages. (B1)
       if (fhNumber === undefined) deferStreakStart = undefined;

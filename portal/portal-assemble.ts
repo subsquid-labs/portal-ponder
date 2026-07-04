@@ -32,7 +32,6 @@ import {
 } from '@/runtime/filter.js';
 import type { Interval } from '@/utils/interval.js';
 import type { ChildAddresses, FetchSpec } from './portal-filters.js';
-import { invariantStrict } from './portal-invariant.js';
 import {
   cmpTraceAddr,
   hx,
@@ -91,17 +90,15 @@ export function rankTraces(traces: RawTrace[]): RankedTrace[] {
   const sorted = [...traces].sort((x, y) =>
     cmpTraceAddr(x.traceAddress ?? [], y.traceAddress ?? []),
   );
+  // Ranks are strictly increasing BY CONSTRUCTION (each rank is the forEach counter of a monotonically
+  // walked array) — the same "an assert that could never fire" INV-2 deliberately omits, so none here
+  // either (wave 4; the property is proven in portal-assemble.test.ts).
   const out: RankedTrace[] = [];
   sorted.forEach((t, i) => {
     const frame = parityToCallFrame(t, i) as CallFrame | undefined;
     if (frame) out.push({ frame, index: i });
   });
-  invariantStrict(
-    'INV-5',
-    () => out.every((r, i) => i === 0 || r.index > out[i - 1]!.index),
-    'trace ranks not strictly increasing',
-    () => ({ ranks: out.map((r) => r.index) }),
-  );
+
   return out;
 }
 

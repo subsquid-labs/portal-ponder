@@ -2,7 +2,7 @@
  * portal-invariant.ts — runtime invariant checks.
  *
  * The Portal layer is organised around explicit, provable invariants (portal/INVARIANTS.md,
- * INV-1…INV-15). This module lets the code ASSERT them at runtime and cross-reference the
+ * INV-1…INV-16). This module lets the code ASSERT them at runtime and cross-reference the
  * catalog by id, so a violated assumption is a loud, attributable crash rather than silent
  * data corruption.
  *
@@ -26,12 +26,6 @@ export const setCheckMode = (m: CheckMode): void => {
 };
 
 export const getCheckMode = (): CheckMode => mode;
-
-/** True when any check should run (mode ≠ "off"). */
-export const checksEnabled = (): boolean => mode !== 'off';
-
-/** True when O(n) whole-structure checks should run (mode === "strict"). */
-export const checksStrict = (): boolean => mode === 'strict';
 
 /**
  * Assert an O(1) invariant. Throws `InvariantViolation` (carrying `id` + `ctx`) when `cond`

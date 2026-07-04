@@ -56,11 +56,6 @@ export type RawBlock = {
   traces?: RawTrace[];
 };
 
-// `traceSafeChunkBlocks` now lives in portal-chunks.ts (its natural home with the rest of the grid
-// math). Re-exported here for compatibility — existing call sites and tests import it from this
-// module.
-export { traceSafeChunkBlocks } from './portal-chunks.js';
-
 /** An interval reaching past Portal's finalized head must fall back to RPC for the gap.
  * (undefined head = not yet known → treat as no gap.) Pure so it's unit-testable. */
 export const isFinalityGap = (
@@ -242,22 +237,3 @@ export const parityToCallFrame = (t: any, index: number): any | undefined => {
     subcalls: t.subtraces ?? 0,
   };
 };
-
-/** State diffs — Portal has them; Ponder has no state-diff source today, so this is
- * engine-level only (available via the standalone client, not wired into HistoricalSync). */
-export type StateDiff = {
-  transactionIndex: number;
-  address: Address;
-  key: string;
-  kind: '=' | '+' | '*' | '-';
-  prev: Hex | null;
-  next: Hex | null;
-};
-export const toStateDiff = (d: any): StateDiff => ({
-  transactionIndex: d.transactionIndex,
-  address: (d.address as string)?.toLowerCase() as Address,
-  key: d.key,
-  kind: d.kind,
-  prev: d.prev ?? null,
-  next: d.next ?? null,
-});

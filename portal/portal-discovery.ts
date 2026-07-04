@@ -21,11 +21,13 @@ import type { ChildAddresses } from './portal-filters.js';
 import type { PortalStats } from './portal-metrics.js';
 import { hx } from './portal-transform.js';
 
-export type DiscoveryStatus = 'idle' | 'scanning' | 'failed';
+// (wave 4) DiscoveryState carried a `status: 'idle' | 'scanning' | 'failed'` field written on every
+// transition and read by NOTHING (planDiscovery ignored it; no caller or test asserted on it) — and it
+// was subtly wrong as telemetry (a predecessor completing set 'idle' while a chained successor still
+// scanned). Deleted rather than fixed: the G2-critical machine keeps no redundant mutable state.
 export type DiscoveryState = Readonly<{
   floor: number;
   through: number;
-  status: DiscoveryStatus;
 }>;
 
 /** Split [from, to] into ≤ `discoveryWindows` disjoint windows sized by `chunkBlocks`. Pure. */
@@ -118,7 +120,6 @@ export function createDiscovery(deps: DiscoveryDeps): Discovery {
   let floor = -1;
   let through = -1; // optimistic watermark (dedup + `from`)
   let confirmed = -1; // last SUCCESSFUL watermark (rollback target)
-  let status: DiscoveryStatus = 'idle';
   let inflight: Promise<void> = Promise.resolve();
   // Bumped by reset(). Each scan captures the generation at plan time; a scan that resolves OR rejects
   // after a reset changed the generation must NOT touch the watermark. Otherwise a stale success advances
@@ -223,7 +224,7 @@ export function createDiscovery(deps: DiscoveryDeps): Discovery {
     opts: { chunkBlocks: number; endHint: number },
   ): Promise<void> => {
     if (factories.length === 0) return Promise.resolve();
-    const plan = planDiscovery({ floor, through, status }, needTo, {
+    const plan = planDiscovery({ floor, through }, needTo, {
       chunkBlocks: opts.chunkBlocks,
       endHint: opts.endHint,
       discoveryWindows,
@@ -233,7 +234,6 @@ export function createDiscovery(deps: DiscoveryDeps): Discovery {
     const earlier = inflight;
     const gen = generation; // stamp: a reset() after this point invalidates this scan
     through = to; // optimistic advance so concurrent ensures dedup onto one scan
-    status = 'scanning';
     const p = (async () => {
       // G2/INV-3: a predecessor extension's failure MUST propagate. This extension only scans
       // [through+1..to] on the assumption the predecessor covered everything below it; swallowing the
@@ -247,7 +247,6 @@ export function createDiscovery(deps: DiscoveryDeps): Discovery {
       if (gen !== generation) return; // a reset() invalidated this scan — never confirm over it (issue #9)
 
       confirmed = to; // INV-3: advance the confirmed watermark ONLY on success (never past a gap)
-      status = 'idle';
     })();
     inflight = p;
     // On failure roll the optimistic watermark back to the last good one and drop the rejected promise so
@@ -256,7 +255,6 @@ export function createDiscovery(deps: DiscoveryDeps): Discovery {
       if (gen !== generation) return; // invalidated by reset() — leave the post-reset state untouched (issue #9)
 
       through = confirmed;
-      status = 'failed';
       if (inflight === p) inflight = Promise.resolve();
     });
     return p;
@@ -272,7 +270,6 @@ export function createDiscovery(deps: DiscoveryDeps): Discovery {
       floor = -1;
       through = -1;
       confirmed = -1;
-      status = 'idle';
       inflight = Promise.resolve();
       generation++; // invalidate any in-flight scan stamped with the previous generation (issue #9)
     },
@@ -280,6 +277,6 @@ export function createDiscovery(deps: DiscoveryDeps): Discovery {
     through: () => through,
     takePendingInRange,
     restorePending,
-    snapshot: () => ({ floor, through, status }),
+    snapshot: () => ({ floor, through }),
   };
 }

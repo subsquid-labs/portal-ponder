@@ -174,7 +174,8 @@ export const createPortalHistoricalSync = (
   };
   // stream-realtime mode: the recent region is served by the Portal /stream (portal-realtime-wire), so
   // historical never targets past the head and this RPC finality-gap fallback is neither needed nor wanted.
-  const STREAM_REALTIME = Boolean(chain.portal) && cfg.realtime === 'stream';
+  // (this constructor is only selected for chains WITH a portal source, so the flag alone decides)
+  const STREAM_REALTIME = cfg.realtime === 'stream';
 
   const refreshPortalHead = async (): Promise<number | undefined> => {
     if (cfg.finalizedHead !== undefined) {

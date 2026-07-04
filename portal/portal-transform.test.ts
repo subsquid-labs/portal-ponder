@@ -2,15 +2,14 @@ import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { hexToBigInt } from 'viem';
 import { expect, test } from 'vitest';
+import { traceSafeChunkBlocks } from './portal-chunks.js';
 import {
   cmpTraceAddr,
   hx,
   isFinalityGap,
   parityToCallFrame,
-  toStateDiff,
   toSyncReceipt,
   toSyncTransaction,
-  traceSafeChunkBlocks,
 } from './portal-transform.js';
 
 // C7: hx("0x") used to return the invalid quantity "0x" (throws downstream in BigInt); empty
@@ -29,7 +28,7 @@ test('hx: empty quantity → 0x0 (never invalid 0x); decimal/hex normalize', () 
  * Unit tests over REAL Portal NDJSON captured at eth block 21,000,000 (+ base).
  * They pin the type mismatches the schema audit flagged — Portal's split encoding
  * (status/type decimal, gas/value hex), trace callType at action.callType,
- * staticcall value:null, CREATE init/code, stateDiff prev:null⟺"+".
+ * staticcall value:null, CREATE init/code.
  */
 const FIX = join(__dirname, '__fixtures__');
 const load = (f: string): any[] =>
@@ -41,7 +40,6 @@ const allTx = load('receipts.json').flatMap((b) =>
   (b.transactions ?? []).map((t: any) => ({ t, h: b.header })),
 );
 const allTrace = load('traces.json').flatMap((b) => b.traces ?? []);
-const allDiff = load('statediffs.json').flatMap((b) => b.stateDiffs ?? []);
 
 // Regression for a byte-identity divergence vs the RPC path (harness/diff): Portal returns
 // accessList=[] for every tx, but the RPC sync stores accessList only on TYPED txs (EIP-2930/
@@ -161,16 +159,4 @@ test('traceSafeChunkBlocks: caps only when traces needed and base exceeds cap', 
   expect(traceSafeChunkBlocks(500_000, false, 25_000)).toBe(500_000); // no traces → unchanged
   expect(traceSafeChunkBlocks(500_000, true, 25_000)).toBe(25_000); // traces → capped
   expect(traceSafeChunkBlocks(10_000, true, 25_000)).toBe(10_000); // already small → unchanged
-});
-
-test("stateDiff: kind/key preserved; prev:null ⟺ '+'; hex prev/next", () => {
-  for (const d of allDiff) {
-    const sd = toStateDiff(d);
-    expect(['=', '+', '*', '-']).toContain(sd.kind);
-    expect(sd.address).toBe((d.address as string).toLowerCase());
-    if (sd.kind === '+') expect(sd.prev).toBeNull();
-    if (sd.prev !== null) expect(String(sd.prev)).toMatch(/^0x/);
-  }
-  const add = allDiff.find((d) => d.kind === '+');
-  if (add) expect(toStateDiff(add).prev).toBeNull();
 });

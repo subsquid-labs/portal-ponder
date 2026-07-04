@@ -82,20 +82,20 @@ test('splitWindows: disjoint, cover [from,to], ≤ discoveryWindows', () => {
 
 test('planDiscovery: null when no floor or already covered; reaches endHint', () => {
   expect(
-    planDiscovery({ floor: -1, through: -1, status: 'idle' }, 100, {
+    planDiscovery({ floor: -1, through: -1 }, 100, {
       chunkBlocks: 50,
       endHint: 100,
       discoveryWindows: 8,
     }),
   ).toBeNull();
   expect(
-    planDiscovery({ floor: 0, through: 100, status: 'idle' }, 100, {
+    planDiscovery({ floor: 0, through: 100 }, 100, {
       chunkBlocks: 50,
       endHint: 100,
       discoveryWindows: 8,
     }),
   ).toBeNull();
-  const p = planDiscovery({ floor: 0, through: -1, status: 'idle' }, 100, {
+  const p = planDiscovery({ floor: 0, through: -1 }, 100, {
     chunkBlocks: 50,
     endHint: 500,
     discoveryWindows: 8,

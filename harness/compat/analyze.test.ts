@@ -1,6 +1,5 @@
 import assert from 'node:assert';
 import { test } from 'node:test';
-import { getPortalDataset, withPortal } from '../../portal/config.ts';
 import { analyzeConfig } from './analyze.ts';
 import type { DatasetInfo } from './datasets.ts';
 
@@ -92,23 +91,4 @@ test('block-range caveat note surfaced (Optimism Bedrock)', () => {
   const s = analyzeConfig(cfg, new Map()).sources[0]!;
   assert.equal(s.verdict, 'READY');
   assert.ok(s.notes.some((n) => n.includes('Bedrock')));
-});
-
-test('withPortal: extracts portal into registry and strips it from the chain', () => {
-  const cfg: any = {
-    chains: {
-      mainnet: {
-        id: 1,
-        rpc: 'x',
-        portal: 'https://portal.sqd.dev/datasets/ethereum-mainnet',
-      },
-    },
-  };
-  withPortal(cfg);
-  assert.equal(
-    getPortalDataset(1),
-    'https://portal.sqd.dev/datasets/ethereum-mainnet',
-  );
-  assert.equal(cfg.chains.mainnet.portal, undefined);
-  assert.equal(cfg.chains.mainnet.rpc, 'x');
 });

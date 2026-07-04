@@ -45,13 +45,14 @@ export const scaleChunkBlocks = (base: number, head: number): number => {
  * cap is conservative. When a chain has trace (or includeAllBlocks) sources, cap the chunk to a
  * trace-safe width (`PORTAL_TRACE_CHUNK_BLOCKS`, default 2k).
  *
- * NOTE: this is the canonical home; `portal-transform.ts` re-exports it for compat. The `cap`
- * default reads env for the standalone signature — the shell always passes `cfg.traceChunkBlocks`.
+ * The cap always comes from the caller (`cfg.traceChunkBlocks` — env is parsed ONCE into the
+ * validated PortalConfig, INV-14); the old env-reading default parameter here was dead in
+ * production and reintroduced the exact silent-NaN shape INV-14 was written to kill.
  */
 export const traceSafeChunkBlocks = (
   base: number,
   needTraces: boolean,
-  cap = Number(process.env.PORTAL_TRACE_CHUNK_BLOCKS ?? 2_000),
+  cap: number,
 ): number => (needTraces && base > cap ? cap : base);
 
 /**
