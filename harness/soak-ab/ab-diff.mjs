@@ -597,17 +597,29 @@ export function readStagnationThreshold(raw) {
 // Returns { fail, reason, staleSide, skew, tsA, tsB, maxA, maxB, nextState }. `nextState` is the state
 // to persist for THIS chain for the next run (never mutates `prev`); it is null when there is nothing
 // to carry (both legs healthy / both empty). `reason` is a short machine tag naming what was decided
-// (e.g. 'frozen', 'skew-growing', 'skew-above-threshold-arming', 'catching-up', 'one-sided-empty',
-// 'empty-arming', 'both-populated-in-skew', 'both-empty', 'one-leg-empty-indeterminate').
+// (e.g. 'frozen', 'skew-growing', 'lagging-constant', 'skew-above-threshold-arming', 'catching-up',
+// 'one-sided-empty', 'empty-arming', 'both-populated-in-skew', 'both-empty').
+//
+// The both-populated state persists BOTH legs' newest-row timestamps + the observed skew each run
+// ({ tsA, tsB, skew }), NOT just the currently-stale leg's (review finding 2). The direction check
+// evaluates EACH leg's frozen-ness vs the previous run's timestamps REGARDLESS of which side is "stale"
+// this run, so a stale-side FLIP between runs never discards the evidence and re-arms from scratch: a
+// leg that keeps freezing while the other advances — even as the older side alternates run to run — is
+// caught, not laundered into a fresh arm every time. (The pre-fix keying on staleSide let an
+// alternating adversarial sequence, one leg always frozen, evade FAIL forever.)
 //
 // The four cases (all handled here so the caller is thin wiring):
 //   • BOTH legs populated, skew ≤ threshold → PASS; clear any prior emptiness state (nextState null).
 //   • BOTH legs populated, skew > threshold:
-//       – no prev → NOT a fail yet: ARM (nextState carries this run's stale-leg ts + skew), reason
-//         'skew-above-threshold-arming' (a loud INFO line, non-fail — decision deferred one run).
-//       – prev exists → FAIL iff the stale (older-ts) leg did NOT advance since prev (frozen) OR the
-//         skew INCREASED vs prev (falling further behind). Both clauses fail-CLOSED. If the stale leg
-//         advanced AND skew decreased → 'catching-up', non-fail (a loud INFO line).
+//       – no prev (or a prev without both legs' ts) → NOT a fail yet: ARM (nextState carries this run's
+//         { tsA, tsB, skew }), reason 'skew-above-threshold-arming' (a loud INFO line, non-fail —
+//         decision deferred one run).
+//       – prev with both legs' ts → FAIL iff a leg was FROZEN since prev while the OTHER advanced (a
+//         one-sided wedge, regardless of which side is currently older) OR the skew INCREASED vs prev
+//         (falling further behind). Both clauses fail-CLOSED. Non-fail otherwise: 'catching-up' when the
+//         skew strictly SHRANK, 'lagging-constant' when the skew held flat with both legs advancing (a
+//         steady lag, not a freeze — the finalized-overlap window `hi` advances with the stale leg, so
+//         the WINDOWED diff owns coverage of that regime; this guard exists only for FROZEN windows).
 //   • ONE leg empty, other populated: ARM `firstEmptyAtMs` on first observation; FAIL when
 //     nowMs − firstEmptyAtMs > threshold*1000 AND the populated leg ADVANCED since prev (a genuinely
 //     one-sided wedge — the empty leg is stuck while the other moves). If the populated leg is ALSO
@@ -690,25 +702,35 @@ export function stagnationDecision({
   }
 
   if (skew <= threshold) {
-    // healthy / within tolerance — clear any prior emptiness/skew state
-    return pass('both-populated-in-skew');
+    // healthy / within tolerance — clear any prior emptiness/skew state, but STILL surface the real
+    // computed skew (finding 3: below-threshold telemetry is lost if this returns skew:null). staleSide
+    // stays null (a below-threshold lag has an older leg but no stall).
+    return {
+      fail: false,
+      reason: 'both-populated-in-skew',
+      staleSide: null,
+      skew,
+      ...base,
+      nextState: null,
+    };
   }
 
-  // skew > threshold — the stale leg's newest ts (the OLDER one), carried for the next run's direction
-  // check. equal ts cannot be over-threshold (skew 0), so olderSide is always set here.
-  const staleTs = olderSide === 'A' ? a : b;
-  const armed = {
-    staleSide: olderSide,
-    staleTs,
-    skew,
-  };
+  // skew > threshold — carry BOTH legs' newest ts and the skew for the next run's direction check
+  // (finding 2: NOT keyed on the stale side, so a stale-side flip never discards the evidence).
+  const armed = { tsA: a, tsB: b, skew };
 
-  // No prior over-threshold observation for THIS stale side → ARM, defer the verdict one run.
-  const priorSkew =
-    prev && prev.staleSide === olderSide && Number.isFinite(prev.staleTs)
+  // A prev is usable for the direction check only when it carries BOTH legs' timestamps AND a skew
+  // (the both-populated shape). A one-leg-empty prev ({ emptySide, firstEmptyAtMs, populatedTs }) has
+  // no tsA/tsB/skew, so it is NOT treated as a prior over-threshold observation — those shapes never
+  // collide. No usable prev → ARM, defer the verdict one run.
+  const priorBoth =
+    prev &&
+    Number.isFinite(prev.tsA) &&
+    Number.isFinite(prev.tsB) &&
+    Number.isFinite(prev.skew)
       ? prev
       : null;
-  if (!priorSkew) {
+  if (!priorBoth) {
     return {
       fail: false,
       reason: 'skew-above-threshold-arming',
@@ -719,21 +741,42 @@ export function stagnationDecision({
     };
   }
 
-  // prev exists: FAIL iff the stale leg did NOT advance (frozen) OR the skew INCREASED (falling
-  // further behind). Both fail-closed. Only a stale leg that advanced AND a skew that shrank is
-  // catching up (non-fail).
-  const staleAdvanced = staleTs > priorSkew.staleTs;
-  const skewIncreased = skew > priorSkew.skew;
-  const fail = !staleAdvanced || skewIncreased;
-  let reason = 'catching-up';
+  // Direction, evaluated per leg vs prev REGARDLESS of which side is stale this run. "Advanced" = this
+  // run's newest ts is strictly greater than prev's for that leg; anything else (unchanged, or a
+  // regression from a one-sided reorg/resync) is "not advancing" = frozen — the fail-closed reading.
+  const aAdvanced = a > priorBoth.tsA;
+  const bAdvanced = b > priorBoth.tsB;
+  // A one-sided wedge: one leg frozen since prev while the OTHER moved. A side flip does not matter —
+  // this fires whether A or B is the frozen one, so an alternating-stale-side sequence cannot escape.
+  const oneLegFrozenWhileOtherAdvanced =
+    (!aAdvanced && bAdvanced) || (!bAdvanced && aAdvanced);
+  const skewIncreased = skew > priorBoth.skew;
+  const skewDecreased = skew < priorBoth.skew;
+  // FAIL iff a leg was frozen while the other advanced (one-sided wedge) OR the skew grew (falling
+  // further behind). Both fail-closed.
+  const fail = oneLegFrozenWhileOtherAdvanced || skewIncreased;
+  let reason;
   if (fail) {
-    reason = staleAdvanced ? 'skew-growing' : 'frozen';
+    // 'frozen' when a leg is stuck while the other moves; 'skew-growing' when both moved but the gap
+    // widened (a trickling wedge that never freezes outright but keeps losing ground).
+    reason = oneLegFrozenWhileOtherAdvanced ? 'frozen' : 'skew-growing';
+  } else if (skewDecreased) {
+    // both advanced AND the gap narrowed → a leg mid-recovery, closing the gap. Non-fail.
+    reason = 'catching-up';
+  } else {
+    // both advanced, skew flat over threshold (finding 1): a STEADY lag, not a freeze. This is
+    // deliberately non-fail. Rationale: the stale leg IS advancing, so the finalized-overlap window
+    // `hi` (pinned to min(maxA, maxB)) advances with it and the WINDOWED row/bucket diff owns coverage
+    // of that regime — the persist-stagnation guard exists only to close the FROZEN-window blind spot
+    // above a stuck `hi`, which a steadily-advancing stale leg is not.
+    reason = 'lagging-constant';
   }
 
   return {
     fail,
-    reason,
+    // Name the older-ts leg only on a FAIL — that is the stalled side the alert points at.
     staleSide: fail ? olderSide : null,
+    reason,
     skew,
     ...base,
     nextState: armed,

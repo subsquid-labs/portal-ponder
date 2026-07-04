@@ -1619,13 +1619,14 @@ test('stagnationDecision: both legs populated, skew ≤ threshold → PASS, clea
     maxB: '99',
     tsB: 1_700_000_000 - 3600, // 1h behind, under 2h
     threshold: t,
-    prev: { staleSide: 'B', staleTs: 1_699_000_000, skew: 999_999 }, // stale prior state
+    prev: { tsA: 1_699_000_000, tsB: 1_699_000_000 - 999_999, skew: 999_999 }, // stale prior state
     nowMs: NOW,
   });
   assert.equal(r.fail, false, '1h skew is under the 2h threshold');
   assert.equal(r.reason, 'both-populated-in-skew');
   assert.equal(r.staleSide, null, 'a below-threshold lag names no stalled side');
-  assert.equal(r.skew, null, 'in-skew: skew is not surfaced as a stall metric');
+  // FINDING 3: the real skew IS surfaced below threshold (telemetry), not nulled.
+  assert.equal(r.skew, 3600, 'the below-threshold skew is surfaced for telemetry');
   assert.equal(r.nextState, null, 'a healthy run CLEARS any prior armed state');
   // maxA/maxB carried through for the counters JSON
   assert.equal(r.maxA, 100);
@@ -1650,47 +1651,49 @@ test('stagnationDecision: both populated, skew > threshold, NO prev → ARM (non
   assert.equal(r.reason, 'skew-above-threshold-arming');
   assert.equal(r.staleSide, null, 'no side named on the deferred (armed) run');
   assert.equal(r.skew, 10_800, 'the skew is surfaced (loud info), just not yet a fail');
-  // nextState carries THIS run's stale-leg ts + skew for the next run's direction check
+  // nextState carries BOTH legs' ts + skew (finding 2: NOT keyed on the stale side) for the next run's
+  // direction check.
   assert.deepEqual(r.nextState, {
-    staleSide: 'B',
-    staleTs: 1_700_000_000 - 10_800,
+    tsA: 1_700_000_000,
+    tsB: 1_700_000_000 - 10_800,
     skew: 10_800,
   });
 });
 
-// DIRECTION — FROZEN: prev armed the same stale side; this run the stale leg did NOT advance → FAIL
-// 'frozen'. MUTATION: invert the frozen clause (`!staleAdvanced` → `staleAdvanced`) → a frozen leg
-// reads as advancing and this `fail === true` assertion fails.
+// DIRECTION — FROZEN: prev carries BOTH legs' ts; this run leg B did NOT advance while leg A did → a
+// one-sided wedge → FAIL 'frozen'. MUTATION: invert the frozen clause (`(!bAdvanced && aAdvanced)` →
+// `(bAdvanced && aAdvanced)`) → a frozen leg reads as advancing and this `fail === true` fails.
 test('stagnationDecision: both populated, over threshold, prev armed, stale leg FROZEN → FAIL frozen', () => {
   const t = 7200;
-  const prev = { staleSide: 'B', staleTs: 1_699_989_200, skew: 10_800 };
+  const prev = { tsA: 1_699_995_000, tsB: 1_699_989_200, skew: 5800 };
   const r = stagnationDecision({
     maxA: '100',
-    tsA: 1_700_000_000,
+    tsA: 1_700_000_000, // leg A advanced since prev.tsA
     maxB: '90',
-    tsB: 1_699_989_200, // UNCHANGED since prev.staleTs → frozen
+    tsB: 1_699_989_200, // leg B UNCHANGED since prev.tsB → frozen
     threshold: t,
     prev,
     nowMs: NOW,
   });
-  assert.equal(r.fail, true, 'a stale leg that did not advance since prev is a frozen wedge');
+  assert.equal(r.fail, true, 'a leg that did not advance while the other did is a frozen wedge');
   assert.equal(r.reason, 'frozen');
   assert.equal(r.staleSide, 'B', 'the OLDER-ts leg is the stalled one');
   assert.equal(r.skew, 10_800);
 });
 
-// DIRECTION — SKEW GROWING: the stale leg advanced a little, but the skew INCREASED vs prev (falling
-// further behind = a trickling wedge) → FAIL 'skew-growing'. This is the clause that stops a slow
-// wedge fail-OPENing. MUTATION: drop the `skewIncreased` clause (fail = !staleAdvanced only) → a leg
-// that trickles forward while the healthy leg races ahead reads as catching-up and this fails.
+// DIRECTION — SKEW GROWING: BOTH legs advanced (so it is not a frozen wedge), but the skew INCREASED
+// vs prev (the stale leg trickles forward while the healthy leg races ahead = falling further behind)
+// → FAIL 'skew-growing'. This is the clause that stops a slow wedge fail-OPENing. MUTATION: drop the
+// `skewIncreased` disjunct (fail = oneLegFrozenWhileOtherAdvanced only) → a trickling leg reads
+// non-fail and this fails.
 test('stagnationDecision: both populated, prev armed, stale leg advanced BUT skew GROWING → FAIL skew-growing', () => {
   const t = 7200;
-  const prev = { staleSide: 'B', staleTs: 1_699_988_000, skew: 9000 };
+  const prev = { tsA: 1_699_997_000, tsB: 1_699_988_000, skew: 9000 };
   const r = stagnationDecision({
     maxA: '100',
-    tsA: 1_700_000_000,
+    tsA: 1_700_000_000, // leg A advanced +3000s
     maxB: '95',
-    tsB: 1_699_988_500, // advanced +500s since prev.staleTs …
+    tsB: 1_699_988_500, // leg B advanced +500s — both moved, but B fell further behind
     threshold: t,
     prev,
     nowMs: NOW,
@@ -1702,23 +1705,24 @@ test('stagnationDecision: both populated, prev armed, stale leg advanced BUT ske
   assert.equal(r.staleSide, 'B');
 });
 
-// DIRECTION — CATCHING UP: the stale leg advanced AND the skew SHRANK → non-fail 'catching-up' (a leg
-// mid-recovery, e.g. a Soak restart re-syncing). MUTATION: drop the catching-up branch (always fail
-// when over threshold) → a legitimately-recovering leg false-FAILs and this `fail === false` fails.
+// DIRECTION — CATCHING UP: BOTH legs advanced AND the skew SHRANK → non-fail 'catching-up' (a leg
+// mid-recovery, e.g. a Soak restart re-syncing, closing the gap). MUTATION: drop the catching-up
+// branch (always fail when over threshold) → a legitimately-recovering leg false-FAILs and this
+// `fail === false` fails.
 test('stagnationDecision: both populated, prev armed, stale leg advanced AND skew SHRANK → non-fail catching-up', () => {
   const t = 7200;
-  const prev = { staleSide: 'B', staleTs: 1_699_985_000, skew: 15_000 };
+  const prev = { tsA: 1_699_995_000, tsB: 1_699_980_000, skew: 15_000 };
   const r = stagnationDecision({
     maxA: '100',
-    tsA: 1_700_000_000,
+    tsA: 1_700_000_000, // leg A advanced +5000s
     maxB: '98',
-    tsB: 1_699_990_000, // advanced +5000s since prev; skew now 10_000 < prev 15_000 → shrinking
+    tsB: 1_699_990_000, // leg B advanced +10000s; skew now 10_000 < prev 15_000 → shrinking, gap closing
     threshold: t,
     prev,
     nowMs: NOW,
   });
   assert.equal(r.skew, 10_000, 'skew shrank from 15000 to 10000');
-  assert.equal(r.fail, false, 'a leg advancing AND closing the gap is catching up, not a wedge');
+  assert.equal(r.fail, false, 'both legs advancing AND closing the gap is catching up, not a wedge');
   assert.equal(r.reason, 'catching-up');
   assert.equal(r.staleSide, null, 'a catching-up leg is not named as stalled');
 });
@@ -1727,12 +1731,13 @@ test('stagnationDecision: both populated, prev armed, stale leg advanced AND ske
 // stale side by the LARGER ts (swap the a<b / b<a arms) → the leg-A-stale case below reads 'B'.
 test('stagnationDecision: direction — the OLDER-timestamp leg is named, symmetric A/B', () => {
   const t = 7200;
-  const prevA = { staleSide: 'A', staleTs: 1_699_989_200, skew: 10_800 };
+  // leg A frozen (unchanged) while leg B advanced → one-sided wedge, A stalled
+  const prevA = { tsA: 1_699_989_200, tsB: 1_699_995_000, skew: 5800 };
   const aStale = stagnationDecision({
     maxA: '90',
-    tsA: 1_699_989_200, // leg A older, frozen
+    tsA: 1_699_989_200, // leg A older AND frozen since prev.tsA
     maxB: '100',
-    tsB: 1_700_000_000,
+    tsB: 1_700_000_000, // leg B advanced
     threshold: t,
     prev: prevA,
     nowMs: NOW,
@@ -1740,12 +1745,13 @@ test('stagnationDecision: direction — the OLDER-timestamp leg is named, symmet
   assert.equal(aStale.fail, true);
   assert.equal(aStale.staleSide, 'A', 'leg A (older newest row) is the stalled side');
 
-  const prevB = { staleSide: 'B', staleTs: 1_699_989_200, skew: 10_800 };
+  // mirror: leg B frozen while leg A advanced → B stalled
+  const prevB = { tsA: 1_699_995_000, tsB: 1_699_989_200, skew: 5800 };
   const bStale = stagnationDecision({
     maxA: '100',
-    tsA: 1_700_000_000,
+    tsA: 1_700_000_000, // leg A advanced
     maxB: '90',
-    tsB: 1_699_989_200, // leg B older, frozen
+    tsB: 1_699_989_200, // leg B older AND frozen since prev.tsB
     threshold: t,
     prev: prevB,
     nowMs: NOW,
@@ -1765,7 +1771,7 @@ test('stagnationDecision: skew exactly at the threshold is in tolerance (PASS, c
     maxB: '9',
     tsB: 1_700_000_000 - t, // skew exactly == threshold
     threshold: t,
-    prev: { staleSide: 'B', staleTs: 1, skew: 999 },
+    prev: { tsA: 1, tsB: 1 - 999, skew: 999 },
     nowMs: NOW,
   });
   assert.equal(r.fail, false, 'skew == threshold is within tolerance, not a stall');
@@ -1787,6 +1793,179 @@ test('stagnationDecision: equal timestamps → PASS, no stale side, state cleare
   assert.equal(eq.fail, false);
   assert.equal(eq.reason, 'both-populated-in-skew');
   assert.equal(eq.staleSide, null);
+});
+
+// ── FINDING 2 (High): a stale-side FLIP must not discard evidence and re-arm ─────────────────────────
+//
+// The pre-fix state was keyed on the stale side, so an ALTERNATING sequence — one leg always frozen but
+// the OLDER side flipping run to run — re-armed every run and never FAILed. The fix persists BOTH legs'
+// ts + skew each run and evaluates each leg's frozen-ness regardless of which is currently stale, so the
+// wedge is caught the first run after arming. This encodes the exact adversarial sequence from the
+// review: it MUST FAIL at run 2 (leg B frozen while leg A advanced, skew grew 19000 → 30000).
+//
+// MUTATION: revert to keying the prior-observation lookup on the stale side
+// (`prev && prev.staleSide === olderSide` for `priorBoth`, carrying only the stale leg's ts) → run 2's
+// stale side (B) differs from run 1's (A), so `priorBoth` is null, run 2 RE-ARMS instead of failing,
+// and the `run2.fail === true` assertion below fails. This is the finding-2 mutation.
+test('FINDING 2: the exact 4-run alternating adversarial sequence FAILs at run 2 (one leg always frozen)', () => {
+  const t = 7200;
+  // Feed the runs through the state machine exactly as the differ would: prev = the previous run's
+  // nextState. threshold 7200s throughout.
+  const run = (tsA, tsB, prev) =>
+    stagnationDecision({
+      maxA: String(tsA),
+      tsA,
+      maxB: String(tsB),
+      tsB,
+      threshold: t,
+      prev,
+      nowMs: NOW,
+    });
+
+  // run1: A=1000, B=20000 → A older, skew 19000 > threshold, NO prev → ARM (non-fail)
+  const r1 = run(1000, 20_000, null);
+  assert.equal(r1.fail, false, 'run1 is the first over-threshold observation → arms');
+  assert.equal(r1.reason, 'skew-above-threshold-arming');
+  assert.deepEqual(r1.nextState, { tsA: 1000, tsB: 20_000, skew: 19_000 });
+
+  // run2: A=50000, B=20000 → B FROZEN (unchanged 20000) while A advanced; skew grew 19000 → 30000.
+  // The stale side FLIPPED A→B, but the fix does NOT re-arm: it FAILs (B frozen, A advanced).
+  const r2 = run(50_000, 20_000, r1.nextState);
+  assert.equal(r2.fail, true, 'run2: leg B frozen while leg A advanced is a one-sided wedge → FAIL');
+  assert.equal(r2.reason, 'frozen');
+  assert.equal(r2.staleSide, 'B', 'leg B (the frozen, older leg) is named stalled');
+  assert.equal(r2.skew, 30_000, 'skew grew from 19000 to 30000');
+
+  // run3 & run4 (the rest of the alternation) also FAIL — the wedge is caught every run, not laundered.
+  const r3 = run(50_000, 90_000, r2.nextState); // A now frozen while B advanced
+  assert.equal(r3.fail, true, 'run3: leg A frozen while leg B advanced → FAIL');
+  assert.equal(r3.staleSide, 'A');
+  const r4 = run(140_000, 90_000, r3.nextState); // B frozen again
+  assert.equal(r4.fail, true, 'run4: leg B frozen again while leg A advanced → FAIL');
+  assert.equal(r4.staleSide, 'B');
+});
+
+// FINDING 2 — the CONVERSE: a stale-side flip on a HEALTHY (below-threshold, or both-advancing)
+// sequence must NOT false-FAIL. Flips alone are not a signal — only a frozen leg while the other
+// advances (or a growing skew) is. Here the older side flips A→B across runs but both legs keep
+// advancing and the skew stays under / shrinks — never a fail.
+test('FINDING 2: a stale-side flip while both legs stay HEALTHY does not false-FAIL', () => {
+  const t = 7200;
+  const run = (tsA, tsB, prev) =>
+    stagnationDecision({
+      maxA: String(tsA),
+      tsA,
+      maxB: String(tsB),
+      tsB,
+      threshold: t,
+      prev,
+      nowMs: NOW,
+    });
+
+  // run1: A older by 100 (under threshold) — PASS, state cleared
+  const r1 = run(1_700_000_000, 1_700_000_100, null);
+  assert.equal(r1.fail, false);
+  assert.equal(r1.reason, 'both-populated-in-skew');
+  assert.equal(r1.nextState, null, 'a below-threshold run clears state (no armed carry)');
+
+  // run2: the older side FLIPS to B, still under threshold, both advanced — PASS, no fail
+  const r2 = run(1_700_000_300, 1_700_000_150, r1.nextState);
+  assert.equal(r2.fail, false, 'a below-threshold flip is not a wedge');
+  assert.equal(r2.reason, 'both-populated-in-skew');
+  assert.equal(r2.staleSide, null);
+
+  // Now an OVER-threshold flip where BOTH legs advance and the skew SHRINKS across the flip: run1 arms
+  // (A older by 29000), run2 flips (B now older) but BOTH legs moved and the gap narrowed to 10000 →
+  // catching-up, NOT a fail — a flip that is genuinely closing (both legs live) is not a wedge.
+  const a1 = run(1_000, 30_000, null); // A older, skew 29000 → arm
+  assert.equal(a1.fail, false);
+  assert.equal(a1.reason, 'skew-above-threshold-arming');
+  // A advanced 1000→45000, B advanced 30000→35000 (both live); B now older by 10000 (flip), skew shrank
+  const a2 = run(45_000, 35_000, a1.nextState);
+  assert.equal(a2.fail, false, 'both legs advanced and the gap narrowed — catching up, not a wedge');
+  assert.equal(a2.reason, 'catching-up');
+  assert.equal(a2.staleSide, null);
+});
+
+// ── FINDING 1 (semantics + candor): a steady over-threshold lag with BOTH legs advancing and the skew
+// HELD FLAT is a distinct, honest NON-FAIL reason ('lagging-constant'), not mislabelled 'catching-up' ──
+//
+// My ruling (see PR body): this stays NON-FAIL — the stale leg IS advancing, so the finalized-overlap
+// window `hi` advances with it and the WINDOWED diff owns coverage of that regime; this guard exists
+// only for FROZEN windows. But labelling a constant-skew lag as 'catching-up' (which implies the gap is
+// closing) is dishonest — a flat skew is NOT closing. MUTATION: fold the flat-skew case back into
+// 'catching-up' (drop the `skewDecreased` split, use `reason = 'catching-up'` for any non-fail) → the
+// `reason === 'lagging-constant'` assertion below fails.
+test('FINDING 1: both legs advance, skew HELD FLAT over threshold → non-fail, reason lagging-constant (not catching-up)', () => {
+  const t = 7200;
+  // prev: A older by 10000; this run BOTH advance by the SAME +5000 so the skew is unchanged at 10000
+  const prev = { tsA: 1_699_990_000, tsB: 1_700_000_000, skew: 10_000 };
+  const r = stagnationDecision({
+    maxA: '100',
+    tsA: 1_699_995_000, // leg A advanced +5000
+    maxB: '110',
+    tsB: 1_700_005_000, // leg B advanced +5000 → skew still 10000 (flat), still > threshold
+    threshold: t,
+    prev,
+    nowMs: NOW,
+  });
+  assert.equal(r.skew, 10_000, 'the skew held flat at 10000 across the run');
+  assert.equal(r.fail, false, 'a steady lag with the stale leg advancing is NOT a frozen-window wedge');
+  assert.equal(
+    r.reason,
+    'lagging-constant',
+    'a flat skew is honestly labelled lagging-constant, not catching-up (the gap is NOT closing)',
+  );
+  assert.equal(r.staleSide, null, 'a non-fail lag names no stalled side');
+});
+
+// ── FINDING 3 (Low): the real skew is surfaced BELOW threshold, in chainCounters, in the pass state ───
+//
+// pass() returned skew:null for a both-populated below-threshold state, so chainCounters emitted
+// stagnationSkewSeconds:null — real telemetry lost. The fix surfaces the computed skew whenever both
+// legs have timestamps. MUTATION: restore `pass('both-populated-in-skew')` (skew:null) for the
+// below-threshold branch → chainCounters.stagnationSkewSeconds reads null and this assertion fails.
+test('FINDING 3: below-threshold both-populated → real skew surfaced in chainCounters (not null)', () => {
+  // drive the decision below threshold, then flow it through the exact persistStagnation shape the
+  // caller builds, then chainCounters — the full telemetry path.
+  const d = stagnationDecision({
+    maxA: '100',
+    tsA: 1_700_000_000,
+    maxB: '99',
+    tsB: 1_700_000_000 - 3600, // 1h skew, under the 2h threshold
+    threshold: 7200,
+    prev: null,
+    nowMs: NOW,
+  });
+  assert.equal(d.fail, false);
+  assert.equal(d.skew, 3600, 'the decision surfaces the real below-threshold skew');
+
+  const r = {
+    chain: 1,
+    lo: 100,
+    hi: 200,
+    verdict: 'PASS',
+    classes: {
+      persistStagnation: {
+        fail: d.fail,
+        reason: d.reason,
+        staleSide: d.staleSide,
+        skewSeconds: d.skew,
+        thresholdSeconds: 7200,
+        maxA: d.maxA,
+        maxB: d.maxB,
+        tsA: d.tsA,
+        tsB: d.tsB,
+      },
+    },
+  };
+  const c = chainCounters(r);
+  assert.equal(
+    c.stagnationSkewSeconds,
+    3600,
+    'the below-threshold skew is real telemetry in the counters, never null',
+  );
+  assert.equal(c.stagnationReason, 'both-populated-in-skew');
 });
 
 // ── one-leg-empty: wall-clock arming + mutual-freeze exemption ──────────────────────────────────────
@@ -2151,7 +2330,8 @@ test('D1: compareChain — fired guard forces FAIL even when the windowed diff i
         : { maxBlock: '132825', ts: String(tsB) }; // leg B (advanced)
     },
   });
-  const prev = { staleSide: 'A', staleTs: tsA, skew: 17 * 3600 }; // armed last run, still frozen
+  // armed last run: leg A frozen (same tsA), leg B advanced since prev.tsB → one-sided wedge
+  const prev = { tsA, tsB: tsB - 3600, skew: 17 * 3600 - 3600 };
 
   const out = await compareChain(
     'urlA',
@@ -2183,10 +2363,10 @@ test('D1: compareChain — fired guard forces FAIL even when the windowed diff i
   assert.equal(out.classes.logs.fail, false, 'the windowed logs diff is clean');
   assert.equal(out.classes.transactions.fail, false);
 
-  // and the state to carry forward is the armed next-state
+  // and the state to carry forward is the armed next-state — BOTH legs' ts + skew (finding 2)
   assert.deepEqual(out.stagnationState, {
-    staleSide: 'A',
-    staleTs: tsA,
+    tsA,
+    tsB,
     skew: 17 * 3600,
   });
 });
@@ -2210,7 +2390,7 @@ test('D1: compareChain — a fired guard OR-composes to FAIL even on the NO-OVER
         : { maxBlock: '132825', ts: String(tsB) };
     },
   });
-  const prev = { staleSide: 'A', staleTs: tsA, skew: 17 * 3600 };
+  const prev = { tsA, tsB: tsB - 3600, skew: 17 * 3600 - 3600 };
   const out = await compareChain(
     'a',
     'b',
@@ -2291,7 +2471,8 @@ test('D3: compareChain — the threshold parameter actually reaches the decision
       },
     });
   };
-  const prev = { staleSide: 'A', staleTs: tsA, skew };
+  // prev: leg A frozen at tsA, leg B advanced since prev.tsB → one-sided wedge over the 2h threshold
+  const prev = { tsA, tsB: tsB - 1800, skew: skew - 1800 };
 
   const failing = await compareChain(
     'a', 'b', 8453, 0, 64, 1000, '', 7200, prev, Date.now(), mkDeps(),
@@ -2327,7 +2508,8 @@ test('D1: compareChain — a WINDOWED hard-fail AND a fired guard compose to one
     },
     diffLogs: async () => hardLogs,
   });
-  const prev = { staleSide: 'A', staleTs: tsA, skew: 17 * 3600 };
+  // leg A frozen at tsA, leg B advanced since prev.tsB → one-sided wedge fires alongside the hard logs
+  const prev = { tsA, tsB: tsB - 3600, skew: 17 * 3600 - 3600 };
   const out = await compareChain(
     'a', 'b', 8453, 0, 64, 1000, '', 7200, prev, Date.now(), deps,
   );
@@ -2565,7 +2747,8 @@ test('CHECKPOINT_FILE: _stagnation state round-trips and is disjoint from the nu
     1: [100, 200, 300],
     8453: [7, 8, 9],
     _stagnation: {
-      1: { staleSide: 'A', staleTs: 1_699_989_200, skew: 10_800 },
+      // both-populated shape: BOTH legs' ts + skew (finding 2) — no longer keyed on the stale side
+      1: { tsA: 1_699_995_000, tsB: 1_699_989_200, skew: 10_800 },
       8453: { emptySide: 'B', firstEmptyAtMs: 1_000_000_000_000, populatedTs: 1_700_000_000 },
     },
   };
@@ -2574,8 +2757,8 @@ test('CHECKPOINT_FILE: _stagnation state round-trips and is disjoint from the nu
   assert.deepEqual(back[1], [100, 200, 300], 'the numeric-chain series is intact');
   assert.deepEqual(
     back._stagnation[1],
-    { staleSide: 'A', staleTs: 1_699_989_200, skew: 10_800 },
-    'the per-chain stagnation state round-trips',
+    { tsA: 1_699_995_000, tsB: 1_699_989_200, skew: 10_800 },
+    'the per-chain both-populated stagnation state round-trips',
   );
   assert.deepEqual(back._stagnation[8453].emptySide, 'B');
 });
