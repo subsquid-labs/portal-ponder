@@ -4,9 +4,9 @@
  * clean completion) and BACKFILL SPEED (wall-clock, events/sec) — plus the Portal-side
  * efficiency it pulls from PORTAL_METRICS_FILE (http, bytes, chunks, fallback, inserts).
  */
-import { spawn } from "node:child_process";
-import { existsSync, readFileSync, rmSync } from "node:fs";
-import { join } from "node:path";
+import { spawn } from 'node:child_process';
+import { existsSync, readFileSync, rmSync } from 'node:fs';
+import { join } from 'node:path';
 
 export type BenchSpec = {
   name: string; // display name
@@ -44,18 +44,19 @@ export type BenchResult = {
 };
 
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
-const strip = (s: string) => s.replace(/\x1b\[[0-9;]*m/g, "");
+// biome-ignore lint/suspicious/noControlCharactersInRegex: intentional ANSI escape strip
+const strip = (s: string) => s.replace(/\u001B\[[0-9;]*m/g, '');
 
 /** sum RSS (MB) of a pid and all its descendants (ponder forks indexing workers). */
 async function rssTreeMB(pid: number): Promise<number> {
   return new Promise((resolve) => {
-    const ps = spawn("bash", ["-c", "ps -Ao pid=,ppid=,rss="]);
-    let out = "";
-    ps.stdout.on("data", (d) => (out += d));
-    ps.on("close", () => {
+    const ps = spawn('bash', ['-c', 'ps -Ao pid=,ppid=,rss=']);
+    let out = '';
+    ps.stdout.on('data', (d) => (out += d));
+    ps.on('close', () => {
       const rss = new Map<number, number>(),
         kids = new Map<number, number[]>();
-      for (const l of out.trim().split("\n")) {
+      for (const l of out.trim().split('\n')) {
         const [p, pp, r] = l.trim().split(/\s+/).map(Number);
         if (!p) continue;
         rss.set(p, r);
@@ -71,7 +72,7 @@ async function rssTreeMB(pid: number): Promise<number> {
       }
       resolve(total / 1024);
     });
-    ps.on("error", () => resolve(0));
+    ps.on('error', () => resolve(0));
   });
 }
 
@@ -82,31 +83,31 @@ export async function runBench(spec: BenchSpec): Promise<BenchResult> {
       rmSync(`${metricsBase}.${cid}`);
     } catch {}
   try {
-    rmSync(join(spec.dir, ".ponder"), { recursive: true, force: true });
+    rmSync(join(spec.dir, '.ponder'), { recursive: true, force: true });
   } catch {}
 
   const env: Record<string, string> = {
     ...(process.env as Record<string, string>),
     PONDER_START: String(spec.start),
     PONDER_END: String(spec.end),
-    PONDER_LOG_LEVEL: "info",
-    CI: "true",
+    PONDER_LOG_LEVEL: 'info',
+    CI: 'true',
     PORTAL_METRICS_FILE: metricsBase,
     NODE_OPTIONS: `--max-old-space-size=${spec.maxOldSpaceMB ?? 4096}`,
     // size the chunk to the bench range so we measure the PURE backfill of that range,
     // not chunk over-fetch (the big chunk amortizes only over a full multi-interval backfill).
     // dense sources (traces/blocks) still auto-cap below this.
-    PORTAL_CHUNK_FIXED: "1",
+    PORTAL_CHUNK_FIXED: '1',
     PORTAL_CHUNK_BLOCKS: String(Math.max(1000, spec.end - spec.start)),
     // read-ahead prefetches chunks BEYOND the bounded endBlock (pure waste in a bounded bench;
     // amortizes only in an open-ended backfill) — keep it shallow here.
-    PORTAL_READAHEAD: "1",
+    PORTAL_READAHEAD: '1',
     ...(spec.env ?? {}),
   };
-  const bin = join(spec.dir, "node_modules/.bin/ponder");
+  const bin = join(spec.dir, 'node_modules/.bin/ponder');
   const proc = spawn(
     bin,
-    ["start", "--schema", spec.schema, "--port", String(spec.port)],
+    ['start', '--schema', spec.schema, '--port', String(spec.port)],
     { cwd: spec.dir, env },
   );
 
@@ -114,8 +115,8 @@ export async function runBench(spec: BenchSpec): Promise<BenchResult> {
   let events = 0,
     peakRssMB = 0,
     done = false,
-    failed = "";
-  let buf = "";
+    failed = '';
+  let buf = '';
   const onLine = (line: string) => {
     const m = line.match(/event_count=(\d+)/);
     if (m) events += Number(m[1]);
@@ -129,15 +130,16 @@ export async function runBench(spec: BenchSpec): Promise<BenchResult> {
   };
   const onData = (d: Buffer) => {
     buf += d.toString();
-    let nl: number;
-    while ((nl = buf.indexOf("\n")) >= 0) {
+    let nl = buf.indexOf('\n');
+    while (nl >= 0) {
       onLine(buf.slice(0, nl));
       buf = buf.slice(nl + 1);
+      nl = buf.indexOf('\n');
     }
   };
-  proc.stdout.on("data", onData);
-  proc.stderr.on("data", onData);
-  proc.on("error", (e) => (failed ||= String(e)));
+  proc.stdout.on('data', onData);
+  proc.stderr.on('data', onData);
+  proc.on('error', (e) => (failed ||= String(e)));
 
   const timeoutMs = (spec.timeoutMin ?? 10) * 60_000;
   while (
@@ -155,22 +157,22 @@ export async function runBench(spec: BenchSpec): Promise<BenchResult> {
     failed =
       proc.exitCode !== null
         ? `process exited (code ${proc.exitCode})`
-        : "timeout";
+        : 'timeout';
   try {
-    proc.kill("SIGTERM");
+    proc.kill('SIGTERM');
   } catch {}
   await sleep(400);
   try {
-    proc.kill("SIGKILL");
+    proc.kill('SIGKILL');
   } catch {}
 
-  let portal: BenchResult["portal"] = null;
+  let portal: BenchResult['portal'] = null;
   for (const cid of spec.chainIds) {
     const file = `${metricsBase}.${cid}`;
     if (!existsSync(file)) continue;
     let m: any;
     try {
-      m = JSON.parse(readFileSync(file, "utf8"));
+      m = JSON.parse(readFileSync(file, 'utf8'));
     } catch {
       continue;
     }

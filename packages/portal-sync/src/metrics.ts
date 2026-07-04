@@ -15,14 +15,14 @@
  */
 
 export type StatusKey =
-  | "200"
-  | "204"
-  | "409"
-  | "429"
-  | "500"
-  | "503"
-  | "529"
-  | "other";
+  | '200'
+  | '204'
+  | '409'
+  | '429'
+  | '500'
+  | '503'
+  | '529'
+  | 'other';
 
 export type DatasetMetrics = {
   dataset: string;
@@ -50,23 +50,23 @@ export type DatasetMetrics = {
 };
 
 const emptyStatus = (): Record<StatusKey, number> => ({
-  "200": 0,
-  "204": 0,
-  "409": 0,
-  "429": 0,
-  "500": 0,
-  "503": 0,
-  "529": 0,
+  '200': 0,
+  '204': 0,
+  '409': 0,
+  '429': 0,
+  '500': 0,
+  '503': 0,
+  '529': 0,
   other: 0,
 });
 
 const statusKey = (status: number): StatusKey => {
   const k = String(status) as StatusKey;
   return (
-    ["200", "204", "409", "429", "500", "503", "529"] as StatusKey[]
+    ['200', '204', '409', '429', '500', '503', '529'] as StatusKey[]
   ).includes(k)
     ? k
-    : "other";
+    : 'other';
 };
 
 export class PortalMetrics {
@@ -169,7 +169,7 @@ export class PortalMetrics {
     const wallMs = now - this.startedAt;
     const perDataset = [...this.datasets.values()].map((d) => {
       const clientFacingErrors =
-        d.status["503"] + d.status["529"] + d.status["500"];
+        d.status['503'] + d.status['529'] + d.status['500'];
       const httpPerLogicalStream = d.logicalStreams
         ? d.httpRequests / d.logicalStreams
         : 0;
@@ -239,31 +239,31 @@ export class PortalMetrics {
       lines.push(`# HELP ${name} ${help}`, `# TYPE ${name} ${type}`);
     };
     g(
-      "portal_logical_streams_total",
-      "High-level Portal stream() calls (one per fork interval-query)",
-      "counter",
+      'portal_logical_streams_total',
+      'High-level Portal stream() calls (one per fork interval-query)',
+      'counter',
     );
     g(
-      "portal_http_requests_total",
-      "Actual Portal HTTP POSTs incl. continuations, by status",
-      "counter",
+      'portal_http_requests_total',
+      'Actual Portal HTTP POSTs incl. continuations, by status',
+      'counter',
     );
     g(
-      "portal_blocks_scanned_total",
-      "Forward-progress blocks scanned per dataset",
-      "counter",
+      'portal_blocks_scanned_total',
+      'Forward-progress blocks scanned per dataset',
+      'counter',
     );
-    g("portal_logs_total", "Logs returned by Portal per dataset", "counter");
-    g("portal_bytes_total", "Decoded NDJSON bytes per dataset", "counter");
+    g('portal_logs_total', 'Logs returned by Portal per dataset', 'counter');
+    g('portal_bytes_total', 'Decoded NDJSON bytes per dataset', 'counter');
     g(
-      "portal_client_facing_errors_total",
-      "503/529/500 surfaced to the client",
-      "counter",
+      'portal_client_facing_errors_total',
+      '503/529/500 surfaced to the client',
+      'counter',
     );
     g(
-      "portal_cu_estimate",
-      "Estimated compute units (blocks/assumedChunkBlocks)",
-      "gauge",
+      'portal_cu_estimate',
+      'Estimated compute units (blocks/assumedChunkBlocks)',
+      'gauge',
     );
     for (const d of this.datasets.values()) {
       const l = `dataset="${d.dataset}"`;
@@ -277,13 +277,13 @@ export class PortalMetrics {
       lines.push(`portal_logs_total{${l}} ${d.logs}`);
       lines.push(`portal_bytes_total{${l}} ${d.bytes}`);
       lines.push(
-        `portal_client_facing_errors_total{${l}} ${d.status["503"] + d.status["529"] + d.status["500"]}`,
+        `portal_client_facing_errors_total{${l}} ${d.status['503'] + d.status['529'] + d.status['500']}`,
       );
       lines.push(
         `portal_cu_estimate{${l}} ${round((d.forwardProgressBlocks || d.blocksRequested) / this.assumedChunkBlocks, 2)}`,
       );
     }
-    return lines.join("\n") + "\n";
+    return lines.join('\n') + '\n';
   }
 }
 

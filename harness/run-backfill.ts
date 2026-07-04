@@ -11,15 +11,15 @@
  * Env: CHAIN (default 143/Monad), START, TO (default finalized head).
  */
 
-import { writeFileSync } from "node:fs";
-import { PortalMetrics } from "../packages/portal-sync/src/metrics.ts";
-import { PortalClient } from "../packages/portal-sync/src/portal-client.ts";
+import { writeFileSync } from 'node:fs';
+import { PortalMetrics } from '../packages/portal-sync/src/metrics.ts';
+import { PortalClient } from '../packages/portal-sync/src/portal-client.ts';
 import {
   buildPortalQuery,
   type LogFilter,
-} from "../packages/portal-sync/src/query.ts";
-import { toSyncLog } from "../packages/portal-sync/src/transform.ts";
-import { extractChild, loadEulerChain } from "./euler/load-sources.ts";
+} from '../packages/portal-sync/src/query.ts';
+import { toSyncLog } from '../packages/portal-sync/src/transform.ts';
+import { extractChild, loadEulerChain } from './euler/load-sources.ts';
 
 const CHAIN = Number(process.env.CHAIN ?? 143);
 const chain = loadEulerChain(CHAIN);
@@ -39,7 +39,7 @@ console.log(
   `range [${START.toLocaleString()}, ${TO.toLocaleString()}] = ${(TO - START).toLocaleString()} blocks | finalizedHead=${head.number}`,
 );
 console.log(
-  `sources: ${chain.factories.map((f) => f.name).join(", ")}${chain.singletons.length ? " + " + chain.singletons.map((s) => s.name).join(",") : ""}`,
+  `sources: ${chain.factories.map((f) => f.name).join(', ')}${chain.singletons.length ? ' + ' + chain.singletons.map((s) => s.name).join(',') : ''}`,
 );
 
 // ---------- PASS 1: discovery ----------
@@ -89,14 +89,16 @@ for (const s of chain.singletons)
     dataFilters.push({ address: [s.address], topic0: s.topic0s });
 
 const topicLabel = new Map<string, string>();
-for (const f of chain.factories)
-  f.childTopic0s.forEach((t, i) =>
-    topicLabel.set(t, `${f.name}.${f.childEventNames[i]}`),
-  );
-for (const s of chain.singletons)
-  s.topic0s.forEach((t, i) =>
-    topicLabel.set(t, `${s.name}.${s.eventNames[i]}`),
-  );
+for (const f of chain.factories) {
+  f.childTopic0s.forEach((t, i) => {
+    topicLabel.set(t, `${f.name}.${f.childEventNames[i]}`);
+  });
+}
+for (const s of chain.singletons) {
+  s.topic0s.forEach((t, i) => {
+    topicLabel.set(t, `${s.name}.${s.eventNames[i]}`);
+  });
+}
 
 const perEvent = new Map<string, number>();
 let sampleRow: unknown;
@@ -110,7 +112,7 @@ for await (const batch of client.streamFinalized(
   for (const b of batch.blocks) {
     for (const log of b.logs ?? []) {
       totalLogs++;
-      const label = topicLabel.get(log.topics?.[0]) ?? "other";
+      const label = topicLabel.get(log.topics?.[0]) ?? 'other';
       perEvent.set(label, (perEvent.get(label) ?? 0) + 1);
       if (!sampleRow) sampleRow = toSyncLog(log, b.header); // prove transform on real data
     }
@@ -151,14 +153,14 @@ console.log(`\n=== EVAL GATE ===`);
 let pass = true;
 for (const [k, g] of Object.entries(gate)) {
   const ok =
-    ("max" in g ? (g as any).value <= (g as any).max : true) &&
-    ("min" in g ? (g as any).value >= (g as any).min : true);
+    ('max' in g ? (g as any).value <= (g as any).max : true) &&
+    ('min' in g ? (g as any).value >= (g as any).min : true);
   pass &&= ok;
   console.log(
-    `  [${ok ? "PASS" : "FAIL"}] ${k} = ${(g as any).value} (${"max" in g ? "≤" + (g as any).max : "≥" + (g as any).min})`,
+    `  [${ok ? 'PASS' : 'FAIL'}] ${k} = ${(g as any).value} (${'max' in g ? '≤' + (g as any).max : '≥' + (g as any).min})`,
   );
 }
-console.log(`\n  GATE: ${pass ? "✅ PASS" : "❌ FAIL"}`);
+console.log(`\n  GATE: ${pass ? '✅ PASS' : '❌ FAIL'}`);
 
 const out = `/Users/dz/Projects/portal-ponder/harness/results.${chain.dataset}.json`;
 writeFileSync(

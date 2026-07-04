@@ -1,4 +1,4 @@
-import { ponder } from "ponder:registry";
+import { ponder } from 'ponder:registry';
 import {
   borrow,
   counter,
@@ -8,8 +8,8 @@ import {
   vault,
   vaultStatus,
   withdraw,
-} from "ponder:schema";
-import { EVaultAbi } from "../abis/EVault";
+} from 'ponder:schema';
+import { EVaultAbi } from '../abis/EVault';
 
 const logId = (event: any) => `${event.transaction.hash}-${event.log.logIndex}`;
 const base = (event: any) => ({
@@ -50,13 +50,13 @@ async function ensureVault(event: any, context: any) {
       .catch(() => null);
   const [asset, name, symbol, decimals, oracle, creator, evc] =
     await Promise.all([
-      read("asset"),
-      read("name"),
-      read("symbol"),
-      read("decimals"),
-      read("oracle"),
-      read("creator"),
-      read("EVC"),
+      read('asset'),
+      read('name'),
+      read('symbol'),
+      read('decimals'),
+      read('oracle'),
+      read('creator'),
+      read('EVC'),
     ]);
   await context.db
     .insert(vault)
@@ -76,7 +76,7 @@ async function ensureVault(event: any, context: any) {
 
 // the subgraph's Counter: bump the per-action row AND the "global" singleton.
 async function bump(context: any, type: string) {
-  for (const id of [type, "global"]) {
+  for (const id of [type, 'global']) {
     await context.db
       .insert(counter)
       .values({ id, value: 1n })
@@ -84,7 +84,7 @@ async function bump(context: any, type: string) {
   }
 }
 
-ponder.on("EVault:Deposit", async ({ event, context }) => {
+ponder.on('EVault:Deposit', async ({ event, context }) => {
   await ensureVault(event, context);
   await context.db
     .insert(deposit)
@@ -96,9 +96,9 @@ ponder.on("EVault:Deposit", async ({ event, context }) => {
       shares: event.args.shares,
     })
     .onConflictDoNothing();
-  await bump(context, "deposit");
+  await bump(context, 'deposit');
 });
-ponder.on("EVault:Withdraw", async ({ event, context }) => {
+ponder.on('EVault:Withdraw', async ({ event, context }) => {
   await ensureVault(event, context);
   await context.db
     .insert(withdraw)
@@ -111,9 +111,9 @@ ponder.on("EVault:Withdraw", async ({ event, context }) => {
       shares: event.args.shares,
     })
     .onConflictDoNothing();
-  await bump(context, "withdraw");
+  await bump(context, 'withdraw');
 });
-ponder.on("EVault:Borrow", async ({ event, context }) => {
+ponder.on('EVault:Borrow', async ({ event, context }) => {
   await ensureVault(event, context);
   await context.db
     .insert(borrow)
@@ -123,9 +123,9 @@ ponder.on("EVault:Borrow", async ({ event, context }) => {
       assets: event.args.assets,
     })
     .onConflictDoNothing();
-  await bump(context, "borrow");
+  await bump(context, 'borrow');
 });
-ponder.on("EVault:Repay", async ({ event, context }) => {
+ponder.on('EVault:Repay', async ({ event, context }) => {
   await ensureVault(event, context);
   await context.db
     .insert(repay)
@@ -135,9 +135,9 @@ ponder.on("EVault:Repay", async ({ event, context }) => {
       assets: event.args.assets,
     })
     .onConflictDoNothing();
-  await bump(context, "repay");
+  await bump(context, 'repay');
 });
-ponder.on("EVault:Liquidate", async ({ event, context }) => {
+ponder.on('EVault:Liquidate', async ({ event, context }) => {
   await ensureVault(event, context);
   await context.db
     .insert(liquidate)
@@ -150,9 +150,9 @@ ponder.on("EVault:Liquidate", async ({ event, context }) => {
       yieldBalance: event.args.yieldBalance,
     })
     .onConflictDoNothing();
-  await bump(context, "liquidate");
+  await bump(context, 'liquidate');
 });
-ponder.on("EVault:VaultStatus", async ({ event, context }) => {
+ponder.on('EVault:VaultStatus', async ({ event, context }) => {
   const { borrowApy, supplyApy } = computeAPYs(
     event.args.interestRate,
     event.args.cash,

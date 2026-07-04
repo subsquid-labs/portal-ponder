@@ -44,7 +44,7 @@ export type PortalFieldSelection = {
 };
 
 export type PortalEvmQuery = {
-  type: "evm";
+  type: 'evm';
   fromBlock: number;
   toBlock?: number;
   parentBlockHash?: string;
