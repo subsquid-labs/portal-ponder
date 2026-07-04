@@ -167,6 +167,89 @@ test('a tx matched by BOTH a log filter and a tx filter keeps one tx row AND get
   expect((out.receipts[0] as any).transactionHash).toBe('0xBOTH');
 });
 
+// ── log re-match: parity with the RPC path's per-filter matching (wave 4) ───────────────────────────
+
+test("wave 4: a factory child's PRE-CREATION log is excluded — and its parent tx/block with it (parity with isAddressMatched)", () => {
+  // The Portal log request carries the child address with NO per-address creation floor, so a child that
+  // emitted filter-matching logs BEFORE its creation event comes back "matched". Upstream's RPC path
+  // stores a child's logs only from its creation block on (isAddressMatched: creation ≤ blockNumber);
+  // skipping the re-match stored the pre-creation log + its tx + its block — an INV-6 store divergence.
+  const CHILD = '0x000000000000000000000000000000000c0ffee1';
+  const factory: any = {
+    id: 'f1',
+    type: 'log',
+    chainId: 1,
+    sourceId: 's',
+    address: '0x00000000000000000000000000000000000fac70',
+    eventSelector: '0xsel',
+    childAddressLocation: 'topic1',
+    fromBlock: undefined,
+    toBlock: undefined,
+  };
+  const factoryLogFilter: any = { ...logFilter, address: factory };
+  const childAddresses = new Map([['f1', new Map([[CHILD, 100]])]]); // created at block 100
+  const cd = createChunkData();
+  cd.headers.set(50, header(50));
+  cd.logs.set(50, [rawLog(CHILD, '0xtxPRE')]); // emitted BEFORE creation → must be dropped
+  cd.txs.set(50, [rawTx('0xtxPRE')]);
+  cd.headers.set(150, header(150));
+  cd.logs.set(150, [rawLog(CHILD, '0xtxPOST')]); // after creation → kept
+  cd.txs.set(150, [rawTx('0xtxPOST')]);
+  const spec = compileFetchSpec(
+    [{ filter: factoryLogFilter }],
+    childAddresses as any,
+  );
+  const out = assembleRange([cd], [0, 200], spec, childAddresses as any);
+  expect(out.logs).toHaveLength(1);
+  expect(Number(BigInt((out.logs[0] as any).blockNumber))).toBe(150);
+  expect(out.txs).toHaveLength(1); // the dropped log's parent tx must not ride in
+  expect((out.txs[0] as any).hash).toBe('0xtxPOST');
+  expect(out.blocks.map((b) => Number(BigInt((b as any).number)))).toEqual([
+    150,
+  ]); // block 50 held ONLY the dropped log → not stored
+});
+
+test("wave 4: a bounded filter's below-fromBlock log is excluded even when another filter's chunk fetched it (per-filter range re-match)", () => {
+  // Chunk fetches are bounded by the SPEC-global backfillStart/dataEnd, so with filter A unbounded and
+  // filter B fromBlock:200, chunks below 200 are fetched with B's topics too (merged server request).
+  // Upstream's isLogFilterMatched rejects a B-matching log below 200; without the re-match it was
+  // stored and returned as matched — an INV-6 store divergence.
+  const filterA: any = { ...logFilter, topic0: '0xaaaa' }; // unbounded
+  const filterB: any = { ...logFilter, topic0: '0xbbbb', fromBlock: 200 };
+  const logWithTopic = (topic0: string, tx: string) => ({
+    ...rawLog('0xV', tx),
+    topics: [topic0],
+  });
+  const cd = createChunkData();
+  cd.headers.set(100, header(100));
+  // block 100: an A log (kept) and a B log BELOW B's fromBlock (dropped)
+  cd.logs.set(100, [
+    logWithTopic('0xaaaa', '0xtxA100'),
+    logWithTopic('0xbbbb', '0xtxB100'),
+  ]);
+  cd.txs.set(100, [rawTx('0xtxA100'), rawTx('0xtxB100')]);
+  cd.headers.set(250, header(250));
+  cd.logs.set(250, [logWithTopic('0xbbbb', '0xtxB250')]); // in B's range → kept
+  cd.txs.set(250, [rawTx('0xtxB250')]);
+  const spec = compileFetchSpec(
+    [{ filter: filterA }, { filter: filterB }],
+    new Map(),
+  );
+  const out = assembleRange([cd], [0, 300], spec, new Map());
+  const keptBlocks = out.logs.map((l) =>
+    Number(BigInt((l as any).blockNumber)),
+  );
+  expect(keptBlocks.sort((x, y) => x - y)).toEqual([100, 250]);
+  expect(out.logs.map((l) => (l as any).topics[0]).sort()).toEqual([
+    '0xaaaa',
+    '0xbbbb',
+  ]); // the below-range B log at 100 is gone
+  expect(out.txs.map((t) => (t as any).hash).sort()).toEqual([
+    '0xtxA100',
+    '0xtxB250',
+  ]); // 0xtxB100 (parent of the dropped log) must not be inserted
+});
+
 // ── INV-5: trace ranking = index in the cmpTraceAddr-sorted full list ────────────────────────────────
 
 const arbTraceAddr = fc.array(fc.integer({ min: 0, max: 3 }), { maxLength: 4 });

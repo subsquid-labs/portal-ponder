@@ -294,27 +294,51 @@ export async function* streamHotBlocks(
       args.diag.lastPreviousBlocks = lastPreviousBlocks;
   };
 
-  // Tx fields the dataset can't serve, dropped across reconnects. TX_FIELDS includes `accessList`, which is
-  // DROPPABLE (non-typed txs lack it) and which the HISTORICAL client degrades on a schema-field 400 — so a
-  // dataset historical handles fine (e.g. no access_list) must not make stream mode refuse to start. We
-  // degrade the SAME droppable tx fields here; a genuinely-unserveable (non-droppable) field stays fatal.
-  // (review B3)
-  const droppedTxFields = new Set<string>();
+  // Fields the dataset can't serve, dropped across reconnects — keyed `table.field`, exactly the keys in
+  // DROPPABLE_FIELDS. The projections include droppable fields on TWO tables: `transaction.accessList`
+  // (non-typed txs lack it) and five nullable block columns (`block.mixHash`, `block.nonce`, …) that the
+  // HISTORICAL client degrades on a schema-field 400 via `stripFields` — so a dataset historical handles
+  // fine must not make stream mode refuse to start. Restricting this to `transaction.*` (the original B3
+  // fix) left every droppable BLOCK field fatal: a mix_hash-less dataset backfilled fine, then the chain
+  // was down at the tip on every restart. Degrade ANY droppable field, whichever table it lives on; a
+  // genuinely-unserveable (non-droppable) field stays fatal. (review B3; completed in wave 4)
+  const droppedFields = new Set<string>();
+  // Strip dropped fields for `table` from a projection (the same removal the historical `stripFields`
+  // applies). Returns the input object untouched when nothing is dropped for that table.
+  const projectFields = (
+    fields: Record<string, boolean> | undefined,
+    table: string,
+  ): Record<string, boolean> | undefined => {
+    if (fields === undefined || droppedFields.size === 0) return fields;
+
+    let out = fields;
+    for (const key of droppedFields) {
+      if (!key.startsWith(`${table}.`)) continue;
+
+      if (out === fields) {
+        out = { ...fields };
+      }
+      delete out[key.slice(table.length + 1)];
+    }
+
+    return out;
+  };
   // Consecutive 409 fork-negotiations. Reset on any successful delivery; a runaway (>MAX) is a bug (the
   // server keeps rejecting a chain the ring believes canonical) → fail loud rather than spin. (issue #33)
   let consecutive409 = 0;
   for (;;) {
     if (args.signal?.aborted) return;
-    // strip any dropped tx field from the projection before building the body (the same fields the
-    // historical `stripFields` removes — keyed `transaction.<field>` in DROPPABLE_FIELDS).
-    let txFields = args.txFields;
-    if (txFields && droppedTxFields.size > 0) {
-      txFields = { ...txFields };
-      for (const key of droppedTxFields) {
-        const field = key.slice(key.indexOf('.') + 1);
-        delete txFields[field];
-      }
-    }
+    const txFields = projectFields(args.txFields, 'transaction');
+    const blockFields = projectFields(
+      args.blockFields ?? {
+        number: true,
+        hash: true,
+        parentHash: true,
+        timestamp: true,
+      },
+      'block',
+    );
+
     // The parentBlockHash for this request: the ring's hash at cursor−1. When ARMED, a MISSING entry is an
     // invariant violation — the ring is seeded with the anchor and updated on every delivery, and the cursor
     // only ever sits at a height whose predecessor we've delivered (fromBlock−1 = anchor; number+1 after a
@@ -337,12 +361,7 @@ export async function* streamHotBlocks(
       ...(parentBlockHash !== undefined ? { parentBlockHash } : {}),
       includeAllBlocks: true,
       fields: {
-        block: args.blockFields ?? {
-          number: true,
-          hash: true,
-          parentHash: true,
-          timestamp: true,
-        },
+        block: blockFields,
         log: args.logFields ?? {
           address: true,
           topics: true,
@@ -446,9 +465,10 @@ export async function* streamHotBlocks(
       // degrades. 429/5xx are load — retry. (review B3)
       if (res.status >= 400 && res.status < 500 && res.status !== 429) {
         // Read the body (bounded, own-the-lock cancel-on-stall — a stalled 400 body can't hang forever) and
-        // parse it the SAME way the historical client does. A droppable tx field (e.g. `transaction.accessList`
-        // on a dataset with no access_list) → drop it and retry, mirroring the backfill; anything else is a
-        // genuinely-unserveable config → fatal.
+        // parse it the SAME way the historical client does. ANY droppable field (`transaction.accessList`
+        // on a dataset with no access_list, `block.mixHash` on one with no mix_hash, …) → drop it and
+        // retry, mirroring the backfill's stripFields; anything else is a genuinely-unserveable config →
+        // fatal. No tableKey restriction: DROPPABLE_FIELDS itself is the whitelist.
         const text = (
           await readTextWithIdle(res, 10_000).catch(() => '')
         ).slice(0, 300);
@@ -456,10 +476,9 @@ export async function* streamHotBlocks(
         if (
           schemaErr &&
           DROPPABLE_FIELDS.has(schemaErr.fieldKey) &&
-          schemaErr.tableKey === 'transaction' &&
-          droppedTxFields.has(schemaErr.fieldKey) === false
+          droppedFields.has(schemaErr.fieldKey) === false
         ) {
-          droppedTxFields.add(schemaErr.fieldKey);
+          droppedFields.add(schemaErr.fieldKey);
           continue; // retry immediately without the dropped field (no backoff — a config fix, not load)
         }
 

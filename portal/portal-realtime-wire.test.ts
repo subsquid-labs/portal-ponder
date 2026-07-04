@@ -15,6 +15,7 @@ import {
   getPortalRealtimeEventGenerator,
   isPortalRealtime,
   lightToLightBlock,
+  portalFinalizedHead,
   resolveRedeliveryTimeoutMs,
   toRealtimeSyncEvent,
   uniqueFactories,
@@ -274,6 +275,32 @@ test('buildPortalLogRequests: a factory filter with no known children yet still 
         r.topic0?.includes(PROXY_CREATED) && r.address?.[0] === FACTORY_ADDR,
     ),
   ).toBe(true);
+});
+
+// ─────────────────────────────── finalized-head probe (bounded — wave 4) ───────────────────────────────
+
+test('portalFinalizedHead: a HUNG probe is BOUNDED — resolves undefined instead of freezing the block loop (wave 4)', async () => {
+  // This probe used to be a bare fetch().then(r => r.json()) with no timeout, abort signal, or body
+  // bound — one black-holed connection froze finalize emission mid-run (portalRealtimeEvents awaits it
+  // inline in the block loop) and startup (the clamp's 3-attempt retry never reached attempt 2, because
+  // attempt 1 never settled). It now delegates to the client's shared bounded probe (probeFinalizedHead,
+  // issue #14 / PR #16 hardening): the connect phase aborts after timeoutMs and every failure collapses
+  // to undefined, so the caller stays conservative.
+  const hung = ((_url: string, init?: { signal?: AbortSignal }) =>
+    new Promise((_resolve, reject) => {
+      init?.signal?.addEventListener('abort', () => {
+        reject(new Error('aborted'));
+      });
+    })) as any;
+  const out = await portalFinalizedHead('http://portal', {}, hung, 50);
+  expect(out).toBeUndefined(); // resolved (bounded), not a forever-pending await
+});
+
+test('portalFinalizedHead: parses number + canonical hash (the hash arms the wrong-fork finalize guard)', async () => {
+  const fetchImpl = (async () =>
+    new Response(JSON.stringify({ number: 7, hash: '0xabc' }))) as any;
+  const out = await portalFinalizedHead('http://portal/', {}, fetchImpl);
+  expect(out).toEqual({ number: 7, hash: '0xabc' });
 });
 
 // ─────────────────────────────── finality clamp (independence-critical) ───────────────────────────────

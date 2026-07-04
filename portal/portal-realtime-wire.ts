@@ -34,6 +34,7 @@ import { eth_getBlockByNumber } from '@/rpc/actions.js';
 import type { Rpc } from '@/rpc/index.js';
 import { getChildAddress, isLogFactoryMatched } from '@/runtime/filter.js';
 import type { RealtimeSyncEvent } from '@/sync-realtime/index.js';
+import { probeFinalizedHead } from './portal-client.js';
 // Log-request construction + field projections are the SINGLE source in portal-filters — shared with the
 // historical sync so realtime and backfill fetch-specs can never drift. Re-exported for callers/tests.
 import {
@@ -102,27 +103,25 @@ export function resolveRedeliveryTimeoutMs(
 
 // ─────────────────────────────── Portal finalized head + finality clamp ───────────────────────────────
 
-/** Poll the Portal `/finalized-head` (reused by both the historical finality-gap decision and here).
- * Carries the canonical hash when the endpoint provides one — it arms portalRealtimeEvents' wrong-fork
- * finalize guard (a local block finalized by NUMBER must match the canonical hash at that height). */
+/** Poll the Portal `/finalized-head`. Delegates to the client's SHARED bounded probe
+ * (`probeFinalizedHead` — connect-abort + own-the-lock body read, issue #14 / PR #16): this used to be a
+ * bare `fetch().then(r => r.json())` with no timeout or abort, so one hung probe froze finalize emission
+ * mid-run (and startup, via clampFinalizedToPortalHead) with zero log output. Carries the canonical hash
+ * when the endpoint provides one — it arms portalRealtimeEvents' wrong-fork finalize guard (a local block
+ * finalized by NUMBER must match the canonical hash at that height). `timeoutMs` is injectable for tests.
+ * (wave 4 review) */
 export async function portalFinalizedHead(
   portalUrl: string,
   headers: Record<string, string>,
   fetchImpl: typeof fetch = fetch,
+  timeoutMs?: number,
 ): Promise<{ number: number; hash?: string } | undefined> {
-  try {
-    const h = await fetchImpl(`${cleanUrl(portalUrl)}/finalized-head`, {
-      headers,
-    }).then((r) => r.json());
-    if (typeof h?.number === 'number')
-      return {
-        number: h.number,
-        hash: typeof h?.hash === 'string' ? h.hash : undefined,
-      };
-  } catch {
-    /* head unknown → caller stays conservative */
-  }
-  return undefined;
+  return probeFinalizedHead({
+    portalUrl: cleanUrl(portalUrl),
+    headers,
+    fetchImpl,
+    timeoutMs,
+  });
 }
 
 /**
