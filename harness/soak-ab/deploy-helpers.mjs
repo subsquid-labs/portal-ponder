@@ -170,6 +170,26 @@ export function parseEnvLine(line) {
   return { key, value: stripped.slice(eq + 1), line: stripped };
 }
 
+// Strip ONE surrounding matching quote pair (`"…"` or `'…'`) from an env value. `.env`/systemd
+// EnvironmentFile syntax legally wraps a value in quotes (`DATABASE_URL="postgresql://…"`), and
+// parseEnvLine returns the RAW RHS including those quotes — fine for the carry (which re-emits the
+// line verbatim), but a caller that must INTERPRET the value (derive-database-url → new URL()) needs
+// the bare value or a quoted-but-valid URL is falsely rejected as unparseable. Only strips a matched
+// leading+trailing pair; a lone or mismatched quote is left untouched (so a genuinely malformed value
+// still surfaces downstream rather than being silently "repaired").
+export function unquoteEnvValue(value) {
+  const v = String(value);
+  if (v.length >= 2) {
+    const first = v[0];
+    const last = v[v.length - 1];
+    if ((first === '"' || first === "'") && last === first) {
+      return v.slice(1, -1);
+    }
+  }
+
+  return v;
+}
+
 // Guard against multi-line / unterminated-quote values in the source env (defect: the carry splits
 // the raw file on `\n`, so a quoted value spanning newlines — `FOO='a<newline>b'` — would be emitted
 // truncated on the first line and its continuation misparsed as garbage lines). systemd
@@ -266,6 +286,48 @@ function hasUnescapedClosingQuote(value, quote) {
   }
 
   return false;
+}
+
+// ── DATABASE_URL derivation (defect: redeploy clobbered a role-authenticated TCP DATABASE_URL) ─────
+//
+// The env regen used to author `DATABASE_URL=postgresql:///${DB_NAME}` unconditionally — a peer-auth
+// form that only works where the unit's OS user maps to a DB role via peer auth on the default
+// socket. If the SOURCE env's DATABASE_URL carried an explicit role+password over TCP (a perfectly
+// normal setup), the redeploy silently replaced a working URL with a non-working one and the app
+// then spun on DB-connection diagnostics at startup while the unit sat happily `active`.
+//
+// The correct move is to PRESERVE the source URL's connection identity (scheme, userinfo, host, port,
+// query) and swap ONLY the database — the path segment. Shell string surgery (`${A%/*}/newdb`)
+// corrupts URLs whose password (or any earlier segment) contains reserved characters like `/`, `?`,
+// `@` or `#` (observed), so we parse with `new URL()`. Any URL WHATWG can parse round-trips exactly
+// except the single path swap; an unparseable source URL throws (the CLI surfaces it, the shell falls
+// back to the peer-auth form). Returns the derived `postgres[ql]://…/<dbName>` string.
+//
+// `dbName` is validated as a bare SQL identifier (the deploy guards DB_NAME=euler_rt_b before this is
+// reached, but keep the function self-defending so a caller can't inject path/query syntax through it).
+export function deriveDatabaseUrl(sourceUrl, dbName) {
+  if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(String(dbName ?? ''))) {
+    throw new Error(
+      `deriveDatabaseUrl: dbName ${JSON.stringify(dbName)} is not a bare SQL identifier`,
+    );
+  }
+  const url = new URL(sourceUrl); // throws on an unparseable source URL — caller decides the fallback
+  // Guard against fail-open on a corrupt source: `new URL()` happily parses ANY WHATWG scheme, so a
+  // stray `mysql://…`/`http://…` in the source env would derive cleanly and write a non-Postgres
+  // DATABASE_URL for the unit (the app would then fail at connect time with no hint at deploy). Only
+  // the Postgres URL schemes are valid here — refuse anything else LOUD so a corrupt env aborts.
+  if (url.protocol !== 'postgres:' && url.protocol !== 'postgresql:') {
+    throw new Error(
+      `deriveDatabaseUrl: unsupported DATABASE_URL scheme ${JSON.stringify(url.protocol)} — ` +
+        'expected postgres: or postgresql:',
+    );
+  }
+  // Swap ONLY the database (the single path segment). `new URL()` percent-encodes the assignment, so
+  // a bare identifier can never smuggle a query/fragment; everything else — scheme, userinfo (role +
+  // reserved-char password), host, port, search — is preserved by the parser exactly.
+  url.pathname = `/${dbName}`;
+
+  return url.href;
 }
 
 // Filter the lines of an existing env file down to the ones a redeploy should carry over verbatim.
@@ -377,9 +439,49 @@ export function loadKnownChains(chainsJsonPath) {
 //                                      loud on any multi-line/unterminated-quote value (F3).
 //   resolve-chains <chains> <json>   → prints the canonical EULER_CHAINS value to stdout; exits
 //                                      non-zero with a loud message on stderr for unknown names.
+//   derive-database-url <envfile> <dbName>
+//                                    → derive the new DATABASE_URL from the source env's own
+//                                      DATABASE_URL (swap only the database, preserve everything
+//                                      else) and print it. A quoted source value
+//                                      (`DATABASE_URL="postgresql://…"`) is unquoted first (normal
+//                                      .env syntax). When the source has NO DATABASE_URL, exit code 3
+//                                      (a SILENT signal, no stderr) so the shell can fall back to the
+//                                      peer-auth form. An UNPARSEABLE or non-Postgres-scheme source
+//                                      DATABASE_URL is a loud exit 1 (a corrupt env should abort, not
+//                                      degrade to a peer-auth form that masks the real problem).
 // All errors go to stderr and exit 1 so the shell's `$(…)` + `set -e` propagate the failure.
 export function runCli(argv) {
   const [cmd, ...rest] = argv;
+  if (cmd === 'derive-database-url') {
+    const [file, dbName] = rest;
+    if (!file || !dbName) {
+      throw new Error(
+        'usage: deploy-helpers.mjs derive-database-url <envfile> <dbName>',
+      );
+    }
+    const text = readFileSync(file, 'utf8');
+    // Find the source DATABASE_URL via the same env-line parser used for the carry (last one wins,
+    // mirroring shell env semantics) so `export DATABASE_URL=…` and stray whitespace are handled.
+    let sourceUrl = null;
+    for (const line of text.split('\n')) {
+      const parsed = parseEnvLine(line);
+      if (parsed && parsed.key === 'DATABASE_URL') {
+        // Unquote here (derive path only): a quoted `DATABASE_URL="postgresql://…"` is normal .env /
+        // EnvironmentFile syntax; without stripping the wrapping quotes new URL() would reject a VALID
+        // env file as unparseable and abort the deploy. carry-env keeps its verbatim `parsed.line`
+        // output untouched — this unquoting is confined to the value we hand to the URL parser.
+        sourceUrl = unquoteEnvValue(parsed.value);
+      }
+    }
+    // No source DATABASE_URL → exit 3 (distinct from the loud exit 1) so the shell falls back to the
+    // peer-auth form. Handled in the direct-run wrapper below, not thrown, so it stays a clean signal.
+    if (sourceUrl == null || sourceUrl === '') {
+      return { exitCode: 3 };
+    }
+    // An unparseable source DATABASE_URL is corrupt — fail LOUD (exit 1) rather than silently degrade
+    // to a peer-auth form that would replace an intended-but-broken URL and mask the real problem.
+    return deriveDatabaseUrl(sourceUrl, dbName);
+  }
   if (cmd === 'carry-env') {
     const [file, unitFile] = rest;
     if (!file) {
@@ -418,6 +520,11 @@ export function runCli(argv) {
 if (process.argv[1] && import.meta.url === `file://${process.argv[1]}`) {
   try {
     const out = runCli(process.argv.slice(2));
+    // A subcommand may return a `{ exitCode }` sentinel (e.g. derive-database-url signalling "no
+    // source DATABASE_URL → fall back") — exit with that code and print nothing.
+    if (out != null && typeof out === 'object' && 'exitCode' in out) {
+      process.exit(out.exitCode);
+    }
     if (out) {
       process.stdout.write(`${out}\n`);
     }

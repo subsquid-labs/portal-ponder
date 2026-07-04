@@ -83,12 +83,30 @@ echo "  chains=$RUN_CHAINS"
 # ── 1. workspace: copy Soak A's app config, swap in the pinned tarball ──
 mkdir -p "$WORKDIR"
 if [ -d "$SOAK_A_DIR" ]; then
-  # copy config only (ponder.config.ts, schema, abis, package.json) — NOT Soak A's node_modules / DB
+  # copy config only (ponder.config.ts, schema, abis, package.json) — NOT Soak A's node_modules / DB.
+  # Track whether ANY expected config was actually copied: a source dir that exists but holds none of
+  # the expected files would otherwise no-op silently and leave a half-provisioned workdir (only the
+  # package.json warning below firing on a fresh deploy). Warn LOUD naming the source dir instead.
+  COPIED_ANY=0
   for f in ponder.config.ts ponder.schema.ts package.json tsconfig.json; do
-    [ -f "$SOAK_A_DIR/$f" ] && cp "$SOAK_A_DIR/$f" "$WORKDIR/"
+    if [ -f "$SOAK_A_DIR/$f" ]; then
+      cp "$SOAK_A_DIR/$f" "$WORKDIR/"
+      COPIED_ANY=1
+    fi
   done
-  [ -d "$SOAK_A_DIR/abis" ] && cp -r "$SOAK_A_DIR/abis" "$WORKDIR/"
-  [ -d "$SOAK_A_DIR/src" ] && cp -r "$SOAK_A_DIR/src" "$WORKDIR/"
+  if [ -d "$SOAK_A_DIR/abis" ]; then
+    cp -r "$SOAK_A_DIR/abis" "$WORKDIR/"
+    COPIED_ANY=1
+  fi
+  if [ -d "$SOAK_A_DIR/src" ]; then
+    cp -r "$SOAK_A_DIR/src" "$WORKDIR/"
+    COPIED_ANY=1
+  fi
+  if [ "$COPIED_ANY" != "1" ]; then
+    echo "⚠ $SOAK_A_DIR exists but has none of the expected app config"
+    echo "  (ponder.config.ts / ponder.schema.ts / package.json / tsconfig.json / abis / src) —"
+    echo "  copy the Soak A app config into $WORKDIR before starting, or set SOAK_A_CONFIG_DIR."
+  fi
 else
   echo "⚠ $SOAK_A_DIR not found — copy the Soak A app config into $WORKDIR before starting"
 fi
@@ -103,7 +121,43 @@ fi
 
 # ── 2. database: create euler_rt_b if absent (guarded) ──
 if command -v psql >/dev/null; then
-  EXISTS="$(psql "$PGADMIN_URL" -Xtqc "select 1 from pg_database where datname='${DB_NAME}'" 2>/dev/null | tr -d '[:space:]')"
+  # Run the probe OUTSIDE the assignment and check psql's exit EXPLICITLY. The old form
+  # `EXISTS="$(psql … 2>/dev/null | tr -d …)"` died silently under `set -euo pipefail`: when psql
+  # cannot connect (no matching role / pg_hba / socket for the invoking user) the command-substitution
+  # pipeline fails under pipefail, `set -e` aborts the whole deploy with a bare exit 2, and `2>/dev/null`
+  # has swallowed the only diagnostic — nothing points at PGADMIN_URL. Now: capture psql's own exit,
+  # keep its stderr, and fail LOUD naming PGADMIN_URL if the connection itself failed.
+  PROBE_OUT="$(mktemp)"
+  set +e
+  psql "$PGADMIN_URL" -Xtqc "select 1 from pg_database where datname='${DB_NAME}'" >"$PROBE_OUT" 2>&1
+  PROBE_RC=$?
+  set -e
+  # Consume the temp NOW (both branches) and delete it, so nothing downstream depends on the file
+  # still existing. This also keeps the probe-failure `exit 1` the SOLE abort of the fail path: a
+  # later read of a removed temp must never become a second, masking abort.
+  PROBE_DIAG="$(cat "$PROBE_OUT")"
+  EXISTS="$(printf '%s' "$PROBE_DIAG" | tr -d '[:space:]')"
+  rm -f "$PROBE_OUT"
+  if [ "$PROBE_RC" != "0" ]; then
+    # NEVER echo PGADMIN_URL raw: it can carry admin credentials in its userinfo
+    # (postgres://user:pw@host/db), and this script's own guardrail is "never print" secrets.
+    # Redact the ENTIRE userinfo (the credential-bearing part) but keep scheme/host/db for provenance —
+    # mirrors the redaction precedent in harness/validate/rpc-meter.mjs (redactTarget), which keeps
+    # the endpoint identity and replaces only the credential. psql's own captured diagnostic
+    # (PROBE_DIAG) does not contain the password, so it may keep printing verbatim below.
+    #
+    # The regex is ANCHORED to the scheme and consumes the whole authority up to the LAST `@` before
+    # the first `/?#`, so: (a) a password containing a raw `@` (e.g. `p@ss`) is fully redacted, not
+    # just up to its first `@`; and (b) a stray `://…@` inside the PATH/QUERY of a URL with no userinfo
+    # is never rewritten (only the real authority is touched, and only when it actually has userinfo).
+    PGADMIN_URL_SAFE="$(printf '%s' "$PGADMIN_URL" | sed -E 's#^([a-zA-Z][a-zA-Z0-9+.-]*://)[^/?#]*@#\1<redacted>@#')"
+    echo "✗ could not connect to Postgres to check for database $DB_NAME."
+    echo "  PGADMIN_URL=$PGADMIN_URL_SAFE — psql exited $PROBE_RC. Its diagnostic was:"
+    printf '%s\n' "$PROBE_DIAG" | sed 's/^/    /'
+    echo "  Fix PGADMIN_URL (role / pg_hba / socket) so the invoking user can reach an admin DB, or"
+    echo "  create the $DB_NAME database manually and re-run."
+    exit 1
+  fi
   if [ "$EXISTS" != "1" ]; then
     echo "▶ creating database $DB_NAME"
     psql "$PGADMIN_URL" -Xqc "CREATE DATABASE ${DB_NAME}"
@@ -112,6 +166,30 @@ if command -v psql >/dev/null; then
   fi
 else
   echo "⚠ psql not found — create the $DB_NAME database manually"
+fi
+
+# ── 2b. DATABASE_URL: derive from the source env's own DATABASE_URL, swapping ONLY the database ──
+# The old code authored `postgresql:///${DB_NAME}` unconditionally — a peer-auth form that silently
+# clobbers a role-authenticated TCP DATABASE_URL from the source env (the app then spins on DB-connect
+# diagnostics while the unit sits `active`). Derive from the source URL with the node helper (real URL
+# parser, never shell `${A%/*}/newdb` surgery that corrupts reserved-char passwords). Fall back to the
+# peer-auth form ONLY when the source has no DATABASE_URL (helper exit 3); an UNPARSEABLE source URL is
+# a loud abort (exit 1). Never printed — the derived URL is written into the chmod-600 env file only.
+NEW_DATABASE_URL="postgresql:///${DB_NAME}"
+if [ -f "$SOAK_A_ENV" ]; then
+  set +e
+  DERIVED="$(node "$HELPERS" derive-database-url "$SOAK_A_ENV" "$DB_NAME")"
+  DERIVE_RC=$?
+  set -e
+  case "$DERIVE_RC" in
+    0) NEW_DATABASE_URL="$DERIVED" ;;
+    3) : ;; # source has no DATABASE_URL — keep the peer-auth fallback (do not print the URL)
+    *)
+      echo "✗ could not derive DATABASE_URL from the source env's DATABASE_URL (unparseable — fix it)"
+      echo "  the source env file is: $SOAK_A_ENV"
+      exit 1
+      ;;
+  esac
 fi
 
 # ── 3. secrets: derive a fresh chmod-600 env file from Soak A's (never print, never commit) ──
@@ -141,7 +219,7 @@ trap 'rm -f "$ENVFILE_TMP"' EXIT
   fi
   # Authoritative overrides (these always win over any carried value; keep in sync with
   # OVERRIDDEN_KEYS in deploy-helpers.mjs).
-  echo "DATABASE_URL=postgresql:///${DB_NAME}"
+  echo "DATABASE_URL=${NEW_DATABASE_URL}"
   echo "DATABASE_SCHEMA=${RUN_SCHEMA}"
   echo "EULER_CHAINS=${RUN_CHAINS}"
   echo "PORTAL_REALTIME=stream"
