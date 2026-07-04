@@ -33,7 +33,8 @@ following are **pending** and must not be read as proven:
 - The full paid **byte-diff matrix** (all cells in `harness/validate/cells.json`) — only the plumbing
   smoke cell has completed; the flagship full-range cell (`F-full`) is in progress.
 - The **flagship benchmark gate** (backfill speed reproduced within a stated tolerance of the
-  published baseline) — tracked separately in `BENCHMARKS.md`, not asserted here.
+  published baseline) — tracked separately in a separate benchmarks document (pending publication),
+  not asserted here.
 - A **long-duration soak** sign-off. The A/B soak differ runs hourly and its findings are already
   public issues (below), but no multi-day green-soak claim is made in this document yet.
 - **Zero-RPC realtime** without an experimental label. The Portal `/stream` realtime path is under
@@ -151,8 +152,7 @@ the operator (see `harness/validate/README.md`).
 | `R` | (raw breadth) | eth, base, arbitrum, polygon, bsc, avalanche | raw | 30 spots / chain | PENDING | `harness/compare/differential.ts` (not `run-cell.sh`) |
 
 Notes:
-- **`SMOKE`** proved `run-cell.sh` end-to-end on public endpoints (§3.1). It is deliberately outside
-  the paid matrix.
+- **`SMOKE`** proved `run-cell.sh` end-to-end (§3.1). It is deliberately outside the paid matrix.
 - **`CTRL`** is the *inertness* control: genuine upstream `ponder@0.16.6` vs the fork with the Portal
   path unset, same config → proves the Portal patch does not perturb the stock RPC path. It runs via
   `ctrl-cell.sh`, not `run-cell.sh`.
@@ -169,11 +169,12 @@ Notes:
 
 ### 3.1 Matrix cell — SMOKE (DONE, 2026-07-04)
 
-The plumbing smoke cell ran `run-cell.sh` end-to-end on the **public** Portal and a **free** public
-RPC (no paid endpoints): **PASS**, with **byte-identical stores across all five row families**,
-**136 matched logs**, **37 metered RPC requests**, **33 s** wall time. This validates the cell
-runner, the request meter, and the byte-diff plumbing — it is a plumbing proof, not a matrix data
-point.
+The plumbing smoke cell ran `run-cell.sh` end-to-end against the **public** Portal dataset endpoint
+and the operator's **metered RPC endpoint** (37 requests, trivial spend): **PASS**, with
+**byte-identical stores across all five row families**, **136 matched logs**, **37 metered RPC
+requests**, **33 s** wall time. This validates the cell runner, the request meter, and the
+byte-diff plumbing — it is a plumbing proof, not a matrix data point. The cell also runs on a free
+public RPC via `RPC_URL_OVERRIDE` (see repro command below).
 
 Repro:
 
@@ -195,7 +196,7 @@ The chaos kill-loop was accepted against the campaign's acceptance criteria. Agg
   traces, blocks**.
 - **Every sync interval fragment tiled the range exactly** (including the factory-discovery
   fragments) — no gap, no overlap.
-- Zero `InvariantViolation` under `PORTAL_CHECKS=strict`.
+- Zero `InvariantViolation` under `PORTAL_CHECKS=strict`. (Both `kill-loop.sh` and `verify-resume.sh` export `PORTAL_CHECKS=strict`; an `InvariantViolation` is fatal to the run, so 41/41 clean completions entail zero violations.)
 
 Conditions: Poisson kill schedule (mean 30 s), `MIN_KILLS=2` enforced per completed backfill (a run
 that finished without being killed proves nothing about resume and is rejected), chain 1 (ethereum)
@@ -299,7 +300,7 @@ tolerated block numbers per table specifically to keep that audit reproducible.
 - The **full paid byte-diff matrix** (§3) — only SMOKE is DONE; `F-full` is in progress; the rest are
   PENDING. **This document will update the `F-full` row (and the others) as each cell completes.**
 - The **flagship benchmark gate** (speed reproduced within tolerance of the published baseline) —
-  see `BENCHMARKS.md`; not asserted here.
+  see a separate benchmarks document (pending publication); not asserted here.
 - A **multi-day green-soak** sign-off and **GA of the zero-RPC realtime (stream) path** — the stream
   path remains experimental while #33 and the longer soak are open.
 
