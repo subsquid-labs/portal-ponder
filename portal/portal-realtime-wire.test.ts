@@ -15,6 +15,7 @@ import {
   getPortalRealtimeEventGenerator,
   isPortalRealtime,
   lightToLightBlock,
+  resolveRedeliveryTimeoutMs,
   toRealtimeSyncEvent,
   uniqueFactories,
 } from './portal-realtime-wire.js';
@@ -866,4 +867,32 @@ test('getPortalRealtimeEventGenerator: a finalize covering a block held for rede
   const blockIdx = events.findIndex((e) => e.type === 'block');
   const finalizeIdx = events.findIndex((e) => e.type === 'finalize');
   expect(finalizeIdx).toBeGreaterThan(blockIdx); // block N precedes finalize N
+});
+
+// ─────────────────────────────── redelivery watchdog env knob (delta review) ───────────────────────────────
+
+test('resolveRedeliveryTimeoutMs: precedence — param wins, then env, then default; garbage env fails loud (delta review)', () => {
+  // The 300_000ms (5 min) default is a deliberate availability/diagnosability trade; PORTAL_STREAM_REDELIVERY_
+  // TIMEOUT_MS makes it a conscious production knob. Pure over its args so no process.env mutation is needed.
+
+  // param (tests) wins over both env and default, even a valid env
+  expect(resolveRedeliveryTimeoutMs(50, '120000', 300_000)).toBe(50);
+  expect(resolveRedeliveryTimeoutMs(0, '120000', 300_000)).toBe(0); // explicit 0 is honored (test injection)
+
+  // env used when no param — a valid positive integer
+  expect(resolveRedeliveryTimeoutMs(undefined, '120000', 300_000)).toBe(
+    120_000,
+  );
+
+  // unset env → the default
+  expect(resolveRedeliveryTimeoutMs(undefined, undefined, 300_000)).toBe(
+    300_000,
+  );
+
+  // garbage / non-positive env → LOUD, not silently ignored (a silently-dropped knob is an operator trap)
+  for (const bad of ['abc', '12.5', '0', '-5', '', '  ', 'NaN', 'Infinity']) {
+    expect(() => resolveRedeliveryTimeoutMs(undefined, bad, 300_000)).toThrow(
+      /PORTAL_STREAM_REDELIVERY_TIMEOUT_MS must be a positive integer/i,
+    );
+  }
 });

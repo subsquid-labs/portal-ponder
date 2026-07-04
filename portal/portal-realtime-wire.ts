@@ -75,6 +75,31 @@ const cleanUrl = (portal: string): string => portal.replace(/\/$/, '');
 const sleep = (ms: number): Promise<void> =>
   new Promise((r) => setTimeout(r, ms));
 
+/**
+ * Resolve the redelivery watchdog bound (ms). Precedence: an explicit `override` (tests) wins, then the
+ * `PORTAL_STREAM_REDELIVERY_TIMEOUT_MS` env var, then the default. The env value must be a positive integer;
+ * a garbage or non-positive value is a config error and fails LOUD rather than being silently ignored (a
+ * silently-dropped knob is an operator trap — they'd think it took effect). Pure over its args so the parse
+ * is unit-testable without mutating process.env. `envRaw` is the raw string (or undefined when unset).
+ * (delta review — redelivery watchdog knob)
+ */
+export function resolveRedeliveryTimeoutMs(
+  override: number | undefined,
+  envRaw: string | undefined,
+  fallback: number,
+): number {
+  if (override !== undefined) return override;
+  if (envRaw === undefined) return fallback;
+
+  const n = Number(envRaw);
+  if (Number.isInteger(n) === false || n <= 0)
+    throw new Error(
+      `Portal realtime: PORTAL_STREAM_REDELIVERY_TIMEOUT_MS must be a positive integer (milliseconds), got ${JSON.stringify(envRaw)}.`,
+    );
+
+  return n;
+}
+
 // ─────────────────────────────── Portal finalized head + finality clamp ───────────────────────────────
 
 /** Poll the Portal `/finalized-head` (reused by both the historical finality-gap decision and here).
@@ -314,12 +339,19 @@ export async function* getPortalRealtimeEventGenerator(params: {
   childAddresses: Map<FactoryId, Map<Address, number>>;
   fetchImpl?: typeof fetch; // injected for tests
   finalizePollMs?: number; // injected for tests (prod: portal-realtime.ts default cadence)
+  finalizeDeferMaxMs?: number; // injected for tests (prod: portal-realtime.ts default B1 defer bound)
   /**
    * Watchdog for a redelivery that never lands: after suppressing block N for its same-block child
    * redelivery, streamHotBlocks re-opens FROM N and we await the complete N. On a HALTED chain (or any
    * stream that never re-serves N) that await stalls SILENTLY forever. This bounds it — if the redelivery
-   * doesn't arrive within the timeout, fail loud (diagnosable) instead. Default 5 min; small values
-   * injected in tests. (recommended: redelivery watchdog)
+   * doesn't arrive within the timeout, fail loud (diagnosable) instead.
+   *
+   * Resolution precedence: this param (tests) → the `PORTAL_STREAM_REDELIVERY_TIMEOUT_MS` env var (a
+   * conscious production knob; must be a positive-integer ms, else startup fails loud) → the 300_000 ms
+   * (5 min) default. Five minutes is a DELIBERATE availability/diagnosability trade: long enough that a
+   * transient Portal re-serve delay doesn't crash a healthy chain, short enough that a genuinely halted
+   * chain surfaces a loud, actionable fatal within one operator attention span instead of stalling
+   * silently. (recommended: redelivery watchdog; delta review: made configurable)
    */
   redeliveryTimeoutMs?: number;
 }) {
@@ -375,7 +407,11 @@ export async function* getPortalRealtimeEventGenerator(params: {
   // no event ever reaches this loop to trip a per-event check) would stall SILENTLY. Arm a timer whenever we
   // start awaiting; on expiry, record a loud fatal and ABORT the stream so the generator unwinds and rethrows
   // it (below). Disarmed the instant the wait clears. (recommended: redelivery watchdog)
-  const redeliveryTimeoutMs = params.redeliveryTimeoutMs ?? 300_000;
+  const redeliveryTimeoutMs = resolveRedeliveryTimeoutMs(
+    params.redeliveryTimeoutMs,
+    process.env.PORTAL_STREAM_REDELIVERY_TIMEOUT_MS,
+    300_000,
+  );
   let watchdog: ReturnType<typeof setTimeout> | undefined;
   let watchdogError: Error | undefined;
   const setAwaiting = (
@@ -442,6 +478,7 @@ export async function* getPortalRealtimeEventGenerator(params: {
       finalizedHead: () =>
         portalFinalizedHead(portalUrl, headers, params.fetchImpl),
       finalizePollMs: params.finalizePollMs,
+      finalizeDeferMaxMs: params.finalizeDeferMaxMs,
       signal: controller.signal,
       fetchImpl: params.fetchImpl,
     })) {
