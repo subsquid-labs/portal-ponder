@@ -132,17 +132,32 @@ if command -v psql >/dev/null; then
   psql "$PGADMIN_URL" -Xtqc "select 1 from pg_database where datname='${DB_NAME}'" >"$PROBE_OUT" 2>&1
   PROBE_RC=$?
   set -e
+  # Consume the temp NOW (both branches) and delete it, so nothing downstream depends on the file
+  # still existing. This also keeps the probe-failure `exit 1` the SOLE abort of the fail path: a
+  # later read of a removed temp must never become a second, masking abort.
+  PROBE_DIAG="$(cat "$PROBE_OUT")"
+  EXISTS="$(printf '%s' "$PROBE_DIAG" | tr -d '[:space:]')"
+  rm -f "$PROBE_OUT"
   if [ "$PROBE_RC" != "0" ]; then
+    # NEVER echo PGADMIN_URL raw: it can carry admin credentials in its userinfo
+    # (postgres://user:pw@host/db), and this script's own guardrail is "never print" secrets.
+    # Redact the ENTIRE userinfo (the credential-bearing part) but keep scheme/host/db for provenance —
+    # mirrors the redaction precedent in harness/validate/rpc-meter.mjs (redactTarget), which keeps
+    # the endpoint identity and replaces only the credential. psql's own captured diagnostic
+    # (PROBE_DIAG) does not contain the password, so it may keep printing verbatim below.
+    #
+    # The regex is ANCHORED to the scheme and consumes the whole authority up to the LAST `@` before
+    # the first `/?#`, so: (a) a password containing a raw `@` (e.g. `p@ss`) is fully redacted, not
+    # just up to its first `@`; and (b) a stray `://…@` inside the PATH/QUERY of a URL with no userinfo
+    # is never rewritten (only the real authority is touched, and only when it actually has userinfo).
+    PGADMIN_URL_SAFE="$(printf '%s' "$PGADMIN_URL" | sed -E 's#^([a-zA-Z][a-zA-Z0-9+.-]*://)[^/?#]*@#\1<redacted>@#')"
     echo "✗ could not connect to Postgres to check for database $DB_NAME."
-    echo "  PGADMIN_URL=$PGADMIN_URL — psql exited $PROBE_RC. Its diagnostic was:"
-    sed 's/^/    /' "$PROBE_OUT"
+    echo "  PGADMIN_URL=$PGADMIN_URL_SAFE — psql exited $PROBE_RC. Its diagnostic was:"
+    printf '%s\n' "$PROBE_DIAG" | sed 's/^/    /'
     echo "  Fix PGADMIN_URL (role / pg_hba / socket) so the invoking user can reach an admin DB, or"
     echo "  create the $DB_NAME database manually and re-run."
-    rm -f "$PROBE_OUT"
     exit 1
   fi
-  EXISTS="$(tr -d '[:space:]' < "$PROBE_OUT")"
-  rm -f "$PROBE_OUT"
   if [ "$EXISTS" != "1" ]; then
     echo "▶ creating database $DB_NAME"
     psql "$PGADMIN_URL" -Xqc "CREATE DATABASE ${DB_NAME}"
