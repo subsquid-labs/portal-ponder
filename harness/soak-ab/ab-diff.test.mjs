@@ -6,6 +6,7 @@ import { test } from 'node:test';
 import {
   aggregateKnownBadRows,
   aggregateToleratedIssue27,
+  buildTxSql,
   CHECKPOINT_BLOCK_LEN,
   CHECKPOINT_BLOCK_OFFSET_0,
   checkpointDecision,
@@ -23,6 +24,8 @@ import {
   restartStats,
   sanitizeSchemaIdent,
   TOLERATED_CLASSES,
+  TX_COL,
+  TX_SELECT_COLUMNS,
   writeJsonAtomic,
 } from './ab-diff.mjs';
 
@@ -621,6 +624,43 @@ test('classifySharedTx: the exact issue #32 row (hash + chain 42161, only access
   assert.equal(classifySharedTx(knownBadTx(), 42161), 'knownBadRow');
 });
 
+// ── issue #32, Round-2 FINDING 1 (High): the pin must enforce the EVIDENCED both-non-null shape ──────
+//
+// The evidenced divergence is A='[]' (concrete) vs B=63-entry list (concrete) — BOTH sides non-null.
+// Without the `aAccessListNull === false && bAccessListNull === false` guard, the pin would tolerate
+// ANY access_list divergence on the exact pinned hash+chain, including an A-NULL / B-non-null drift
+// (issue #27's leaked-key shape masquerading as the pin) or a B-side rot to NULL — precisely the
+// silent-mask the pin must never become. MUTATION: drop the both-non-null clause from the pin predicate
+// in classifySharedTx → the A-NULL pinned-hash row below flips 'mismatch' → 'knownBadRow' and this fails.
+
+test('classifySharedTx: FINDING 1 — the pinned hash with A access_list NULL is NOT a knownBadRow → FAIL (both sides must be concrete)', () => {
+  // The exact issue #32 hash+chain, ex-AL md5s equal — but side A is NULL, not the evidenced '[]'. This
+  // is NOT the measured '[]'-vs-concrete-list shape; it is an access_list divergence the pin must refuse.
+  // (It is also not the issue #27 tolerated shape here: block 469300066 is below chain 42161's issue #27
+  // floor 479635494, so there is no fall-through tolerance — it is a hard mismatch.)
+  assert.equal(
+    classifySharedTx(knownBadTx({ aAccessListNull: true }), 42161),
+    'mismatch',
+    'A-NULL on the pinned hash is not the evidenced both-non-null shape',
+  );
+
+  // and the inverted rot — B side goes NULL — is equally refused on the pinned hash.
+  assert.equal(
+    classifySharedTx(knownBadTx({ bAccessListNull: true }), 42161),
+    'mismatch',
+    'B-NULL on the pinned hash is not the evidenced both-non-null shape',
+  );
+
+  // both NULL (a wholly different divergence) is also not the pin's shape.
+  assert.equal(
+    classifySharedTx(
+      knownBadTx({ aAccessListNull: true, bAccessListNull: true }),
+      42161,
+    ),
+    'mismatch',
+  );
+});
+
 test('classifySharedTx: the issue #32 hash on the WRONG chain → FAIL (chain must match)', () => {
   // Same pinned hash, but the shared tx is on a different chain than the entry pins. Guards the chain
   // clause: dropping `r.chain === chain` would tolerate the hash on ANY chain.
@@ -693,24 +733,30 @@ test('classifyTxDiff: threads the knownBadRows tally through, SEPARATELY from to
   assert.equal(bad.fail, true);
   assert.deepEqual(bad.knownBadRows, kbr);
 
-  // default when no knownBadRows tally is passed: an empty {count:0, perChain:{}}
+  // default when no knownBadRows tally is passed: an empty {count:0, perChain:{}, perHash:{}}
   const none = classifyTxDiff([], [], new Set());
-  assert.deepEqual(none.knownBadRows, { count: 0, perChain: {} });
+  assert.deepEqual(none.knownBadRows, { count: 0, perChain: {}, perHash: {} });
 });
 
-test('aggregateKnownBadRows: sums per-chain knownBadRows tallies across chain results', () => {
+test('aggregateKnownBadRows: sums per-chain + per-hash knownBadRows tallies across chain results', () => {
   const results = [
     {
       chain: 42161,
       classes: {
-        transactions: { knownBadRows: { count: 1, perChain: { 42161: 1 } } },
+        transactions: {
+          knownBadRows: {
+            count: 1,
+            perChain: { 42161: 1 },
+            perHash: { [ISSUE_32_HASH]: 1 },
+          },
+        },
       },
     },
     // a chain with no knownBadRows contributes nothing
     {
       chain: 1,
       classes: {
-        transactions: { knownBadRows: { count: 0, perChain: {} } },
+        transactions: { knownBadRows: { count: 0, perChain: {}, perHash: {} } },
       },
     },
     // a PENDING/ERROR chain with no transactions class is skipped, never throws
@@ -721,6 +767,7 @@ test('aggregateKnownBadRows: sums per-chain knownBadRows tallies across chain re
   assert.deepEqual(aggregateKnownBadRows(results, pins), {
     count: 1,
     perChain: { 42161: 1 },
+    perHash: { [ISSUE_32_HASH]: 1 },
     unmatched: [],
   });
 });
@@ -756,19 +803,93 @@ test('aggregateKnownBadRows: a configured pin that matched nothing is reported a
   );
 });
 
-test('aggregateKnownBadRows: a pin that DID match is NOT flagged unmatched (string/number chain keys unify)', () => {
-  // Guards the String(p.chain) key-normalization: the per-chain tally keys are strings ('42161') while
-  // the pin.chain is a number (42161). A matched pin must not be mis-reported as unmatched.
+test('aggregateKnownBadRows: a pin that DID match is NOT flagged unmatched (per-hash fire count)', () => {
+  // The pin's OWN hash fired at least once (perHash carries it), so it is matched — never mis-reported
+  // as unmatched. Guards the per-hash matched-detection: a mutation reverting to a chain-keyed tally
+  // would still pass THIS single-pin case, which is why FINDING 2's two-pins-one-chain test below is
+  // the real tripwire.
   const results = [
     {
       chain: 42161,
       classes: {
-        transactions: { knownBadRows: { count: 1, perChain: { 42161: 1 } } },
+        transactions: {
+          knownBadRows: {
+            count: 1,
+            perChain: { 42161: 1 },
+            perHash: { [ISSUE_32_HASH]: 1 },
+          },
+        },
       },
     },
   ];
   const pins = [{ hash: ISSUE_32_HASH, chain: 42161, issue: 'x' }];
   assert.deepEqual(aggregateKnownBadRows(results, pins).unmatched, []);
+});
+
+// ── issue #32, Round-2 FINDING 2 (Medium): unmatched detection is per-PIN (hash, chain), not per-CHAIN ─
+//
+// Two pins on the SAME chain: pin P1's hash fires, pin P2's hash fires ZERO times (its row was repaired).
+// A chain-keyed unmatched detector sees "chain 42161 fired" and marks BOTH matched — hiding the stale
+// P2. Threading perHash makes the fate exact: only P2 is unmatched. MUTATION: revert aggregateKnownBadRows
+// to key matched-detection by chain (perPin/perChain) → P2 is wrongly treated as matched and this fails.
+
+test('aggregateKnownBadRows: FINDING 2 — two pins on one chain, only the non-firing pin is UNMATCHED (per (hash, chain), not per chain)', () => {
+  const P1_HASH = ISSUE_32_HASH; // fires this run
+  const P2_HASH =
+    '0x1111111111111111111111111111111111111111111111111111111111111111'; // repaired → 0 fires
+  const results = [
+    {
+      chain: 42161,
+      classes: {
+        transactions: {
+          knownBadRows: {
+            count: 1,
+            perChain: { 42161: 1 },
+            perHash: { [P1_HASH]: 1 }, // ONLY P1's hash fired
+          },
+        },
+      },
+    },
+  ];
+  const pins = [
+    { hash: P1_HASH, chain: 42161, issue: 'x' },
+    { hash: P2_HASH, chain: 42161, issue: 'y' },
+  ];
+  const agg = aggregateKnownBadRows(results, pins);
+
+  // per-hash fire counts are aggregated and exposed for exact pin fate.
+  assert.deepEqual(agg.perHash, { [P1_HASH]: 1 });
+
+  // ONLY P2 (the pin whose OWN hash fired zero times) is unmatched — P1 fired so it is not. A chain-keyed
+  // detector would return [] here (both "matched" via the chain), hiding the stale P2.
+  assert.deepEqual(
+    agg.unmatched,
+    [{ hash: P2_HASH, chain: 42161, issue: 'y' }],
+    'the non-firing pin is surfaced even though a sibling pin on the same chain fired',
+  );
+});
+
+test('aggregateKnownBadRows: string/number hash keys — a pin fired via perHash is matched regardless of result key type', () => {
+  // perHash keys are the raw hash strings from the tx stream; pin.hash is the same string literal. This
+  // pins the key type contract so a matched pin is never mis-flagged on a coercion mismatch.
+  const results = [
+    {
+      chain: 42161,
+      classes: {
+        transactions: {
+          knownBadRows: {
+            count: 2,
+            perChain: { 42161: 2 },
+            perHash: { [ISSUE_32_HASH]: 2 },
+          },
+        },
+      },
+    },
+  ];
+  const pins = [{ hash: ISSUE_32_HASH, chain: 42161, issue: 'x' }];
+  const agg = aggregateKnownBadRows(results, pins);
+  assert.deepEqual(agg.unmatched, []);
+  assert.equal(agg.perHash[ISSUE_32_HASH], 2);
 });
 
 test('formatKnownBadRowsLine: an UNMATCHED pin prints (visible) even when the matched count is 0', () => {
@@ -799,4 +920,81 @@ test('formatKnownBadRowsLine: loud REMOVE line naming issue #32 when count>0, em
   assert.match(line, /^KNOWN-BAD ROWS \(issue #32 — REMOVE/);
   assert.match(line, /1 pinned access_list-only rows/);
   assert.match(line, /42161:1/);
+});
+
+// ── Round-2 FINDING 3 (Low): a tripwire pinning the tx SQL SELECT column ORDER to the destructuring ──
+//
+// classifySharedTx reads positional row[] indices (hash=0, block_number=2, ex-AL md5=3, null flag=4).
+// If buildTxSql's SELECT list is reordered without reordering the destructuring — or vice versa — the
+// classifier silently reads the wrong column (e.g. the null flag as an md5), corrupting the tolerance
+// classification with NO error. This tripwire asserts the SELECT list, in order, matches TX_SELECT_COLUMNS
+// AND that TX_COL (the indices diffTx destructures from) equals each column's position — without psql.
+// MUTATION: permute buildTxSql's projection (swap block_number and the ex-AL md5), or change any TX_COL
+// index, → the ordered-SELECT assertion or the position-contract assertion below fails.
+
+test('FINDING 3 — buildTxSql SELECT column order matches the classifySharedTx destructuring contract', () => {
+  const sql = buildTxSql(42161, 100, 200);
+
+  // 1) the projection is exactly TX_SELECT_COLUMNS, in order, right after `select ` and before ` from`.
+  const m = sql.match(/^select (.+?) from ponder_sync\.transactions t /);
+  assert.ok(m, 'buildTxSql projects from ponder_sync.transactions');
+  const projected = m[1].split(', ');
+  assert.deepEqual(
+    projected,
+    TX_SELECT_COLUMNS.map((c) => c.sql),
+    'the SELECT list, in order, is exactly TX_SELECT_COLUMNS',
+  );
+
+  // 2) the positional contract: each destructured index (TX_COL) equals the field's position in the
+  // ordered SELECT. If either the SQL order or an index moves without the other, this diverges.
+  const posByName = Object.fromEntries(
+    TX_SELECT_COLUMNS.map((c, i) => [c.name, i]),
+  );
+  assert.equal(TX_COL.hash, posByName.hash, 'hash is SELECT index 0');
+  assert.equal(
+    TX_COL.fullRowMd5,
+    posByName.fullRowMd5,
+    'full-row md5 is index 1',
+  );
+  assert.equal(
+    TX_COL.blockNumber,
+    posByName.blockNumber,
+    'block_number is index 2',
+  );
+  assert.equal(
+    TX_COL.exAccessListMd5,
+    posByName.exAccessListMd5,
+    'ex-access_list md5 is index 3',
+  );
+  assert.equal(
+    TX_COL.accessListNull,
+    posByName.accessListNull,
+    'access_list-null flag is index 4',
+  );
+
+  // 3) lock the exact indices the review contract names, so a silent renumber of BOTH the array and
+  // TX_COL together (keeping them consistent but wrong) is still caught against the spec.
+  assert.deepEqual(TX_COL, {
+    hash: 0,
+    fullRowMd5: 1,
+    blockNumber: 2,
+    exAccessListMd5: 3,
+    accessListNull: 4,
+  });
+
+  // 4) the specific SQL fragments the classifier depends on are the ones at their contract positions.
+  assert.equal(TX_SELECT_COLUMNS[TX_COL.hash].sql, '"hash"');
+  assert.equal(TX_SELECT_COLUMNS[TX_COL.blockNumber].sql, 'block_number');
+  assert.equal(
+    TX_SELECT_COLUMNS[TX_COL.exAccessListMd5].sql,
+    "md5((to_jsonb(t)-'access_list')::text)",
+  );
+  assert.equal(
+    TX_SELECT_COLUMNS[TX_COL.accessListNull].sql,
+    '(access_list is null)',
+  );
+
+  // and the query is still ordered by hash (the merge-join precondition) and bounds by the args.
+  assert.match(sql, /order by "hash"$/);
+  assert.match(sql, /chain_id=42161 and block_number between 100 and 200/);
 });
