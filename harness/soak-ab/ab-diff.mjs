@@ -575,65 +575,168 @@ export function readStagnationThreshold(raw) {
 }
 
 // Pure per-chain persist-stagnation decision from the two legs' newest-row block TIMESTAMPS (Unix
-// seconds). `maxA`/`maxB` are the newest-row block NUMBERS (carried through only for the counters
-// JSON, so a frozen window is legible even below threshold). `tsA`/`tsB` are the newest-row block
-// timestamps, or null/undefined when that leg has NO rows for the chain (SQL max(timestamp) → NULL).
+// seconds), a WALL-CLOCK `nowMs`, and the CROSS-RUN state persisted from the prior run (`prev`, or
+// null on the first run / for a chain with no prior state). `maxA`/`maxB` are the newest-row block
+// NUMBERS (carried through for the counters JSON, so a frozen window is legible even below
+// threshold). `tsA`/`tsB` are the newest-row block timestamps, or null/undefined when that leg has NO
+// rows for the chain (SQL max(timestamp) → NULL).
 //
-// Returns { fail, staleSide, skew, tsA, tsB, maxA, maxB }:
-//   • staleSide — the leg whose newest row is OLDER (the stalled side), or null when neither is stale.
-//   • skew      — |tsB − tsA| in seconds when BOTH legs have rows; null when it is not computable
-//                 (one/both legs empty — see below).
-//   • fail      — true iff the skew exceeds `threshold`.
+// WHY CROSS-RUN STATE (review findings 1 High + 4 Med, one mechanism). A one-shot skew reading cannot
+// tell a TRANSIENT lag (a leg mid-recovery, catching up) from a genuine WEDGE (a leg that has stopped
+// and stays stopped). Two run observations tell them apart by DIRECTION:
+//   • a wedged leg's newest-row ts does NOT advance between runs (frozen), or the skew keeps GROWING
+//     (falling further behind) → a real one-sided stall → FAIL.
+//   • a recovering leg's newest-row ts DOES advance AND the skew SHRINKS → catching up → non-fail.
+// So the FIRST run to observe an over-threshold skew ARMS (records this run's ts) and defers the
+// verdict one run rather than FAILing blind — a conscious ONE-RUN detection delay (see the PR candor
+// section). This cannot fail-open on a slow/trickling wedge: a leg persisting a trickle still falls
+// further behind a healthy leg, so the skew GROWS run over run and the growing-skew clause catches it.
+// In-window divergence (both legs live, drifting inside [lo,hi]) is NOT this guard's job — that is the
+// windowed row/bucket diff's; this guard only closes the FROZEN-WINDOW blind spot above `hi`.
 //
-// Edge cases (all handled here so the caller is a thin wiring):
-//   • BOTH legs empty (both ts null) — a mutual freeze / not-started chain. Benign → PASS, no side.
-//   • ONE leg empty, the other populated — NOT decidable as a stall from {ts} alone: at genuine cold
-//     start one leg legitimately races ahead by seconds before the other's first row lands, and a
-//     chain one leg simply has not begun looks identical to a wedge. Alarming on it would false-FAIL
-//     every soak startup (block timestamps are ~1.7e9, so any "empty vs populated" delta dwarfs any
-//     threshold). We therefore do NOT alarm on empty-vs-populated here; the caller surfaces the empty
-//     leg's null timestamp in the counters JSON so it is legible, and the guard fires the moment the
-//     empty leg persists its FIRST row and its timestamp is > threshold behind the other leg's — the
-//     wedge is caught then, once it is distinguishable from cold start. See the PR body's residuals.
-//   • EQUAL timestamps — skew 0 → PASS, no stale side.
-//   • NULL/NaN after coercion is treated as "no rows" for that leg (never a phantom 0 timestamp).
+// Returns { fail, reason, staleSide, skew, tsA, tsB, maxA, maxB, nextState }. `nextState` is the state
+// to persist for THIS chain for the next run (never mutates `prev`); it is null when there is nothing
+// to carry (both legs healthy / both empty). `reason` is a short machine tag naming what was decided
+// (e.g. 'frozen', 'skew-growing', 'skew-above-threshold-arming', 'catching-up', 'one-sided-empty',
+// 'empty-arming', 'both-populated-in-skew', 'both-empty', 'one-leg-empty-indeterminate').
+//
+// The four cases (all handled here so the caller is thin wiring):
+//   • BOTH legs populated, skew ≤ threshold → PASS; clear any prior emptiness state (nextState null).
+//   • BOTH legs populated, skew > threshold:
+//       – no prev → NOT a fail yet: ARM (nextState carries this run's stale-leg ts + skew), reason
+//         'skew-above-threshold-arming' (a loud INFO line, non-fail — decision deferred one run).
+//       – prev exists → FAIL iff the stale (older-ts) leg did NOT advance since prev (frozen) OR the
+//         skew INCREASED vs prev (falling further behind). Both clauses fail-CLOSED. If the stale leg
+//         advanced AND skew decreased → 'catching-up', non-fail (a loud INFO line).
+//   • ONE leg empty, other populated: ARM `firstEmptyAtMs` on first observation; FAIL when
+//     nowMs − firstEmptyAtMs > threshold*1000 AND the populated leg ADVANCED since prev (a genuinely
+//     one-sided wedge — the empty leg is stuck while the other moves). If the populated leg is ALSO
+//     frozen, that is a MUTUAL freeze → non-fail. Clear `firstEmptyAtMs` the moment the empty leg
+//     gains rows. (This is why coalescing an empty leg's ts to 0 — which would false-alarm at every
+//     cold start, block timestamps being ~1.7e9 — is never done: emptiness is tracked by wall-clock
+//     duration + the OTHER leg's motion, not by a phantom timestamp.)
+//   • BOTH empty → PASS (mutual / not started); clear state (nextState null).
 // Pure + exported so every branch is mutation-verified without a DB.
-export function stagnationDecision({ maxA, tsA, maxB, tsB, threshold }) {
+export function stagnationDecision({
+  maxA,
+  tsA,
+  maxB,
+  tsB,
+  threshold,
+  prev = null,
+  nowMs = Date.now(),
+}) {
   const a = tsToSeconds(tsA);
   const b = tsToSeconds(tsB);
+  const mA = maxToNumber(maxA);
+  const mB = maxToNumber(maxB);
+  const base = { tsA: a, tsB: b, maxA: mA, maxB: mB };
+  const pass = (reason, nextState = null) => ({
+    fail: false,
+    reason,
+    staleSide: null,
+    skew: null,
+    ...base,
+    nextState,
+  });
 
-  // one or both legs have no newest-row timestamp → not a decidable one-sided stall (see header)
+  // ── both legs empty → benign mutual/not-started; clear state ──
+  if (a === null && b === null) {
+    return pass('both-empty');
+  }
+
+  // ── one leg empty, the other populated ──
   if (a === null || b === null) {
+    const emptySide = a === null ? 'A' : 'B';
+    const populatedTs = a === null ? b : a;
+    // ARM firstEmptyAtMs on first observation of THIS one-sided emptiness for THIS side.
+    const priorEmpty =
+      prev && prev.emptySide === emptySide ? prev.firstEmptyAtMs : null;
+    const firstEmptyAtMs = Number.isFinite(priorEmpty) ? priorEmpty : nowMs;
+    // The populated leg's motion: did it advance since prev? A MUTUAL freeze (populated leg also
+    // frozen) is NOT a one-sided wedge, so never fail on it — only fail when the OTHER leg moves while
+    // this one stays empty.
+    const priorPopTs =
+      prev && prev.emptySide === emptySide ? tsToSeconds(prev.populatedTs) : null;
+    const populatedAdvanced =
+      priorPopTs === null ? false : populatedTs > priorPopTs;
+    const emptyLongEnough = nowMs - firstEmptyAtMs > threshold * 1000;
+    const fail = emptyLongEnough && populatedAdvanced;
+    const nextState = {
+      emptySide,
+      firstEmptyAtMs,
+      populatedTs,
+    };
+
     return {
-      fail: false,
-      staleSide: null,
+      fail,
+      reason: fail ? 'one-sided-empty' : 'empty-arming',
+      // the stalled side is the EMPTY leg (it has persisted nothing while the other advanced)
+      staleSide: fail ? emptySide : null,
       skew: null,
-      tsA: a,
-      tsB: b,
-      maxA: maxToNumber(maxA),
-      maxB: maxToNumber(maxB),
+      ...base,
+      nextState,
     };
   }
 
+  // ── both legs populated ──
   const skew = Math.abs(b - a);
-  const fail = skew > threshold;
-  // the stalled side is the one whose newest row is OLDER; equal ⇒ no side
-  let staleSide = null;
+  // the stalled (older-ts) leg; equal ⇒ no side
+  let olderSide = null;
   if (a < b) {
-    staleSide = 'A';
+    olderSide = 'A';
   } else if (b < a) {
-    staleSide = 'B';
+    olderSide = 'B';
+  }
+
+  if (skew <= threshold) {
+    // healthy / within tolerance — clear any prior emptiness/skew state
+    return pass('both-populated-in-skew');
+  }
+
+  // skew > threshold — the stale leg's newest ts (the OLDER one), carried for the next run's direction
+  // check. equal ts cannot be over-threshold (skew 0), so olderSide is always set here.
+  const staleTs = olderSide === 'A' ? a : b;
+  const armed = {
+    staleSide: olderSide,
+    staleTs,
+    skew,
+  };
+
+  // No prior over-threshold observation for THIS stale side → ARM, defer the verdict one run.
+  const priorSkew =
+    prev && prev.staleSide === olderSide && Number.isFinite(prev.staleTs)
+      ? prev
+      : null;
+  if (!priorSkew) {
+    return {
+      fail: false,
+      reason: 'skew-above-threshold-arming',
+      staleSide: null,
+      skew,
+      ...base,
+      nextState: armed,
+    };
+  }
+
+  // prev exists: FAIL iff the stale leg did NOT advance (frozen) OR the skew INCREASED (falling
+  // further behind). Both fail-closed. Only a stale leg that advanced AND a skew that shrank is
+  // catching up (non-fail).
+  const staleAdvanced = staleTs > priorSkew.staleTs;
+  const skewIncreased = skew > priorSkew.skew;
+  const fail = !staleAdvanced || skewIncreased;
+  let reason = 'catching-up';
+  if (fail) {
+    reason = staleAdvanced ? 'skew-growing' : 'frozen';
   }
 
   return {
     fail,
-    // name a side only WHEN it fails — a below-threshold skew has an older leg but no stall
-    staleSide: fail ? staleSide : null,
+    reason,
+    staleSide: fail ? olderSide : null,
     skew,
-    tsA: a,
-    tsB: b,
-    maxA: maxToNumber(maxA),
-    maxB: maxToNumber(maxB),
+    ...base,
+    nextState: armed,
   };
 }
 
@@ -856,19 +959,21 @@ async function overlapBound(url, chain) {
   return Number(v ?? 0);
 }
 
-// Newest persisted row for the chain: the max block NUMBER and its block TIMESTAMP (Unix seconds).
-// Both use a bare max(...) — NO coalesce — so an EMPTY store returns NULL, letting stagnationDecision
-// tell "no rows" apart from a legitimate block/timestamp of 0 (never a phantom 0). ponder_sync.blocks
-// persists blocks in on-chain order and both number and timestamp are monotonic there, so max(number)
-// and max(timestamp) are the newest block's height and time. Returns { maxBlock, ts } as strings|null
-// (the pure decision helper coerces them). Used ONLY by the issue #38 persist-stagnation guard; the
-// window hi still comes from overlapBound's coalesce(...,0), unchanged.
+// Newest persisted row for the chain: its block NUMBER and block TIMESTAMP (Unix seconds). A SINGLE-ROW
+// `order by number desc limit 1` (NOT two independent max() aggregates) so the number and timestamp
+// come from the SAME row — the actual newest block, its true height AND its true time, never a max
+// height paired with a max timestamp from a different row (finding 7). An EMPTY store yields ZERO rows
+// → both null, letting stagnationDecision tell "no rows" apart from a legitimate block/timestamp of 0
+// (never a phantom 0). ponder_sync.blocks persists blocks in on-chain order, so the highest-number row
+// is the newest block. Returns { maxBlock, ts } as strings|null (the pure decision helper coerces
+// them). Used ONLY by the issue #38 persist-stagnation guard; the window hi still comes from
+// overlapBound's coalesce(...,0), unchanged.
 async function legNewestRow(url, chain) {
   let row = null;
   for await (const r of psqlRows(
     url,
-    `select max(number)::text, max(timestamp)::text ` +
-      `from ponder_sync.blocks where chain_id=${chain}`,
+    `select number::text, timestamp::text ` +
+      `from ponder_sync.blocks where chain_id=${chain} order by number desc limit 1`,
   )) {
     row = r;
     break;
@@ -1220,7 +1325,23 @@ async function bucketHashesExcluding(url, chain, lo, hi, bucket, excludeRows) {
   return map;
 }
 
-async function compareChain(
+// The real module functions compareChain calls, gathered into one deps object so a test can drive the
+// REAL compareChain with stubs (D3 wiring coverage). The production call sites pass nothing, so `deps`
+// defaults to these and behaviour is unchanged; a test overrides only the seams it needs. Every DB-
+// touching adapter compareChain uses is here — swapping them for in-memory stubs makes compareChain's
+// verdict composition (OR-of-stagnation-and-windowed) testable without a psql.
+export const COMPARE_CHAIN_DEPS = {
+  overlapBound,
+  checkpointProgress,
+  legNewestRow,
+  diffLogs,
+  diffBlocks,
+  diffTx,
+  bucketHashes,
+  bucketHashesExcluding,
+};
+
+export async function compareChain(
   urlA,
   urlB,
   chain,
@@ -1229,16 +1350,20 @@ async function compareChain(
   bucket,
   schemaB,
   stagnationThreshold,
+  // Cross-run stagnation state for THIS chain from the prior run (or null); wall clock; deps seam.
+  prevStagnation = null,
+  nowMs = Date.now(),
+  deps = COMPARE_CHAIN_DEPS,
 ) {
   const [boundA, boundB, progressB, newestA, newestB] = await Promise.all([
-    overlapBound(urlA, chain),
-    overlapBound(urlB, chain),
+    deps.overlapBound(urlA, chain),
+    deps.overlapBound(urlB, chain),
     // Soak B's COMMITTED indexing progress from `_ponder_checkpoint` — the real value the
     // monotonicity guard asserts, not merely how far the sync store reached (see checkpointProgress).
-    checkpointProgress(urlB, chain, schemaB),
+    deps.checkpointProgress(urlB, chain, schemaB),
     // Newest persisted (block, timestamp) per leg — for the issue #38 persist-stagnation guard.
-    legNewestRow(urlA, chain),
-    legNewestRow(urlB, chain),
+    deps.legNewestRow(urlA, chain),
+    deps.legNewestRow(urlB, chain),
   ]);
   const hi = Math.min(boundA, boundB) - margin;
   const lo = cutover;
@@ -1257,20 +1382,24 @@ async function compareChain(
   out.lagA = boundA - Math.min(boundA, boundB);
   out.lagB = boundB - Math.min(boundA, boundB);
 
-  // Persist-stagnation guard (issue #38). Computed BEFORE the window check so it fires regardless of
+  // Persist-stagnation guard (issue #38). Computed alongside the window so it fires regardless of
   // window state: a one-sided wedge is exactly the state where `hi` can be frozen or below `lo`, and
-  // the whole point is that this FAILs when the WINDOWED diff would read PASS/PENDING. maxA/maxB and
-  // both newest-row timestamps are surfaced in the per-chain classes (and thus the counters JSON) so
-  // a frozen window is legible at a glance even below threshold.
+  // the whole point is that this FAILs when the WINDOWED diff would read PASS/PENDING. It takes the
+  // prior run's per-chain state (direction-aware decision) + the wall clock (empty-leg timing). maxA/
+  // maxB and both newest-row timestamps are surfaced in the per-chain classes (and thus the counters
+  // JSON) so a frozen window is legible at a glance even below threshold.
   const stagnation = stagnationDecision({
     maxA: newestA.maxBlock,
     tsA: newestA.ts,
     maxB: newestB.maxBlock,
     tsB: newestB.ts,
     threshold: stagnationThreshold,
+    prev: prevStagnation,
+    nowMs,
   });
   const persistStagnation = {
     fail: stagnation.fail,
+    reason: stagnation.reason,
     staleSide: stagnation.staleSide,
     skewSeconds: stagnation.skew,
     thresholdSeconds: stagnationThreshold,
@@ -1280,29 +1409,27 @@ async function compareChain(
     tsB: stagnation.tsB,
   };
   out.classes.persistStagnation = persistStagnation;
-  if (stagnation.fail) {
-    // A one-sided persist stall is a HARD FAIL that overrides any window-derived verdict (PENDING or a
-    // clean windowed PASS) — the frozen window is precisely why the windowed diff cannot see the loss.
-    out.verdict = 'FAIL';
-
-    return out;
-  }
+  // The state to persist for this chain for the next run (loaded/saved via CHECKPOINT_FILE by main).
+  out.stagnationState = stagnation.nextState;
 
   if (hi < lo) {
-    out.verdict = 'PENDING';
+    // No finalized overlap yet — the windowed diff cannot run. This is PENDING on the window axis, but
+    // the stagnation guard still stands: OR-compose so a fired guard FAILs even here (a one-sided wedge
+    // is precisely a state that can hold hi below lo). classes.persistStagnation is already attached.
+    out.verdict = stagnation.fail ? 'FAIL' : 'PENDING';
     out.classes.note = `no finalized overlap yet (lo=${lo} hi=${hi})`;
 
     return out;
   }
 
   const [logsRes, blocksRes, tx] = await Promise.all([
-    diffLogs(urlA, urlB, chain, lo, hi),
-    diffBlocks(urlA, urlB, chain, lo, hi),
-    diffTx(urlA, urlB, chain, lo, hi),
+    deps.diffLogs(urlA, urlB, chain, lo, hi),
+    deps.diffBlocks(urlA, urlB, chain, lo, hi),
+    deps.diffTx(urlA, urlB, chain, lo, hi),
   ]);
   const [ba, bb] = await Promise.all([
-    bucketHashes(urlA, chain, lo, hi, bucket),
-    bucketHashes(urlB, chain, lo, hi, bucket),
+    deps.bucketHashes(urlA, chain, lo, hi, bucket),
+    deps.bucketHashes(urlB, chain, lo, hi, bucket),
   ]);
   const buckets = compareBucketHashes(ba, bb);
 
@@ -1359,7 +1486,7 @@ async function compareChain(
     unexplained: buckets.mismatches,
   };
   if (!buckets.ok && toleratedLogRows.length > 0) {
-    const bbExcl = await bucketHashesExcluding(
+    const bbExcl = await deps.bucketHashesExcluding(
       urlB,
       chain,
       lo,
@@ -1421,7 +1548,13 @@ async function compareChain(
       unexplained: bucketClass.unexplained.length,
     },
   };
-  if (logsFail || blocksFail || tx.fail || bucketsFail) {
+  // OR-composition of the verdict (D1 — no early return on a fired guard): the FULL windowed diff runs
+  // even when the stagnation guard fires, so its tolerated classes / pins / bucket hashes are all still
+  // computed and reported. A fired guard FORCES FAIL (stagnation FAIL wins over a windowed PASS/PENDING)
+  // but NEVER suppresses a windowed failure's own reporting — a stagnation-only FAIL and a windowed FAIL
+  // compose to one FAIL, each visible in its own class. classes.persistStagnation is attached in every
+  // path above.
+  if (logsFail || blocksFail || tx.fail || bucketsFail || stagnation.fail) {
     out.verdict = 'FAIL';
   }
 
@@ -1456,6 +1589,18 @@ async function main() {
   const checkpointFile =
     process.env.CHECKPOINT_FILE ?? 'soak-ab-checkpoints.json';
 
+  // The CHECKPOINT_FILE is the cross-run ledger: it holds the per-chain checkpoint monotonicity series
+  // AND (new, issue #38) a per-chain persist-stagnation state section under the `_stagnation` top-level
+  // key. An ABSENT `_stagnation` key ⇒ no prior state (fully backward compatible with existing files —
+  // the key is numeric-chain-disjoint, so the monotonicity loop below never treats it as a chain). Load
+  // it ONCE here and pass each chain's prior state into compareChain (direction-aware decision).
+  const prior = loadPriorCheckpoints(checkpointFile);
+  const priorStagnation =
+    prior && typeof prior._stagnation === 'object' && prior._stagnation !== null
+      ? prior._stagnation
+      : {};
+  const nowMs = Date.now();
+
   const results = [];
   for (const chain of chains) {
     try {
@@ -1469,6 +1614,8 @@ async function main() {
           bucket,
           schemaB,
           stagnationThreshold,
+          priorStagnation[chain] ?? null,
+          nowMs,
         ),
       );
     } catch (e) {
@@ -1479,10 +1626,16 @@ async function main() {
   // Checkpoint monotonicity across runs: Soak B's per-chain progress must never rewind between
   // hourly runs. A regression (a resume/restart that lost ground) is a hard FAIL, wired into both
   // the verdict/exit code and the alerts — not merely logged.
-  const prior = loadPriorCheckpoints(checkpointFile);
   const nextCheckpoints = { ...prior };
   const regressions = [];
+  const nextStagnation = {};
   for (const r of results) {
+    // Carry forward this chain's persist-stagnation state for the next run's direction check. A chain
+    // that errored before the guard ran leaves stagnationState undefined → nothing to carry.
+    if (r.stagnationState) {
+      nextStagnation[r.chain] = r.stagnationState;
+    }
+
     if (r.progressB === undefined) {
       continue;
     }
@@ -1499,6 +1652,9 @@ async function main() {
     // keep a bounded tail so the file does not grow unbounded across a long soak
     nextCheckpoints[r.chain] = series.slice(-64);
   }
+  // Persist the new per-chain stagnation state section (replaces the prior one wholesale — each run
+  // recomputes every diffed chain's nextState from scratch, so a chain no longer armed clears itself).
+  nextCheckpoints._stagnation = nextStagnation;
 
   const verdict = results.some(
     (r) => r.verdict === 'FAIL' || r.verdict === 'ERROR',
@@ -1523,34 +1679,7 @@ async function main() {
     // no restart log yet — Soak B not started, or first boot
   }
 
-  const alerts = [];
-  if (restarts.crashLoop) {
-    alerts.push(
-      `crash-loop: ${restarts.restartsLastHour} restarts in the last hour (>3)`,
-    );
-  }
-  for (const reg of regressions) {
-    alerts.push(
-      `checkpoint-regression: chain ${reg.chain} rewound ${reg.prev} → ${reg.cur} between runs`,
-    );
-  }
-  // Persist-stagnation alerts (issue #38) — one NAMED line per stalled chain, so a one-sided wedge
-  // that a frozen window would otherwise hide behind a PASS is loud and self-describing.
-  const stagnations = stagnationAlerts(results);
-  for (const line of stagnations) {
-    alerts.push(line);
-  }
-  // The generic finalized-diff line covers the WINDOWED failure modes; a stagnation-only FAIL already
-  // has its own precise alert above, so don't also emit the vague generic line for it.
-  if (
-    verdict === 'FAIL' &&
-    regressions.length === 0 &&
-    stagnations.length === 0
-  ) {
-    alerts.push(
-      'finalized-diff: an unexpected finalized-overlap divergence (see diffClasses)',
-    );
-  }
+  const alerts = composeAlerts(results, regressions, restarts);
 
   const toleratedIssue27 = aggregateToleratedIssue27(results);
   const knownBadRowsAgg = aggregateKnownBadRows(results);
@@ -1582,7 +1711,7 @@ async function main() {
     // table (logs/blocks) and per chain so the growth is legible at a glance.
     toleratedIssue36,
     counters: Object.fromEntries(
-      results.map((r) => [r.chain, { lo: r.lo, hi: r.hi, verdict: r.verdict }]),
+      results.map((r) => [r.chain, chainCounters(r)]),
     ),
   };
 
@@ -1707,19 +1836,124 @@ export function stagnationAlerts(results) {
   const lines = [];
   for (const r of results) {
     const s = r?.classes?.persistStagnation;
-    if (!s || !s.fail) {
+    if (!s?.fail) {
       continue;
     }
 
     const stalled = s.staleSide === 'A' ? 'leg A' : 'leg B';
+    // Say what was PROVEN — the reason tag drives a self-describing clause. A frozen or skew-growing
+    // wedge is a two-leg-populated freeze (skew shown); a one-sided-empty wedge is the empty leg
+    // persisting nothing for N seconds while the other advances (no skew — the leg has no rows).
+    let what;
+    if (s.reason === 'one-sided-empty') {
+      what =
+        `has persisted NO rows for over ${s.thresholdSeconds}s while the other leg advances ` +
+        `(empty leg, one-sided wedge)`;
+    } else if (s.reason === 'skew-growing') {
+      what =
+        `is falling further behind — newest-row timestamp skew GROWING to ${s.skewSeconds}s ` +
+        `> ${s.thresholdSeconds}s`;
+    } else {
+      // 'frozen' (or any other fail reason with a measured skew): the stale leg's newest row is not
+      // advancing while the skew sits above threshold.
+      what =
+        `has stopped persisting rows (newest-row timestamp FROZEN; skew ${s.skewSeconds}s ` +
+        `> ${s.thresholdSeconds}s)`;
+    }
     lines.push(
-      `persist-stagnation: chain ${r.chain} — ${stalled} has stopped persisting rows ` +
-        `(newest-row timestamp skew ${s.skewSeconds}s > ${s.thresholdSeconds}s; ` +
-        `maxA=${s.maxA} maxB=${s.maxB} tsA=${s.tsA} tsB=${s.tsB})`,
+      `persist-stagnation: chain ${r.chain} — ${stalled} ${what}; ` +
+        `maxA=${s.maxA} maxB=${s.maxB} tsA=${s.tsA} tsB=${s.tsB}`,
     );
   }
 
   return lines;
+}
+
+// Whether a chain result FAILed for a WINDOWED reason — a hard divergence in its OWN diff classes
+// (logs / blocks / transactions / checkpoint buckets), as opposed to a stagnation-only or checkpoint-
+// regression FAIL. Finding 3: the generic 'finalized-diff' alert must be emitted iff at least one chain
+// FAILed for a windowed reason, regardless of stagnation lines on other chains — with D1 (no early
+// return) every FAILing chain's windowed classes are present, so we can decide this per chain from the
+// classes. An ERROR result (no classes) counts as a windowed hard-fail (the diff could not complete —
+// exactly the kind of unexpected failure the generic line points a human at). Pure + exported.
+export function chainWindowedFail(r) {
+  if (r?.verdict === 'ERROR') {
+    return true;
+  }
+  if (r?.verdict !== 'FAIL') {
+    return false;
+  }
+
+  const c = r.classes ?? {};
+
+  return Boolean(
+    c.logs?.fail ||
+      c.blocks?.fail ||
+      c.transactions?.fail ||
+      (c.checkpointBuckets && c.checkpointBuckets.ok === false),
+  );
+}
+
+// Compose the FULL alert list from the run results, the checkpoint regressions, and the restart stats.
+// Pure + exported (D3/D4): the alert composition — crash-loop, checkpoint-regression lines, per-chain
+// stagnation lines, and the generic finalized-diff line's SUPPRESSION logic — is asserted directly.
+//
+// The generic 'finalized-diff' line (finding 3) is emitted IFF at least one chain FAILed for a WINDOWED
+// reason (chainWindowedFail), regardless of stagnation lines on OTHER chains: a stagnation-only FAIL has
+// its own precise line and must NOT also trigger the vague generic one, but a real windowed FAIL on
+// chain Y must still surface it even while chain X carries a stagnation line. Checkpoint regressions
+// have their own precise lines and are NOT a windowed-diff cause, so they do not (by themselves) emit
+// the generic line either.
+export function composeAlerts(results, regressions, restarts) {
+  const alerts = [];
+  if (restarts?.crashLoop) {
+    alerts.push(
+      `crash-loop: ${restarts.restartsLastHour} restarts in the last hour (>3)`,
+    );
+  }
+  for (const reg of regressions ?? []) {
+    alerts.push(
+      `checkpoint-regression: chain ${reg.chain} rewound ${reg.prev} → ${reg.cur} between runs`,
+    );
+  }
+  // One NAMED line per stalled chain (issue #38) — a one-sided wedge a frozen window would hide behind
+  // a PASS is loud and self-describing.
+  for (const line of stagnationAlerts(results)) {
+    alerts.push(line);
+  }
+  // The generic finalized-diff line: emit iff SOME chain has a windowed hard-fail. Per-chain from the
+  // classes (D1 makes every FAILing chain's windowed classes present) — so chain X stagnation-only +
+  // chain Y windowed FAIL emits BOTH the X stagnation line above AND this generic line.
+  if ((results ?? []).some(chainWindowedFail)) {
+    alerts.push(
+      'finalized-diff: an unexpected finalized-overlap divergence (see diffClasses)',
+    );
+  }
+
+  return alerts;
+}
+
+// The per-chain `counters` status-JSON entry: the window bounds + verdict, PLUS the persist-stagnation
+// summary (issue #38 finding 6 — the PR body already claimed maxA/maxB/tsA/tsB/skew live here; this
+// aligns the code with the body). A frozen window is legible at a glance from the counters alone, even
+// below threshold. A result with no persistStagnation class (an ERROR before the guard ran) omits the
+// stagnation fields. Pure + exported so the counters contract is asserted.
+export function chainCounters(r) {
+  const base = { lo: r.lo, hi: r.hi, verdict: r.verdict };
+  const s = r?.classes?.persistStagnation;
+  if (!s) {
+    return base;
+  }
+
+  return {
+    ...base,
+    maxA: s.maxA,
+    maxB: s.maxB,
+    tsA: s.tsA,
+    tsB: s.tsB,
+    stagnationSkewSeconds: s.skewSeconds,
+    stagnationReason: s.reason,
+  };
 }
 
 // Sum the per-chain knownBadRows (issue #32) tallies from every chain result into one

@@ -1,8 +1,9 @@
 import assert from 'node:assert/strict';
 import { existsSync, mkdtempSync, readdirSync, readFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { dirname, join } from 'node:path';
 import { test } from 'node:test';
+import { fileURLToPath } from 'node:url';
 import { mergeCompare } from '../validate/diff-batched.mjs';
 import {
   AB_STAGNATION_DEFAULT_MAX_SKEW_S,
@@ -11,6 +12,8 @@ import {
   aggregateToleratedIssue36,
   buildBucketExclusionFilter,
   buildTxSql,
+  chainCounters,
+  chainWindowedFail,
   CHECKPOINT_BLOCK_LEN,
   CHECKPOINT_BLOCK_OFFSET_0,
   checkpointDecision,
@@ -24,6 +27,9 @@ import {
   collectOnlyB,
   collectReferenced,
   compareBucketHashes,
+  compareChain,
+  COMPARE_CHAIN_DEPS,
+  composeAlerts,
   crossCheckOnlyBCollector,
   extractCheckpointBlock,
   formatKnownBadRowsLine,
@@ -1595,196 +1601,391 @@ test('readStagnationThreshold: default when unset, fail-loud on garbage / non-po
   }
 });
 
-// The core: from the two legs' newest-row block TIMESTAMPS, a one-sided skew past threshold is a FAIL
-// naming the OLDER leg; a below-threshold skew is PASS. maxA/maxB are carried through for the counters
-// JSON. This is the whole guard — every clause is mutated below.
-test('stagnationDecision: both legs populated — fail past threshold, name the older leg, pass under it', () => {
-  const t = 7200; // 2h
+// ── stagnationDecision: the DIRECTION-AWARE, cross-run decision (issue #38, review D2) ──────────────
+//
+// The decision now takes the prior run's per-chain state (`prev`) and a wall clock (`nowMs`) and
+// returns { fail, reason, staleSide, skew, tsA, tsB, maxA, maxB, nextState }. A one-shot skew reading
+// cannot tell a transient lag from a wedge; two observations tell them apart by DIRECTION. Each clause
+// below is mutation-verified; the PR body records which mutation each guards.
 
-  // leg B is 3h behind leg A (tsB older) → FAIL, stale side B
-  const bStale = stagnationDecision({
+// Fixed "now" so the empty-leg wall-clock timing is deterministic.
+const NOW = 1_000_000_000_000; // ms
+
+test('stagnationDecision: both legs populated, skew ≤ threshold → PASS, clears state', () => {
+  const t = 7200;
+  const r = stagnationDecision({
     maxA: '100',
-    tsA: 1_000_000,
-    maxB: '90',
-    tsB: 1_000_000 - 10_800,
-    threshold: t,
-  });
-  // MUTATION: `fail = skew > threshold` → `skew >= threshold` does NOT flip this (skew 10800 > 7200
-  // either way); the strict-boundary case is asserted in its own test below.
-  assert.equal(bStale.fail, true, '3h one-sided skew exceeds the 2h threshold');
-  // MUTATION: name the stale side by the LARGER ts (`a > b ? 'A' : 'B'`) instead of the smaller →
-  // this asserts 'B' (the older leg), so the mutant reads 'A' and fails.
-  assert.equal(bStale.staleSide, 'B', 'the OLDER-timestamp leg is the stalled one');
-  assert.equal(bStale.skew, 10_800, 'skew is the absolute timestamp delta in seconds');
-  // maxA/maxB surfaced for the counters JSON even on a FAIL
-  assert.equal(bStale.maxA, 100);
-  assert.equal(bStale.maxB, 90);
-
-  // symmetric: leg A older → stale side A (direction matters for NAMING)
-  const aStale = stagnationDecision({
-    maxA: '90',
-    tsA: 1_000_000 - 10_800,
-    maxB: '100',
-    tsB: 1_000_000,
-    threshold: t,
-  });
-  assert.equal(aStale.fail, true);
-  assert.equal(aStale.staleSide, 'A', 'the OLDER leg is A here');
-  assert.equal(aStale.skew, 10_800);
-
-  // below threshold (1h skew < 2h) → PASS, and NO stale side is named (a below-threshold lag is not a
-  // stall). MUTATION: return `staleSide` unconditionally (drop the `fail ? … : null`) → this asserts
-  // null on a PASS, so the mutant that names the older leg anyway fails.
-  const ok = stagnationDecision({
-    maxA: '100',
-    tsA: 1_000_000,
+    tsA: 1_700_000_000,
     maxB: '99',
-    tsB: 1_000_000 - 3600,
+    tsB: 1_700_000_000 - 3600, // 1h behind, under 2h
     threshold: t,
+    prev: { staleSide: 'B', staleTs: 1_699_000_000, skew: 999_999 }, // stale prior state
+    nowMs: NOW,
   });
-  assert.equal(ok.fail, false, '1h skew is under the 2h threshold');
-  assert.equal(ok.staleSide, null, 'a below-threshold lag names no stalled side');
-  assert.equal(ok.skew, 3600, 'the skew is still surfaced for the counters JSON');
+  assert.equal(r.fail, false, '1h skew is under the 2h threshold');
+  assert.equal(r.reason, 'both-populated-in-skew');
+  assert.equal(r.staleSide, null, 'a below-threshold lag names no stalled side');
+  assert.equal(r.skew, null, 'in-skew: skew is not surfaced as a stall metric');
+  assert.equal(r.nextState, null, 'a healthy run CLEARS any prior armed state');
+  // maxA/maxB carried through for the counters JSON
+  assert.equal(r.maxA, 100);
+  assert.equal(r.maxB, 99);
 });
 
-// Equal timestamps ⇒ skew 0 ⇒ PASS, no stale side — the benign steady state (both legs at the same
-// newest block). MUTATION: use `>=` for the fail comparison → skew 0 >= 0 would FAIL, so this test's
-// `fail === false` assertion catches it.
-test('stagnationDecision: equal timestamps → skew 0, PASS, no stale side', () => {
+// NO-PREV ARMING: the FIRST run to see an over-threshold skew does NOT fail — it ARMS and defers the
+// verdict one run (candor: one-run detection delay). MUTATION: make the no-prev branch FAIL immediately
+// (drop the arming, `fail: false` → `fail: true`) → the `fail === false` assertion here fails.
+test('stagnationDecision: both populated, skew > threshold, NO prev → ARM (non-fail), reason skew-above-threshold-arming', () => {
+  const t = 7200;
+  const r = stagnationDecision({
+    maxA: '100',
+    tsA: 1_700_000_000,
+    maxB: '90',
+    tsB: 1_700_000_000 - 10_800, // 3h behind → over threshold, but no prior observation
+    threshold: t,
+    prev: null,
+    nowMs: NOW,
+  });
+  assert.equal(r.fail, false, 'the FIRST over-threshold observation arms, does not fail');
+  assert.equal(r.reason, 'skew-above-threshold-arming');
+  assert.equal(r.staleSide, null, 'no side named on the deferred (armed) run');
+  assert.equal(r.skew, 10_800, 'the skew is surfaced (loud info), just not yet a fail');
+  // nextState carries THIS run's stale-leg ts + skew for the next run's direction check
+  assert.deepEqual(r.nextState, {
+    staleSide: 'B',
+    staleTs: 1_700_000_000 - 10_800,
+    skew: 10_800,
+  });
+});
+
+// DIRECTION — FROZEN: prev armed the same stale side; this run the stale leg did NOT advance → FAIL
+// 'frozen'. MUTATION: invert the frozen clause (`!staleAdvanced` → `staleAdvanced`) → a frozen leg
+// reads as advancing and this `fail === true` assertion fails.
+test('stagnationDecision: both populated, over threshold, prev armed, stale leg FROZEN → FAIL frozen', () => {
+  const t = 7200;
+  const prev = { staleSide: 'B', staleTs: 1_699_989_200, skew: 10_800 };
+  const r = stagnationDecision({
+    maxA: '100',
+    tsA: 1_700_000_000,
+    maxB: '90',
+    tsB: 1_699_989_200, // UNCHANGED since prev.staleTs → frozen
+    threshold: t,
+    prev,
+    nowMs: NOW,
+  });
+  assert.equal(r.fail, true, 'a stale leg that did not advance since prev is a frozen wedge');
+  assert.equal(r.reason, 'frozen');
+  assert.equal(r.staleSide, 'B', 'the OLDER-ts leg is the stalled one');
+  assert.equal(r.skew, 10_800);
+});
+
+// DIRECTION — SKEW GROWING: the stale leg advanced a little, but the skew INCREASED vs prev (falling
+// further behind = a trickling wedge) → FAIL 'skew-growing'. This is the clause that stops a slow
+// wedge fail-OPENing. MUTATION: drop the `skewIncreased` clause (fail = !staleAdvanced only) → a leg
+// that trickles forward while the healthy leg races ahead reads as catching-up and this fails.
+test('stagnationDecision: both populated, prev armed, stale leg advanced BUT skew GROWING → FAIL skew-growing', () => {
+  const t = 7200;
+  const prev = { staleSide: 'B', staleTs: 1_699_988_000, skew: 9000 };
+  const r = stagnationDecision({
+    maxA: '100',
+    tsA: 1_700_000_000,
+    maxB: '95',
+    tsB: 1_699_988_500, // advanced +500s since prev.staleTs …
+    threshold: t,
+    prev,
+    nowMs: NOW,
+  });
+  // skew now = 1_700_000_000 - 1_699_988_500 = 11_500 > prev.skew 9000 → growing
+  assert.equal(r.skew, 11_500, 'skew grew from 9000 to 11500');
+  assert.equal(r.fail, true, 'a trickling leg still falling behind is a wedge');
+  assert.equal(r.reason, 'skew-growing');
+  assert.equal(r.staleSide, 'B');
+});
+
+// DIRECTION — CATCHING UP: the stale leg advanced AND the skew SHRANK → non-fail 'catching-up' (a leg
+// mid-recovery, e.g. a Soak restart re-syncing). MUTATION: drop the catching-up branch (always fail
+// when over threshold) → a legitimately-recovering leg false-FAILs and this `fail === false` fails.
+test('stagnationDecision: both populated, prev armed, stale leg advanced AND skew SHRANK → non-fail catching-up', () => {
+  const t = 7200;
+  const prev = { staleSide: 'B', staleTs: 1_699_985_000, skew: 15_000 };
+  const r = stagnationDecision({
+    maxA: '100',
+    tsA: 1_700_000_000,
+    maxB: '98',
+    tsB: 1_699_990_000, // advanced +5000s since prev; skew now 10_000 < prev 15_000 → shrinking
+    threshold: t,
+    prev,
+    nowMs: NOW,
+  });
+  assert.equal(r.skew, 10_000, 'skew shrank from 15000 to 10000');
+  assert.equal(r.fail, false, 'a leg advancing AND closing the gap is catching up, not a wedge');
+  assert.equal(r.reason, 'catching-up');
+  assert.equal(r.staleSide, null, 'a catching-up leg is not named as stalled');
+});
+
+// The stale leg is named by the OLDER timestamp, symmetric in both directions. MUTATION: name the
+// stale side by the LARGER ts (swap the a<b / b<a arms) → the leg-A-stale case below reads 'B'.
+test('stagnationDecision: direction — the OLDER-timestamp leg is named, symmetric A/B', () => {
+  const t = 7200;
+  const prevA = { staleSide: 'A', staleTs: 1_699_989_200, skew: 10_800 };
+  const aStale = stagnationDecision({
+    maxA: '90',
+    tsA: 1_699_989_200, // leg A older, frozen
+    maxB: '100',
+    tsB: 1_700_000_000,
+    threshold: t,
+    prev: prevA,
+    nowMs: NOW,
+  });
+  assert.equal(aStale.fail, true);
+  assert.equal(aStale.staleSide, 'A', 'leg A (older newest row) is the stalled side');
+
+  const prevB = { staleSide: 'B', staleTs: 1_699_989_200, skew: 10_800 };
+  const bStale = stagnationDecision({
+    maxA: '100',
+    tsA: 1_700_000_000,
+    maxB: '90',
+    tsB: 1_699_989_200, // leg B older, frozen
+    threshold: t,
+    prev: prevB,
+    nowMs: NOW,
+  });
+  assert.equal(bStale.fail, true);
+  assert.equal(bStale.staleSide, 'B', 'leg B (older newest row) is the stalled side');
+});
+
+// STRICT threshold boundary: a skew EXACTLY at the threshold is within tolerance → PASS (in-skew), no
+// arming. MUTATION: `skew <= threshold` → `skew < threshold` → the exactly-at case falls through to the
+// over-threshold arm and this `fail === false, reason 'both-populated-in-skew'` assertion fails.
+test('stagnationDecision: skew exactly at the threshold is in tolerance (PASS, cleared)', () => {
+  const t = 7200;
+  const r = stagnationDecision({
+    maxA: '10',
+    tsA: 1_700_000_000,
+    maxB: '9',
+    tsB: 1_700_000_000 - t, // skew exactly == threshold
+    threshold: t,
+    prev: { staleSide: 'B', staleTs: 1, skew: 999 },
+    nowMs: NOW,
+  });
+  assert.equal(r.fail, false, 'skew == threshold is within tolerance, not a stall');
+  assert.equal(r.reason, 'both-populated-in-skew');
+  assert.equal(r.nextState, null, 'in-tolerance clears prior armed state');
+});
+
+// EQUAL timestamps → skew 0 → in tolerance → PASS. (skew 0 can never exceed a positive threshold.)
+test('stagnationDecision: equal timestamps → PASS, no stale side, state cleared', () => {
   const eq = stagnationDecision({
     maxA: '500',
     tsA: 1_700_000_000,
     maxB: '500',
     tsB: 1_700_000_000,
     threshold: 7200,
+    prev: null,
+    nowMs: NOW,
   });
   assert.equal(eq.fail, false);
-  assert.equal(eq.skew, 0);
+  assert.equal(eq.reason, 'both-populated-in-skew');
   assert.equal(eq.staleSide, null);
 });
 
-// The threshold boundary is STRICT (`>`), not `>=`: a skew EXACTLY equal to the threshold PASSes.
-// MUTATION: change `skew > threshold` to `skew >= threshold` → the exactly-at-threshold case flips to
-// FAIL and this test's `atThreshold.fail === false` assertion fails.
-test('stagnationDecision: skew exactly at the threshold passes (strict >)', () => {
-  const t = 7200;
-  const atThreshold = stagnationDecision({
-    maxA: '10',
-    tsA: 1_000_000,
-    maxB: '9',
-    tsB: 1_000_000 - t,
-    threshold: t,
-  });
-  assert.equal(atThreshold.fail, false, 'skew == threshold is NOT a failure');
-  assert.equal(atThreshold.skew, t);
+// ── one-leg-empty: wall-clock arming + mutual-freeze exemption ──────────────────────────────────────
 
-  const overByOne = stagnationDecision({
-    maxA: '10',
-    tsA: 1_000_000,
-    maxB: '9',
-    tsB: 1_000_000 - t - 1,
-    threshold: t,
-  });
-  assert.equal(overByOne.fail, true, 'one second past threshold fails');
-});
-
-// Empty-vs-populated is INDETERMINATE from timestamps alone (cold start vs wedge are indistinguishable
-// — see the helper header), so it does NOT alarm; skew is null and neither side is named. Both maxes
-// are still surfaced so the empty leg is legible. This is the conscious residual documented in the PR.
-// MUTATION: coalesce a missing ts to 0 (instead of returning early on null) → skew becomes ~1.7e9,
-// which exceeds any threshold, so the `fail === false` assertions below fail (the cold-start false
-// alarm this branch exists to prevent).
-test('stagnationDecision: one leg empty (no rows) → indeterminate, PASS, skew null, no side', () => {
-  // leg B empty (SQL NULL ts), leg A at a real recent block ts (~1.7e9 Unix seconds)
-  const bEmpty = stagnationDecision({
+// EMPTY ARMING: on the FIRST observation of a one-sided emptiness, arm firstEmptyAtMs = now and do NOT
+// fail (no prior populated-leg motion to compare). MUTATION: fail immediately on emptiness (drop the
+// arming / the `emptyLongEnough && populatedAdvanced` gate) → this `fail === false` at cold start fails.
+test('stagnationDecision: one leg empty, FIRST observation → arm firstEmptyAtMs, non-fail (empty-arming)', () => {
+  const r = stagnationDecision({
     maxA: '12345',
     tsA: 1_700_000_000,
     maxB: null,
-    tsB: null,
+    tsB: null, // leg B empty
     threshold: 7200,
+    prev: null,
+    nowMs: NOW,
   });
-  assert.equal(bEmpty.fail, false, 'empty-vs-populated must NOT false-alarm at cold start');
-  assert.equal(bEmpty.skew, null, 'skew is unmeasurable with one leg empty');
-  assert.equal(bEmpty.staleSide, null, 'no stalled side can be named from one timestamp');
-  assert.equal(bEmpty.maxA, 12_345, 'the populated leg max is still surfaced');
-  assert.equal(bEmpty.maxB, null, 'the empty leg max is null in the counters');
-  assert.equal(bEmpty.tsB, null, 'the empty leg newest timestamp is null');
-
-  // symmetric: leg A empty
-  const aEmpty = stagnationDecision({
-    maxA: null,
-    tsA: null,
-    maxB: '12345',
-    tsB: 1_700_000_000,
-    threshold: 7200,
+  assert.equal(r.fail, false, 'the first one-sided-empty observation arms, never fails at cold start');
+  assert.equal(r.reason, 'empty-arming');
+  assert.equal(r.skew, null, 'skew is unmeasurable with one leg empty');
+  assert.equal(r.staleSide, null);
+  assert.deepEqual(r.nextState, {
+    emptySide: 'B',
+    firstEmptyAtMs: NOW,
+    populatedTs: 1_700_000_000,
   });
-  assert.equal(aEmpty.fail, false);
-  assert.equal(aEmpty.skew, null);
-  assert.equal(aEmpty.staleSide, null);
-  assert.equal(aEmpty.tsA, null);
+  // the populated leg's max is still surfaced for the counters JSON; the empty leg's is null
+  assert.equal(r.maxA, 12_345);
+  assert.equal(r.maxB, null);
 });
 
-// Both legs empty ⇒ mutual not-started / sparse-app quiet — benign, PASS, no signal. MUTATION: as
-// above, coalescing null→0 would make skew 0 and could read as a spurious PASS-for-the-wrong-reason;
-// the explicit skew===null here pins that both-empty yields the indeterminate branch, not a 0 skew.
-test('stagnationDecision: both legs empty → PASS, skew null, no side (mutual freeze / not started)', () => {
+// EMPTY WEDGE FIRES: empty long enough (now − firstEmptyAtMs > threshold*1000) AND the populated leg
+// ADVANCED since prev → a genuinely one-sided wedge → FAIL, staleSide = the empty leg. MUTATION: drop
+// the `emptyLongEnough` clause → it would fire the instant the populated leg moves (no grace); drop the
+// `populatedAdvanced` clause → it would fire even on a mutual freeze (below). Either flips an assertion.
+test('stagnationDecision: one leg empty PAST the grace window while the other advances → FAIL one-sided-empty', () => {
+  const t = 7200; // → grace = 7_200_000 ms
+  const prev = {
+    emptySide: 'B',
+    firstEmptyAtMs: NOW - (t * 1000 + 60_000), // armed > threshold ago
+    populatedTs: 1_700_000_000,
+  };
+  const r = stagnationDecision({
+    maxA: '12500',
+    tsA: 1_700_050_000, // populated leg ADVANCED since prev.populatedTs
+    maxB: null,
+    tsB: null, // leg B still empty
+    threshold: t,
+    prev,
+    nowMs: NOW,
+  });
+  assert.equal(r.fail, true, 'empty past the grace window while the other leg advances is a wedge');
+  assert.equal(r.reason, 'one-sided-empty');
+  assert.equal(r.staleSide, 'B', 'the empty leg is the stalled side');
+  // firstEmptyAtMs is preserved from prev (not re-armed), and populatedTs updated
+  assert.equal(r.nextState.firstEmptyAtMs, prev.firstEmptyAtMs);
+  assert.equal(r.nextState.populatedTs, 1_700_050_000);
+});
+
+// MUTUAL-FREEZE EXEMPTION: empty long enough, but the populated leg is ALSO frozen (did NOT advance
+// since prev) → NOT a one-sided wedge → non-fail. MUTATION: drop the `populatedAdvanced` conjunct so
+// emptiness alone fails → this mutual-freeze case false-FAILs and the `fail === false` assertion fails.
+test('stagnationDecision: one leg empty past grace but the OTHER leg is also frozen → non-fail (mutual freeze)', () => {
+  const t = 7200;
+  const prev = {
+    emptySide: 'B',
+    firstEmptyAtMs: NOW - (t * 1000 + 60_000),
+    populatedTs: 1_700_000_000,
+  };
+  const r = stagnationDecision({
+    maxA: '12345',
+    tsA: 1_700_000_000, // populated leg UNCHANGED since prev → also frozen
+    maxB: null,
+    tsB: null,
+    threshold: t,
+    prev,
+    nowMs: NOW,
+  });
+  assert.equal(r.fail, false, 'a mutual freeze (both quiet) is benign, never a one-sided wedge');
+  assert.equal(r.reason, 'empty-arming');
+  assert.equal(r.staleSide, null);
+});
+
+// EMPTY CLEARS ON FIRST ROW: the moment the empty leg gains rows, both legs are populated → the empty
+// state is gone (the branch is not even entered). Here the once-empty leg now has a ts within skew →
+// PASS with state cleared. MUTATION: carry firstEmptyAtMs forward once populated → the both-populated
+// branch returns nextState null, so a leaked firstEmptyAtMs would violate the deepEqual(null) below.
+test('stagnationDecision: the empty leg gains rows → clears emptiness state (both-populated branch)', () => {
+  const prev = {
+    emptySide: 'B',
+    firstEmptyAtMs: NOW - 9_000_000,
+    populatedTs: 1_700_000_000,
+  };
+  const r = stagnationDecision({
+    maxA: '12500',
+    tsA: 1_700_000_100,
+    maxB: '9',
+    tsB: 1_700_000_000, // leg B now HAS a row, within skew
+    threshold: 7200,
+    prev,
+    nowMs: NOW,
+  });
+  assert.equal(r.fail, false);
+  assert.equal(r.reason, 'both-populated-in-skew');
+  assert.equal(r.nextState, null, 'gaining rows clears the armed emptiness state');
+});
+
+// BOTH EMPTY → benign mutual/not-started → PASS, no side, state cleared. MUTATION: coalesce null→0
+// would make skew 0 read via the populated branch; the explicit reason 'both-empty' pins the branch.
+test('stagnationDecision: both legs empty → PASS, no side, state cleared (mutual / not started)', () => {
   const both = stagnationDecision({
     maxA: null,
     tsA: null,
     maxB: null,
     tsB: null,
     threshold: 7200,
+    prev: { emptySide: 'B', firstEmptyAtMs: NOW - 9_000_000, populatedTs: 1 },
+    nowMs: NOW,
   });
   assert.equal(both.fail, false);
+  assert.equal(both.reason, 'both-empty');
   assert.equal(both.skew, null);
   assert.equal(both.staleSide, null);
+  assert.equal(both.nextState, null);
   assert.equal(both.maxA, null);
   assert.equal(both.maxB, null);
 });
 
-// A NULL/NaN/empty-string timestamp is treated as "no rows" for that leg — never coerced to a phantom
-// 0 (which would be ~1.7e9 seconds behind any real block and false-alarm). Numeric-string timestamps
-// (psql returns bigint as text) are parsed. MUTATION: drop the `Number.isFinite` guard in tsToSeconds
-// so a non-numeric string coerces to NaN and flows on → `NaN > 0`/skew math yields NaN, and the
-// no-alarm assertion below fails.
-test('stagnationDecision: NULL / unparseable timestamps are "no rows", numeric strings parse', () => {
-  // psql bigint-as-text timestamps within threshold → PASS, parsed correctly
+// A NULL/NaN/empty-string timestamp is "no rows" for that leg — never a phantom 0 (which would be
+// ~1.7e9 seconds behind any real block and false-alarm). Numeric-string timestamps (psql bigint text)
+// parse. MUTATION: drop the `Number.isFinite` guard in tsToSeconds → an unparseable string coerces to
+// NaN and flows into the populated branch as a phantom, breaking the "no rows" assertion below.
+test('stagnationDecision: NULL / unparseable timestamps are "no rows"; numeric strings parse', () => {
+  // both parse (psql bigint-as-text), within skew → PASS
   const parsed = stagnationDecision({
     maxA: '100',
     tsA: '1700000000',
     maxB: '100',
     tsB: '1699999000',
     threshold: 7200,
+    prev: null,
+    nowMs: NOW,
   });
   assert.equal(parsed.fail, false);
-  assert.equal(parsed.skew, 1000, 'numeric-string timestamps parse to a numeric skew');
+  assert.equal(parsed.reason, 'both-populated-in-skew');
 
-  // an unparseable ts on one leg is treated as no-rows (indeterminate), never a phantom 0
+  // an unparseable ts on one leg → that leg reads as no-rows (one-sided empty, armed), never a phantom 0
   const garbageTs = stagnationDecision({
     maxA: '100',
     tsA: 'not-a-number',
     maxB: '100',
     tsB: '1700000000',
     threshold: 7200,
+    prev: null,
+    nowMs: NOW,
   });
   assert.equal(garbageTs.fail, false, 'an unparseable ts never becomes a phantom 0 skew');
-  assert.equal(garbageTs.skew, null);
-  assert.equal(garbageTs.tsA, null);
+  assert.equal(garbageTs.reason, 'empty-arming');
+  assert.equal(garbageTs.tsA, null, 'the unparseable-ts leg reads as no rows');
 });
 
-// The alert layer turns a fired guard into one loud, self-describing line per stalled chain, and
-// stays SILENT for a passing/absent guard — the alert must fire even though this is glued onto results
-// whose windowed verdict could be PASS. MUTATION: emit a line for `s.fail === false` too (drop the
-// `!s.fail` continue) → the passing-chain case below produces a line and the `length === 1` assertion
-// fails. MUTATION: name the wrong leg (map 'A'→'leg B') → the "leg A" substring assertion fails.
-test('stagnationAlerts: one loud line per stalled chain naming the older leg, silent otherwise', () => {
+// EMPTY GRACE WINDOW: armed and the populated leg ADVANCED, but the emptiness has NOT yet lasted longer
+// than threshold*1000 ms → NOT a fail (the grace window absorbs a brief one-sided quiet before the
+// empty leg's first row). MUTATION: drop the `emptyLongEnough` conjunct (fire the instant the populated
+// leg advances, no grace) → this within-grace case false-FAILs and the `fail === false` assertion fails.
+test('stagnationDecision: one leg empty, populated leg advanced but WITHIN the grace window → non-fail', () => {
+  const t = 7200; // grace = 7_200_000 ms
+  const prev = {
+    emptySide: 'B',
+    firstEmptyAtMs: NOW - 60_000, // armed only 60s ago — well within the 2h grace
+    populatedTs: 1_700_000_000,
+  };
+  const r = stagnationDecision({
+    maxA: '12500',
+    tsA: 1_700_050_000, // populated leg ADVANCED since prev …
+    maxB: null,
+    tsB: null, // … but leg B is still empty and the grace window has NOT elapsed
+    threshold: t,
+    prev,
+    nowMs: NOW,
+  });
+  assert.equal(r.fail, false, 'within the grace window an advancing other leg is not yet a wedge');
+  assert.equal(r.reason, 'empty-arming');
+  assert.equal(r.nextState.firstEmptyAtMs, prev.firstEmptyAtMs, 'the arm time is preserved');
+});
+
+// ── stagnationAlerts: one loud, self-describing line per stalled chain ───────────────────────────────
+//
+// The alert layer turns a fired guard into one loud line per stalled chain (naming what was PROVEN: a
+// frozen skew, a growing skew, or an empty-leg wedge) and stays SILENT for a passing/absent guard.
+test('stagnationAlerts: one line per stalled chain naming the older leg + reason, silent otherwise', () => {
   const results = [
-    // chain 1: guard fired, leg A stalled
+    // chain 1: frozen wedge, leg A stalled
     {
       chain: 1,
       classes: {
         persistStagnation: {
           fail: true,
+          reason: 'frozen',
           staleSide: 'A',
           skewSeconds: 10_800,
           thresholdSeconds: 7200,
@@ -1801,8 +2002,9 @@ test('stagnationAlerts: one loud line per stalled chain naming the older leg, si
       classes: {
         persistStagnation: {
           fail: false,
+          reason: 'both-populated-in-skew',
           staleSide: null,
-          skewSeconds: 60,
+          skewSeconds: null,
           thresholdSeconds: 7200,
           maxA: 5,
           maxB: 5,
@@ -1816,10 +2018,12 @@ test('stagnationAlerts: one loud line per stalled chain naming the older leg, si
   ];
 
   const lines = stagnationAlerts(results);
+  // MUTATION: drop the `!s?.fail` continue (fire on PASS too) → length becomes 2 and this fails.
   assert.equal(lines.length, 1, 'only the stalled chain emits an alert');
   assert.match(lines[0], /persist-stagnation: chain 1/);
+  // MUTATION: name the wrong leg (map 'A' → 'leg B') → this "leg A" substring assertion fails.
   assert.match(lines[0], /leg A has stopped persisting rows/);
-  assert.match(lines[0], /skew 10800s > 7200s/);
+  assert.match(lines[0], /FROZEN; skew 10800s > 7200s/);
   assert.match(lines[0], /maxA=90 maxB=100 tsA=989200 tsB=1000000/);
 
   // a leg-B stall names leg B
@@ -1829,6 +2033,7 @@ test('stagnationAlerts: one loud line per stalled chain naming the older leg, si
       classes: {
         persistStagnation: {
           fail: true,
+          reason: 'frozen',
           staleSide: 'B',
           skewSeconds: 9000,
           thresholdSeconds: 7200,
@@ -1847,47 +2052,564 @@ test('stagnationAlerts: one loud line per stalled chain naming the older leg, si
   assert.deepEqual(stagnationAlerts([]), []);
 });
 
-// The WHOLE POINT of the guard: it fires on a chain whose WINDOWED diff would read PASS. This is the
-// issue #36 shape — leg A stopped persisting, the window `hi` froze at leg A's max, so the diff inside
-// [lo, hi] is clean (PASS) while ~17h of divergence sits above hi, invisible. We reproduce the exact
-// compareChain composition (decide → attach persistStagnation → alert) WITHOUT a DB: the decision must
-// FAIL and the alert must fire even though nothing inside the window diverged.
-// MUTATION: gate the guard on the windowed verdict (only run stagnationDecision when the window diff
-// FAILs) → this frozen-window PASS chain reads clean and the FAIL/alert assertions below fail — the
-// precise regression this guard exists to prevent.
-test('stagnationDecision + alert: fire on a frozen-window chain whose windowed verdict is PASS (issue #36 shape)', () => {
-  // leg A wedged 17h behind leg B; the window froze at leg A's max so the in-window diff is PASS
-  const decision = stagnationDecision({
-    maxA: '100000', // leg A's frozen max — this is what pinned the window `hi`
-    tsA: 1_700_000_000 - 17 * 3600,
-    maxB: '132825', // leg B kept advancing (32,825 blocks ahead — the issue #36 measurement)
-    tsB: 1_700_000_000,
-    threshold: 7200,
-  });
-  assert.equal(decision.fail, true, 'a 17h one-sided freeze FAILs regardless of a clean window');
-  assert.equal(decision.staleSide, 'A', 'leg A (older newest row) is the stalled side');
+test('stagnationAlerts: a skew-growing wedge and a one-sided-empty wedge each get a self-describing line', () => {
+  const growing = stagnationAlerts([
+    {
+      chain: 1,
+      classes: {
+        persistStagnation: {
+          fail: true,
+          reason: 'skew-growing',
+          staleSide: 'B',
+          skewSeconds: 12_000,
+          thresholdSeconds: 7200,
+          maxA: 100,
+          maxB: 95,
+          tsA: 1_700_000_000,
+          tsB: 1_699_988_000,
+        },
+      },
+    },
+  ]);
+  assert.match(growing[0], /leg B is falling further behind/);
+  assert.match(growing[0], /skew GROWING to 12000s > 7200s/);
 
-  // the exact per-chain class compareChain attaches, then the alert layer over it
-  const chainResult = {
-    chain: 8453,
-    // a windowed verdict of PASS is IRRELEVANT — the guard overrides it in compareChain; here we prove
-    // the alert fires purely from the persistStagnation class the guard produced.
-    verdict: 'PASS',
+  const empty = stagnationAlerts([
+    {
+      chain: 8453,
+      classes: {
+        persistStagnation: {
+          fail: true,
+          reason: 'one-sided-empty',
+          staleSide: 'B',
+          skewSeconds: null,
+          thresholdSeconds: 7200,
+          maxA: 12_500,
+          maxB: null,
+          tsA: 1_700_050_000,
+          tsB: null,
+        },
+      },
+    },
+  ]);
+  assert.match(empty[0], /leg B has persisted NO rows for over 7200s while the other leg advances/);
+  assert.match(empty[0], /maxA=12500 maxB=null tsA=1700050000 tsB=null/);
+});
+
+// ── D1: OR-composition of the verdict — the guard fires on a frozen-window PASS, windowed classes stay ─
+//
+// The WHOLE POINT of the guard: it FAILs a chain whose WINDOWED diff would read PASS (the issue #36
+// shape — leg A stopped, the window `hi` froze at leg A's max, so the in-window diff is clean while
+// hours of divergence sit above hi). D1 requires the FULL windowed diff to still run and report, with a
+// fired guard forcing FAIL by OR-composition. We drive the REAL compareChain with STUBBED deps.
+
+// A deps stub factory: a healthy windowed diff (no divergence at all) so the ONLY failure source is the
+// stagnation guard — proving the guard's FAIL is not leaking from a windowed cause.
+const cleanDiff = { onlyA: 0, onlyB: 0, mismatch: 0, shared: 10 };
+const cleanTableRes = { diff: cleanDiff, onlyBRows: [], capped: false };
+const cleanTx = {
+  fail: false,
+  class: 'realtime-parent-tx-gap',
+  expectedMissing: 0,
+  unexpectedB: [],
+  unreferencedA: [],
+  sharedMismatch: 0,
+  toleratedIssue27: { count: 0, perChain: {} },
+  knownBadRows: { count: 0, perChain: {}, perHash: {} },
+};
+
+// Stub deps that yield the issue #36 frozen-window shape: leg A frozen 17h behind leg B, but the
+// WINDOWED diff (over [lo, hi] where hi is pinned to leg A's frozen max) is perfectly clean.
+const frozenWindowDeps = (overrides = {}) => ({
+  // both legs reach the SAME bound (window is well-formed, hi >= lo)
+  overlapBound: async () => 200_000,
+  checkpointProgress: async () => 200_000,
+  legNewestRow: async (_url, _chain, ...rest) => {
+    // deps.legNewestRow(url, chain); the test distinguishes the two legs by call order via a closure
+    return rest; // unused; overridden per-leg below
+  },
+  diffLogs: async () => cleanTableRes,
+  diffBlocks: async () => cleanTableRes,
+  diffTx: async () => cleanTx,
+  bucketHashes: async () => new Map(),
+  bucketHashesExcluding: async () => new Map(),
+  ...overrides,
+});
+
+test('D1: compareChain — fired guard forces FAIL even when the windowed diff is CLEAN, windowed classes still present', async () => {
+  // leg A newest row is 17h older than leg B; prev armed the same stale side so the direction check
+  // fires (frozen). The windowed diff is clean (cleanDiff) → the ONLY failure source is stagnation.
+  const tsB = 1_700_000_000;
+  const tsA = tsB - 17 * 3600; // 17h behind
+  let legCall = 0;
+  const deps = frozenWindowDeps({
+    legNewestRow: async () => {
+      legCall += 1;
+      // call order in compareChain's Promise.all: legNewestRow(urlA) then legNewestRow(urlB)
+      return legCall === 1
+        ? { maxBlock: '100000', ts: String(tsA) } // leg A (frozen, pins hi)
+        : { maxBlock: '132825', ts: String(tsB) }; // leg B (advanced)
+    },
+  });
+  const prev = { staleSide: 'A', staleTs: tsA, skew: 17 * 3600 }; // armed last run, still frozen
+
+  const out = await compareChain(
+    'urlA',
+    'urlB',
+    8453,
+    0, // cutover (lo)
+    64, // margin
+    1000, // bucket
+    '', // schemaB
+    7200, // threshold
+    prev,
+    Date.now(),
+    deps,
+  );
+
+  // MUTATION (remove the verdict override — drop `|| stagnation.fail` from the OR-composition): the
+  // clean windowed diff makes verdict PASS and this assertion fails. This is wiring mutation W1.
+  assert.equal(out.verdict, 'FAIL', 'a fired guard forces FAIL despite a clean window');
+  assert.equal(out.classes.persistStagnation.fail, true);
+  assert.equal(out.classes.persistStagnation.reason, 'frozen');
+  assert.equal(out.classes.persistStagnation.staleSide, 'A');
+
+  // D1: the FULL windowed diff STILL ran and reported — logs/blocks/transactions/checkpointBuckets are
+  // all present (not short-circuited by an early return), each reading clean.
+  assert.ok(out.classes.logs, 'the windowed logs class is present (no early return)');
+  assert.ok(out.classes.blocks, 'the windowed blocks class is present');
+  assert.ok(out.classes.transactions, 'the windowed transactions class is present');
+  assert.ok(out.classes.checkpointBuckets, 'the windowed checkpointBuckets class is present');
+  assert.equal(out.classes.logs.fail, false, 'the windowed logs diff is clean');
+  assert.equal(out.classes.transactions.fail, false);
+
+  // and the state to carry forward is the armed next-state
+  assert.deepEqual(out.stagnationState, {
+    staleSide: 'A',
+    staleTs: tsA,
+    skew: 17 * 3600,
+  });
+});
+
+test('D1: compareChain — a fired guard OR-composes to FAIL even on the NO-OVERLAP (hi<lo) PENDING path', async () => {
+  // A one-sided wedge is precisely a state that can hold hi below lo (the window never opens). The
+  // guard must still FAIL there, not read PENDING. We force hi<lo by a huge margin, and arm a frozen
+  // stale leg so the guard fires. classes.persistStagnation is attached; verdict is FAIL not PENDING.
+  const tsB = 1_700_000_000;
+  const tsA = tsB - 17 * 3600;
+  let legCall = 0;
+  const deps = frozenWindowDeps({
+    // both bounds small; the margin below drives hi < lo
+    overlapBound: async () => 10,
+    checkpointProgress: async () => 10,
+    legNewestRow: async () => {
+      legCall += 1;
+
+      return legCall === 1
+        ? { maxBlock: '100000', ts: String(tsA) }
+        : { maxBlock: '132825', ts: String(tsB) };
+    },
+  });
+  const prev = { staleSide: 'A', staleTs: tsA, skew: 17 * 3600 };
+  const out = await compareChain(
+    'a',
+    'b',
+    8453,
+    100, // cutover (lo=100) …
+    64, // margin → hi = min(10,10)-64 = -54 < lo=100 → no overlap
+    1000,
+    '',
+    7200,
+    prev,
+    Date.now(),
+    deps,
+  );
+  // MUTATION (PENDING path drops the stagnation OR — `stagnation.fail ? 'FAIL' : 'PENDING'` → always
+  // 'PENDING'): this reads PENDING and the assertion fails. This is the no-overlap arm of W1.
+  assert.equal(out.verdict, 'FAIL', 'a fired guard FAILs even with no finalized overlap');
+  assert.equal(out.classes.persistStagnation.fail, true);
+  assert.match(out.classes.note, /no finalized overlap yet/);
+  // and the windowed classes are NOT present (there is no window to diff) — the guard is the sole cause
+  assert.equal(out.classes.logs, undefined, 'no windowed diff runs when hi<lo');
+});
+
+test('D3: compareChain — window path attaches classes.persistStagnation with the surfaced fields (below-threshold, PASS)', async () => {
+  // a healthy chain (both legs current, skew 0) → PASS, but persistStagnation is STILL attached with
+  // maxA/maxB/tsA/tsB so a frozen window is legible even below threshold. MUTATION: gate attaching
+  // persistStagnation on `stagnation.fail` → this PASS chain would omit it and the assertions fail.
+  const ts = 1_700_000_000;
+  let legCall = 0;
+  const deps = frozenWindowDeps({
+    legNewestRow: async () => {
+      legCall += 1;
+
+      return { maxBlock: legCall === 1 ? '200000' : '200000', ts: String(ts) };
+    },
+  });
+  const out = await compareChain(
+    'urlA',
+    'urlB',
+    1,
+    0,
+    64,
+    1000,
+    '',
+    7200,
+    null,
+    Date.now(),
+    deps,
+  );
+  assert.equal(out.verdict, 'PASS', 'a healthy chain passes');
+  const s = out.classes.persistStagnation;
+  assert.ok(s, 'persistStagnation is attached on the window (PASS) path');
+  assert.equal(s.fail, false);
+  assert.equal(s.maxA, 200_000);
+  assert.equal(s.maxB, 200_000);
+  assert.equal(s.tsA, ts);
+  assert.equal(s.tsB, ts);
+  assert.equal(s.thresholdSeconds, 7200);
+});
+
+test('D3: compareChain — the threshold parameter actually reaches the decision (two thresholds, different outcomes)', async () => {
+  // Same frozen shape (leg A ~2.5h behind leg B), prev armed frozen. With a 2h threshold the guard
+  // FAILs; with a 3h threshold the same skew is within tolerance → PASS. Proves the threshold arg is
+  // threaded to stagnationDecision. MUTATION: stub the decision to a constant / ignore the threshold arg
+  // (wiring mutation W2) → both thresholds give the same verdict and one of these assertions fails.
+  const tsB = 1_700_000_000;
+  const skew = Math.round(2.5 * 3600); // 9000s
+  const tsA = tsB - skew;
+  const mkDeps = () => {
+    let legCall = 0;
+
+    return frozenWindowDeps({
+      legNewestRow: async () => {
+        legCall += 1;
+
+        return legCall === 1
+          ? { maxBlock: '100000', ts: String(tsA) }
+          : { maxBlock: '132825', ts: String(tsB) };
+      },
+    });
+  };
+  const prev = { staleSide: 'A', staleTs: tsA, skew };
+
+  const failing = await compareChain(
+    'a', 'b', 8453, 0, 64, 1000, '', 7200, prev, Date.now(), mkDeps(),
+  );
+  assert.equal(failing.verdict, 'FAIL', '2h threshold: a 2.5h frozen skew fails');
+
+  const passing = await compareChain(
+    'a', 'b', 8453, 0, 64, 1000, '', 10_800, prev, Date.now(), mkDeps(),
+  );
+  assert.equal(passing.verdict, 'PASS', '3h threshold: the same 2.5h skew is in tolerance');
+  assert.equal(passing.classes.persistStagnation.fail, false);
+});
+
+test('D1: compareChain — a WINDOWED hard-fail AND a fired guard compose to one FAIL, both classes reported', async () => {
+  // The stagnation guard fires AND the windowed logs diff has a hard onlyA (a real divergence). D1's
+  // OR-composition must FAIL and BOTH the stagnation class and the hard logs class must be present —
+  // neither suppresses the other's reporting.
+  const tsB = 1_700_000_000;
+  const tsA = tsB - 17 * 3600;
+  let legCall = 0;
+  const hardLogs = {
+    diff: { onlyA: 3, onlyB: 0, mismatch: 0, shared: 5 }, // onlyA → hard fail
+    onlyBRows: [],
+    capped: false,
+  };
+  const deps = frozenWindowDeps({
+    legNewestRow: async () => {
+      legCall += 1;
+
+      return legCall === 1
+        ? { maxBlock: '100000', ts: String(tsA) }
+        : { maxBlock: '132825', ts: String(tsB) };
+    },
+    diffLogs: async () => hardLogs,
+  });
+  const prev = { staleSide: 'A', staleTs: tsA, skew: 17 * 3600 };
+  const out = await compareChain(
+    'a', 'b', 8453, 0, 64, 1000, '', 7200, prev, Date.now(), deps,
+  );
+  assert.equal(out.verdict, 'FAIL');
+  assert.equal(out.classes.persistStagnation.fail, true, 'the stagnation class is reported');
+  assert.equal(out.classes.logs.fail, true, 'the windowed hard-fail is ALSO reported');
+  assert.equal(out.classes.logs.onlyA, 3);
+});
+
+// ── D3: default deps wiring — the production call path uses the REAL module functions ─────────────────
+// COMPARE_CHAIN_DEPS is the default; a test override swaps only the seams it needs, and the default
+// binds every real adapter. MUTATION: drop a key from COMPARE_CHAIN_DEPS (e.g. remove legNewestRow) →
+// compareChain's default-deps call throws "deps.legNewestRow is not a function" — caught here.
+test('D3: COMPARE_CHAIN_DEPS binds every adapter compareChain calls (default-deps wiring)', () => {
+  for (const key of [
+    'overlapBound',
+    'checkpointProgress',
+    'legNewestRow',
+    'diffLogs',
+    'diffBlocks',
+    'diffTx',
+    'bucketHashes',
+    'bucketHashesExcluding',
+  ]) {
+    assert.equal(
+      typeof COMPARE_CHAIN_DEPS[key],
+      'function',
+      `COMPARE_CHAIN_DEPS.${key} is wired to a real function`,
+    );
+  }
+});
+
+// ── D4 / finding 3: composeAlerts — the generic finalized-diff line fires on a WINDOWED fail only ─────
+
+test('chainWindowedFail: true only for a FAIL with a hard windowed class (logs/blocks/tx/buckets) or an ERROR', () => {
+  // a stagnation-ONLY FAIL (no hard windowed class) is NOT a windowed fail
+  assert.equal(
+    chainWindowedFail({
+      chain: 1,
+      verdict: 'FAIL',
+      classes: {
+        persistStagnation: { fail: true },
+        logs: { fail: false },
+        blocks: { fail: false },
+        transactions: { fail: false },
+        checkpointBuckets: { ok: true },
+      },
+    }),
+    false,
+    'a stagnation-only FAIL is not a windowed fail',
+  );
+  // a hard logs fail IS a windowed fail
+  assert.equal(
+    chainWindowedFail({ chain: 1, verdict: 'FAIL', classes: { logs: { fail: true } } }),
+    true,
+  );
+  // a hard checkpointBuckets (ok:false) IS a windowed fail
+  assert.equal(
+    chainWindowedFail({
+      chain: 1,
+      verdict: 'FAIL',
+      classes: { checkpointBuckets: { ok: false } },
+    }),
+    true,
+  );
+  // an ERROR (diff could not complete) counts as a windowed hard-fail
+  assert.equal(chainWindowedFail({ chain: 1, verdict: 'ERROR', classes: {} }), true);
+  // a PASS / PENDING is never a windowed fail
+  assert.equal(chainWindowedFail({ chain: 1, verdict: 'PASS', classes: {} }), false);
+  assert.equal(chainWindowedFail({ chain: 1, verdict: 'PENDING', classes: {} }), false);
+});
+
+test('composeAlerts: FINDING 3 — chain X stagnation-only + chain Y windowed FAIL → BOTH the stagnation line AND the generic line', () => {
+  const results = [
+    // chain X: stagnation-only FAIL (frozen window, clean windowed classes)
+    {
+      chain: 1,
+      verdict: 'FAIL',
+      classes: {
+        persistStagnation: {
+          fail: true,
+          reason: 'frozen',
+          staleSide: 'A',
+          skewSeconds: 10_800,
+          thresholdSeconds: 7200,
+          maxA: 90,
+          maxB: 100,
+          tsA: 989_200,
+          tsB: 1_000_000,
+        },
+        logs: { fail: false },
+        blocks: { fail: false },
+        transactions: { fail: false },
+        checkpointBuckets: { ok: true },
+      },
+    },
+    // chain Y: a genuine WINDOWED hard-fail (hard onlyA in logs), no stagnation
+    {
+      chain: 8453,
+      verdict: 'FAIL',
+      classes: {
+        persistStagnation: { fail: false, reason: 'both-populated-in-skew' },
+        logs: { fail: true, onlyA: 2 },
+      },
+    },
+  ];
+  const alerts = composeAlerts(results, [], { crashLoop: false });
+
+  // the stagnation line for chain X is present
+  assert.ok(
+    alerts.some((a) => /persist-stagnation: chain 1/.test(a)),
+    'chain X stagnation line present',
+  );
+  // MUTATION (drop the generic-line push / gate it on `stagnations.length === 0`): with chain X
+  // carrying a stagnation line, the OLD suppression logic would swallow the generic line even though
+  // chain Y has a real windowed fail. The generic line MUST still appear for chain Y.
+  assert.ok(
+    alerts.some((a) => /finalized-diff: an unexpected finalized-overlap divergence/.test(a)),
+    'the generic finalized-diff line fires because chain Y has a WINDOWED fail',
+  );
+});
+
+test('composeAlerts: a stagnation-ONLY run (no windowed fail anywhere) does NOT emit the generic line', () => {
+  const results = [
+    {
+      chain: 1,
+      verdict: 'FAIL',
+      classes: {
+        persistStagnation: {
+          fail: true,
+          reason: 'frozen',
+          staleSide: 'A',
+          skewSeconds: 10_800,
+          thresholdSeconds: 7200,
+          maxA: 90,
+          maxB: 100,
+          tsA: 1,
+          tsB: 2,
+        },
+        logs: { fail: false },
+        blocks: { fail: false },
+        transactions: { fail: false },
+        checkpointBuckets: { ok: true },
+      },
+    },
+  ];
+  const alerts = composeAlerts(results, [], { crashLoop: false });
+  assert.ok(alerts.some((a) => /persist-stagnation: chain 1/.test(a)));
+  assert.equal(
+    alerts.some((a) => /finalized-diff/.test(a)),
+    false,
+    'a stagnation-only FAIL does not emit the vague generic line',
+  );
+});
+
+test('composeAlerts: crash-loop and checkpoint-regression lines are emitted; a checkpoint regression alone does NOT emit the generic line', () => {
+  const results = [
+    {
+      chain: 1,
+      verdict: 'FAIL', // FAILed by the checkpoint regression, but no windowed class fail
+      classes: {
+        persistStagnation: { fail: false, reason: 'both-populated-in-skew' },
+        checkpointRegression: { ok: false, prev: '500', cur: '400' },
+      },
+    },
+  ];
+  const regressions = [{ chain: 1, prev: '500', cur: '400' }];
+  const alerts = composeAlerts(results, regressions, {
+    crashLoop: true,
+    restartsLastHour: 5,
+  });
+  assert.ok(alerts.some((a) => /crash-loop: 5 restarts/.test(a)));
+  assert.ok(
+    alerts.some((a) => /checkpoint-regression: chain 1 rewound 500 → 400/.test(a)),
+  );
+  // a checkpoint regression is not a WINDOWED diff cause → no generic line
+  assert.equal(alerts.some((a) => /finalized-diff/.test(a)), false);
+});
+
+// ── D5(a): chainCounters surfaces the stagnation summary in the per-chain counters entry ─────────────
+
+test('chainCounters: carries the persist-stagnation summary (maxA/maxB/tsA/tsB/skew/reason) next to lo/hi/verdict', () => {
+  const r = {
+    chain: 1,
+    lo: 100,
+    hi: 200,
+    verdict: 'FAIL',
     classes: {
       persistStagnation: {
-        fail: decision.fail,
-        staleSide: decision.staleSide,
-        skewSeconds: decision.skew,
+        fail: true,
+        reason: 'frozen',
+        staleSide: 'A',
+        skewSeconds: 10_800,
         thresholdSeconds: 7200,
-        maxA: decision.maxA,
-        maxB: decision.maxB,
-        tsA: decision.tsA,
-        tsB: decision.tsB,
+        maxA: 90,
+        maxB: 100,
+        tsA: 989_200,
+        tsB: 1_000_000,
       },
     },
   };
-  const lines = stagnationAlerts([chainResult]);
-  assert.equal(lines.length, 1, 'the frozen-window chain emits a loud alert despite a PASS window');
-  assert.match(lines[0], /chain 8453 — leg A has stopped persisting rows/);
-  assert.match(lines[0], /skew 61200s > 7200s/);
+  const c = chainCounters(r);
+  assert.equal(c.lo, 100);
+  assert.equal(c.hi, 200);
+  assert.equal(c.verdict, 'FAIL');
+  // MUTATION (drop the stagnation-summary spread): these fields go missing and the assertions fail.
+  assert.equal(c.maxA, 90);
+  assert.equal(c.maxB, 100);
+  assert.equal(c.tsA, 989_200);
+  assert.equal(c.tsB, 1_000_000);
+  assert.equal(c.stagnationSkewSeconds, 10_800);
+  assert.equal(c.stagnationReason, 'frozen');
+
+  // a result with no persistStagnation (ERROR before the guard) → bare {lo, hi, verdict}
+  const bare = chainCounters({ chain: 9, lo: 1, hi: 2, verdict: 'ERROR' });
+  assert.deepEqual(bare, { lo: 1, hi: 2, verdict: 'ERROR' });
+});
+
+// ── D2: cross-run state round-trips through the CHECKPOINT_FILE (backward-compatible `_stagnation`) ────
+//
+// The differ persists per-chain stagnation state under a `_stagnation` top-level key in the SAME file
+// as the checkpoint monotonicity series. An ABSENT key ⇒ no prior state (backward compatible). The key
+// is chain-disjoint (numeric chains), so the monotonicity loop never treats it as a chain.
+test('CHECKPOINT_FILE: _stagnation state round-trips and is disjoint from the numeric-chain series', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'ab-stag-'));
+  const file = join(dir, 'soak-ab-checkpoints.json');
+
+  // a legacy file with ONLY the checkpoint series (no _stagnation key) is valid → absent = no state
+  writeJsonAtomic(file, { 1: [100, 200], 8453: [7, 8] });
+  const legacy = JSON.parse(readFileSync(file, 'utf8'));
+  assert.equal(legacy._stagnation, undefined, 'a legacy file has no _stagnation key');
+
+  // writing a file WITH the state section: the numeric series and _stagnation coexist untouched
+  const withState = {
+    1: [100, 200, 300],
+    8453: [7, 8, 9],
+    _stagnation: {
+      1: { staleSide: 'A', staleTs: 1_699_989_200, skew: 10_800 },
+      8453: { emptySide: 'B', firstEmptyAtMs: 1_000_000_000_000, populatedTs: 1_700_000_000 },
+    },
+  };
+  writeJsonAtomic(file, withState);
+  const back = JSON.parse(readFileSync(file, 'utf8'));
+  assert.deepEqual(back[1], [100, 200, 300], 'the numeric-chain series is intact');
+  assert.deepEqual(
+    back._stagnation[1],
+    { staleSide: 'A', staleTs: 1_699_989_200, skew: 10_800 },
+    'the per-chain stagnation state round-trips',
+  );
+  assert.deepEqual(back._stagnation[8453].emptySide, 'B');
+});
+
+// ── W4: the env fail-loud wiring — garbage AB_STAGNATION_MAX_SKEW_S exits nonzero BEFORE any DB access ─
+//
+// main() must parse the env (readStagnationThreshold) BEFORE the per-chain loop touches a DB, so a
+// garbage threshold fails loud immediately. This spawns the REAL script with a garbage threshold and
+// dummy DB URLs and asserts a nonzero exit + the naming error on stderr. MUTATION (bypass env parse /
+// move it after the DB loop — wiring mutation W4) → the process would instead hang/err on the fake DB
+// with a DIFFERENT message, so the "must be a positive number of seconds" match fails.
+test('W4: node ab-diff.mjs with garbage AB_STAGNATION_MAX_SKEW_S exits nonzero naming the var, before any DB access', async () => {
+  const { spawnSync } = await import('node:child_process');
+  const script = join(
+    dirname(fileURLToPath(import.meta.url)),
+    'ab-diff.mjs',
+  );
+  const res = spawnSync(process.execPath, [script], {
+    env: {
+      ...process.env,
+      AB_STAGNATION_MAX_SKEW_S: 'garbage',
+      // dummy URLs that pass the presence check; if env-parse were AFTER the DB loop, the script would
+      // instead fail trying to reach these — a DIFFERENT error, which the assertion below would miss.
+      DATABASE_URL_A: 'postgresql://nobody@127.0.0.1:1/none',
+      DATABASE_URL_B: 'postgresql://nobody@127.0.0.1:1/none',
+      CHAINS: '1',
+    },
+    encoding: 'utf8',
+    timeout: 20_000,
+  });
+  assert.notEqual(res.status, 0, 'a garbage threshold exits nonzero');
+  assert.match(
+    res.stderr,
+    /AB_STAGNATION_MAX_SKEW_S must be a positive number of seconds/,
+    'the naming error is on stderr, raised before any DB access',
+  );
 });
