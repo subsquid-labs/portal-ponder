@@ -14,6 +14,7 @@ import { fileURLToPath } from 'node:url';
 import {
   assertNoMultilineValues,
   CHAIN_ALIASES,
+  deriveDatabaseUrl,
   effectiveOverriddenKeys,
   filterCarriedEnv,
   loadKnownChains,
@@ -398,6 +399,71 @@ test('CHAIN_ALIASES: every alias target is itself a known chains.json name (no d
   }
 });
 
+// ── deriveDatabaseUrl (defect: redeploy clobbered a role-authenticated TCP DATABASE_URL) ──────────
+//
+// The env regen used to author `postgresql:///${DB_NAME}` unconditionally (peer auth), silently
+// replacing a working role+password TCP URL. deriveDatabaseUrl must swap ONLY the database and
+// preserve scheme/userinfo/host/port/query — via a real URL parser, never shell string surgery.
+
+test('deriveDatabaseUrl: swaps only the database, preserving role, host, port and query', () => {
+  const out = deriveDatabaseUrl(
+    'postgresql://soakrole:pw@db.internal:6432/olddb?sslmode=require',
+    'euler_rt_b',
+  );
+  assert.equal(
+    out,
+    'postgresql://soakrole:pw@db.internal:6432/euler_rt_b?sslmode=require',
+  );
+});
+
+// THE class the issue pins: a password with reserved URL characters. Shell `${A%/*}/newdb` surgery
+// corrupts these (splits on the `/` inside the password); a real URL parser preserves them exactly.
+test('deriveDatabaseUrl: a reserved-characters-in-password URL round-trips (only the DB swaps)', () => {
+  // Password is p@ss/w?rd#1 percent-encoded — every reserved char (@ / ? #) that shell surgery would
+  // mangle. The userinfo, host, port and query must survive byte-for-byte; only the path changes.
+  const src =
+    'postgresql://role:p%40ss%2Fw%3Frd%231@db.host:5432/euler?sslmode=verify-full';
+  const out = deriveDatabaseUrl(src, 'euler_rt_b');
+  assert.equal(
+    out,
+    'postgresql://role:p%40ss%2Fw%3Frd%231@db.host:5432/euler_rt_b?sslmode=verify-full',
+  );
+  // And the derived URL still parses to the SAME password the source encoded (no corruption).
+  assert.equal(new URL(out).password, 'p%40ss%2Fw%3Frd%231');
+  assert.equal(new URL(out).pathname, '/euler_rt_b');
+});
+
+test('deriveDatabaseUrl: preserves the postgres:// scheme variant unchanged', () => {
+  assert.equal(
+    deriveDatabaseUrl('postgres://u:p@h:5432/old', 'euler_rt_b'),
+    'postgres://u:p@h:5432/euler_rt_b',
+  );
+});
+
+test('deriveDatabaseUrl: a peer-auth source (no host/userinfo) swaps only the DB', () => {
+  // postgresql:///olddb → the empty-authority peer-auth form; still parseable, DB swapped in place.
+  assert.equal(
+    deriveDatabaseUrl('postgresql:///olddb', 'euler_rt_b'),
+    'postgresql:///euler_rt_b',
+  );
+});
+
+test('deriveDatabaseUrl: an unparseable source URL throws (caller decides the fallback)', () => {
+  assert.throws(() => deriveDatabaseUrl('not a url', 'euler_rt_b'));
+});
+
+test('deriveDatabaseUrl: a dbName that is not a bare SQL identifier is refused (no injection)', () => {
+  // A dbName carrying path/query syntax must never be smuggled into the URL — fail loud instead.
+  assert.throws(
+    () => deriveDatabaseUrl('postgresql://u:p@h/old', 'euler_rt_b?evil=1'),
+    /not a bare SQL identifier/,
+  );
+  assert.throws(
+    () => deriveDatabaseUrl('postgresql://u:p@h/old', 'a/b'),
+    /not a bare SQL identifier/,
+  );
+});
+
 // ── unit-template render (defects 1 + 3: schema knob + placeholder-only template) ─────────────────
 //
 // Renders the real unit via the deploy script's own sed pipeline (a tiny bash shim that sources the
@@ -514,12 +580,96 @@ test('CLI resolve-chains: unknown name → non-zero exit, message on stderr', ()
   assert.ok(threw, 'resolve-chains with an unknown name must exit non-zero');
 });
 
+// CLI derive-database-url: derive from the source env's DATABASE_URL, or exit-3 to signal fallback.
+test('CLI derive-database-url: derives from the source env DATABASE_URL, DB swapped only', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'deploy-helpers-'));
+  const envFile = join(dir, 'src.env');
+  writeFileSync(
+    envFile,
+    'PORTAL_API_KEY=k\nexport DATABASE_URL=postgresql://role:p%40ss@db.host:5432/euler?sslmode=require\n',
+  );
+  const out = execFileSync(
+    'node',
+    [
+      join(HERE, 'deploy-helpers.mjs'),
+      'derive-database-url',
+      envFile,
+      'euler_rt_b',
+    ],
+    { encoding: 'utf8' },
+  );
+  assert.equal(
+    out.trim(),
+    'postgresql://role:p%40ss@db.host:5432/euler_rt_b?sslmode=require',
+  );
+});
+
+test('CLI derive-database-url: no source DATABASE_URL → exit 3 (silent fallback signal), no stdout', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'deploy-helpers-'));
+  const envFile = join(dir, 'src.env');
+  writeFileSync(envFile, 'PORTAL_API_KEY=k\nPORTAL_URL=https://p.example\n');
+  let threw = false;
+  try {
+    execFileSync(
+      'node',
+      [
+        join(HERE, 'deploy-helpers.mjs'),
+        'derive-database-url',
+        envFile,
+        'euler_rt_b',
+      ],
+      { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] },
+    );
+  } catch (err) {
+    threw = true;
+    assert.equal(
+      err.status,
+      3,
+      'no source DATABASE_URL must signal fallback via exit 3',
+    );
+    assert.equal(
+      String(err.stdout).trim(),
+      '',
+      'must print nothing on the fallback signal',
+    );
+  }
+  assert.ok(threw, 'a missing source DATABASE_URL must exit non-zero (3)');
+});
+
+test('CLI derive-database-url: an unparseable source DATABASE_URL → loud exit 1', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'deploy-helpers-'));
+  const envFile = join(dir, 'src.env');
+  writeFileSync(envFile, 'DATABASE_URL=this is not a url\n');
+  let threw = false;
+  try {
+    execFileSync(
+      'node',
+      [
+        join(HERE, 'deploy-helpers.mjs'),
+        'derive-database-url',
+        envFile,
+        'euler_rt_b',
+      ],
+      { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] },
+    );
+  } catch (err) {
+    threw = true;
+    assert.equal(
+      err.status,
+      1,
+      'an unparseable source URL must be a loud abort (exit 1)',
+    );
+  }
+  assert.ok(threw, 'an unparseable source DATABASE_URL must exit non-zero (1)');
+});
+
 // The deploy script must reference the helper so this coverage tracks the real integration point.
 test('deploy-soak-b.sh invokes the pure helpers (integration is wired)', () => {
   const src = execFileSync('cat', [DEPLOY_SH], { encoding: 'utf8' });
   assert.match(src, /deploy-helpers\.mjs/);
   assert.match(src, /carry-env/);
   assert.match(src, /resolve-chains/);
+  assert.match(src, /derive-database-url/);
 });
 
 // ── end-to-end script runs (defects 1-4 through the REAL deploy-soak-b.sh) ─────────────────────────
@@ -528,7 +678,10 @@ test('deploy-soak-b.sh invokes the pure helpers (integration is wired)', () => {
 // no SOAK_A_DIR skips the npm/psql work, and psql is absent (a benign warning). This exercises the
 // real env-carry, schema/chain rendering and — critically — the $RENDER lifetime.
 
-function runDeploy(env, { chains, srcEnvLines, noNode } = {}) {
+function runDeploy(
+  env,
+  { chains, srcEnvLines, noNode, psqlExit, psqlStderr, soakADir } = {},
+) {
   const sandbox = mkdtempSync(join(tmpdir(), 'deploy-e2e-'));
   const tarball = join(sandbox, 'fake.tgz');
   writeFileSync(tarball, 'not-a-real-tarball');
@@ -563,6 +716,16 @@ function runDeploy(env, { chains, srcEnvLines, noNode } = {}) {
   for (const cmd of ['psql', 'systemctl', 'npm']) {
     const stub = join(stubBin, cmd);
     writeFileSync(stub, '#!/bin/sh\nexit 0\n');
+    chmodSync(stub, 0o755);
+  }
+  // psqlExit (defect 1): override the psql stub to simulate a connection FAILURE (non-zero exit +
+  // a diagnostic on stderr), proving the deploy fails LOUD naming PGADMIN_URL instead of dying with
+  // a bare exit 2 under `set -euo pipefail` (the swallowed-diagnostic bug this fix closes).
+  if (psqlExit != null) {
+    const stub = join(stubBin, 'psql');
+    const diag =
+      psqlStderr ?? 'could not connect to server: Connection refused';
+    writeFileSync(stub, `#!/bin/sh\necho '${diag}' >&2\nexit ${psqlExit}\n`);
     chmodSync(stub, 0o755);
   }
   // noNode (M2): run with a PATH that has every coreutil the script needs EXCEPT `node`, to prove the
@@ -610,7 +773,7 @@ function runDeploy(env, { chains, srcEnvLines, noNode } = {}) {
         ...process.env,
         SOAK_B_WORKDIR: workdir,
         SOAK_B_ENVFILE: envFile,
-        SOAK_A_CONFIG_DIR: join(sandbox, 'no-such-soak-a'),
+        SOAK_A_CONFIG_DIR: soakADir ?? join(sandbox, 'no-such-soak-a'),
         SOAK_A_ENV: srcEnv,
         SYSTEMD_DIR: unitDir,
         SOAK_B_RESTART_LOG: restartLog,
@@ -629,7 +792,7 @@ function runDeploy(env, { chains, srcEnvLines, noNode } = {}) {
     throw err;
   }
 
-  return { stdout: result, envFile, unitDir };
+  return { stdout: result, envFile, unitDir, sandbox, workdir };
 }
 
 test('e2e: non-root path keeps the rendered unit alive and prints its real location (defect 3)', () => {
@@ -757,4 +920,109 @@ test('e2e: a multi-line source env value fails the deploy loud naming the key (F
     );
   }
   assert.ok(threw, 'a multi-line env value must abort the deploy');
+});
+
+// ── issue #35 defect 1: the DB-exists probe must fail LOUD when psql cannot connect ────────────────
+//
+// Under `set -euo pipefail` the old `EXISTS="$(psql … 2>/dev/null | tr …)"` died with a bare exit 2
+// when psql could not connect — the pipeline failed under pipefail, `set -e` aborted, and 2>/dev/null
+// had swallowed the only diagnostic. Now the probe runs outside the assignment, psql's exit is checked
+// explicitly, and a connect failure aborts LOUD naming PGADMIN_URL and echoing psql's own diagnostic.
+test('e2e: a psql connect failure aborts LOUD naming PGADMIN_URL, not a bare exit (issue #35 defect 1)', () => {
+  let threw = false;
+  try {
+    runDeploy(
+      {
+        SOAK_B_SCHEMA: 'euler_rt_b',
+        PGADMIN_URL: 'postgres://nobody@127.0.0.1:1/postgres',
+      },
+      {
+        chains: 'eth,base',
+        psqlExit: 2,
+        psqlStderr:
+          'psql: error: connection to server failed: FATAL: role "nobody" does not exist',
+      },
+    );
+  } catch (err) {
+    threw = true;
+    const out = `${err.stdout ?? ''}${err.stderr ?? ''}`;
+    assert.match(
+      out,
+      /could not connect to Postgres to check for database euler_rt_b/,
+      `expected a loud connect-failure message, got:\n${out}`,
+    );
+    // Names PGADMIN_URL (the actionable knob) and surfaces psql's own diagnostic — not swallowed.
+    assert.match(
+      out,
+      /PGADMIN_URL=postgres:\/\/nobody@127\.0\.0\.1:1\/postgres/,
+    );
+    assert.match(out, /role "nobody" does not exist/);
+    // And it must NOT have proceeded to write the env file (aborted at the DB step).
+    assert.ok(
+      !existsSync(err.envFile),
+      'a psql connect failure must abort before the env file is written',
+    );
+  }
+  assert.ok(
+    threw,
+    'a psql connect failure must abort the deploy loud (not a silent bare exit)',
+  );
+});
+
+// ── issue #35 defect 2: a role-authenticated TCP DATABASE_URL must be preserved, only the DB swapped ─
+//
+// The old regen authored `postgresql:///euler_rt_b` unconditionally (peer auth), silently clobbering
+// a working role+password TCP URL from the source env. Now the new URL is DERIVED from the source's
+// own DATABASE_URL — scheme/userinfo/host/port/query preserved, only the database swapped.
+test('e2e: a role-authenticated TCP DATABASE_URL is preserved, only the DB swapped (issue #35 defect 2)', () => {
+  const srcEnvLines = [
+    'PORTAL_API_KEY=secretkey',
+    'PORTAL_URL=https://portal.example',
+    // A reserved-char password (p@ss/word, percent-encoded) over TCP — the class shell surgery breaks.
+    'DATABASE_URL=postgresql://soakrole:p%40ss%2Fword@db.internal:6432/euler_rt?sslmode=require',
+    '',
+  ];
+  const { envFile } = runDeploy(
+    { SOAK_B_SCHEMA: 'euler_rt_b' },
+    { chains: 'eth,base', srcEnvLines },
+  );
+  const env = readFileSync(envFile, 'utf8');
+  // The derived URL keeps role/password/host/port/query verbatim; only the database becomes euler_rt_b.
+  assert.match(
+    env,
+    /^DATABASE_URL=postgresql:\/\/soakrole:p%40ss%2Fword@db\.internal:6432\/euler_rt_b\?sslmode=require$/m,
+  );
+  // The peer-auth clobber must NOT have replaced the working TCP URL.
+  assert.doesNotMatch(env, /^DATABASE_URL=postgresql:\/\/\/euler_rt_b$/m);
+});
+
+test('e2e: no source DATABASE_URL → falls back to the peer-auth form (issue #35 defect 2)', () => {
+  // The default source env has no DATABASE_URL, so the derive helper signals fallback (exit 3) and the
+  // script authors the peer-auth form — the only case where that form is correct.
+  const { envFile } = runDeploy(
+    { SOAK_B_SCHEMA: 'euler_rt_b' },
+    { chains: 'eth,base' },
+  );
+  const env = readFileSync(envFile, 'utf8');
+  assert.match(env, /^DATABASE_URL=postgresql:\/\/\/euler_rt_b$/m);
+});
+
+// ── issue #35 defect 3: a SOAK_A_DIR that exists but holds NO expected config must warn LOUD ────────
+//
+// The config-copy loop used to no-op silently when the source dir existed but contained none of the
+// expected files, leaving a half-provisioned workdir. Now it warns loud naming the source dir.
+test('e2e: a SOAK_A_DIR with none of the expected config warns loud (issue #35 defect 3)', () => {
+  const emptyDir = mkdtempSync(join(tmpdir(), 'soak-a-empty-'));
+  writeFileSync(join(emptyDir, 'README.txt'), 'not app config'); // exists, but no expected file
+  const { stdout } = runDeploy(
+    { SOAK_B_SCHEMA: 'euler_rt_b' },
+    { chains: 'eth,base', soakADir: emptyDir },
+  );
+  assert.match(
+    stdout,
+    new RegExp(
+      `${emptyDir.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')} exists but has none of the expected app config`,
+    ),
+    `expected a loud "exists but has none of the expected app config" warning, got:\n${stdout}`,
+  );
 });
