@@ -4098,3 +4098,124 @@ test('W4: node ab-diff.mjs with garbage AB_STAGNATION_MAX_SKEW_S exits nonzero n
     rmSync(dir, { recursive: true, force: true });
   }
 });
+
+// ── sticky-wedge recovery-precondition isolation (independent mutation survivor-hunt) ────────────────
+//
+// Two survivors an independent mutation hunt found the 242-test suite did NOT kill in ISOLATION. The
+// shipped code is CORRECT for both — these tests close the coverage gap so a future regression is caught.
+//
+// S7 — the sticky-gate `bothPopulated = a !== null && b !== null` recovery precondition. Every existing
+// sticky-recovery test that lands in the FAIL exit ALSO has a growing carried gap (or an out-of-threshold
+// skew), so the `bothPopulated` conjunct was never the SOLE thing keeping the wedge FAILed: mutating it to
+// `||` survived. This case isolates it — the ONLY reason recovery does not fire is that a leg is EMPTY.
+// The carried wedge-stale leg (A, behind B) ADVANCES this run (toward B, so the carried gap SHRINKS and
+// the skew-growth guard does NOT catch it) while B reads EMPTY. Under the shipped `&&` this is
+// wedge-unrecovered (an empty observation lacks the finite both-populated evidence recovery requires).
+// MUTATION S7 (`a !== null && b !== null` → `||`): bothPopulated reads true off the single populated leg,
+// the carried stale leg advanced with a non-growing gap → the wedge CLEARS → this run reads non-fail
+// ('empty-arming'), so `fail === true` / `reason === 'wedge-unrecovered'` here fail.
+test('stagnationDecision: S7 — an EMPTY leg can NEVER recover a wedge even when the carried stale leg advances (bothPopulated is load-bearing)', () => {
+  const t = 7200;
+  // prev is a LIVE wedge: A is the carried stale leg (behind B), reason 'frozen'. This run A advances
+  // 100000 → 140000 (toward B's carried 150000, so the carried gap SHRINKS 50000 → 10000), B is EMPTY.
+  const prev = {
+    tsA: 100_000,
+    tsB: 150_000,
+    skew: 50_000,
+    emptySinceA: null,
+    emptySinceB: null,
+    wedgeFailedSince: NOW - 3_600_000,
+    wedgeStaleSide: 'A',
+    wedgeReason: 'frozen',
+  };
+  const r = stagnationDecision({
+    maxA: '140',
+    tsA: 140_000, // A (the carried stale leg) advanced toward B — gap shrinks, no skew growth
+    maxB: null,
+    tsB: null, // B reads EMPTY → no finite both-populated recovery evidence
+    threshold: t,
+    prev,
+    nowMs: NOW,
+  });
+  assert.equal(
+    r.fail,
+    true,
+    'an empty observation can NEVER clear a live wedge — recovery requires BOTH legs populated',
+  );
+  assert.equal(r.reason, 'wedge-unrecovered');
+  assert.equal(
+    r.staleSide,
+    'A',
+    'the CARRIED wedge stale leg (A) stays named through the sticky fail',
+  );
+  assert.equal(
+    r.originalReason,
+    'frozen',
+    'the true first-fail reason of the wedge episode is carried',
+  );
+  // the wedge is carried forward UNCHANGED — the advancing-but-empty run laundered nothing.
+  assert.equal(
+    r.nextState.wedgeFailedSince,
+    prev.wedgeFailedSince,
+    'the wedge episode start is preserved (still the same unrecovered wedge)',
+  );
+  assert.equal(
+    r.nextState.wedgeStaleSide,
+    'A',
+    'the carried stale side is threaded forward unchanged',
+  );
+  assert.equal(
+    r.nextState.wedgeReason,
+    'frozen',
+    'the carried first-fail reason is threaded forward unchanged',
+  );
+});
+
+// S5 — a CORRUPT/hand-edited live wedge: wedgeFailedSince is set but wedgeStaleSide AND wedgeReason are
+// MISSING (a legacy/corrupt checkpoint record). The sticky gate reads the carried stale side defensively
+// (prevWedgeStaleSide is null when it is neither 'A' nor 'B'), so `wedgeStaleAdvanced` MUST fall to its
+// final ternary arm = false: an UNKNOWN carried stale side cannot count as "the stale leg advanced".
+// Recovery from a corrupt wedge record is then possible ONLY via skew ≤ threshold. Here both legs are
+// populated with the skew still over threshold (one leg advanced), so the shipped code stays
+// wedge-unrecovered and falls its originalReason back to 'frozen'. MUTATION S5 (the wedgeStaleAdvanced
+// final arm false → true — an unknown/null carried side is treated as advanced): with a non-growing
+// carried gap the corrupt wedge wrongly CLEARS and this run re-derives a FRESH regime ('frozen'), so the
+// `reason === 'wedge-unrecovered'` and `originalReason === 'frozen'` assertions here fail.
+test('stagnationDecision: S5 — a corrupt wedge (wedgeStaleSide/wedgeReason missing) does NOT fail-open; unknown stale side is NOT "advanced"', () => {
+  const t = 7200;
+  // Corrupt prev: a live wedge (wedgeFailedSince set) whose stale-side + reason attribution was lost.
+  const prev = {
+    tsA: 100_000,
+    tsB: 80_000,
+    skew: 20_000,
+    emptySinceA: null,
+    emptySinceB: null,
+    wedgeFailedSince: NOW - 3_600_000,
+    // wedgeStaleSide MISSING, wedgeReason MISSING (hand-edited / corrupt state)
+  };
+  const r = stagnationDecision({
+    maxA: '100',
+    tsA: 100_000, // A holds
+    maxB: '81',
+    tsB: 81_000, // the stale-ish leg B advances 80000 → 81000; skew 19000 still > threshold
+    threshold: t,
+    prev,
+    nowMs: NOW,
+  });
+  assert.equal(
+    r.fail,
+    true,
+    'a corrupt wedge with an unknown stale side recovers ONLY via skew ≤ threshold, not via a phantom advance',
+  );
+  assert.equal(r.reason, 'wedge-unrecovered');
+  assert.equal(
+    r.staleSide,
+    null,
+    'the corrupt record carried no stale side, so none is named',
+  );
+  assert.equal(
+    r.originalReason,
+    'frozen',
+    'a missing carried wedgeReason falls back to frozen',
+  );
+});
