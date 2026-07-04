@@ -435,6 +435,46 @@ test('portalRealtimeEvents: a finalize whose canonical hash mismatches the local
   ).rejects.toThrow(/losing fork/i);
 });
 
+test('portalRealtimeEvents: a hash-carrying finalize ABOVE the local tip is DEFERRED, not applied by number — it lands only once the window reaches a hash-verifiable boundary (review B1)', async () => {
+  // The probe carries the canonical hash for block 12, but the window is still catching up: takeFinalized
+  // splits by NUMBER, so a naive guard would finalize block 10/11 by number with NO way to check they
+  // descend from canonical 12 — persisting a possibly-losing fork below finality. The fix DEFERS the
+  // hash-unverifiable finalize until the window reaches height 12, where the local hash IS checkable.
+  const batches = [
+    {
+      header: { number: 10, hash: 'a', parentHash: 'z', timestamp: 10 },
+      logs: [],
+    },
+    {
+      header: { number: 11, hash: 'b', parentHash: 'a', timestamp: 11 },
+      logs: [],
+    },
+    {
+      header: { number: 12, hash: 'c', parentHash: 'b', timestamp: 12 },
+      logs: [],
+    },
+  ];
+  const ac = new AbortController();
+  const events: any[] = [];
+  for await (const e of portalRealtimeEvents({
+    portalUrl: 'http://portal',
+    headers: {},
+    fromBlock: 10,
+    logs: [],
+    fetchImpl: mockFetch(batches, () => ac.abort()),
+    signal: ac.signal,
+    // canonical head is block 12 (hash 'c'); it is stable across polls — the window catches up to it
+    finalizedHead: async () => ({ number: 12, hash: 'c' }),
+    finalizePollMs: 0, // poll on every block so the deferral is exercised at heights 10 and 11
+  })) {
+    events.push(e);
+  }
+  const finalizes = events.filter((e) => e.type === 'finalize');
+  // EXACTLY ONE finalize, at block 12 — the polls at heights 10 and 11 deferred (no finalize(10)/(11)).
+  expect(finalizes.map((f: any) => f.block.number)).toEqual([12]);
+  expect(finalizes[0]!.block.hash).toBe('c');
+});
+
 test('streamHotBlocks: a deterministic 4xx from /stream is FATAL, not an infinite silent retry loop', async () => {
   const fetchImpl = (async () => ({
     status: 400,

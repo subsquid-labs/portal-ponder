@@ -400,19 +400,27 @@ export async function* portalRealtimeEvents(
           fhNumber,
         );
         if (finalizedTip) {
-          // Wrong-fork finalize guard: `takeFinalized` splits by NUMBER; if the probe carries the
-          // canonical hash and our local block at that height differs, the window sits on a fork that
-          // lost to a finalized competitor — persisting it as finalized would commit wrong-fork data
-          // with no rollback event. No safe silent recovery: fail loud, restart re-derives from the
-          // finalized head.
-          if (
-            fhHash !== undefined &&
-            finalizedTip.number === fhNumber &&
-            finalizedTip.hash !== fhHash
-          )
-            throw new Error(
-              `Portal realtime: local block ${finalizedTip.number} (${finalizedTip.hash}) diverges from the canonical finalized block (${fhHash}) — the unfinalized window is on a losing fork at/below finality. Cannot finalize safely; restart to re-sync from the finalized head.`,
-            );
+          // Wrong-fork finalize guard: `takeFinalized` splits by NUMBER, so the finalizedTip is only
+          // hash-VERIFIABLE against the probe when it sits at the probe's exact height. Two cases when the
+          // probe carries the canonical hash:
+          //   • finalizedTip.number === fhNumber — our local block at that height must equal the canonical
+          //     hash, else the window is on a fork that lost to a finalized competitor; persisting it as
+          //     finalized would commit wrong-fork data with no rollback event. Fail loud (review B1 keeps
+          //     this).
+          //   • finalizedTip.number  <  fhNumber — the probe references a block ABOVE our local tip, so we
+          //     have NO canonical hash for finalizedTip's height and cannot confirm it descends from the
+          //     canonical finalized block. Finalizing it by number alone would persist a possibly-losing
+          //     fork below finality (the exact hole this guard closes). DEFER: skip this poll and let the
+          //     window catch up to a hash-verifiable boundary (finality is monotonic and live chains reach
+          //     fhNumber within a poll or two, at which point the === case verifies or fatals). (review B1)
+          if (fhHash !== undefined && finalizedTip.number === fhNumber) {
+            if (finalizedTip.hash !== fhHash)
+              throw new Error(
+                `Portal realtime: local block ${finalizedTip.number} (${finalizedTip.hash}) diverges from the canonical finalized block (${fhHash}) — the unfinalized window is on a losing fork at/below finality. Cannot finalize safely; restart to re-sync from the finalized head.`,
+              );
+          } else if (fhHash !== undefined && finalizedTip.number < fhNumber) {
+            continue; // hash-unverifiable finalize deferred until the window reaches fhNumber
+          }
 
           anchor = finalizedTip; // the reconcile anchor advances with finality
           unfinalized.length = 0;
