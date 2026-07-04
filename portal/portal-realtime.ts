@@ -131,6 +131,35 @@ export const toLight = (h: RawHeader): Light => ({
 
 // ─────────────────────────────── /stream I/O shell ───────────────────────────────
 
+/**
+ * A `{number, hash}` seen on the wire — the shape of a `/stream` 409's `previousBlocks` entries AND of the
+ * delivered-hash ring's records. `number` decimal (Portal-native).
+ */
+export type NumberedHash = { number: number; hash: string };
+
+/**
+ * Live diagnostic snapshot of the /stream I/O shell, mutated by `streamHotBlocks` and read by the fatal
+ * paths (the `gap` fatal in `portalRealtimeEvents`, the 409-exhausted fatal here) so both dumps carry the
+ * ring/connection state that pins the mechanism of a future instance. In-memory only, zero steady-state
+ * cost — the objects are re-pointed, never accumulated. (issue #33 diagnostic dump)
+ */
+export type StreamDiag = {
+  /** the last ~8 delivered ring entries (oldest→newest), for the dump */
+  ring: NumberedHash[];
+  /** the cursor the failing connection opened at */
+  cursor: number;
+  /** the `parentBlockHash` the failing connection sent (undefined ⇒ none/first-boot before seed) */
+  parentBlockHashSent: string | undefined;
+  /** blocks delivered on the current connection since it opened */
+  blocksDeliveredThisConn: number;
+  /** the previousBlocks of the last 409 seen, if any */
+  lastPreviousBlocks: NumberedHash[] | undefined;
+};
+
+/** Render a NumberedHash list compactly for a fatal message. */
+export const fmtNumberedHashes = (xs: NumberedHash[]): string =>
+  `[${xs.map((x) => `${x.number}:${x.hash}`).join(', ')}]`;
+
 export type PortalRealtimeArgs = {
   portalUrl: string;
   headers: Record<string, string>;
@@ -155,9 +184,50 @@ export type PortalRealtimeArgs = {
    * logQuery uses. Absent ⇒ no transactions requested (batches carry `transactions: []`).
    */
   txFields?: Record<string, boolean>;
+  /**
+   * The startup finality anchor `{number → hash}`, used to SEED the delivered-hash ring so the FIRST
+   * `/stream` request (resuming at `fromBlock = anchor.number + 1`) can carry `parentBlockHash =
+   * anchor.hash` — opting the client into the Portal's fork negotiation from the very first connection.
+   * Absent ⇒ no seed, and the first request carries no `parentBlockHash` (legacy pre-#33 behavior, kept
+   * for the unit-test call sites that don't wire it). (issue #33)
+   */
+  seedRing?: NumberedHash;
+  /**
+   * The current finalized floor (decimal). streamHotBlocks prunes the delivered-hash ring below it and
+   * bounds the 409 rewind/step-down at it: a fork point below finality has no safe recovery, so it is
+   * FATAL rather than rewound. The wire advances this with each finalize. Absent ⇒ the floor is
+   * `fromBlock − 1` (the startup boundary — safe, since nothing below it was ever streamed). (issue #33)
+   */
+  getFinalizedFloor?: () => number;
+  /**
+   * Live diagnostic snapshot the shell keeps current so the fatal paths can dump the ring/connection
+   * state. Absent ⇒ the shell keeps its ring internally with no external mirror (unit-test call sites).
+   * (issue #33)
+   */
+  diag?: StreamDiag;
   signal?: AbortSignal;
   fetchImpl?: typeof fetch;
 };
+
+/**
+ * Max delivered-hash ring entries kept (per height). ~2048 covers far more than any unfinalized window.
+ * CANDOR (F5): with an unfinalized window DEEPER than RING_CAP — a fast chain under a max finalize-defer
+ * streak, so the anchor (and thus the pruning floor) hasn't advanced while the tip has climbed >2048 blocks
+ * above it — a deep 409 step-down could reach an EVICTED ring height and find no confirming entry, ending at
+ * the floor fatal. That is an availability edge (a loud restart, never wrong data): the step-down simply
+ * fails to confirm a fork point whose ring hash was capped out, exactly as a fresh restart would re-derive
+ * the window from the finalized head. The B1 finalize-defer watchdog bounds how long that window can grow.
+ */
+export const RING_CAP = 2048;
+/**
+ * Max consecutive 409 fork-negotiation rounds WITHOUT cursor progress before failing loud (F2). This is an
+ * OSCILLATION guard, NOT a per-409 counter: a legitimate no-match negotiation steps the cursor DOWN one
+ * height per 409 (SQD's docs describe the 409 `previousBlocks` as a SAMPLE and warn clients to expect
+ * several repeated 409s), and a deep fork can descend far more than 10 heights — that monotonic descent is
+ * bounded separately by the floor fatal (cursor − floor is finite). Only rounds that make NO progress (the
+ * cursor did not strictly decrease — a rewind/re-409 stuck at the same spot) count toward this cap.
+ */
+export const MAX_CONSECUTIVE_409 = 10;
 
 /**
  * Stream fork-aware hot-blocks with `includeAllBlocks` (every header + filtered logs + the matched logs'
@@ -174,12 +244,65 @@ export async function* streamHotBlocks(
 }> {
   const fetchImpl = args.fetchImpl ?? fetch;
   let cursor = args.fromBlock;
+  // Delivered-hash ring: height → last-delivered hash at that height. Its semantics is "what is my
+  // parentBlockHash if I resume at h+1" — so `ring.get(cursor − 1)` is sent on EVERY /stream request. It
+  // opts the client into the Portal's fork negotiation: on a fork the server answers 409 with the canonical
+  // `previousBlocks` (the replacement chain) instead of blindly serving 200. Seeded with the startup anchor
+  // so the FIRST request already carries a parentBlockHash. Overwrite-per-height (a redelivered/reorged
+  // height replaces its hash); pruned below the finalized floor (bounded). (issue #33)
+  const ring = new Map<number, string>();
+  // ARMED only when a seed was wired: production ALWAYS seeds via the startup anchor (the wire passes it at
+  // portal-realtime-wire.ts anchor construction → portalRealtimeEvents seeds streamHotBlocks), so the ring
+  // is armed and `parentBlockHash` is sent on every request incl. the first. Legacy/unit call sites that
+  // pass no seed stay UNARMED: they send no `parentBlockHash` and a missing ring entry is not fatal — the
+  // pre-#33 number-only behavior, so those hermetic tests keep their exact wire shape. (issue #33)
+  const armed = args.seedRing !== undefined;
+  if (args.seedRing !== undefined)
+    ring.set(args.seedRing.number, args.seedRing.hash);
+
+  const floor = (): number => args.getFinalizedFloor?.() ?? args.fromBlock - 1;
+
+  // Prune ring heights strictly below the finalized floor: those blocks are committed, never re-negotiated
+  // (a fork below finality is fatal, not rewound), so their hashes can be dropped. Also cap the size.
+  const pruneRing = (): void => {
+    const lo = floor();
+    for (const [n] of ring) {
+      if (n < lo) ring.delete(n);
+    }
+    if (ring.size > RING_CAP) {
+      const heights = [...ring.keys()].sort((a, b) => a - b);
+      const drop = heights.length - RING_CAP;
+      for (let i = 0; i < drop; i++) ring.delete(heights[i]!);
+    }
+  };
+
+  // Keep the shared diagnostic mirror current (in-memory; the fatal paths read it). `lastPreviousBlocks`
+  // survives until the next 409 so a subsequent `gap` fatal can still cite it.
+  const syncDiag = (
+    parentBlockHashSent: string | undefined,
+    blocksDeliveredThisConn: number,
+    lastPreviousBlocks?: NumberedHash[],
+  ): void => {
+    if (args.diag === undefined) return;
+
+    const heights = [...ring.keys()].sort((a, b) => a - b).slice(-8);
+    args.diag.ring = heights.map((n) => ({ number: n, hash: ring.get(n)! }));
+    args.diag.cursor = cursor;
+    args.diag.parentBlockHashSent = parentBlockHashSent;
+    args.diag.blocksDeliveredThisConn = blocksDeliveredThisConn;
+    if (lastPreviousBlocks !== undefined)
+      args.diag.lastPreviousBlocks = lastPreviousBlocks;
+  };
+
   // Tx fields the dataset can't serve, dropped across reconnects. TX_FIELDS includes `accessList`, which is
   // DROPPABLE (non-typed txs lack it) and which the HISTORICAL client degrades on a schema-field 400 — so a
   // dataset historical handles fine (e.g. no access_list) must not make stream mode refuse to start. We
   // degrade the SAME droppable tx fields here; a genuinely-unserveable (non-droppable) field stays fatal.
   // (review B3)
   const droppedTxFields = new Set<string>();
+  // Consecutive 409 fork-negotiations. Reset on any successful delivery; a runaway (>MAX) is a bug (the
+  // server keeps rejecting a chain the ring believes canonical) → fail loud rather than spin. (issue #33)
+  let consecutive409 = 0;
   for (;;) {
     if (args.signal?.aborted) return;
     // strip any dropped tx field from the projection before building the body (the same fields the
@@ -192,9 +315,26 @@ export async function* streamHotBlocks(
         delete txFields[field];
       }
     }
+    // The parentBlockHash for this request: the ring's hash at cursor−1. When ARMED, a MISSING entry is an
+    // invariant violation — the ring is seeded with the anchor and updated on every delivery, and the cursor
+    // only ever sits at a height whose predecessor we've delivered (fromBlock−1 = anchor; number+1 after a
+    // block; number after a redelivery reopen; a rewound 409 target that matched the ring). If it's absent
+    // the client would send NO parentBlockHash and silently re-open the fork-negotiation hole this fix
+    // closes. Fail loud with the diagnostic dump. When UNARMED (no seed), send no parentBlockHash (legacy).
+    // (issue #33)
+    const parentBlockHash = ring.get(cursor - 1);
+    if (armed && parentBlockHash === undefined) {
+      syncDiag(undefined, 0);
+
+      throw new Error(
+        `Portal realtime: no delivered-hash ring entry for the resume parent at ${cursor - 1} (cursor ${cursor}, floor ${floor()}) — cannot send parentBlockHash, which would re-open the /stream fork-negotiation hole. ${diagDump(args.diag)} Restart to re-sync from the finalized head.`,
+      );
+    }
     const body = JSON.stringify({
       type: 'evm',
       fromBlock: cursor,
+      // omit the key entirely when we have no hash, so an unarmed legacy request is byte-identical to pre-#33
+      ...(parentBlockHash !== undefined ? { parentBlockHash } : {}),
       includeAllBlocks: true,
       fields: {
         block: args.blockFields ?? {
@@ -229,10 +369,77 @@ export async function* streamHotBlocks(
       await sleep(1000, args.signal);
       continue;
     }
-    if (res.status === 204 || !res.body) {
+    if (res.status === 204) {
       await sleep(500, args.signal);
       continue;
     } // no hot data yet; re-poll
+    // NB: only a 204 short-circuits to a re-poll here. The old guard ALSO re-polled on `!res.body` BEFORE
+    // the 409/4xx branches below — so a bodyless 409 (or 4xx) silently re-polled forever, a quiet permanent
+    // negotiation stall / tip outage. The bodyless re-poll now applies only to a bodyless 200 (its original
+    // intent — a "no hot data yet" empty OK), gated just before ndjsonLines consumes res.body. 409 and 4xx
+    // tolerate a null body: parsePreviousBlocks / readTextWithIdle read '' from a bodyless response, which
+    // drives the 409 step-down/floor path and the 4xx not-a-droppable-400 fatal respectively. (F1)
+    // 409 fork negotiation (BEFORE the deterministic-4xx branch, which would otherwise treat it as a fatal
+    // config). The server saw our parentBlockHash orphaned and returned the canonical replacement chain in
+    // `previousBlocks` (ending at fromBlock−1). Rewind the cursor to the highest previousBlocks entry that
+    // MATCHES our ring at/above the floor — that block is the confirmed fork point; re-opening there re-serves
+    // the canonical chain, which reconcile() surfaces as a normal reorg + appends. If nothing matches, step
+    // DOWN one block per 409 (each retry re-sends the ring hash at the new cursor−1) until a match or the
+    // floor. A fork point below the finalized floor has no safe recovery (finalized data can't be rolled
+    // back) → fatal. An OSCILLATING 409 loop that never lowers the cursor → fatal (the no-progress cap
+    // below); a monotonic descent is bounded by the floor, not the cap. (issue #33)
+    if (res.status === 409) {
+      const prev = await parsePreviousBlocks(res).catch(() => undefined);
+      syncDiag(parentBlockHash, 0, prev ?? []);
+      // OSCILLATION guard (NOT a per-409 counter). A legitimate no-match negotiation steps the cursor DOWN
+      // one height per 409, and a deep fork can sit far more than 10 heights above the floor — SQD's public
+      // docs describe the 409 `previousBlocks` as a SAMPLE and warn clients to expect several repeated 409s.
+      // Counting every 409 would fatal such a descent BEFORE it reached the floor, contradicting the
+      // "until a match or the floor" contract. So we count only consecutive 409 rounds that made NO cursor
+      // PROGRESS (progress = the cursor STRICTLY DECREASED this round, via a rewind that lands lower or a
+      // step-down). Monotonic descent is separately bounded by the floor fatal below (cursor − floor is
+      // finite), so termination and loudness are preserved: a genuine oscillation (a rewind/re-409 that
+      // never lowers the cursor) trips this cap; a real descent reaches the floor. (F2)
+      const cursorBefore = cursor;
+      const lo = floor();
+      // Highest previousBlocks entry whose {number,hash} matches our ring, at/above the floor.
+      let rewindTo: number | undefined;
+      for (const pb of prev ?? []) {
+        if (pb.number < lo) continue;
+        if (ring.get(pb.number) !== pb.hash) continue;
+        if (rewindTo === undefined || pb.number > rewindTo)
+          rewindTo = pb.number;
+      }
+      if (rewindTo !== undefined) {
+        cursor = rewindTo + 1; // re-open just above the confirmed common ancestor
+      } else {
+        // No previousBlocks entry matches the ring. If the server named a fork point below the floor, or the
+        // step-down has reached the floor, recovery is unsafe (below finality) → fatal. Otherwise step the
+        // cursor down one block and re-negotiate with the ring hash at the new cursor−1.
+        const belowFloor = (prev ?? []).some((pb) => pb.number < lo);
+        if (belowFloor || cursor - 1 <= lo) {
+          throw new Error(
+            `Portal realtime: /stream fork point is at or below the finalized floor ${lo} (cursor ${cursor}) — no safe recovery below finality. ${diagDump(args.diag)} Restart to re-sync from the finalized head.`,
+          );
+        }
+        cursor -= 1;
+      }
+      // Did this round make progress? A rewind that lands the cursor at the same height or HIGHER (the server
+      // named a confirmed block at/above where we already are) is NOT progress — it's the shape a stuck
+      // oscillation takes (re-open, get the same 409, rewind to the same spot). Only a strict decrease resets.
+      if (cursor < cursorBefore) {
+        consecutive409 = 0;
+      } else {
+        consecutive409 += 1;
+        if (consecutive409 > MAX_CONSECUTIVE_409) {
+          throw new Error(
+            `Portal realtime: ${consecutive409} consecutive /stream 409 fork-negotiations without cursor progress (cursor ${cursor}, floor ${lo}) — the Portal keeps rejecting the chain the ring believes canonical without the negotiation descending. ${diagDump(args.diag)} Restart to re-sync from the finalized head.`,
+          );
+        }
+      }
+
+      continue;
+    }
     if (!res.ok) {
       // A 4xx (except 429) is DETERMINISTIC — the same body will 400 forever. Retrying it every second is a
       // silent, permanent tip outage; fail loud UNLESS it's a droppable-field 400 the historical path also
@@ -265,16 +472,33 @@ export async function* streamHotBlocks(
       await sleep(1000, args.signal);
       continue;
     }
+    // A 200 means the fork negotiation (if any) resolved — the chain from `cursor` links to our ring. Clear
+    // the streak so a later, unrelated fork negotiates fresh from the 10-cap. (issue #33)
+    consecutive409 = 0;
+    // A bodyless 200 (empty OK — "no hot data yet") re-polls, preserving the old `!res.body` semantics but
+    // now ONLY on the OK path, after the 409/4xx branches have had their turn. (F1)
+    if (!res.body) {
+      await sleep(500, args.signal);
+      continue;
+    }
     // Snapshot the filter revision at open; if it advances while streaming (a child was discovered), break
     // to re-open with the widened server-side filter NOW rather than waiting for an unrelated reconnect.
     // Breaking early cancels the ndjsonLines reader (its finally), closing this connection. (finding 4)
     const openedRev = args.getLogsRevision?.() ?? 0;
     let reopen = false;
+    let deliveredThisConn = 0;
     try {
       for await (const line of ndjsonLines(res.body)) {
         const batch = JSON.parse(line);
         if (batch?.header?.number != null) {
-          cursor = batch.header.number + 1; // resume past this block on reconnect
+          const num = batch.header.number as number;
+          // Record this height's hash in the ring so the NEXT resume (at num+1) carries it as
+          // parentBlockHash. Overwrite-per-height (a reorged/redelivered height replaces its prior hash).
+          ring.set(num, batch.header.hash as string);
+          deliveredThisConn += 1;
+          pruneRing();
+          cursor = num + 1; // resume past this block on reconnect
+          syncDiag(parentBlockHash, deliveredThisConn);
           yield {
             header: batch.header,
             logs: batch.logs ?? [],
@@ -287,8 +511,9 @@ export async function* streamHotBlocks(
             // re-delivers it under the widened filter, and the consumer accepts exactly the duplicate it
             // awaits (the redelivery handshake in portalRealtimeEvents / the wire). Resuming from
             // `number + 1` here permanently lost the child's block-N logs — ponder marked the interval
-            // cached on finalize, so the gap survived restarts.
-            cursor = batch.header.number;
+            // cached on finalize, so the gap survived restarts. The reopen at `num` sends
+            // `parentBlockHash = ring.get(num − 1)` — the ring holds num−1 from its earlier delivery.
+            cursor = num;
             reopen = true;
             break;
           }
@@ -299,6 +524,69 @@ export async function* streamHotBlocks(
     }
     if (!reopen) await sleep(200, args.signal); // filter changed ⇒ re-open immediately, no backoff
   }
+}
+
+/**
+ * Parse a /stream 409's `previousBlocks` (the canonical replacement chain). Reads the body via
+ * `readTextWithIdle` (bounded, cancel-on-stall) then extracts `{number, hash}` entries. Tolerant: a
+ * malformed/absent body yields `[]` rather than throwing (the caller's step-down fallback still terminates
+ * at the floor). (issue #33)
+ */
+async function parsePreviousBlocks(res: Response): Promise<NumberedHash[]> {
+  const text = await readTextWithIdle(res, 10_000);
+  const parsed = JSON.parse(text) as { previousBlocks?: unknown };
+  const raw = Array.isArray(parsed?.previousBlocks)
+    ? parsed.previousBlocks
+    : [];
+  const out: NumberedHash[] = [];
+  for (const e of raw) {
+    if (
+      e != null &&
+      typeof (e as NumberedHash).number === 'number' &&
+      typeof (e as NumberedHash).hash === 'string'
+    ) {
+      out.push({
+        number: (e as NumberedHash).number,
+        hash: (e as NumberedHash).hash,
+      });
+    }
+  }
+  return out;
+}
+
+/** Render the shared StreamDiag as a single-line fatal-message fragment. Empty when no diag is wired. */
+export function diagDump(diag: StreamDiag | undefined): string {
+  if (diag === undefined) return '';
+
+  const prev =
+    diag.lastPreviousBlocks !== undefined
+      ? fmtNumberedHashes(diag.lastPreviousBlocks)
+      : 'none';
+
+  return `[diag: cursor=${diag.cursor}, parentBlockHashSent=${diag.parentBlockHashSent ?? 'none'}, blocksDeliveredThisConn=${diag.blocksDeliveredThisConn}, ring(last8)=${fmtNumberedHashes(diag.ring)}, last409.previousBlocks=${prev}]`;
+}
+
+/**
+ * Render the unfinalized window + anchor for a `gap` fatal (issue #33): the window size, its first/tip
+ * `{number,hash}`, the entry at `parentHeight` (`next.number − 1` — present/absent + hash pins whether an
+ * orphaned sibling occupied the local N−1), and the anchor. In-memory only.
+ */
+export function windowDump(
+  unfinalized: Light[],
+  anchor: Light | undefined,
+  parentHeight: number,
+): string {
+  const first = unfinalized[0];
+  const tip = unfinalized[unfinalized.length - 1];
+  const at = unfinalized.find((b) => b.number === parentHeight);
+  const atStr = at !== undefined ? `present ${at.hash}` : 'absent';
+  const firstStr =
+    first !== undefined ? `${first.number}:${first.hash}` : 'none';
+  const tipStr = tip !== undefined ? `${tip.number}:${tip.hash}` : 'none';
+  const anchorStr =
+    anchor !== undefined ? `${anchor.number}:${anchor.hash}` : 'none';
+
+  return `[window: size=${unfinalized.length}, first=${firstStr}, tip=${tipStr}, at(${parentHeight})=${atStr}, anchor=${anchorStr}]`;
 }
 
 // `{ once: true }` removes the abort listener only when `abort` FIRES — on the normal timer path it was
@@ -373,6 +661,27 @@ export async function* portalRealtimeEvents(
   let anchor = args.anchor;
   let lastFinalizePoll = 0;
   const pollMs = args.finalizePollMs ?? 4000;
+  // Wire the /stream fork-negotiation state (issue #33): SEED the delivered-hash ring with the startup
+  // anchor so the first request carries its hash, and expose the FINALIZED FLOOR (the anchor's number,
+  // advanced on each finalize) so the ring prunes and the 409 rewind bounds correctly. `diag` mirrors the
+  // shell's ring/connection state so the `gap` fatal below can dump it alongside the window/anchor. When
+  // there is no anchor (legacy unit-test call sites), the floor defaults to fromBlock−1 and no seed is set.
+  const diag: StreamDiag = {
+    ring: [],
+    cursor: args.fromBlock,
+    parentBlockHashSent: undefined,
+    blocksDeliveredThisConn: 0,
+    lastPreviousBlocks: undefined,
+  };
+  const streamArgs: PortalRealtimeArgs = {
+    ...args,
+    seedRing:
+      anchor !== undefined
+        ? { number: anchor.number, hash: anchor.hash }
+        : args.seedRing,
+    getFinalizedFloor: () => anchor?.number ?? args.fromBlock - 1,
+    diag,
+  };
   // B1 defer-streak watchdog: `deferStreakStart` is the Date.now() of the FIRST poll in an unbroken run of
   // hash-unverifiable-finalize deferrals (undefined ⇒ not armed). Set when a poll defers and the streak is
   // not already armed; cleared whenever a finalize poll does NOT defer (finalize emitted, no finalizedTip,
@@ -381,7 +690,9 @@ export async function* portalRealtimeEvents(
   const deferMaxMs = args.finalizeDeferMaxMs ?? 600_000;
   let deferStreakStart: number | undefined;
 
-  for await (const { header, logs, transactions } of streamHotBlocks(args)) {
+  for await (const { header, logs, transactions } of streamHotBlocks(
+    streamArgs,
+  )) {
     const light = toLight(header);
     const r = reconcile(unfinalized, light, anchor);
     const redelivered =
@@ -398,8 +709,12 @@ export async function* portalRealtimeEvents(
       // a forced reopen on child discovery widens the reconnect window in which a concurrent deep reorg
       // surfaces here as a fatal gap rather than a handled reorg — accepted, a crash beats silent
       // corruption. (finding 7 / G5; a walk-parents-and-refetch auto-recovery is a follow-up.)
+      // Diagnostic dump (issue #33): the window shape + the ENTRY AT next.number−1 (the parent height —
+      // present/absent + hash pins whether an orphaned sibling was the local N−1), the anchor, and the
+      // shell's ring/connection state (whether a parentBlockHash was sent, blocks delivered, the last 409).
+      // In-memory only — a future instance is self-identifying without a code change.
       throw new Error(
-        `Portal realtime: streamed block ${light.number} (${light.hash}) has an unknown parent ${light.parentHash} — a reorg deeper than the unfinalized window, or a skipped block. Cannot reconcile safely; restart to re-sync from the finalized head.`,
+        `Portal realtime: streamed block ${light.number} (${light.hash}) has an unknown parent ${light.parentHash} — a reorg deeper than the unfinalized window, or a skipped block. ${windowDump(unfinalized, anchor, light.number - 1)} ${diagDump(diag)} Cannot reconcile safely; restart to re-sync from the finalized head.`,
       );
     }
 

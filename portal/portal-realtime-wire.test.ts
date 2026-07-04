@@ -896,3 +896,231 @@ test('resolveRedeliveryTimeoutMs: precedence — param wins, then env, then defa
     );
   }
 });
+
+// ─────────────────────────────── 1-block orphan heal via 409 (issue #33) ───────────────────────────────
+
+// mock the Portal /stream where a connection can be either a block run (200) or a 409 fork negotiation
+// carrying { previousBlocks }. /finalized-head returns a bare number. Captures each /stream body.
+function mockPortalConnsFork(
+  connections: Array<
+    | { status: 200; blocks: any[] }
+    | { status: 409; previousBlocks: Array<{ number: number; hash: string }> }
+  >,
+  finalizedHead: number,
+  seenBodies?: any[],
+) {
+  const enc = new TextEncoder();
+  let conn = 0;
+  return (async (url: string, init?: any) => {
+    if (url.endsWith('/finalized-head'))
+      return { json: async () => ({ number: finalizedHead }) };
+    if (seenBodies && init?.body) seenBodies.push(JSON.parse(init.body));
+    if (conn >= connections.length)
+      return { status: 204, ok: false, body: null };
+    const c = connections[conn++]!;
+    if (c.status === 409) {
+      const body = new ReadableStream({
+        start(ctrl) {
+          ctrl.enqueue(
+            enc.encode(JSON.stringify({ previousBlocks: c.previousBlocks })),
+          );
+          ctrl.close();
+        },
+      });
+
+      return { status: 409, ok: false, body };
+    }
+    const lines = c.blocks.map((b) => `${JSON.stringify(b)}\n`).join('');
+    const body = new ReadableStream({
+      start(ctrl) {
+        ctrl.enqueue(enc.encode(lines));
+        ctrl.close();
+      },
+    });
+
+    return { status: 200, ok: true, body };
+  }) as any;
+}
+
+test('getPortalRealtimeEventGenerator: a 1-block orphan at tip HEALS via 409 fork negotiation — the wire emits reorg→block→block with hex LightBlocks and the #26 child-prune fires on the reorg (issue #33 T5)', async () => {
+  // End-to-end through the wire, combining the #26 same-block redelivery handshake with the #33 409 heal.
+  // conn1 serves canonical 674 (no factory logs) then the ORPHAN 675 (a non-canonical sibling) which
+  // CREATES factory child Y — so the wire suppresses 675o for its same-block redelivery and re-opens FROM
+  // 675 (parentBlockHash = ring[674] = h674). conn2 re-delivers the complete 675o (child Y present) →
+  // forwarded; the connection closes → resume at 676 carrying parentBlockHash = h675o. conn3 is the 409:
+  // the Portal saw h675o orphaned and returns the canonical replacement chain [674, 675]. The wire rewinds
+  // to 675 (just above the matched common ancestor 674) carrying parentBlockHash = h674; conn4 serves the
+  // canonical 675c then 676c. reconcile surfaces 675c as a reorg off 674 (popping the orphan 675o) then
+  // appends 675c, 676c. The #26 prune fires on that reorg: child Y (creation block 675, reorged away) is
+  // deleted from the running childAddresses map.
+  process.env.PORTAL_REALTIME = 'stream';
+  const factory = eulerFactory();
+  const childY = '0x2222222222222222222222222222222222222222';
+  const conns = [
+    {
+      status: 200 as const,
+      blocks: [
+        {
+          header: {
+            number: 674,
+            hash: 'h674',
+            parentHash: 'h673',
+            timestamp: 674,
+          },
+          logs: [],
+        },
+        {
+          // the ORPHAN 675 — a non-canonical sibling of canonical 675; it creates child Y (reorged away)
+          header: {
+            number: 675,
+            hash: 'h675o',
+            parentHash: 'h674',
+            timestamp: 675,
+          },
+          logs: [proxyLog(childY, { blockNumber: 675 })],
+        },
+      ],
+    },
+    {
+      // the same-block redelivery of 675o (re-opened FROM 675, parentBlockHash = h674) — child Y present
+      status: 200 as const,
+      blocks: [
+        {
+          header: {
+            number: 675,
+            hash: 'h675o',
+            parentHash: 'h674',
+            timestamp: 675,
+          },
+          logs: [proxyLog(childY, { blockNumber: 675 })],
+        },
+      ],
+    },
+    {
+      // the wire resumed at 676 with parentBlockHash = h675o → the Portal detects the orphan and 409s
+      status: 409 as const,
+      previousBlocks: [
+        { number: 674, hash: 'h674' },
+        { number: 675, hash: 'h675c' },
+      ],
+    },
+    {
+      // rewound to 675 with parentBlockHash = h674 → canonical 675c then 676c
+      status: 200 as const,
+      blocks: [
+        {
+          header: {
+            number: 675,
+            hash: 'h675c',
+            parentHash: 'h674',
+            timestamp: 675,
+          },
+          logs: [],
+        },
+      ],
+    },
+    {
+      // The reorg prunes child Y and rebuilds the server filter (revision bump), so streamHotBlocks
+      // re-opens from 675 (parentBlockHash = h674 again). This connection re-serves the canonical 675c (a
+      // routine duplicate — skipped) then 676c, which appends and hits endBlock.
+      status: 200 as const,
+      blocks: [
+        {
+          header: {
+            number: 675,
+            hash: 'h675c',
+            parentHash: 'h674',
+            timestamp: 675,
+          },
+          logs: [],
+        },
+        {
+          header: {
+            number: 676,
+            hash: 'h676c',
+            parentHash: 'h675c',
+            timestamp: 676,
+          },
+          logs: [],
+        },
+      ],
+    },
+  ];
+  const childAddresses = new Map<string, Map<Address, number>>([
+    ['euler-factory', new Map()],
+  ]);
+  const bodies: any[] = [];
+  const events: any[] = [];
+  for await (const { event } of getPortalRealtimeEventGenerator({
+    common: { logger: { info() {}, debug() {}, warn() {}, trace() {} } } as any,
+    chain: { id: 1, name: 'mainnet', portal: 'http://portal' } as any,
+    rpc: {} as any,
+    eventCallbacks: [{ filter: logFilter({ address: factory as any }) } as any],
+    syncProgress: {
+      finalized: {
+        number: '0x2a1', // 673 — startup finalized (the anchor that seeds the ring)
+        hash: 'h673',
+        parentHash: 'h672',
+        timestamp: '0x1',
+      } as any,
+      end: { number: '0x2a4' } as any, // endBlock 676: stop after the healed tip is indexed
+    },
+    childAddresses,
+    fetchImpl: mockPortalConnsFork(conns, 673, bodies), // finalized head stays at the anchor
+    redeliveryTimeoutMs: 500, // bound the handshake await so a construction bug fails fast, not hangs
+  })) {
+    events.push(event);
+  }
+
+  // The healed event sequence reaching ponder includes: block 674, block 675(orphan), reorg→674, block
+  // 675c, block 676c (a `finalize` may or may not interleave — the head sits at the anchor 673 here).
+  const seq = events.map((e) =>
+    e.type === 'block'
+      ? `block ${hexToNumber(e.block.number)}:${e.block.hash}`
+      : e.type === 'reorg'
+        ? `reorg ${hexToNumber(e.block.number)}`
+        : `finalize ${hexToNumber(e.block.number)}`,
+  );
+  expect(seq).toContain('block 674:h674');
+  expect(seq).toContain('block 675:h675o'); // the orphan reached ponder (via the #26 redelivery)
+  expect(seq).toContain('reorg 674'); // rollback to the common ancestor 674 (hex LightBlock)
+  expect(seq).toContain('block 675:h675c'); // canonical 675 re-delivered post-409
+  expect(seq).toContain('block 676:h676c');
+  // ordering: the reorg precedes the canonical 675c which precedes 676c
+  const iReorg = seq.indexOf('reorg 674');
+  const i675c = seq.indexOf('block 675:h675c');
+  const i676c = seq.indexOf('block 676:h676c');
+  expect(iReorg).toBeGreaterThanOrEqual(0);
+  expect(iReorg).toBeLessThan(i675c);
+  expect(i675c).toBeLessThan(i676c);
+
+  // the reorg carries a hex LightBlock for the common ancestor, and the orphan among the reorged blocks
+  const reorgEv = events.find((e) => e.type === 'reorg');
+  expect(reorgEv.block.number).toBe('0x2a2'); // 674 in hex
+  expect(reorgEv.reorgedBlocks.some((b: any) => b.hash === 'h675o')).toBe(true);
+
+  // #26 child-prune: child Y (created on the reorged-away orphan 675) is pruned from the running map
+  expect(childAddresses.get('euler-factory')!.has(childY as Address)).toBe(
+    false,
+  );
+
+  // wire-side proof the /stream carried the fork-negotiation parentBlockHash: the first request carried the
+  // anchor hash; the resume that triggered the 409 sent the orphan's hash; the rewound reconnect sent the
+  // confirmed common-ancestor hash
+  const stream = bodies.filter((b) => b.fromBlock !== undefined);
+  expect(stream[0].parentBlockHash).toBe('h673'); // first request carries the anchor hash
+  const resume676 = stream.find((b) => b.fromBlock === 676);
+  expect(resume676?.parentBlockHash).toBe('h675o');
+  const rewind675 = stream.find(
+    (b) => b.fromBlock === 675 && b.parentBlockHash === 'h674',
+  );
+  expect(rewind675).toBeDefined(); // the rewound reconnect after the 409 carried the ancestor hash
+  // F3: in armed (production) mode EVERY /stream request must carry a parentBlockHash — a later connection
+  // silently going number-only (dropping the key) would re-open the fork-negotiation hole this fix closes,
+  // and a find()-based spot check would miss it. Assert the invariant over ALL captured stream bodies.
+  expect(stream.length).toBeGreaterThan(0);
+  for (const b of stream) {
+    expect(typeof b.parentBlockHash).toBe('string');
+    expect(b.parentBlockHash.length).toBeGreaterThan(0);
+  }
+});
