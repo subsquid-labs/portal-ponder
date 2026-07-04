@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { spawn } from 'node:child_process';
-import { mkdtempSync, readFileSync, rmSync } from 'node:fs';
+import { copyFileSync, mkdtempSync, readFileSync, rmSync } from 'node:fs';
 import { createServer } from 'node:http';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
@@ -183,5 +183,55 @@ test('meter startup banner and persisted state redact the credential (both leak 
     child.kill('SIGKILL');
     upstream.srv.close();
     rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+// ── integration: space in path — main() must still run (pathToFileURL guard) ─────────────────────
+//
+// The true failure mode of the old `file://${process.argv[1]}` guard is percent-encoding:
+// import.meta.url is always a properly-encoded URL (spaces become %20, etc.), but the naive string
+// concat is NOT encoded — so any path containing a space produces a mismatch and main() silently
+// never runs.  Node.js resolves argv[1] to an absolute path regardless of how the script is invoked
+// (relative or absolute), so a relative invocation is NOT a failure mode.
+// pathToFileURL(process.argv[1]) encodes identically to how Node encodes import.meta.url, so the
+// comparison holds for any path including those with spaces (or other percent-encodable characters).
+test('meter starts correctly when the script path contains a space (percent-encoding guard)', async () => {
+  const upstream = await startUpstream();
+  const meterPort = await freePort();
+  const target = `http://127.0.0.1:${upstream.port}/eth/${FAKE_KEY}`;
+
+  // Create a temp dir whose name contains a space — this forces percent-encoding in the URL form.
+  // The old string-concat guard would produce `file:///tmp/meter test-XXXXX/rpc-meter.mjs`
+  // (unencoded space) which never equals import.meta.url `…/meter%20test-XXXXX/…`, so main()
+  // silently never ran.  pathToFileURL encodes identically, so the comparison succeeds.
+  const spaceDir = mkdtempSync(join(tmpdir(), 'meter test-'));
+  const meterCopy = join(spaceDir, 'rpc-meter.mjs');
+  copyFileSync(METER, meterCopy);
+
+  const child = spawn(process.execPath, [meterCopy], {
+    env: {
+      ...process.env,
+      METER_TARGET: target,
+      METER_PORT: String(meterPort),
+    },
+    stdio: ['ignore', 'pipe', 'pipe'],
+  });
+
+  try {
+    const banner = await waitForLine(child, /rpc-meter →/, 10_000);
+
+    assert.ok(
+      /rpc-meter →/.test(banner),
+      'startup banner must appear — main() must run even when the path contains a space',
+    );
+    assert.equal(
+      banner.includes(FAKE_KEY),
+      false,
+      'startup banner must NOT contain the credential',
+    );
+  } finally {
+    child.kill('SIGKILL');
+    upstream.srv.close();
+    rmSync(spaceDir, { recursive: true, force: true });
   }
 });

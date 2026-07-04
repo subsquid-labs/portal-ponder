@@ -16,6 +16,7 @@
 
 import { writeFileSync } from 'node:fs';
 import { createServer } from 'node:http';
+import { pathToFileURL } from 'node:url';
 
 // Paid RPC endpoints carry the credential IN the URL path (…/<chain-slug>/<key>), so the raw
 // METER_TARGET must NEVER reach a log line or a persisted file — a captured stdout or a leaked state
@@ -202,6 +203,9 @@ function main() {
   });
 }
 
-if (import.meta.url === `file://${process.argv[1]}`) {
+if (
+  process.argv[1] &&
+  import.meta.url === pathToFileURL(process.argv[1]).href
+) {
   main();
 }
