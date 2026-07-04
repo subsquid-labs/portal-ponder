@@ -190,13 +190,34 @@ SQD_PONDER_TARBALL=<tarball> RPC_URL_OVERRIDE=<free-eth-rpc> \
 The chaos kill-loop was accepted against the campaign's acceptance criteria. Aggregate result:
 
 - **203 `SIGKILL`s** delivered across **80 attempted / 41 completed** backfill runs.
-- **41 / 41 clean resumes** — every completed backfill finished after being killed and resuming from
-  its persisted `ponder_sync` state.
+- **41 / 41 completed backfills survived kill-and-resume** — every completed backfill was `SIGKILL`ed
+  at least twice mid-flight and still reached a correct, complete final store on resume.
 - Final stores **byte-identical** to an unkilled baseline across **logs, transactions, receipts,
   traces, blocks**.
 - **Every sync interval fragment tiled the range exactly** (including the factory-discovery
   fragments) — no gap, no overlap.
 - Zero `InvariantViolation` under `PORTAL_CHECKS=strict`. (Both `kill-loop.sh` and `verify-resume.sh` export `PORTAL_CHECKS=strict`; an `InvariantViolation` is fatal to the run, so 41/41 clean completions entail zero violations.)
+
+**What this proves — and what it does not.** The evidence above establishes three things precisely:
+**(1) `SIGKILL`-atomicity** — a kill never leaves torn state; rows and their sync-interval fragments
+commit together (all-or-nothing per commit), so the store never overstates coverage. **(2) Restart
+idempotence** — a killed process, restarted, converges to the same correct store regardless of when
+it was killed. **(3) Byte-identical completion** — the resumed store equals an uninterrupted baseline
+across all five row families with intervals tiling exactly.
+
+It does **not**, as parameterized, prove **attributable resume-from-partial-persisted-state**. Under
+[#50](../../issues/50), the fork's historical path makes its **first durable commit only after
+full-range discovery plus the entire first data chunk** (default `PORTAL_CHUNK_BLOCKS` 500k); for a
+range inside one chunk the durable store goes **0% → 100% in a single transaction, seconds before
+completion**. The chaos range `[20529207, 20579207]` (50k blocks) sits inside one chunk, so at almost
+every kill instant the durable store was **either empty or already complete** — a restart re-paid the
+discovery scan and re-streamed the chunk from zero rather than continuing from a persisted partial
+watermark. With ~one atomic commit per backfill, the great majority of the 203 kills exercised
+**restart-from-zero**; any kills that happened to land in the sub-second commit window and produced a
+genuine mid-range resume are **statistically expected but were not recorded or attributed** by this
+run (`kill-loop.sh` counts kills regardless of the durable coverage present at kill time — see
+[#50](../../issues/50)). So "resume from a persisted partial `ponder_sync` state" is **plausible but
+unproven here**; what is proven is atomicity, idempotence, and byte-identical completion.
 
 Conditions: Poisson kill schedule (mean 30 s), `MIN_KILLS=2` enforced per completed backfill (a run
 that finished without being killed proves nothing about resume and is rejected), chain 1 (ethereum)
@@ -277,6 +298,19 @@ spot audit** (Layer F): in the confirmed cases (#36, #27) leg B's rows matched a
 byte-for-byte, establishing leg A as the lossy side. The status JSON carries a bounded sample of
 tolerated block numbers per table specifically to keep that audit reproducible.
 
+### 5.4 Chaos-discovered findings (Layer C)
+
+| Issue | State | Finding | Attribution / layer |
+|-------|-------|---------|---------------------|
+| [#50](../../issues/50) | OPEN | **First-durable-commit granularity.** The fork's historical path makes its first durable sync-store commit only after **full-range factory discovery + the entire first data chunk** stream (default `PORTAL_CHUNK_BLOCKS` 500k); for a range inside one chunk the durable store goes **0% → 100% in one transaction, seconds before completion**. A restart loop shorter than that window makes **zero forward progress** and re-pays discovery + chunk re-stream each cycle (upstream, which commits proportionally to a 25-block first interval, creeps forward instead). An availability/progress regression vs upstream, with a zero-progress-livelock shape under sub-window crash loops. **Correctness is unaffected**: coverage never overstates and rows+intervals still commit atomically (that invariant held under all 203 chaos kills). | Discovered by the chaos campaign (Layer C): a 60-kill Poisson run (mean 5 s) ended with a **provably byte-empty store** — every restart began from zero — root-caused to the first-commit granularity and filed as [#50](../../issues/50). |
+
+This finding also bounds what §4 can claim: because the 50k chaos range fits inside one 500k chunk,
+the campaign's kills overwhelmingly hit an empty-or-complete durable store, so *attributable*
+resume-from-partial state was not witnessed (see §4). A **re-parameterized chaos campaign** — small
+fixed chunks (`PORTAL_CHUNK_BLOCKS` on the order of 2k) that force staircase durable commits,
+per-kill coverage snapshots, and an acceptance criterion requiring kills observed with
+`0 < coverage < 100%` at restart — is queued to close that evidence gap directly.
+
 ---
 
 ## 6. Current status — what a reader can rely on today
@@ -286,9 +320,11 @@ tolerated block numbers per table specifically to keep that audit reproducible.
 - The Portal layer's invariants (INV-1 … INV-16) hold under property-based tests **on both supported
   upstream Ponder versions** (`0.16.6`, `0.15.17`), and every fix is backed by a mutation-verified
   regression test.
-- **Crash/resume is byte-safe** at the accepted chaos scale: 203 kills, 41/41 clean resumes,
-  byte-identical to an unkilled baseline across all five row families, intervals tiling exactly, zero
-  invariant violations (§4).
+- **Crash/resume is byte-safe** at the accepted chaos scale: 203 kills across 41/41 completed
+  backfills, `SIGKILL`-atomic and restart-idempotent, byte-identical to an unkilled baseline across
+  all five row families, intervals tiling exactly, zero invariant violations (§4). *Attributable*
+  resume-from-partial-persisted-state is not yet proven at this parameterization — see the
+  [#50](../../issues/50) granularity property and §4.
 - The fork-vs-stock **byte-diff plumbing** is proven end-to-end by the SMOKE cell (byte-identical
   across all five row families on public endpoints, §3.1).
 - The A/B dual-implementation soak is **actively cross-validating** the Portal path against the RPC
