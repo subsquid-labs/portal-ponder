@@ -1031,6 +1031,18 @@ export function buildBucketExclusionFilter(rows) {
 // rows (A's md5 === B-minus-tolerated md5) and nothing else. Same query as bucketHashes but with the
 // exclusion predicate. Only called when there ARE mismatched buckets AND tolerated onlyB log rows exist,
 // so the extra query is off the healthy path.
+//
+// SEPARATE-SNAPSHOT RESIDUAL (non-blocking, deliberately out of scope): this recompute and the earlier
+// bucketHashes/diff queries are DISTINCT psql statements, each its own MVCC snapshot — leg B's rows
+// could in principle change between them, so the bucket-md5 attribution is not read from ONE frozen
+// view. The mitigating reality: the differ compares ONLY the FINALIZED overlap [cutover,
+// min(finalizedA,finalizedB)-margin], where both legs' rows are STABLE between queries in the same run —
+// finalized data is append-only and not rewritten — EXCEPT during an active repair (a re-ingest that
+// rewrites finalized rows). So outside a repair the race window is practically empty, and a repair
+// in-flight would surface as a transient bucket/row mismatch that clears on the next hourly run rather
+// than a false PASS. Folding every per-side query into a single repeatable-read snapshot would close the
+// window fully but is a larger refactor (one long-lived connection/transaction per side, threaded
+// through every adapter) and is intentionally NOT done here.
 async function bucketHashesExcluding(url, chain, lo, hi, bucket, excludeRows) {
   const exclusion = buildBucketExclusionFilter(excludeRows);
   const sql =
