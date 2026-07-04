@@ -85,10 +85,18 @@ async function* fromArray(rows) {
 //     was vacuous — it failed only on a shared mismatch and let a portal-only block sail through the
 //     F-full differ.
 // Returns counters and small samples (never the whole diff) so memory stays bounded.
+//
+// `onOnlyB` (optional): a callback invoked with each B-only row's value AS the merge encounters it, in
+// key order. It exists ONLY so the A/B differ can floor-gate B-only rows against a tolerated class
+// (issue #36) WITHOUT collecting the whole B-only set into memory here — the callback streams one row
+// at a time, so this function stays constant-memory. Default undefined ⇒ the existing strict/blocks
+// callers (chaos verify, the F-full store diff) are byte-for-byte unaffected: no callback, no behavior
+// change. The callback NEVER alters this function's fail verdict — it is a pure observer; the caller
+// decides tolerance from the rows it collects.
 export async function streamingDiff(
   iterA,
   iterB,
-  { keyFn, drop, mode = 'strict' },
+  { keyFn, drop, mode = 'strict', onOnlyB },
 ) {
   const itA = iterA[Symbol.asyncIterator]();
   const itB = iterB[Symbol.asyncIterator]();
@@ -141,6 +149,11 @@ export async function streamingDiff(
       if (mode === 'strict') {
         res.fail = true;
         sample('B-only', normRow(b.value, drop));
+      }
+      // Stream this B-only row to the observer (issue #36 floor-gate), one row at a time — never
+      // collected here, so memory stays bounded. A pure observer: it does NOT change res.fail.
+      if (onOnlyB) {
+        onOnlyB(b.value);
       }
       b = await itB.next();
     } else {
