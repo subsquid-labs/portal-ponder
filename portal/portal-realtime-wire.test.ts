@@ -15,6 +15,7 @@ import {
   getPortalRealtimeEventGenerator,
   isPortalRealtime,
   lightToLightBlock,
+  resolveRedeliveryTimeoutMs,
   toRealtimeSyncEvent,
   uniqueFactories,
 } from './portal-realtime-wire.js';
@@ -74,9 +75,12 @@ const proxyLog = (proxy: string, over: Record<string, any> = {}): any => ({
 });
 
 const savedEnv = process.env.PORTAL_REALTIME;
+const savedPin = process.env.PORTAL_FINALIZED_HEAD;
 afterEach(() => {
   if (savedEnv === undefined) delete process.env.PORTAL_REALTIME;
   else process.env.PORTAL_REALTIME = savedEnv;
+  if (savedPin === undefined) delete process.env.PORTAL_FINALIZED_HEAD;
+  else process.env.PORTAL_FINALIZED_HEAD = savedPin;
 });
 
 // ─────────────────────────────── flag gating ───────────────────────────────
@@ -167,7 +171,7 @@ test('discoverChildAddresses: multiple children in one block', () => {
 
 // ─────────────────────────────── event conversion ───────────────────────────────
 
-test('toRealtimeSyncEvent: block → log-only BlockWithEventData (no txs/receipts/traces, childAddresses, no blockCallback)', () => {
+test('toRealtimeSyncEvent: block → BlockWithEventData with logs + their parent TRANSACTIONS (no receipts/traces, childAddresses, no blockCallback)', () => {
   const factory = eulerFactory();
   const childAddresses = new Map([
     [factory, new Set<Address>(['0xchild' as Address])],
@@ -181,6 +185,9 @@ test('toRealtimeSyncEvent: block → log-only BlockWithEventData (no txs/receipt
       timestamp: '0x1',
     } as any,
     logs: [{ address: '0xchild' } as any],
+    // the matched log's parent tx rides the stream (TX_FIELDS via `transaction: true`) — it must reach
+    // ponder's BlockWithEventData, so `event.transaction` works and the finalize insert stores it
+    transactions: [{ hash: '0xt' } as any],
     hasMatchedFilter: true,
   };
   const ev = toRealtimeSyncEvent(block, childAddresses) as Extract<
@@ -189,7 +196,7 @@ test('toRealtimeSyncEvent: block → log-only BlockWithEventData (no txs/receipt
   >;
   expect(ev.type).toBe('block');
   expect(ev.hasMatchedFilter).toBe(true);
-  expect(ev.transactions).toEqual([]);
+  expect(ev.transactions).toEqual([{ hash: '0xt' }]); // passthrough, not []
   expect(ev.transactionReceipts).toEqual([]);
   expect(ev.traces).toEqual([]);
   expect(ev.childAddresses).toBe(childAddresses);
@@ -386,17 +393,84 @@ test('clampFinalizedToPortalHead: Portal head BELOW RPC finalized → refetch th
   expect(hexToNumber(out.number)).toBe(900);
 });
 
+test('clampFinalizedToPortalHead: an explicit PORTAL_FINALIZED_HEAD pin below the live head is AUTHORITATIVE — the clamp honors it with NO /finalized-head probe (review B5a / fix 4)', async () => {
+  // FIX 5 made the pin authoritative for the finality boundary in portal.ts (the historical seam). This
+  // clamp MUST agree: if it re-probed the LIVE head while portal.ts honored the pin, intervals in
+  // (pin, liveHead] would be marked synced EMPTY while realtime streamed from liveHead+1 — the exact
+  // G4/C11 silent gap. So with the pin set, the clamp returns the block at the PIN and never hits the
+  // network. (Zero-coverage before: making the clamp ignore the pin and probe the live head left the whole
+  // suite green.)
+  process.env.PORTAL_REALTIME = 'stream';
+  process.env.PORTAL_FINALIZED_HEAD = '900'; // pin 900 < RPC finalized 1000
+  let probed = false;
+  const fetchImpl = (async () => {
+    probed = true; // any /finalized-head probe flips this — the pin path must NOT
+    return { json: async () => ({ number: 5000 }) }; // a live head that, if probed, would NOT clamp
+  }) as any;
+  let requested: any;
+  const pinBlock = {
+    number: '0x384', // block at the pin (900)
+    hash: '0xpinhead',
+    parentHash: '0xpp',
+    timestamp: '0x2',
+    logsBloom: `0x${'0'.repeat(512)}`,
+    sha3Uncles: '0x0',
+    miner: '0x0',
+    stateRoot: '0x0',
+    transactionsRoot: '0x0',
+    receiptsRoot: '0x0',
+    gasUsed: '0x0',
+    gasLimit: '0x0',
+    extraData: '0x',
+    nonce: '0x0',
+    mixHash: '0x0',
+    difficulty: '0x0',
+    size: '0x0',
+    transactions: [],
+  };
+  const rpc = {
+    request: async (req: any) => {
+      requested = req;
+      return pinBlock;
+    },
+  } as any;
+  const finalized = {
+    number: '0x3e8', // 1000
+    hash: '0xh',
+    parentHash: '0xp',
+    timestamp: '0x1',
+  } as LightBlock;
+  const out = await clampFinalizedToPortalHead({
+    chain: { portal: 'http://p', name: 'c' } as any,
+    rpc,
+    finalizedBlock: finalized,
+    fetchImpl,
+  });
+  expect(probed).toBe(false); // the pin is authoritative — NO live-head probe
+  expect(requested.method).toBe('eth_getBlockByNumber');
+  expect(requested.params[0]).toBe('0x384'); // clamped to the PIN (900), not the un-probed live head
+  expect(hexToNumber(out.number)).toBe(900);
+});
+
 // ─────────────────────────────── end-to-end generator ───────────────────────────────
 
-// mock the Portal /stream (NDJSON batches once → 204) and /finalized-head (JSON)
-function mockPortal(batches: any[], finalizedHead: number) {
-  let streamed = false;
-  return (async (url: string) => {
+// mock the Portal /stream — one NDJSON connection per entry in `connections` (then 204) — and
+// /finalized-head (JSON). `seenBodies` (optional) collects each /stream request body for filter asserts.
+function mockPortalConns(
+  connections: any[][],
+  finalizedHead: number,
+  seenBodies?: any[],
+) {
+  let conn = 0;
+  return (async (url: string, init?: any) => {
     if (url.endsWith('/finalized-head'))
       return { json: async () => ({ number: finalizedHead }) };
-    if (streamed) return { status: 204, ok: false, body: null };
-    streamed = true;
-    const lines = batches.map((b) => JSON.stringify(b) + '\n').join('');
+    if (seenBodies && init?.body) seenBodies.push(JSON.parse(init.body));
+    if (conn >= connections.length)
+      return { status: 204, ok: false, body: null };
+    const lines = connections[conn++]!.map(
+      (b) => JSON.stringify(b) + '\n',
+    ).join('');
     const body = new ReadableStream({
       start(c) {
         c.enqueue(new TextEncoder().encode(lines));
@@ -406,17 +480,36 @@ function mockPortal(batches: any[], finalizedHead: number) {
     return { status: 200, ok: true, body };
   }) as any;
 }
+const mockPortal = (batches: any[], finalizedHead: number) =>
+  mockPortalConns([batches], finalizedHead);
 
-test('getPortalRealtimeEventGenerator: streams block events, discovers a new child, and updates the running childAddresses; terminates at endBlock', async () => {
+test('getPortalRealtimeEventGenerator: a child discovered in block N gets N RE-DELIVERED complete — its SAME-BLOCK logs are not lost; terminates at endBlock', async () => {
+  // The /stream filter is server-side and snapshotted at connection open, so a child created in block N
+  // has its own block-N logs filtered out of the connection N arrived on. The old flow forwarded N's
+  // incomplete event and resumed from N+1 — the child's same-block logs were permanently lost (interval
+  // marked cached on finalize). Now the wire suppresses the incomplete event, widens the filter, and the
+  // stream re-opens FROM N: ponder receives exactly ONE block event for N, carrying the child's log.
   process.env.PORTAL_REALTIME = 'stream';
   const factory = eulerFactory();
   const child = '0x1111111111111111111111111111111111111111';
-  const batches = [
+  const childDeposit = {
+    address: child,
+    topics: [DEPOSIT],
+    data: '0x',
+    blockNumber: 101,
+    logIndex: 1,
+    transactionHash: '0xtx2',
+    transactionIndex: 0,
+    removed: false,
+  };
+  const conn1 = [
     {
       header: { number: 100, hash: 'h100', parentHash: 'h99', timestamp: 1000 },
       logs: [],
     },
     {
+      // the OLD filter matches only the factory's creation event — the child's own Deposit in the SAME
+      // block was filtered out server-side and is absent here
       header: {
         number: 101,
         hash: 'h101',
@@ -426,9 +519,22 @@ test('getPortalRealtimeEventGenerator: streams block events, discovers a new chi
       logs: [proxyLog(child, { blockNumber: 101 })],
     },
   ];
+  const conn2 = [
+    {
+      // the reopened connection (widened filter) re-delivers block 101 COMPLETE
+      header: {
+        number: 101,
+        hash: 'h101',
+        parentHash: 'h100',
+        timestamp: 1012,
+      },
+      logs: [proxyLog(child, { blockNumber: 101 }), childDeposit],
+    },
+  ];
   const childAddresses = new Map<string, Map<Address, number>>([
     ['euler-factory', new Map()],
   ]);
+  const bodies: any[] = [];
   const events: any[] = [];
   for await (const { event } of getPortalRealtimeEventGenerator({
     common: { logger: { info() {}, debug() {}, warn() {}, trace() {} } } as any,
@@ -446,21 +552,141 @@ test('getPortalRealtimeEventGenerator: streams block events, discovers a new chi
       end: { number: '0x65' } as any,
     },
     childAddresses,
-    fetchImpl: mockPortal(batches, 0),
+    fetchImpl: mockPortalConns([conn1, conn2], 0, bodies),
   })) {
     events.push(event);
   }
 
   const blocks = events.filter((e) => e.type === 'block');
-  expect(blocks.length).toBe(2);
+  expect(blocks.length).toBe(2); // EXACTLY one event per block — no double-delivery of 101
   expect(blocks[0].block.number).toBe('0x64'); // 100
-  expect(blocks[1].block.number).toBe('0x65'); // 101
-  // block 101 discovered the new vault → surfaced on the event AND folded into the running map
+  expect(blocks[1].block.number).toBe('0x65'); // 101 (the redelivered, COMPLETE version)
+  // THE REGRESSION: the child's own same-block Deposit is present on the (single) block-101 event
+  expect(
+    blocks[1].logs.some(
+      (l: any) => l.address === child && l.topics[0] === DEPOSIT,
+    ),
+  ).toBe(true);
+  // discovery still surfaced on the event AND folded into the running map
   expect([...blocks[1].childAddresses.get(factory)!]).toEqual([child]);
   expect(childAddresses.get('euler-factory')!.get(child as Address)).toBe(101);
-  // conversion shape
-  expect(blocks[1].transactions).toEqual([]);
+  // the redelivery connection re-opened FROM block 101 with the WIDENED server-side filter
+  const reopened = bodies[bodies.length - 1];
+  expect(reopened.fromBlock).toBe(101);
+  expect(JSON.stringify(reopened.logs)).toContain(child);
   expect(blocks[1].blockCallback).toBeUndefined();
+  // FIX 5 request side (review B5b): EVERY outgoing /stream body must project the parent transaction — the
+  // `transaction: true` relation on each log request PLUS the TX_FIELDS `fields.transaction` map. Dropping
+  // either would silently leave `event.transaction` undefined and store logs without tx rows (only mocks
+  // that inject `transactions` directly would still pass). So assert the projection on the wire.
+  for (const b of bodies) {
+    expect(b.fields.transaction).toBeDefined();
+    expect(b.fields.transaction.hash).toBe(true); // a TX_FIELDS column
+    for (const r of b.logs) expect(r.transaction).toBe(true); // the parent-tx relation per log request
+  }
+});
+
+test('getPortalRealtimeEventGenerator: a reorg PRUNES reorged-out children from the running map and narrows the filter', async () => {
+  // Stock createRealtimeSync deletes reorged blocks' children (childAddressesPerBlock); without pruning,
+  // a child whose creation block was reorged away keeps matching — every later log from that address is
+  // indexed as a phantom child event until restart.
+  process.env.PORTAL_REALTIME = 'stream';
+  const factory = eulerFactory();
+  const child = '0x2222222222222222222222222222222222222222';
+  const conn1 = [
+    {
+      header: { number: 100, hash: 'h100', parentHash: 'h99', timestamp: 1000 },
+      logs: [],
+    },
+    {
+      header: {
+        number: 101,
+        hash: 'h101a',
+        parentHash: 'h100',
+        timestamp: 1012,
+      },
+      logs: [proxyLog(child, { blockNumber: 101 })],
+    },
+  ];
+  const conn2 = [
+    {
+      // redelivery of 101a (same-block handshake) — still carries the creation log
+      header: {
+        number: 101,
+        hash: 'h101a',
+        parentHash: 'h100',
+        timestamp: 1012,
+      },
+      logs: [proxyLog(child, { blockNumber: 101 })],
+    },
+    {
+      // the fork: 101b replaces 101a (parent = 100) — the creation event is GONE on the new fork
+      header: {
+        number: 101,
+        hash: 'h101b',
+        parentHash: 'h100',
+        timestamp: 1013,
+      },
+      logs: [],
+    },
+  ];
+  // the prune rebuilds the filter (revision bump) → the stream re-opens from the tip; the re-delivered
+  // tip is a routine duplicate (skipped — no redelivery awaited), then the chain continues
+  const conn3 = [
+    {
+      header: {
+        number: 101,
+        hash: 'h101b',
+        parentHash: 'h100',
+        timestamp: 1013,
+      },
+      logs: [],
+    },
+    {
+      header: {
+        number: 102,
+        hash: 'h102b',
+        parentHash: 'h101b',
+        timestamp: 1024,
+      },
+      logs: [],
+    },
+  ];
+  const childAddresses = new Map<string, Map<Address, number>>([
+    ['euler-factory', new Map()],
+  ]);
+  const bodies: any[] = [];
+  const events: any[] = [];
+  for await (const { event } of getPortalRealtimeEventGenerator({
+    common: { logger: { info() {}, debug() {}, warn() {}, trace() {} } } as any,
+    chain: { id: 1, name: 'mainnet', portal: 'http://portal' } as any,
+    rpc: {} as any,
+    eventCallbacks: [{ filter: logFilter({ address: factory as any }) } as any],
+    syncProgress: {
+      finalized: {
+        number: '0x63',
+        hash: 'h99',
+        parentHash: 'h98',
+        timestamp: '0x1',
+      } as any,
+      end: { number: '0x66' } as any,
+    },
+    childAddresses,
+    fetchImpl: mockPortalConns([conn1, conn2, conn3], 0, bodies),
+  })) {
+    events.push(event);
+  }
+
+  const reorg = events.find((e) => e.type === 'reorg');
+  expect(reorg).toBeDefined();
+  expect(reorg.block.hash).toBe('h100'); // common ancestor
+  // THE REGRESSION: the reorged-out child is pruned from the running map…
+  expect(childAddresses.get('euler-factory')!.has(child as Address)).toBe(
+    false,
+  );
+  // …and the server-side filter was rebuilt WITHOUT it after the reorg
+  const last = bodies[bodies.length - 1];
+  expect(JSON.stringify(last.logs)).not.toContain(child);
 });
 
 test('getPortalRealtimeEventGenerator: emits a monotonic finalize (above the startup finalized) from the head poll', async () => {
@@ -504,4 +730,169 @@ test('getPortalRealtimeEventGenerator: emits a monotonic finalize (above the sta
   const finalize = events.find((e) => e.type === 'finalize');
   expect(finalize).toBeDefined();
   expect(hexToNumber(finalize.block.number)).toBe(100); // > startup finalized (99) → allowed
+});
+
+test('getPortalRealtimeEventGenerator: a redelivery that never lands is bounded by a watchdog and fails loud (recommended)', async () => {
+  // Block N discovers a child and is suppressed for its same-block redelivery; streamHotBlocks re-opens
+  // FROM N. On a HALTED chain the reopened stream 204s forever, so no event reaches the wire loop to trip a
+  // per-event check — the wait would stall SILENTLY. The watchdog bounds it: after redeliveryTimeoutMs it
+  // aborts the stream and the generator rethrows a diagnosable fatal instead of hanging.
+  process.env.PORTAL_REALTIME = 'stream';
+  const factory = eulerFactory();
+  const child = '0x5555555555555555555555555555555555555555';
+  const conn1 = [
+    {
+      // block 100 creates a child → suppressed, redelivery awaited. No further connection redelivers it
+      // (mockPortalConns 204s past the last entry), simulating a halted/non-re-serving stream.
+      header: { number: 100, hash: 'h100', parentHash: 'h99', timestamp: 1000 },
+      logs: [proxyLog(child, { blockNumber: 100 })],
+    },
+  ];
+  const run = (async () => {
+    for await (const _ of getPortalRealtimeEventGenerator({
+      common: {
+        logger: { info() {}, debug() {}, warn() {}, trace() {} },
+      } as any,
+      chain: { id: 1, name: 'mainnet', portal: 'http://portal' } as any,
+      rpc: {} as any,
+      eventCallbacks: [
+        { filter: logFilter({ address: factory as any }) } as any,
+      ],
+      syncProgress: {
+        finalized: {
+          number: '0x63',
+          hash: 'h99',
+          parentHash: 'h98',
+          timestamp: '0x1',
+        } as any,
+        end: { number: '0x66' } as any,
+      },
+      childAddresses: new Map<string, Map<Address, number>>([
+        ['euler-factory', new Map()],
+      ]),
+      fetchImpl: mockPortalConns([conn1], 0),
+      redeliveryTimeoutMs: 50, // tiny watchdog: the redelivery never comes → fail loud fast
+    })) {
+      /* drain */
+    }
+  })();
+  await expect(run).rejects.toThrow(/never re-delivered it within/i);
+});
+
+// like mockPortalConns but the /finalized-head carries the canonical HASH (arms the wrong-fork guard and
+// lets a finalize land at the exact height) — used for the held-finalize-during-redelivery case.
+function mockPortalConnsWithHead(
+  connections: any[][],
+  head: { number: number; hash: string },
+  seenBodies?: any[],
+) {
+  let conn = 0;
+  return (async (url: string, init?: any) => {
+    if (url.endsWith('/finalized-head')) return { json: async () => head };
+    if (seenBodies && init?.body) seenBodies.push(JSON.parse(init.body));
+    if (conn >= connections.length)
+      return { status: 204, ok: false, body: null };
+    const lines = connections[conn++]!.map(
+      (b: any) => JSON.stringify(b) + '\n',
+    ).join('');
+    const body = new ReadableStream({
+      start(c) {
+        c.enqueue(new TextEncoder().encode(lines));
+        c.close();
+      },
+    });
+    return { status: 200, ok: true, body };
+  }) as any;
+}
+
+test('getPortalRealtimeEventGenerator: a finalize covering a block held for redelivery is EMITTED after the redelivered block, not dropped (review B2)', async () => {
+  // Block N discovers a child and is suppressed for redelivery. A finalize covering N arrives from the
+  // head poll WHILE awaiting — portalRealtimeEvents has already consumed it (window cleared, anchor
+  // advanced), so if the wire merely dropped it no later poll would re-emit it: at endBlock=N (here) or a
+  // halted chain ponder would never finalize N. The wire must stash it and emit it right after forwarding
+  // the redelivered N — ordering: block N, then finalize N.
+  process.env.PORTAL_REALTIME = 'stream';
+  const factory = eulerFactory();
+  const child = '0x4444444444444444444444444444444444444444';
+  const conn1 = [
+    {
+      // block 100 creates a child → its own same-block logs were filtered out; the wire suppresses it and
+      // awaits the redelivery. The finalize poll right after (head 100 = h100) is HELD, not forwarded.
+      header: { number: 100, hash: 'h100', parentHash: 'h99', timestamp: 1000 },
+      logs: [proxyLog(child, { blockNumber: 100 })],
+    },
+  ];
+  const conn2 = [
+    {
+      // the reopened connection (widened filter) re-delivers block 100 complete
+      header: { number: 100, hash: 'h100', parentHash: 'h99', timestamp: 1000 },
+      logs: [proxyLog(child, { blockNumber: 100 })],
+    },
+  ];
+  const events: any[] = [];
+  for await (const { event } of getPortalRealtimeEventGenerator({
+    common: { logger: { info() {}, debug() {}, warn() {}, trace() {} } } as any,
+    chain: { id: 1, name: 'mainnet', portal: 'http://portal' } as any,
+    rpc: {} as any,
+    eventCallbacks: [{ filter: logFilter({ address: factory as any }) } as any],
+    syncProgress: {
+      finalized: {
+        number: '0x63', // 99 — startup finalized
+        hash: 'h99',
+        parentHash: 'h98',
+        timestamp: '0x1',
+      } as any,
+      end: { number: '0x64' } as any, // endBlock 100: the finalize must still land before return
+    },
+    childAddresses: new Map<string, Map<Address, number>>([
+      ['euler-factory', new Map()],
+    ]),
+    // head 100 with its canonical hash → finalize(100) fires at the exact height (no B1 defer)
+    fetchImpl: mockPortalConnsWithHead([conn1, conn2], {
+      number: 100,
+      hash: 'h100',
+    }),
+    finalizePollMs: 0,
+  })) {
+    events.push(event);
+  }
+  // exactly one block-100 event (the redelivered, complete one) …
+  const blocks = events.filter((e) => e.type === 'block');
+  expect(blocks.length).toBe(1);
+  expect(hexToNumber(blocks[0].block.number)).toBe(100);
+  // … and the held finalize(100) IS emitted, AFTER the block (ordering: block N, then finalize N)
+  const finalize = events.find((e) => e.type === 'finalize');
+  expect(finalize).toBeDefined();
+  expect(hexToNumber(finalize.block.number)).toBe(100);
+  const blockIdx = events.findIndex((e) => e.type === 'block');
+  const finalizeIdx = events.findIndex((e) => e.type === 'finalize');
+  expect(finalizeIdx).toBeGreaterThan(blockIdx); // block N precedes finalize N
+});
+
+// ─────────────────────────────── redelivery watchdog env knob (delta review) ───────────────────────────────
+
+test('resolveRedeliveryTimeoutMs: precedence — param wins, then env, then default; garbage env fails loud (delta review)', () => {
+  // The 300_000ms (5 min) default is a deliberate availability/diagnosability trade; PORTAL_STREAM_REDELIVERY_
+  // TIMEOUT_MS makes it a conscious production knob. Pure over its args so no process.env mutation is needed.
+
+  // param (tests) wins over both env and default, even a valid env
+  expect(resolveRedeliveryTimeoutMs(50, '120000', 300_000)).toBe(50);
+  expect(resolveRedeliveryTimeoutMs(0, '120000', 300_000)).toBe(0); // explicit 0 is honored (test injection)
+
+  // env used when no param — a valid positive integer
+  expect(resolveRedeliveryTimeoutMs(undefined, '120000', 300_000)).toBe(
+    120_000,
+  );
+
+  // unset env → the default
+  expect(resolveRedeliveryTimeoutMs(undefined, undefined, 300_000)).toBe(
+    300_000,
+  );
+
+  // garbage / non-positive env → LOUD, not silently ignored (a silently-dropped knob is an operator trap)
+  for (const bad of ['abc', '12.5', '0', '-5', '', '  ', 'NaN', 'Infinity']) {
+    expect(() => resolveRedeliveryTimeoutMs(undefined, bad, 300_000)).toThrow(
+      /PORTAL_STREAM_REDELIVERY_TIMEOUT_MS must be a positive integer/i,
+    );
+  }
 });

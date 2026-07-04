@@ -130,7 +130,7 @@ async function readWithIdle<T>(
  * test mock with only `text()`), there is nothing to lock or cancel: race `res.text()` against the timer.
  * (PR #16 review)
  */
-async function readTextWithIdle(
+export async function readTextWithIdle(
   res: { text(): Promise<string>; body?: ReadableStream<Uint8Array> | null },
   idleMs: number,
 ): Promise<string> {
@@ -192,6 +192,52 @@ const colToFieldKey = (col: string, table: string): string => {
     col.replace(/_([a-z0-9])/g, (_, c: string) => c.toUpperCase());
   return `${key}.${field}`;
 };
+
+/**
+ * Parse a Portal 400 body for a "dataset can't serve this field" error and map it to a
+ * `PortalSchemaFieldError` (the field key + table so the caller can drop it and retry). Two shapes:
+ *   • "column '<col>' is not found in '<table>'" — the parquet column is absent (e.g. Monad has no
+ *     accessList);
+ *   • "unknown field `<field>`" — the schema doesn't know the field at all (a query PARSE error); the
+ *     table is recovered from the request `body`'s fields block.
+ * Returns undefined for any other 400 (not a droppable-field problem). SHARED by the historical fetch
+ * loop and the realtime `/stream` so the two degrade identically. `body` is the JSON request string
+ * (only read for the "unknown field" table lookup). (review B3)
+ */
+export function parseSchemaFieldError(
+  status: number,
+  text: string,
+  body: string,
+): PortalSchemaFieldError | undefined {
+  if (status !== 400) return undefined;
+  // a dataset that lacks a requested column (e.g. Monad has no accessList) → the whole request 400s.
+  const m = text.match(/column '([a-z0-9_]+)' is not found in '([a-z_]+)'/i);
+  if (m)
+    return new PortalSchemaFieldError(
+      colToFieldKey(m[1]!, m[2]!),
+      TABLE_TO_KEY[m[2]!] ?? m[2]!,
+      m[1]!,
+    );
+  // OTHER schema shape: a dataset whose schema doesn't know the field → query PARSE error.
+  const u = text.match(/unknown field `([a-zA-Z0-9_]+)`/);
+  if (u?.[1]) {
+    const fn = u[1];
+    let table = 'transaction';
+    try {
+      const q = JSON.parse(body);
+      for (const t of ['transaction', 'block', 'log', 'trace'])
+        if (q?.fields?.[t] && q.fields[t][fn] !== undefined) {
+          table = t;
+          break;
+        }
+    } catch {
+      /* default transaction */
+    }
+    return new PortalSchemaFieldError(`${table}.${fn}`, table, fn);
+  }
+
+  return undefined;
+}
 
 const stripFields = (q: PortalQuery, dropped: Set<string>): PortalQuery => {
   if (dropped.size === 0 || !q.fields) return q;
@@ -425,34 +471,9 @@ export function createPortalClient(deps: PortalClientDeps): PortalClient {
         // with what we have (never abort, per issue #14) so the typed error still throws PROMPTLY. Only
         // the message-extraction below needs the body, so a truncated/empty body is acceptable. (PR #16 review)
         const text = (await readTextWithIdle(res, idleTimeoutMs)).slice(0, 300);
-        // a dataset that lacks a requested column (e.g. Monad has no accessList) → the whole request 400s.
-        const m =
-          res.status === 400 &&
-          text.match(/column '([a-z0-9_]+)' is not found in '([a-z_]+)'/i);
-        if (m)
-          throw new PortalSchemaFieldError(
-            colToFieldKey(m[1]!, m[2]!),
-            TABLE_TO_KEY[m[2]!] ?? m[2]!,
-            m[1]!,
-          );
-        // OTHER schema shape: a dataset whose schema doesn't know the field → query PARSE error.
-        const u =
-          res.status === 400 && text.match(/unknown field `([a-zA-Z0-9_]+)`/);
-        if (u && u[1]) {
-          const fn = u[1];
-          let table = 'transaction';
-          try {
-            const q = JSON.parse(body);
-            for (const t of ['transaction', 'block', 'log', 'trace'])
-              if (q?.fields?.[t] && q.fields[t][fn] !== undefined) {
-                table = t;
-                break;
-              }
-          } catch {
-            /* default transaction */
-          }
-          throw new PortalSchemaFieldError(`${table}.${fn}`, table, fn);
-        }
+        // a dataset that can't serve a requested field (absent column / unknown field) → drop + retry.
+        const schemaErr = parseSchemaFieldError(res.status, text, body);
+        if (schemaErr) throw schemaErr;
         // a dataset that doesn't begin at genesis (e.g. TAC starts at block 1) 400s when queried below its first block.
         const s =
           res.status === 400 &&
