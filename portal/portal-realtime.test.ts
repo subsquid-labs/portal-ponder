@@ -1,6 +1,6 @@
 import { getEventListeners } from 'node:events';
 import { afterEach, expect, test, vi } from 'vitest';
-import { TX_FIELDS } from './portal-filters.js';
+import { BLOCK_FIELDS, TX_FIELDS } from './portal-filters.js';
 import {
   diagDump,
   type Light,
@@ -1346,6 +1346,73 @@ test('streamHotBlocks: a DROPPABLE tx-field 400 (dataset lacks access_list) degr
   expect(bodies[0].fields.transaction.accessList).toBe(true);
   expect(bodies[1].fields.transaction.accessList).toBeUndefined();
   expect(bodies[1].fields.transaction.hash).toBe(true); // only the droppable field was removed
+  await gen.return(undefined);
+  ac.abort();
+});
+
+test('streamHotBlocks: a DROPPABLE BLOCK-field 400 (dataset lacks mix_hash) degrades too — B3 covered only transaction.*, leaving every droppable block field a fatal (wave 4)', async () => {
+  // The wire always projects BLOCK_FIELDS, which includes five DROPPABLE nullable block columns
+  // (mixHash, nonce, sha3Uncles, totalDifficulty, baseFeePerGas). The historical client degrades ANY of
+  // them via stripFields, so a dataset without e.g. mix_hash backfills fine — but the B3 degradation
+  // here required tableKey === 'transaction', so the SAME dataset fataled the moment stream realtime
+  // started, on every restart. DROPPABLE_FIELDS itself is the whitelist; the table restriction is gone.
+  const textBody = (s: string) =>
+    new ReadableStream({
+      start(c) {
+        c.enqueue(new TextEncoder().encode(s));
+        c.close();
+      },
+    });
+  const bodies: any[] = [];
+  let conn = 0;
+  const fetchImpl = (async (_url: string, init: any) => {
+    bodies.push(JSON.parse(init.body));
+    conn += 1;
+    if (conn === 1)
+      // first request (with mixHash) 400s exactly the way the Portal reports a missing parquet column
+      return {
+        status: 400,
+        ok: false,
+        body: textBody("column 'mix_hash' is not found in 'blocks'"),
+      };
+    if (conn === 2)
+      // retry (mixHash dropped) succeeds and streams a block
+      return {
+        status: 200,
+        ok: true,
+        body: textBody(
+          `${JSON.stringify({
+            header: {
+              number: 100,
+              hash: 'h100',
+              parentHash: 'h99',
+              timestamp: 1,
+            },
+            logs: [],
+            transactions: [],
+          })}\n`,
+        ),
+      };
+    return { status: 204, ok: false, body: null };
+  }) as any;
+
+  const ac = new AbortController();
+  const gen = streamHotBlocks({
+    portalUrl: 'http://portal',
+    headers: {},
+    fromBlock: 100,
+    logs: [{ address: ['0xf'], topic0: ['0xt'] }],
+    blockFields: BLOCK_FIELDS,
+    fetchImpl,
+    signal: ac.signal,
+  });
+  const first = await gen.next(); // NOT a throw — the field is dropped and the retry delivers block 100
+  expect(first.value?.header.number).toBe(100);
+  // the first request carried mixHash; the retry DROPPED it (kept the required block fields)
+  expect(bodies[0].fields.block.mixHash).toBe(true);
+  expect(bodies[1].fields.block.mixHash).toBeUndefined();
+  expect(bodies[1].fields.block.number).toBe(true); // the linkage-required fields stay
+  expect(bodies[1].fields.block.parentHash).toBe(true);
   await gen.return(undefined);
   ac.abort();
 });

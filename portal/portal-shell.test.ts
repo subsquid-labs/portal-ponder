@@ -449,19 +449,17 @@ test('INV-9: an unknown head (probe persistently failing) delegates to RPC', asy
   }
 }, 20_000); // the head probe retries with real backoff before giving up
 
-test('INV-9: stream-realtime mode suppresses the RPC fallback (empty, NOT delegated) — known head past the interval', async () => {
+test('INV-9: stream-realtime mode with a KNOWN head below the interval is FATAL, not empty — a stale-LOW probe must not mark the range synced (wave 4)', async () => {
+  // This used to debug + return [] as "realtime /stream covers it". But clampFinalizedToPortalHead bounds
+  // every historical interval at the boundary head and realtime streams only ABOVE that boundary — so an
+  // interval "past the head" here means OUR probe is stale-LOW (a lagging replica), and [] marked the
+  // interval synced while NO path ever delivers its data: the exact G4/C11 silent gap. Fatal now, like
+  // the unknown-head case; still never delegated to RPC.
   delete process.env.PORTAL_FINALIZED_HEAD;
   process.env.PORTAL_REALTIME = 'stream';
   const srv = headServer(() => 100);
   const port = await listen(srv);
   try {
-    const debugs: string[] = [];
-    const logger = {
-      ...stubLogger(),
-      debug(x: any) {
-        debugs.push(x?.msg ?? '');
-      },
-    };
     let rpcTouched = false;
     const rpc: any = {
       request: async () => {
@@ -470,42 +468,73 @@ test('INV-9: stream-realtime mode suppresses the RPC fallback (empty, NOT delega
       },
     };
     const filter = mkFilter({ fromBlock: 150, toBlock: 200 });
-    const sync = createPortalHistoricalSync({
-      common: { logger } as any,
-      chain: {
-        id: 1,
-        name: 'mainnet',
-        portal: `http://localhost:${port}`,
-        finalityBlockCount: 10,
-      } as any,
-      rpc,
-      childAddresses: new Map(),
-      eventCallbacks: [{ filter }],
-    } as any);
+    const sync = mkSync(port, filter, { rpc });
     const interval: [number, number] = [150, 200]; // past head 100
 
+    await expect(
+      sync.syncBlockRangeData({
+        interval,
+        requiredIntervals: [{ interval, filter }],
+        requiredFactoryIntervals: [],
+        syncStore: mkSyncStore(),
+      }),
+    ).rejects.toThrow(/stale-LOW/);
+    expect(rpcTouched).toBe(false); // fatal, NOT delegated to RPC (suppressed in stream mode)
+  } finally {
+    srv.close();
+  }
+});
+
+test('INV-9: the cached Portal head is MONOTONIC — a stale-LOW later probe cannot unserve an interval at/below the highest observed head (wave 4)', async () => {
+  // Load-balanced Portal replicas answer probes independently, so a later probe can return a LOWER head.
+  // Adopting it regressed the cache; in stream mode an interval at/below the true head then read as
+  // "past the head" — under the old code that returned [] (marked synced, silent gap), and under the
+  // wave-4 contract it would fatal spuriously. With the max-keep, the interval is served normally.
+  delete process.env.PORTAL_FINALIZED_HEAD;
+  process.env.PORTAL_REALTIME = 'stream';
+  let probes = 0;
+  const srv = headServer(() => {
+    probes += 1;
+    return probes === 1 ? 200 : 150; // first replica answers 200; every later probe is stale-LOW
+  });
+  const port = await listen(srv);
+  try {
+    const filter = mkFilter({ fromBlock: 0, toBlock: 300 });
+    const sync = mkSync(port, filter, {});
+
+    // Call A seeds the head cache at 200 (first probe).
+    const iA: [number, number] = [190, 200];
+    await sync.syncBlockRangeData({
+      interval: iA,
+      requiredIntervals: [{ interval: iA, filter }],
+      requiredFactoryIntervals: [],
+      syncStore: mkSyncStore(),
+    });
+    expect(probes).toBeGreaterThan(0);
+
+    // Call B targets past the cache → triggers re-probes, which now answer a stale-LOW 150. The head
+    // must NOT regress; [201,210] is genuinely past the highest observed head → fatal (stream mode).
+    const iB: [number, number] = [201, 210];
+    await expect(
+      sync.syncBlockRangeData({
+        interval: iB,
+        requiredIntervals: [{ interval: iB, filter }],
+        requiredFactoryIntervals: [],
+        syncStore: mkSyncStore(),
+      }),
+    ).rejects.toThrow(/stale-LOW|past the probed finalized head/);
+
+    // Call C sits at/below the highest observed head (200). Under the regression (portalHead = 150 after
+    // B's probes) this would read as past-the-head and fatal; with the monotonic cache it serves (204 →
+    // no logs, no throw).
+    const iC: [number, number] = [160, 200];
     const logs = await sync.syncBlockRangeData({
-      interval,
-      requiredIntervals: [{ interval, filter }],
+      interval: iC,
+      requiredIntervals: [{ interval: iC, filter }],
       requiredFactoryIntervals: [],
       syncStore: mkSyncStore(),
     });
     expect(logs).toEqual([]);
-    // known head past the interval → the by-design case: log at debug, serve nothing (realtime covers it)
-    expect(debugs.some((m) => m.includes('realtime /stream covers it'))).toBe(
-      true,
-    );
-    expect(rpcTouched).toBe(false); // never delegated
-
-    // NOT delegated: syncBlockData is a portal-side no-op, not an RPC-sync call
-    const out = await sync.syncBlockData({
-      interval,
-      requiredIntervals: [{ interval, filter }],
-      logs: [],
-      syncStore: mkSyncStore(),
-    } as any);
-    expect(out).toBeUndefined();
-    expect(rpcTouched).toBe(false);
   } finally {
     srv.close();
   }

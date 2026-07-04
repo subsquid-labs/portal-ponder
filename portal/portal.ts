@@ -180,8 +180,15 @@ export const createPortalHistoricalSync = (
       portalHead = cfg.finalizedHead;
       return portalHead;
     }
+    // MONOTONIC cache: the Portal's finalized head only advances upstream, but load-balanced replicas
+    // answer probes independently, so a LATER probe can return a LOWER number. Adopting it regressed the
+    // cached head; in stream mode that reopened the G4/C11 silent gap (an interval at/below the true head
+    // read as "past the head"). Every observation is ≤ the true head, so keeping the max stays
+    // finality-safe. (wave 4 review)
     const h = await client.finalizedHeadRetry(3); // retry lives in the client (injectable sleep)
-    if (h !== undefined) portalHead = h;
+    if (h !== undefined) {
+      portalHead = portalHead === undefined ? h : Math.max(portalHead, h);
+    }
 
     return portalHead; // may be a kept-prior value, or undefined if never probed successfully
   };
@@ -197,8 +204,11 @@ export const createPortalHistoricalSync = (
         // PORTAL_FINALIZED_HEAD pin — the pin is authoritative for the finality/delegation decision, and
         // clobbering it here (which happened whenever the pin was set but PORTAL_CHUNK_FIXED was not) let
         // intervals above the pin but below the live head be served instead of delegated. Only adopt the
-        // probe as the head when there is no pin; scaling may still use the live `h`.
-        if (cfg.finalizedHead === undefined) portalHead = h;
+        // probe as the head when there is no pin; scaling may still use the live `h`. Monotonic, same as
+        // refreshPortalHead: a stale-LOW replica answer must not regress the cache. (wave 4 review)
+        if (cfg.finalizedHead === undefined) {
+          portalHead = portalHead === undefined ? h : Math.max(portalHead, h);
+        }
         chunkBlocks = scaleChunkBlocks(cfg.chunkBlocks, h);
         log.debug({
           service: 'portal',
@@ -464,22 +474,27 @@ export const createPortalHistoricalSync = (
           isFinalityGap(interval[1], portalHead)
         ) {
           if (STREAM_REALTIME) {
-            // Stream mode does NOT delegate to RPC — the Portal `/stream` covers (portal-head → tip]. But
-            // head UNKNOWN (probe persistently failing) means we can't locate the historical↔realtime
-            // boundary: returning [] would mark this interval synced with NO data while realtime streams
-            // only ABOVE the head we can't find — a permanent silent gap. Fail loud. A KNOWN head with the
-            // interval past it is by design (clampFinalizedToPortalHead keeps historical at/under the head,
-            // realtime /stream serves the remainder). (finding 6 / C11 / INV-9)
+            // Stream mode does NOT delegate to RPC — the Portal `/stream` covers (portal-head → tip]. Head
+            // UNKNOWN (probe persistently failing) means we can't locate the historical↔realtime boundary:
+            // returning [] would mark this interval synced with NO data while realtime streams only ABOVE
+            // the head we can't find — a permanent silent gap. Fail loud. (finding 6 / C11 / INV-9)
             if (portalHead === undefined)
               throw new Error(
                 `Portal ${chain.name}: /finalized-head probe failed in stream mode (PORTAL_REALTIME=stream) — cannot establish the historical/realtime boundary for [${interval[0]},${interval[1]}]. Refusing to mark the range synced with no data. Check Portal connectivity for ${portalUrl}.`,
               );
 
-            log.debug({
-              service: 'portal',
-              msg: `Portal ${chain.name} [${interval[0]},${interval[1]}] past finalized head ${portalHead} in stream mode → realtime /stream covers it`,
-            });
-            return [];
+            // A KNOWN head below the interval is ALSO fatal in stream mode (wave 4 review; this used to
+            // debug + return [] as "realtime /stream covers it"). It never legitimately fires:
+            // clampFinalizedToPortalHead bounds every historical interval at the boundary head, and
+            // realtime streams only ABOVE that boundary — so an interval "past the head" here means OUR
+            // probe is stale-LOW relative to the boundary's (replica lag), and returning [] would mark
+            // the interval synced while NO path ever delivers its data: the exact G4/C11 silent gap. The
+            // head cache is monotonic and was just re-probed (retry ×3, twice), so reaching this line
+            // means the lag persisted through all retries — the same "boundary cannot be located"
+            // condition as an unknown head. Fail loud; a restart re-probes cleanly.
+            throw new Error(
+              `Portal ${chain.name}: interval [${interval[0]},${interval[1]}] ends past the probed finalized head ${portalHead} in stream mode (PORTAL_REALTIME=stream). Historical intervals are bounded at the finality boundary, so this head is stale-LOW (a lagging Portal replica). Refusing to mark the range synced with no data — realtime streams only above the boundary. Check ${portalUrl} replica consistency, or pin PORTAL_FINALIZED_HEAD.`,
+            );
           }
           delegated.add(ikey(interval));
           stats.rpcFallback++;

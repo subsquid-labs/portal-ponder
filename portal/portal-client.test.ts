@@ -212,6 +212,46 @@ test('field degradation: a NEEDED field (logsBloom) missing is recorded in neede
   expect([...neededMissing]).toEqual(['transaction.logsBloom (logs_bloom)']);
 });
 
+test('field degradation: the SAME column missing in TWO tables drops each independently (bound keyed per-FIELD, not per-column — wave 4)', async () => {
+  // A dataset lacking logs_bloom in BOTH blocks and transactions (the Monad-style shape FIX 3 exists
+  // for; every query projects block.logsBloom, and the tx query always projects RECEIPT_FIELDS'
+  // logsBloom). The "dropping didn't help → real error" bound used to key on the BARE column name, so
+  // the second table's 400 hit the bound and threw a fatal PortalSchemaFieldError → the chunk rejected,
+  // was G1-evicted, refetched, and failed identically: a deterministic crash-loop. Keying per
+  // table-qualified field drops each table's column independently while keeping the bound for a field
+  // whose OWN drop didn't fix its own 400.
+  const bodies: any[] = [];
+  const client = mk({
+    fetchImpl: (async (_u: string, init: any) => {
+      const q = JSON.parse(init.body);
+      bodies.push(q);
+      if (q.fields?.block?.logsBloom !== undefined)
+        return badRes("column 'logs_bloom' is not found in 'blocks'");
+      if (q.fields?.transaction?.logsBloom !== undefined)
+        return badRes("column 'logs_bloom' is not found in 'transactions'");
+      return ndjsonRes([{ header: { number: 10 } }]);
+    }) as any,
+  });
+  const neededMissing = new Set<string>();
+  const q: PortalQuery = {
+    type: 'evm',
+    fields: {
+      block: { logsBloom: true, number: true },
+      transaction: { logsBloom: true, hash: true },
+    },
+  };
+  const out = await collect(client.stream(q, 0, 10, { neededMissing })); // no throw — the old code threw here
+  expect(out).toHaveLength(1);
+  const last = bodies[bodies.length - 1];
+  expect(last.fields.block.logsBloom).toBeUndefined(); // first drop
+  expect(last.fields.transaction.logsBloom).toBeUndefined(); // second drop (used to be the fatal)
+  expect(last.fields.block.number).toBe(true); // other fields kept (locality)
+  expect(last.fields.transaction.hash).toBe(true);
+  // both are NEEDED (non-droppable) fields → each recorded for the FIX-3 seam to judge, not silent
+  expect(neededMissing.has('block.logsBloom (logs_bloom)')).toBe(true);
+  expect(neededMissing.has('transaction.logsBloom (logs_bloom)')).toBe(true);
+});
+
 test('dataset-start 400 clamps the cursor forward, not a crash', async () => {
   let clampedFrom = -1;
   const client = mk({

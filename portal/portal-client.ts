@@ -312,6 +312,74 @@ export type PortalClientDeps = {
 const FINALIZED_HEAD_TIMEOUT_MS = 10_000;
 
 /**
+ * GET `/finalized-head`, bounded — the SINGLE probe implementation, shared by the historical client's
+ * `finalizedHead()` and the realtime wire's `portalFinalizedHead()`. The wire used to carry its own bare
+ * `fetch(...).then(r => r.json())` with no timeout, abort, or body bound — a hung probe silently froze
+ * finalize emission (and startup, via clampFinalizedToPortalHead) while THIS hardened twin sat unused.
+ * (wave 4 review; the hardening itself is issue #14 / PR #16)
+ *
+ * Two-phase bound, same shape as fetchBatch and for the same reason (issue #14): `AbortSignal.timeout`
+ * would stay live while we read the body, and portal.ts sends `accept-encoding: gzip` globally, so a live
+ * abort landing on an in-flight gzip body is the exact process-kill shape. So:
+ *   (a) CONNECT/headers phase — a genuine AbortController.abort(), disarmed the instant headers arrive.
+ *   (b) BODY phase — we OWN the read: acquire the body reader and accumulate the text under a SOFT idle
+ *       deadline (`readTextWithIdle`), then `JSON.parse` (json() ≡ text+parse, so identical on the happy
+ *       path). On a stall we `reader.cancel()` — LEGAL because we hold the lock, unlike a `body.cancel()`
+ *       on a body already locked by `r.json()`, which the Web Streams spec REJECTS, leaking the socket —
+ *       and fall through to `undefined`. Never abort() (graceful teardown).
+ * Every failure collapses to `undefined`, so callers stay conservative. Returns the canonical hash too
+ * when the endpoint carries one — it arms the realtime wrong-fork finalize guard (INV-10).
+ */
+export async function probeFinalizedHead(args: {
+  portalUrl: string;
+  headers: Record<string, string>;
+  fetchImpl?: typeof fetch;
+  timeoutMs?: number;
+}): Promise<{ number: number; hash?: string } | undefined> {
+  const fetchImpl = args.fetchImpl ?? fetch;
+  const timeoutMs = args.timeoutMs ?? FINALIZED_HEAD_TIMEOUT_MS;
+  const controller = new AbortController();
+  let connectTimer: ReturnType<typeof setTimeout> | undefined = setTimeout(
+    () => controller.abort(),
+    timeoutMs,
+  );
+  connectTimer.unref?.();
+  const disarm = () => {
+    if (connectTimer !== undefined) {
+      clearTimeout(connectTimer);
+      connectTimer = undefined;
+    }
+  };
+  try {
+    const r = await fetchImpl(`${args.portalUrl}/finalized-head`, {
+      headers: args.headers,
+      signal: controller.signal,
+    });
+    disarm(); // headers arrived — never abort() once the body is streaming (issue #14)
+
+    // Own-read the body text under the soft deadline, then parse (json() ≡ text+parse). A simple mock or
+    // an empty body (no `.body`) falls through readTextWithIdle to `r.text()`; if it exposes neither, use
+    // `r.json()` directly. A stall yields '' → JSON.parse throws → caught → undefined.
+    const h =
+      r.body || typeof r.text === 'function'
+        ? JSON.parse(await readTextWithIdle(r, timeoutMs))
+        : await r.json();
+    if (typeof h?.number === 'number') {
+      return {
+        number: h.number,
+        hash: typeof h?.hash === 'string' ? h.hash : undefined,
+      };
+    }
+  } catch {
+    /* head unknown (connect timed out, fetch failed, or bad JSON) → caller stays conservative */
+  } finally {
+    disarm();
+  }
+
+  return undefined;
+}
+
+/**
  * Parse a `Retry-After` header into a POSITIVE back-off in ms, or `undefined` when the header carries no
  * usable positive advice. RFC-7231 allows two forms and a Portal gateway can send either: delta-seconds
  * (`"120"`) and an HTTP-date (`"Wed, 21 Oct 2025 07:28:00 GMT"` → the remaining delay via `Date.parse`).
@@ -570,8 +638,15 @@ export function createPortalClient(deps: PortalClientDeps): PortalClient {
             throw err; // start ≤ cursor yet still 400 ⇒ not a below-start issue; surface it
           }
           if (err instanceof PortalSchemaFieldError) {
-            if (triedCols.has(err.tag)) throw err; // dropping its field didn't help → real error
-            triedCols.add(err.tag);
+            // Keyed by fieldKey (table-qualified), NOT err.tag: the tag is the BARE column name, and two
+            // tables can miss the SAME column (logs_bloom in blocks AND transactions, gas_used, nonce…).
+            // Keying by tag made the second table's 400 read as "dropping didn't help" → a fatal throw →
+            // G1 eviction → refetch → identical failure: a deterministic crash-loop on a dataset the
+            // degradation exists to serve. Per-field keying drops each table's column independently; a
+            // RE-thrown fieldKey still means its own drop didn't fix its own 400 — the real-error bound
+            // is preserved. (wave 4 review, F1)
+            if (triedCols.has(err.fieldKey)) throw err; // dropping THIS field didn't help → real error
+            triedCols.add(err.fieldKey);
             dropped.add(err.fieldKey); // drop for THIS chunk's retries only (chunks that have it keep it)
             if (!DROPPABLE_FIELDS.has(err.fieldKey))
               neededMissing?.add(`${err.fieldKey} (${err.tag})`);
@@ -606,52 +681,17 @@ export function createPortalClient(deps: PortalClientDeps): PortalClient {
     }
   }
 
+  // The bounded probe lives in the shared `probeFinalizedHead` (also the realtime wire's implementation —
+  // one probe, hardened once). This method keeps the client's number-only surface.
   const finalizedHead = async (): Promise<number | undefined> => {
-    // Bound the probe so a hung /finalized-head can't stall the finality-gap decision — in the SAME two
-    // phases as fetchBatch, and for the SAME reason (issue #14): `AbortSignal.timeout` would stay live
-    // while we read the body, and portal.ts sends `accept-encoding: gzip` globally, so a live abort landing
-    // on an in-flight gzip body is the exact process-kill shape. So:
-    //   (a) CONNECT/headers phase — a genuine AbortController.abort(), disarmed the instant headers arrive.
-    //   (b) BODY phase — we OWN the read: acquire the body reader and accumulate the text under a SOFT idle
-    //       deadline (`readTextWithIdle`), then `JSON.parse` (json() ≡ text+parse, so identical on the
-    //       happy path). On a stall we `reader.cancel()` — LEGAL because we hold the lock, unlike a
-    //       `body.cancel()` on a body already locked by `r.json()`, which the Web Streams spec REJECTS,
-    //       leaking the socket — and fall through to `undefined`. Never abort() (graceful teardown).
-    // Every failure collapses to `undefined`, so the caller stays conservative. (PR #16 review)
-    const controller = new AbortController();
-    let connectTimer: ReturnType<typeof setTimeout> | undefined = setTimeout(
-      () => controller.abort(),
-      finalizedHeadTimeoutMs,
-    );
-    connectTimer.unref?.();
-    const disarm = () => {
-      if (connectTimer !== undefined) {
-        clearTimeout(connectTimer);
-        connectTimer = undefined;
-      }
-    };
-    try {
-      const r = await fetchImpl(`${portalUrl}/finalized-head`, {
-        headers,
-        signal: controller.signal,
-      });
-      disarm(); // headers arrived — never abort() once the body is streaming (issue #14)
+    const h = await probeFinalizedHead({
+      portalUrl,
+      headers,
+      fetchImpl,
+      timeoutMs: finalizedHeadTimeoutMs,
+    });
 
-      // Own-read the body text under the soft deadline, then parse (json() ≡ text+parse). A simple mock or
-      // an empty body (no `.body`) falls through readTextWithIdle to `r.text()`; if it exposes neither, use
-      // `r.json()` directly. A stall yields '' → JSON.parse throws → caught → undefined.
-      const h =
-        r.body || typeof r.text === 'function'
-          ? JSON.parse(await readTextWithIdle(r, finalizedHeadTimeoutMs))
-          : await r.json();
-      if (typeof h?.number === 'number') return h.number;
-    } catch {
-      /* head unknown (connect timed out, fetch failed, or bad JSON) → caller stays conservative */
-    } finally {
-      disarm();
-    }
-
-    return undefined;
+    return h?.number;
   };
 
   // The head probe is cheap and load-bearing for the finality-gap decision, so callers retry it.

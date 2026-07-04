@@ -25,6 +25,7 @@ import type {
 import {
   isAddressFactory,
   isAddressMatched,
+  isLogFilterMatched,
   isTraceFilterMatched,
   isTransactionFilterMatched,
   isTransferFilterMatched,
@@ -105,6 +106,7 @@ export function rankTraces(traces: RawTrace[]): RankedTrace[] {
 }
 
 type Matchers = {
+  logMatched: (log: SyncLog, bn: number) => boolean;
   traceMatched: (frame: CallFrame, bn: number) => boolean;
   txFilterMatched: (tx: SyncTransaction, bn: number) => boolean;
 };
@@ -125,6 +127,19 @@ const buildMatchers = (
       childAddresses: childAddresses.get((filterAddr as { id: string }).id)!,
     });
   return {
+    // Log re-match (wave 4 review): the Portal's server-side log filter is the MERGED request set with no
+    // per-filter fromBlock/toBlock and no per-child creation floor, so it legitimately returns (a) a
+    // factory child's logs from BEFORE the child's creation block and (b) a bounded filter's logs outside
+    // its own range when another filter's chunk fetched them. Upstream's RPC path re-matches every log
+    // (isLogFilterMatched + isAddressMatched) before insertion; skipping that here stored/returned rows
+    // the RPC path excludes — an INV-6 store divergence. buildEvents re-filters, so no wrong events fired,
+    // but the sync store must be byte-identical across both paths.
+    logMatched: (log, bn) =>
+      spec.logFilters.some(
+        (f) =>
+          isLogFilterMatched({ filter: f, log }) &&
+          factoryAddrOk(f.address, log.address, bn),
+      ),
     traceMatched: (frame, bn) => {
       const blk = { number: BigInt(bn) } as never;
       for (const f of spec.transferFilters)
@@ -260,20 +275,34 @@ export function assembleRange(
   // INV-2 is enforced BY CONSTRUCTION here: every emitting branch below sits behind the single
   // `inRange` predicate (there is deliberately no redundant per-row assert — it could never fire),
   // and the exactness property is proven against a brute-force model in portal-assemble.test.ts.
+  // Each log is re-matched against the ACTUAL log filters (see logMatched above); a dropped log's
+  // parent tx/block must not ride in either, so txs are keyed to the KEPT logs' transactionHash.
   for (const cd of chunks)
     for (const [bn, hdr] of cd.headers) {
       if (!inRange(bn)) continue;
-      const logs = cd.logs.get(bn) ?? [];
-      if (logs.length) {
-        blocksByNumber.set(bn, toSyncBlockHeader(hdr));
-        for (const raw of logs) syncLogs.push(toSyncLog(raw, hdr));
-        for (const tx of cd.txs.get(bn) ?? [])
-          if (tx.hash && !seenTx.has(tx.hash)) {
-            seenTx.add(tx.hash);
-            syncTxs.push(toSyncTransaction(tx, hdr));
-            if (spec.needReceipts) pushReceipt(tx, hdr);
-          }
+
+      const rawLogs = cd.logs.get(bn) ?? [];
+      if (rawLogs.length === 0) continue;
+
+      const keptTxHashes = new Set<string>();
+      let keptAny = false;
+      for (const raw of rawLogs) {
+        const log = toSyncLog(raw, hdr);
+        if (!matchers.logMatched(log, bn)) continue;
+
+        keptAny = true;
+        syncLogs.push(log);
+        if (raw.transactionHash) keptTxHashes.add(raw.transactionHash);
       }
+      if (!keptAny) continue;
+
+      blocksByNumber.set(bn, toSyncBlockHeader(hdr));
+      for (const tx of cd.txs.get(bn) ?? [])
+        if (tx.hash && keptTxHashes.has(tx.hash) && !seenTx.has(tx.hash)) {
+          seenTx.add(tx.hash);
+          syncTxs.push(toSyncTransaction(tx, hdr));
+          if (spec.needReceipts) pushReceipt(tx, hdr);
+        }
     }
 
   // block-interval sources: ensure each matched block is in the blocks table (cd.blockHeaders already
