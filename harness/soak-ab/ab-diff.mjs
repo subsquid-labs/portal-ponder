@@ -608,31 +608,47 @@ export function readStagnationThreshold(raw) {
 //
 // The fix is ONE per-chain state shape, written EVERY run, regime derived from the CURRENT observation
 // only, prior evidence used REGARDLESS of the prior run's regime:
-//   { tsA, tsB, skew, emptySince: { side, atMs } | null, wedgeFailedSince: ms | null }
+//   { tsA, tsB, skew, emptySinceA: { atMs } | null, emptySinceB: { atMs } | null,
+//     wedgeFailedSince: ms | null, wedgeStaleSide: 'A' | 'B' | null, wedgeReason: string | null }
 //   • tsA / tsB — each leg's LAST-KNOWN newest-row ts (null only if that leg has NEVER had a row). When
 //     a leg is EMPTY this run, its ts is CARRIED FORWARD from prior evidence (D1 carry-forward rule) so
 //     a shape flip never drops what we knew — the advancement check still has a baseline to compare.
 //   • skew — |tsA − tsB| when both are known this run, else null (unmeasurable with an empty leg).
-//   • emptySince — { side, atMs } when exactly one leg is empty this run and has been since `atMs`
-//     (armed on the first empty observation, preserved while it stays empty), else null.
+//   • emptySinceA / emptySinceB — PER-LEG (review delta 4, F5): { atMs } for a leg that is empty this
+//     run and has been since `atMs` (armed on the FIRST empty observation for THAT leg, preserved while
+//     it stays empty, cleared when it is observed populated). Per-leg so a flip on the OTHER side never
+//     resets this leg's timer — alternating-empty-sides can no longer re-arm forever.
 //   • wedgeFailedSince — the wall-clock ms of the FIRST fail in the current unrecovered wedge episode,
 //     or null when not wedged. STICKY (D2): once set it persists across every regime/shape until a
 //     GENUINE RECOVERY clears it.
+//   • wedgeStaleSide — the leg identified as stalled at the FIRST fail of the current wedge episode,
+//     carried forward UNCHANGED while the wedge is live (review delta 4, F1/N1). Recovery/attribution
+//     read THIS carried side, never a per-run recomputed olderSide — so a wiped-while-ahead leg cannot
+//     flip the recovery check onto the wrong leg.
+//   • wedgeReason — the TRUE first-fail reason of the current wedge episode ('frozen', 'skew-growing',
+//     'one-sided-empty'), written ONCE at the first fail and carried forward (review delta 4, N2). The
+//     sticky 'wedge-unrecovered' returns render `originalReason` from this carried field, so the alert
+//     reads the wedge it actually WAS — not a reason re-derived from the current shape.
 // INVARIANT (D1): NO branch may discard evidence fields it does not itself use. Every return builds
-// `nextState` from the carried-forward tsA/tsB/emptySince/wedgeFailedSince, so a shape or regime
-// transition PRESERVES everything. A field is null ONLY where genuinely unobservable, never because a
-// branch "didn't need it".
+// `nextState` from the carried-forward fields, so a shape or regime transition PRESERVES everything. A
+// field is null ONLY where genuinely unobservable, never because a branch "didn't need it".
 //
-// ── STICKY WEDGE FAIL (ruling D2) ────────────────────────────────────────────────────────────────────
+// ── STICKY WEDGE FAIL (ruling D2 + review delta 4 restructure) ───────────────────────────────────────
 //
-// Once the guard FAILs for ANY wedge reason (one-sided-empty, frozen, skew-growing), `wedgeFailedSince`
-// is set and EVERY subsequent run REMAINS FAIL — reason 'wedge-unrecovered' carrying the original reason
-// — until a GENUINE RECOVERY: skew ≤ threshold this run, OR the previously-stale/empty leg STRICTLY
-// ADVANCED vs its last-known ts AND the skew did NOT grow. Recovery clears `wedgeFailedSince`. This is
-// what kills the oscillation: the empty↔stale-row flip never advances the stuck leg past its last-known
-// ts, so it never recovers — it stays FAIL at r3/r4/r5, exactly as intended. Both legs freezing AFTER a
-// wedge FAIL is likewise no recovery (neither advanced) → stays FAIL. A reappearing leg that genuinely
-// starts advancing with shrinking skew recovers → 'catching-up'.
+// The FIRST branch of the decision is the sticky-wedge gate: if `prev.wedgeFailedSince` is set there are
+// EXACTLY TWO exits, and every shape-handling branch (empty-arming, both-empty, fresh over-threshold)
+// runs ONLY AFTER it — so NO future branch can bypass stickiness by construction (this kills the whole
+// class of round-1..4 findings where some shape branch laundered a live wedge).
+//   (a) GENUINE RECOVERY — provable ONLY with FINITE current evidence: BOTH legs populated this run AND
+//       (skew ≤ threshold, OR the CARRIED wedge-stale leg strictly advanced vs its last-known ts AND the
+//       skew did not grow). Clears the wedge → 'catching-up' / 'both-populated-in-skew'.
+//   (b) OTHERWISE — FAIL 'wedge-unrecovered', carrying ALL evidence forward unchanged (wedgeFailedSince,
+//       wedgeStaleSide, wedgeReason, and both carried ts). An EMPTY observation (one leg or both empty)
+//       can NEVER reach (a): it lacks the finite both-populated evidence recovery requires, so it always
+//       lands in (b). This is what kills the oscillation and the wiped-while-ahead / both-empty-transient
+//       holes: the empty↔stale-row flip never presents both-populated recovery evidence, so it stays FAIL
+//       at r3/r4/r5, exactly as intended. A reappearing leg that genuinely advances with a non-growing
+//       skew recovers via (a).
 //
 // ── LABEL HONESTY + ADVANCEMENT (ruling D3, no wedgeFailedSince set) ─────────────────────────────────
 //
@@ -654,13 +670,21 @@ export function readStagnationThreshold(raw) {
 //                            advancement check discriminates (if the stale leg is truly frozen it FAILs
 //                            'frozen' once the leader re-advances) — a conscious ONE-RUN delay.
 //
-// Returns { fail, reason, staleSide, skew, tsA, tsB, maxA, maxB, nextState }. `nextState` is the unified
-// evidence record to persist for THIS chain for the next run (never mutates `prev`); it is null only
-// when there is NOTHING to carry (both legs empty AND no live wedge). `reason` is a short machine tag
-// (e.g. 'frozen', 'skew-growing', 'lagging-constant', 'mutually-quiescent', 'wedge-unrecovered',
-// 'skew-above-threshold-arming', 'catching-up', 'one-sided-empty', 'empty-arming',
-// 'both-populated-in-skew', 'both-empty'). Pure + exported so every branch is mutation-verified without
-// a DB.
+// Returns { fail, reason, staleSide, skew, tsA, tsB, maxA, maxB, nextState, originalReason? }.
+// `nextState` is the unified evidence record to persist for THIS chain for the next run (never mutates
+// `prev`); it is null only when there is NOTHING to carry (both legs empty AND no live wedge). `reason`
+// is a short machine tag (e.g. 'frozen', 'skew-growing', 'lagging-constant', 'mutually-quiescent',
+// 'wedge-unrecovered', 'skew-above-threshold-arming', 'catching-up', 'one-sided-empty', 'empty-arming',
+// 'both-populated-in-skew', 'both-empty'). A sticky 'wedge-unrecovered' return also carries
+// `originalReason` (the true first-fail reason of the wedge episode). Pure + exported so every branch is
+// mutation-verified without a DB.
+//
+// STATE SHAPE VERSIONING (review delta 4, F4 candor): the `nextState` shape above is v1 as of the FIRST
+// deploy of this guard. The deployed differ runs merged main, which has NO `_stagnation` checkpoint key,
+// so NO intermediate state shape was ever persisted in production — there is nothing to migrate. An
+// UNKNOWN or legacy `prev` shape (e.g. a hand-edited checkpoint) reads as all-null evidence and DELIBERATELY
+// re-arms: a documented ONE-RUN detection delay in the FAIL-SAFE direction (a wedge is re-detected the next
+// run; it is never fabricated). We intentionally do NOT write migration code for a shape that was never shipped.
 export function stagnationDecision({
   maxA,
   tsA,
@@ -676,46 +700,50 @@ export function stagnationDecision({
   const mB = maxToNumber(maxB);
   const base = { tsA: a, tsB: b, maxA: mA, maxB: mB };
 
-  // Prior evidence, read from the UNIFIED shape regardless of the prior run's regime. `prev` may be a
-  // legacy shape (a deploy that predates this rewrite) or corrupt — read defensively, treating any
-  // missing/non-finite field as unobservable (null), never as a phantom. Missing/corrupt prev ⇒ every
-  // prior field null ⇒ fail-safe ARMING (D1 carry-forward: null baseline defers, never fails-open).
+  // Prior evidence, read from the UNIFIED shape regardless of the prior run's regime. `prev` may be an
+  // unknown/legacy shape or corrupt — read defensively, treating any missing/non-finite field as
+  // unobservable (null), never as a phantom. Missing/corrupt prev ⇒ every prior field null ⇒ fail-safe
+  // ARMING (D1 carry-forward: null baseline defers, never fails-open).
   const prevTsA = prev && Number.isFinite(prev.tsA) ? prev.tsA : null;
   const prevTsB = prev && Number.isFinite(prev.tsB) ? prev.tsB : null;
+  const prevSkew = prev && Number.isFinite(prev.skew) ? prev.skew : null;
   const prevWedgeFailedSince =
     prev && Number.isFinite(prev.wedgeFailedSince)
       ? prev.wedgeFailedSince
       : null;
+  // The CARRIED wedge attribution (review delta 4, F1/N1/N2): the stalled leg and the true first-fail
+  // reason of the LIVE wedge episode, written once at the first fail and threaded forward UNCHANGED.
+  // Recovery and sticky attribution read THESE — never a per-run recomputed olderSide (which a
+  // wiped-while-ahead leg would flip onto the wrong leg).
+  const prevWedgeStaleSide =
+    prev && (prev.wedgeStaleSide === 'A' || prev.wedgeStaleSide === 'B')
+      ? prev.wedgeStaleSide
+      : null;
+  const prevWedgeReason =
+    prev && typeof prev.wedgeReason === 'string' ? prev.wedgeReason : null;
 
   // D1 carry-forward: a leg empty THIS run keeps its last-known ts from prior evidence (null if never
   // observed) so the advancement check always has a baseline. A populated leg uses this run's reading.
   const carriedA = a === null ? prevTsA : a;
   const carriedB = b === null ? prevTsB : b;
 
-  // `emptySince` — armed on the first one-sided-empty observation for a side, preserved while it stays
-  // empty on the SAME side, cleared when both populated or both empty. Read the prior arm defensively.
-  const prevEmptySince =
-    prev &&
-    prev.emptySince &&
-    (prev.emptySince.side === 'A' || prev.emptySince.side === 'B') &&
-    Number.isFinite(prev.emptySince.atMs)
-      ? prev.emptySince
+  // Per-leg emptiness timers (review delta 4, F5). Each leg's `emptySince.atMs` is armed on the FIRST
+  // run it is observed empty (and not already armed), preserved while it stays empty, cleared when it is
+  // observed populated. A flip on the OTHER leg never touches this one — alternating-empty-sides can no
+  // longer re-arm forever. Read the prior arms defensively.
+  const prevEmptySinceA =
+    prev?.emptySinceA && Number.isFinite(prev.emptySinceA.atMs)
+      ? prev.emptySinceA
       : null;
+  const prevEmptySinceB =
+    prev?.emptySinceB && Number.isFinite(prev.emptySinceB.atMs)
+      ? prev.emptySinceB
+      : null;
+  const emptySinceA = a === null ? (prevEmptySinceA ?? { atMs: nowMs }) : null;
+  const emptySinceB = b === null ? (prevEmptySinceB ?? { atMs: nowMs }) : null;
 
   // Skew is |a − b| only when BOTH legs are populated THIS run; unmeasurable (null) with an empty leg.
-  const bothPopulated = a !== null && b !== null;
-  const skew = bothPopulated ? Math.abs(b - a) : null;
-
-  // The stale (older-ts) leg among the LAST-KNOWN timestamps; equal / unknown ⇒ no side. Used both to
-  // name the stalled leg and to pick WHICH leg's advancement gates recovery (D2) / 'catching-up' (D3).
-  let olderSide = null;
-  if (carriedA !== null && carriedB !== null) {
-    if (carriedA < carriedB) {
-      olderSide = 'A';
-    } else if (carriedB < carriedA) {
-      olderSide = 'B';
-    }
-  }
+  const skew = a !== null && b !== null ? Math.abs(b - a) : null;
 
   // Did each leg's LAST-KNOWN ts strictly advance vs the prior run's last-known ts? An empty leg (ts
   // carried forward unchanged) is by construction NOT advancing. A regression (reorg-prune) is NOT
@@ -723,40 +751,76 @@ export function stagnationDecision({
   const aAdvanced = prevTsA !== null && carriedA !== null && carriedA > prevTsA;
   const bAdvanced = prevTsB !== null && carriedB !== null && carriedB > prevTsB;
 
-  // Recovery test (D2), evaluated whenever a wedge is live. Recovery = skew back within tolerance, OR
-  // the STALE/empty leg strictly advanced AND the skew did not grow. `olderSide` is the stale leg; when
-  // one leg is empty this run the empty leg is the stale one (its carried ts cannot exceed the live
-  // leg's, so olderSide already names it — an empty leg never "advances" here, so an empty run never
-  // recovers, exactly as intended for the oscillation).
-  const staleAdvanced =
-    olderSide === 'A' ? aAdvanced : olderSide === 'B' ? bAdvanced : false;
-  const prevSkew =
-    prev && Number.isFinite(prev.skew) ? prev.skew : null;
-  const skewWithinThreshold = skew !== null && skew <= threshold;
-  const skewGrewVsPrev = skew !== null && prevSkew !== null && skew > prevSkew;
-  const genuinelyRecovered =
-    skewWithinThreshold || (staleAdvanced && !skewGrewVsPrev);
+  // ONE null-safe skew-grew helper (review delta 4, F3): returns true ONLY when BOTH prev and current
+  // skew are finite and current strictly exceeds prev. A missing prev skew (e.g. after an empty-run gap
+  // where skew was unmeasurable) is NOT "growing" — it is unknown, so this defers rather than fails.
+  const skewGrew = skewGrewFrom(prevSkew, skew);
 
-  // Assemble the unified nextState from carried-forward evidence. The wedge flag is threaded per branch
-  // (a fresh fail sets it to nowMs; a recovery clears it to null; an unrecovered run preserves it). The
-  // INVARIANT: every return path funnels through `evidence(...)` so no field is silently dropped.
-  const evidence = (wedgeFailedSince, emptySince) => ({
+  // Assemble the unified nextState from carried-forward evidence. The wedge fields are threaded per
+  // branch (a fresh fail sets them; a recovery clears them; an unrecovered run preserves them). The
+  // INVARIANT (D1): every return path funnels through `evidence(...)` so no field is silently dropped.
+  const evidence = (wedgeFailedSince, wedgeStaleSide, wedgeReason) => ({
     tsA: carriedA,
     tsB: carriedB,
     skew,
-    emptySince,
+    emptySinceA,
+    emptySinceB,
     wedgeFailedSince,
+    wedgeStaleSide,
+    wedgeReason,
   });
 
+  // ─────────────────────────────────────────────────────────────────────────────────────────────────
+  // STICKY-WEDGE GATE (review delta 4 restructure) — the FIRST branch. If a wedge is live, there are
+  // EXACTLY TWO exits, and no shape-handling branch below can be reached without passing here first. So
+  // stickiness cannot be bypassed by construction.
+  // ─────────────────────────────────────────────────────────────────────────────────────────────────
+  if (prevWedgeFailedSince !== null) {
+    // GENUINE RECOVERY requires FINITE current evidence: BOTH legs populated this run. An empty
+    // observation (one leg or both empty) lacks that evidence and can NEVER clear a wedge.
+    const bothPopulated = a !== null && b !== null;
+    // The wedged/stale leg, from CARRIED evidence — never a per-run recomputed side. Did IT advance?
+    const wedgeStaleAdvanced =
+      prevWedgeStaleSide === 'A'
+        ? aAdvanced
+        : prevWedgeStaleSide === 'B'
+          ? bAdvanced
+          : false;
+    const skewWithinThreshold = skew !== null && skew <= threshold;
+    const genuinelyRecovered =
+      bothPopulated &&
+      (skewWithinThreshold || (wedgeStaleAdvanced && !skewGrew));
+
+    if (!genuinelyRecovered) {
+      // (b) still wedged — FAIL, carrying ALL evidence forward unchanged.
+      return {
+        fail: true,
+        reason: 'wedge-unrecovered',
+        staleSide: prevWedgeStaleSide,
+        skew,
+        ...base,
+        nextState: evidence(
+          prevWedgeFailedSince,
+          prevWedgeStaleSide,
+          prevWedgeReason,
+        ),
+        originalReason: prevWedgeReason ?? 'frozen',
+      };
+    }
+
+    // (a) genuine recovery — the wedge clears. Fall through into the shape branches below with the wedge
+    // cleared: they will label this run's regime honestly ('catching-up' / 'both-populated-in-skew' /
+    // 'lagging-constant') and set nextState.wedgeFailedSince = null. (Both-populated is guaranteed here.)
+  }
+
   // ── both legs empty → benign mutual/not-started ──
-  // A live wedge does NOT survive a both-empty run: with nothing persisted on EITHER leg there is no
-  // one-sided divergence to point at (an ops-level "everything is down" state, out of scope). Clear
-  // the wedge and the emptiness arm; carry forward whatever last-known ts we had (may be null).
+  // A both-empty run cannot be reached with a LIVE wedge (the sticky gate FAILed it above). With no
+  // wedge and nothing persisted on EITHER leg there is no one-sided divergence to point at (an ops-level
+  // "everything is down" state, out of scope). Carry forward whatever last-known ts we had (may be null).
   if (a === null && b === null) {
-    const nextState = evidence(null, null);
+    const nextState = evidence(null, null, null);
     // nextState is null ONLY when there is genuinely nothing to carry (no ts ever seen, no wedge).
-    const nothingToCarry =
-      carriedA === null && carriedB === null;
+    const nothingToCarry = carriedA === null && carriedB === null;
 
     return {
       fail: false,
@@ -769,40 +833,19 @@ export function stagnationDecision({
   }
 
   // ── one leg empty, the other populated ──
+  // A LIVE wedge cannot be here either (the sticky gate FAILed an empty run above — an empty run never
+  // presents both-populated recovery evidence). So this only ever ARMS a FRESH one-sided-empty wedge.
   if (a === null || b === null) {
     const emptySide = a === null ? 'A' : 'B';
-    const populatedTs = a === null ? b : a;
-    // Arm emptySince on the FIRST one-sided-empty observation for THIS side (preserve across runs while
-    // it stays empty on the same side; a side flip re-arms — a different leg going empty is a new event).
-    const atMs =
-      prevEmptySince && prevEmptySince.side === emptySide
-        ? prevEmptySince.atMs
-        : nowMs;
-    const emptySince = { side: emptySide, atMs };
-    const emptyLongEnough = nowMs - atMs > threshold * 1000;
+    const emptySince = emptySide === 'A' ? emptySinceA : emptySinceB;
+    const emptyLongEnough = nowMs - emptySince.atMs > threshold * 1000;
     // The populated (live) leg's motion: did it advance vs its own last-known ts? A MUTUAL freeze
     // (the live leg also not advancing) is NOT a one-sided wedge.
     const liveAdvanced = emptySide === 'A' ? bAdvanced : aAdvanced;
 
-    // STICKY (D2): if a wedge is already live, it stays FAIL unless GENUINELY recovered. An empty leg
-    // never advances (its carried ts is frozen), so an empty run can only recover via skew ≤ threshold —
-    // impossible with one leg empty (skew is null) — so a live wedge NEVER recovers on an empty run.
-    if (prevWedgeFailedSince !== null && !genuinelyRecovered) {
-      return {
-        fail: true,
-        reason: 'wedge-unrecovered',
-        staleSide: emptySide,
-        skew: null,
-        ...base,
-        nextState: evidence(prevWedgeFailedSince, emptySince),
-        originalReason: 'one-sided-empty',
-      };
-    }
-
     // FRESH one-sided-empty wedge: empty past the grace window AND the live leg advanced. If the live
     // leg is also frozen, that is a mutual freeze → non-fail (armed, not failed).
     const fail = emptyLongEnough && liveAdvanced;
-    const wedgeFailedSince = fail ? nowMs : null;
 
     return {
       fail,
@@ -810,48 +853,33 @@ export function stagnationDecision({
       staleSide: fail ? emptySide : null,
       skew: null,
       ...base,
-      nextState: evidence(wedgeFailedSince, emptySince),
+      nextState: fail
+        ? evidence(nowMs, emptySide, 'one-sided-empty')
+        : evidence(null, null, null),
     };
   }
 
   // ── both legs populated ──
   if (skew <= threshold) {
-    // Healthy / within tolerance. Skew ≤ threshold is a GENUINE RECOVERY (D2), so ANY live wedge clears
-    // here. Surface the real computed skew (finding 3: telemetry, not null). staleSide null (a
-    // below-threshold lag has an older leg but no stall). emptySince cleared (both legs populated).
+    // Healthy / within tolerance. Skew ≤ threshold is a GENUINE RECOVERY (D2), so a wedge that cleared
+    // in the sticky gate lands here. Surface the real computed skew (finding 3: telemetry, not null).
+    // staleSide null (a below-threshold lag has an older leg but no stall). Emptiness arms clear.
     return {
       fail: false,
       reason: 'both-populated-in-skew',
       staleSide: null,
       skew,
       ...base,
-      nextState: evidence(null, null),
+      nextState: evidence(null, null, null),
     };
   }
 
-  // skew > threshold, both populated. Evidence carried forward each run (finding 2: NOT keyed on the
-  // stale side, so a stale-side flip never discards it — and now, D1, not keyed on the prior SHAPE
-  // either). Whether we have a prior baseline to judge direction:
+  // skew > threshold, both populated, and no live wedge (the sticky gate either FAILed or recovered).
+  // Whether we have a prior baseline to judge direction:
   const haveBaseline = prevTsA !== null && prevTsB !== null;
 
-  // STICKY (D2): a live wedge stays FAIL until genuinely recovered, regardless of what this run's raw
-  // regime would say. This is what makes the empty↔stale oscillation FAIL at r3/r4/r5: r3's stale leg
-  // (the one that wrote a single stale row) did NOT advance past its last-known ts, so no recovery.
-  if (prevWedgeFailedSince !== null && !genuinelyRecovered) {
-    return {
-      fail: true,
-      reason: 'wedge-unrecovered',
-      staleSide: olderSide,
-      skew,
-      ...base,
-      nextState: evidence(prevWedgeFailedSince, null),
-      originalReason: 'frozen',
-    };
-  }
-
   // No prior baseline (first over-threshold observation, or prev never had both legs) → ARM, defer the
-  // verdict one run (candor: one-run detection delay). A live wedge that reached recovery above already
-  // returned; here wedgeFailedSince is null (recovered or never set).
+  // verdict one run (candor: one-run detection delay).
   if (!haveBaseline) {
     return {
       fail: false,
@@ -859,25 +887,46 @@ export function stagnationDecision({
       staleSide: null,
       skew,
       ...base,
-      nextState: evidence(null, null),
+      nextState: evidence(null, null, null),
     };
   }
 
-  // We have a baseline and no sticky wedge (or it just recovered). Decide THIS run's regime from
+  // We have a baseline and no live wedge (or it just recovered). Decide THIS run's regime from
   // advancement (D3 honesty). A leg that regressed or held still did NOT advance (fail-closed).
   const oneLegFrozenWhileOtherAdvanced =
     (!aAdvanced && bAdvanced) || (!bAdvanced && aAdvanced);
-  const skewIncreased = skew > prevSkew;
+  // The stale (older-ts) leg THIS run, used only for 'catching-up' attribution below (recovery no longer
+  // depends on it — the sticky gate owns recovery). Equal / unknown ⇒ no side.
+  let olderSide = null;
+  if (carriedA < carriedB) {
+    olderSide = 'A';
+  } else if (carriedB < carriedA) {
+    olderSide = 'B';
+  }
+  const staleAdvanced =
+    olderSide === 'A' ? aAdvanced : olderSide === 'B' ? bAdvanced : false;
+  const skewIncreased = skewGrew;
   const skewDecreased = prevSkew !== null && skew < prevSkew;
   const bothAdvanced = aAdvanced && bAdvanced;
   const neitherAdvanced = !aAdvanced && !bAdvanced;
 
   // FAIL iff a one-sided wedge (one frozen, other advancing) OR the skew grew (trickling wedge losing
-  // ground). Both fail-closed. A fresh fail sets wedgeFailedSince = nowMs (sticky from here).
+  // ground). Both fail-closed. A fresh fail sets a new wedge episode (sticky from here). N1: staleSide
+  // names the leg that FAILED TO ADVANCE — the frozen one — computed from per-leg advancement, NOT
+  // olderSide (which mis-names the newer-but-frozen leg).
   const fail = oneLegFrozenWhileOtherAdvanced || skewIncreased;
   let reason;
+  let freshStaleSide = null;
   if (fail) {
-    reason = oneLegFrozenWhileOtherAdvanced ? 'frozen' : 'skew-growing';
+    if (oneLegFrozenWhileOtherAdvanced) {
+      reason = 'frozen';
+      // The frozen leg is the one that did NOT advance while the other did.
+      freshStaleSide = aAdvanced ? 'B' : 'A';
+    } else {
+      reason = 'skew-growing';
+      // A trickling wedge losing ground: the stale (older) leg is the one falling behind.
+      freshStaleSide = olderSide;
+    }
   } else if (neitherAdvanced) {
     // NEITHER leg advanced over threshold → a MUTUAL freeze (D3): out of scope for an A-vs-B divergence
     // guard (both legs down is an ops alarm). A leader-regression + frozen-stale pair (skew shrank but
@@ -903,12 +952,28 @@ export function stagnationDecision({
 
   return {
     fail,
-    staleSide: fail ? olderSide : null,
+    staleSide: fail ? freshStaleSide : null,
     reason,
     skew,
     ...base,
-    nextState: evidence(fail ? nowMs : null, null),
+    nextState: fail
+      ? evidence(nowMs, freshStaleSide, reason)
+      : evidence(null, null, null),
   };
+}
+
+// One null-safe skew-grew comparison, used at EVERY comparison site (review delta 4, F3): returns true
+// ONLY when BOTH prev and current skew are finite numbers and current STRICTLY exceeds prev. A null
+// (unmeasurable) prev or current is NOT "growing" — it is unknown, so this defers rather than manufacturing
+// a false skew-growing FAIL from a null coerced to 0.
+function skewGrewFrom(prevSkew, skew) {
+  return (
+    typeof prevSkew === 'number' &&
+    Number.isFinite(prevSkew) &&
+    typeof skew === 'number' &&
+    Number.isFinite(skew) &&
+    skew > prevSkew
+  );
 }
 
 // Coerce a newest-row block timestamp to a finite number of seconds, or null when the leg has no rows
@@ -2019,25 +2084,35 @@ export function stagnationAlerts(results) {
     // wedge is a two-leg-populated freeze (skew shown); a one-sided-empty wedge is the empty leg
     // persisting nothing for N seconds while the other advances (no skew — the leg has no rows). A
     // sticky 'wedge-unrecovered' fail (D2) resolves through its carried originalReason so it reads as
-    // the wedge it still is, plus an explicit "still unrecovered" note.
+    // the wedge it still is, plus an explicit "still unrecovered" note. F6: if a wedge-unrecovered fail
+    // carries no originalReason (a robustness gap), fall back to the reason itself rather than rendering
+    // an undefined-driven generic clause.
     const effectiveReason =
-      s.reason === 'wedge-unrecovered' ? s.originalReason : s.reason;
-    const unrecovered = s.reason === 'wedge-unrecovered' ? ' (still unrecovered)' : '';
+      s.reason === 'wedge-unrecovered'
+        ? (s.originalReason ?? s.reason)
+        : s.reason;
+    const unrecovered =
+      s.reason === 'wedge-unrecovered' ? ' (still unrecovered)' : '';
+    // F6: only show the skew clause when the skew is a finite measured number. A null skew (an empty-leg
+    // wedge has no measurable skew) must NOT render as "skew nulls > Ns" — omit the clause entirely.
+    const hasSkew =
+      typeof s.skewSeconds === 'number' && Number.isFinite(s.skewSeconds);
+    const skewClause = hasSkew
+      ? `; skew ${s.skewSeconds}s > ${s.thresholdSeconds}s`
+      : '';
     let what;
     if (effectiveReason === 'one-sided-empty') {
       what =
         `has persisted NO rows for over ${s.thresholdSeconds}s while the other leg advances ` +
         `(empty leg, one-sided wedge)${unrecovered}`;
-    } else if (effectiveReason === 'skew-growing') {
+    } else if (effectiveReason === 'skew-growing' && hasSkew) {
       what =
         `is falling further behind — newest-row timestamp skew GROWING to ${s.skewSeconds}s ` +
         `> ${s.thresholdSeconds}s${unrecovered}`;
     } else {
-      // 'frozen' (or any other fail reason with a measured skew): the stale leg's newest row is not
-      // advancing while the skew sits above threshold.
-      what =
-        `has stopped persisting rows (newest-row timestamp FROZEN; skew ${s.skewSeconds}s ` +
-        `> ${s.thresholdSeconds}s)${unrecovered}`;
+      // 'frozen' (or any other fail reason): the stale leg's newest row is not advancing. Show the skew
+      // clause only when a finite skew is present (F6: a null skew omits it, never "skew nulls > Ns").
+      what = `has stopped persisting rows (newest-row timestamp FROZEN${skewClause})${unrecovered}`;
     }
     lines.push(
       `persist-stagnation: chain ${r.chain} — ${stalled} ${what}; ` +
