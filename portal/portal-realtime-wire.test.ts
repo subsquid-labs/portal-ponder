@@ -659,3 +659,93 @@ test('getPortalRealtimeEventGenerator: emits a monotonic finalize (above the sta
   expect(finalize).toBeDefined();
   expect(hexToNumber(finalize.block.number)).toBe(100); // > startup finalized (99) → allowed
 });
+
+// like mockPortalConns but the /finalized-head carries the canonical HASH (arms the wrong-fork guard and
+// lets a finalize land at the exact height) — used for the held-finalize-during-redelivery case.
+function mockPortalConnsWithHead(
+  connections: any[][],
+  head: { number: number; hash: string },
+  seenBodies?: any[],
+) {
+  let conn = 0;
+  return (async (url: string, init?: any) => {
+    if (url.endsWith('/finalized-head')) return { json: async () => head };
+    if (seenBodies && init?.body) seenBodies.push(JSON.parse(init.body));
+    if (conn >= connections.length)
+      return { status: 204, ok: false, body: null };
+    const lines = connections[conn++]!.map(
+      (b: any) => JSON.stringify(b) + '\n',
+    ).join('');
+    const body = new ReadableStream({
+      start(c) {
+        c.enqueue(new TextEncoder().encode(lines));
+        c.close();
+      },
+    });
+    return { status: 200, ok: true, body };
+  }) as any;
+}
+
+test('getPortalRealtimeEventGenerator: a finalize covering a block held for redelivery is EMITTED after the redelivered block, not dropped (review B2)', async () => {
+  // Block N discovers a child and is suppressed for redelivery. A finalize covering N arrives from the
+  // head poll WHILE awaiting — portalRealtimeEvents has already consumed it (window cleared, anchor
+  // advanced), so if the wire merely dropped it no later poll would re-emit it: at endBlock=N (here) or a
+  // halted chain ponder would never finalize N. The wire must stash it and emit it right after forwarding
+  // the redelivered N — ordering: block N, then finalize N.
+  process.env.PORTAL_REALTIME = 'stream';
+  const factory = eulerFactory();
+  const child = '0x4444444444444444444444444444444444444444';
+  const conn1 = [
+    {
+      // block 100 creates a child → its own same-block logs were filtered out; the wire suppresses it and
+      // awaits the redelivery. The finalize poll right after (head 100 = h100) is HELD, not forwarded.
+      header: { number: 100, hash: 'h100', parentHash: 'h99', timestamp: 1000 },
+      logs: [proxyLog(child, { blockNumber: 100 })],
+    },
+  ];
+  const conn2 = [
+    {
+      // the reopened connection (widened filter) re-delivers block 100 complete
+      header: { number: 100, hash: 'h100', parentHash: 'h99', timestamp: 1000 },
+      logs: [proxyLog(child, { blockNumber: 100 })],
+    },
+  ];
+  const events: any[] = [];
+  for await (const { event } of getPortalRealtimeEventGenerator({
+    common: { logger: { info() {}, debug() {}, warn() {}, trace() {} } } as any,
+    chain: { id: 1, name: 'mainnet', portal: 'http://portal' } as any,
+    rpc: {} as any,
+    eventCallbacks: [{ filter: logFilter({ address: factory as any }) } as any],
+    syncProgress: {
+      finalized: {
+        number: '0x63', // 99 — startup finalized
+        hash: 'h99',
+        parentHash: 'h98',
+        timestamp: '0x1',
+      } as any,
+      end: { number: '0x64' } as any, // endBlock 100: the finalize must still land before return
+    },
+    childAddresses: new Map<string, Map<Address, number>>([
+      ['euler-factory', new Map()],
+    ]),
+    // head 100 with its canonical hash → finalize(100) fires at the exact height (no B1 defer)
+    fetchImpl: mockPortalConnsWithHead([conn1, conn2], {
+      number: 100,
+      hash: 'h100',
+    }),
+    finalizePollMs: 0,
+  })) {
+    events.push(event);
+  }
+  // exactly one block-100 event (the redelivered, complete one) …
+  const blocks = events.filter((e) => e.type === 'block');
+  expect(blocks.length).toBe(1);
+  expect(hexToNumber(blocks[0].block.number)).toBe(100);
+  // … and the held finalize(100) IS emitted, AFTER the block (ordering: block N, then finalize N)
+  const finalize = events.find((e) => e.type === 'finalize');
+  expect(finalize).toBeDefined();
+  expect(hexToNumber(finalize.block.number)).toBe(100);
+  const blockIdx = events.findIndex((e) => e.type === 'block');
+  const finalizeIdx = events.findIndex((e) => e.type === 'finalize');
+  expect(finalizeIdx).toBeGreaterThan(blockIdx); // block N precedes finalize N
+});

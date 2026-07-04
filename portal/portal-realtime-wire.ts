@@ -363,6 +363,25 @@ export async function* getPortalRealtimeEventGenerator(params: {
   // hasn't seen N — finalizing it would mark the interval cached without N's data; the next poll
   // re-emits it) and a reorg that removes N clears the wait.
   let awaiting: { hash: string; number: number } | undefined;
+  // A finalize that arrives WHILE awaiting a redelivery covers a block ponder hasn't received yet, so it
+  // cannot be forwarded immediately. But portalRealtimeEvents has ALREADY applied it (anchor advanced,
+  // window cleared) — dropping it means no later poll re-emits it, so at endBlock=N or on a halted chain
+  // ponder would never finalize N (a liveness stall, the interval never cached). Stash it here and emit it
+  // right after the redelivered block N is forwarded (ordering: block N, then finalize N). (review B2)
+  let heldFinalize:
+    | Extract<PortalRealtimeEvent, { type: 'finalize' }>
+    | undefined;
+  // Emit a finalize with the Q3 safety checks (never regress ponder's finalized/safe checkpoints: skip a
+  // finalize at/below the startup boundary or below one already emitted — Portal head only ever advances,
+  // so this is defensive). Shared by the live finalize branch and the held-finalize drain. (review B2)
+  function* emitFinalize(
+    ev: Extract<PortalRealtimeEvent, { type: 'finalize' }>,
+  ): Generator<{ chain: Chain; event: RealtimeSyncEvent }> {
+    const n = ev.block.number;
+    if (n <= startupFinalized || n <= lastFinalized) return;
+    lastFinalized = n;
+    yield { chain, event: toRealtimeSyncEvent(ev, new Map()) };
+  }
   const rebuildLogs = (): void => {
     const next = buildPortalLogRequests(eventCallbacks, childAddresses);
     logs.length = 0;
@@ -395,27 +414,36 @@ export async function* getPortalRealtimeEventGenerator(params: {
     })) {
       if (ev.type === 'finalize') {
         // Hold back a finalize covering a block ponder hasn't received yet (suppressed for redelivery):
-        // handleRealtimeSyncEvent would mark its interval cached WITHOUT its data. Finality is monotonic
-        // and re-polled, so the next finalize (after the redelivery lands) re-covers it.
-        if (awaiting !== undefined && ev.block.number >= awaiting.number)
+        // handleRealtimeSyncEvent would mark its interval cached WITHOUT its data. portalRealtimeEvents has
+        // already consumed this finalize (window cleared, anchor advanced) — dropping it would lose it, so
+        // STASH it and drain it right after the redelivered block lands (see the block branch). A later
+        // finalize supersedes an earlier stash (finality is monotonic → keep the highest). (review B2)
+        if (awaiting !== undefined && ev.block.number >= awaiting.number) {
+          if (
+            heldFinalize === undefined ||
+            ev.block.number > heldFinalize.block.number
+          )
+            heldFinalize = ev;
+
           continue;
-        // Q3 safety: never regress ponder's finalized/safe checkpoints. Suppress a finalize at/below the
-        // startup boundary or below one already emitted (Portal head only ever advances, so this is defensive).
-        const n = ev.block.number;
-        if (n <= startupFinalized || n <= lastFinalized) continue;
-        lastFinalized = n;
-        yield { chain, event: toRealtimeSyncEvent(ev, new Map()) };
+        }
+        for (const out of emitFinalize(ev)) yield out;
+
         continue;
       }
 
       if (ev.type === 'reorg') {
         // The awaited block was reorged away before its redelivery — stop waiting for it. Ponder never
         // saw it (suppressed), and a rollback to the common ancestor is a no-op for blocks it never had.
+        // Drop any finalize stashed for it too: it will never be redelivered, and finality would re-derive
+        // it from the new fork on the next poll if it truly finalized. (review B2)
         if (
           awaiting !== undefined &&
           ev.reorgedBlocks.some((b) => b.hash === awaiting!.hash)
-        )
+        ) {
           awaiting = undefined;
+          heldFinalize = undefined;
+        }
         // Prune reorged-out factory children from the RUNNING map (stock createRealtimeSync does this via
         // childAddressesPerBlock): a child whose creation block was reorged away must stop matching —
         // otherwise every later log from that address is indexed as a phantom child event until restart.
@@ -457,6 +485,16 @@ export async function* getPortalRealtimeEventGenerator(params: {
       }
 
       yield { chain, event: toRealtimeSyncEvent(ev, discovered) };
+
+      // Drain a finalize held back during this block's redelivery, now that ponder has the block: block N
+      // is forwarded above, then finalize N here. Otherwise the finalize (already consumed by
+      // portalRealtimeEvents) would be lost — at endBlock=N or a halted chain, ponder never finalizes N.
+      // (review B2)
+      if (heldFinalize !== undefined) {
+        const held = heldFinalize;
+        heldFinalize = undefined;
+        for (const out of emitFinalize(held)) yield out;
+      }
 
       if (endBlock !== undefined && blockNumber >= endBlock) {
         common.logger.info({
