@@ -104,6 +104,18 @@ export const knownBadRows = [
 // start per chain; `toBlock` stays null until leg A is repaired or the leg is retired. REMOVE this
 // entry when issue #36 is resolved (A repaired or the RPC-realtime leg retired) to restore full
 // strictness with no other code change (classifyOnlyBRow returns 'mismatch' for everything then).
+//
+// CANDOR — the limit of what cross-validation alone can prove here: within the tolerated span the A/B
+// differ CANNOT, by itself, distinguish leg-A row loss (leg A dropped an on-chain row leg B holds — the
+// diagnosed cause) from a hypothetical leg-B FABRICATION of a row of the same (chain, block>=floor)
+// shape (leg B inventing a row that was never on chain). Both surface identically as an onlyB row at/
+// above the floor. What breaks the tie is a THIRD-PARTY spot audit — comparing leg B's tolerated rows
+// against an independent node/receipt (as done when issue #36 was filed: leg B's rows matched on-chain
+// receipts byte-for-byte, so leg A is the lossy side). To keep that audit possible WITHOUT psql access
+// to the raw diff, the status JSON carries a bounded spot-audit sample of tolerated block numbers per
+// table (toleratedIssue36Sample — see sampleToleratedOnlyB): a human or script can re-run the audit on
+// a handful of rows against a third-party node at any time. This tolerance is only ever as sound as
+// that external control — it is a REPORTED, spot-auditable exception, never a proof of correctness.
 export const TOLERATED_ONLYB_CLASSES = {
   issue36OnlyBRowLoss: {
     issue: 'https://github.com/subsquid-labs/portal-ponder/issues/36',
@@ -190,6 +202,41 @@ export function classifyOnlyBDiff(diff, onlyBRows, chain, classes) {
     hardOnlyB,
     onlyA,
     mismatch,
+  };
+}
+
+// AUDITABILITY (issue #36 candor): the maximum sample size of tolerated onlyB block numbers surfaced
+// in the status JSON. Small on purpose — it is a spot-audit anchor for a human/script to cross-check a
+// handful of leg-B rows against a third-party node, NOT the full set (which stays out of the status
+// JSON to keep it bounded). 5 is enough to seed an audit; min/max bracket the whole span.
+export const TOLERATED_SAMPLE_SIZE = 5;
+
+// Build a BOUNDED spot-audit sample of tolerated onlyB rows' block numbers for the status JSON: the
+// first TOLERATED_SAMPLE_SIZE block numbers plus the min and max over the WHOLE tolerated set (so the
+// span is bracketed even though the sample is truncated). This is the auditability control for the
+// candor limitation documented on TOLERATED_ONLYB_CLASSES: within the tolerated span, cross-validation
+// alone cannot distinguish leg-A row loss from a hypothetical leg-B fabrication of the same (chain,
+// block>=floor) shape — the resolving control is a third-party spot audit, and this sample is what a
+// human/script anchors that audit on WITHOUT psql access to the raw diff. Empty set ⇒ null (nothing to
+// audit). Pure + exported: the sample MUST stay bounded at TOLERATED_SAMPLE_SIZE and min/max must span
+// the whole set (mutation: unbound the sample or break min/max → a test fails).
+export function sampleToleratedOnlyB(rows) {
+  const blocks = [];
+  for (const r of rows ?? []) {
+    const b = Number(r.blockNumber);
+    if (Number.isFinite(b)) {
+      blocks.push(b);
+    }
+  }
+  if (blocks.length === 0) {
+    return null;
+  }
+
+  return {
+    sample: blocks.slice(0, TOLERATED_SAMPLE_SIZE),
+    min: Math.min(...blocks),
+    max: Math.max(...blocks),
+    count: blocks.length,
   };
 }
 
@@ -1043,6 +1090,11 @@ async function compareChain(
   const toleratedLogRows = logsRes.onlyBRows.filter(
     (r) => classifyOnlyBRow(r, chain) === 'tolerated',
   );
+  // The tolerated onlyB BLOCK rows (issue #36) — used only for the bounded spot-audit sample in the
+  // status JSON (block-table rows have no log_index and never enter the bucket-hash attribution).
+  const toleratedBlockRows = blocksRes.onlyBRows.filter(
+    (r) => classifyOnlyBRow(r, chain) === 'tolerated',
+  );
 
   // checkpointBuckets knock-on: a bucket md5 mismatch FULLY explained by the tolerated onlyB log rows
   // must not fail the verdict; any bucket mismatch NOT fully explained stays FAIL. Attribution is EXACT
@@ -1078,6 +1130,11 @@ async function compareChain(
       // per-chain realtime-era floor). Counted so the verdict is PASS-compatible while still visible.
       toleratedIssue36: logsClass.toleratedOnlyB,
       capped: logsRes.capped,
+      // A bounded, spot-auditable sample of the tolerated onlyB block numbers (issue #36) — so a human
+      // or script can cross-check leg B's tolerated rows against a third-party node WITHOUT psql access
+      // to the raw diff (the ONLY control that distinguishes leg-A loss from a hypothetical leg-B
+      // fabrication of the same shape — see TOLERATED_ONLYB_CLASSES).
+      toleratedIssue36Sample: sampleToleratedOnlyB(toleratedLogRows),
     },
     blocks: {
       fail: blocksFail,
@@ -1087,6 +1144,8 @@ async function compareChain(
       // Reported, never fails: onlyB block rows leg A lost, tolerated per issue #36.
       toleratedIssue36: blocksClass.toleratedOnlyB,
       capped: blocksRes.capped,
+      // Bounded spot-audit sample of the tolerated onlyB block numbers (issue #36), as for logs above.
+      toleratedIssue36Sample: sampleToleratedOnlyB(toleratedBlockRows),
     },
     transactions: tx,
     checkpointBuckets: {

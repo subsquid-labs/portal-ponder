@@ -31,9 +31,11 @@ import {
   ONLYB_ROW_CAP,
   psqlExitVerdict,
   restartStats,
+  sampleToleratedOnlyB,
   sanitizeSchemaIdent,
   TOLERATED_CLASSES,
   TOLERATED_ONLYB_CLASSES,
+  TOLERATED_SAMPLE_SIZE,
   TX_COL,
   TX_SELECT_COLUMNS,
   writeJsonAtomic,
@@ -1411,4 +1413,63 @@ test('D2 hook integration: the REAL streamingDiff onOnlyB streams EVERY B-only r
   assert.equal(cls.fail, true, 'the below-floor B-only row FAILs the table');
   assert.equal(cls.hardOnlyB, 1);
   assert.equal(cls.toleratedOnlyB.count, 4);
+});
+
+// ── D3: sampleToleratedOnlyB — the BOUNDED, spot-auditable sample for the status JSON ──
+// Within the tolerated span cross-validation alone cannot distinguish leg-A loss from a leg-B
+// fabrication of the same shape; the control is a third-party spot audit. This surfaces a bounded
+// sample of tolerated block numbers so that audit is possible without psql access to the raw diff.
+
+test('sampleToleratedOnlyB: bounded at TOLERATED_SAMPLE_SIZE, with min/max over the WHOLE set', () => {
+  // 12 tolerated rows (block numbers out of order) → the sample is the FIRST 5, but min/max bracket ALL
+  // 12. MUTATION (unbound the sample → returns all 12; or break min/max → wrong bracket) → this fails.
+  const rows = [
+    { blockNumber: 500 },
+    { blockNumber: 100 },
+    { blockNumber: 900 },
+    { blockNumber: 300 },
+    { blockNumber: 700 },
+    { blockNumber: 200 },
+    { blockNumber: 800 },
+    { blockNumber: 400 },
+    { blockNumber: 600 },
+    { blockNumber: 1000 },
+    { blockNumber: 50 },
+    { blockNumber: 1100 },
+  ];
+  const s = sampleToleratedOnlyB(rows);
+  assert.equal(TOLERATED_SAMPLE_SIZE, 5);
+  assert.equal(
+    s.sample.length,
+    5,
+    'the sample is bounded at TOLERATED_SAMPLE_SIZE, never the whole set',
+  );
+  assert.deepEqual(s.sample, [500, 100, 900, 300, 700], 'first 5, in order');
+  assert.equal(s.min, 50, 'min over the WHOLE set, not just the sample');
+  assert.equal(s.max, 1100, 'max over the WHOLE set, not just the sample');
+  assert.equal(s.count, 12, 'the full tolerated count is reported alongside');
+});
+
+test('sampleToleratedOnlyB: fewer than the cap → sample is the whole (small) set; empty → null', () => {
+  const s = sampleToleratedOnlyB([{ blockNumber: 42 }, { blockNumber: 7 }]);
+  assert.deepEqual(s.sample, [42, 7]);
+  assert.equal(s.min, 7);
+  assert.equal(s.max, 42);
+  assert.equal(s.count, 2);
+
+  // nothing tolerated ⇒ null (no noisy empty sample in the status JSON)
+  assert.equal(sampleToleratedOnlyB([]), null);
+  assert.equal(sampleToleratedOnlyB(undefined), null);
+});
+
+test('sampleToleratedOnlyB: non-finite block numbers are dropped (never leak into the audit sample)', () => {
+  const s = sampleToleratedOnlyB([
+    { blockNumber: 10 },
+    { blockNumber: 'x' }, // dropped
+    { blockNumber: 20 },
+  ]);
+  assert.deepEqual(s.sample, [10, 20]);
+  assert.equal(s.min, 10);
+  assert.equal(s.max, 20);
+  assert.equal(s.count, 2);
 });
