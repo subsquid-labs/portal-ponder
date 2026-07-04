@@ -23,6 +23,7 @@ import {
   collectOnlyB,
   collectReferenced,
   compareBucketHashes,
+  crossCheckOnlyBCollector,
   extractCheckpointBlock,
   formatKnownBadRowsLine,
   formatToleratedIssue27Line,
@@ -1472,4 +1473,82 @@ test('sampleToleratedOnlyB: non-finite block numbers are dropped (never leak int
   assert.equal(s.min, 10);
   assert.equal(s.max, 20);
   assert.equal(s.count, 2);
+});
+
+// ── D1: crossCheckOnlyBCollector — the BACKSTOP that refuses to trust an incomplete onlyB collector ──
+// classifyOnlyBDiff decides tolerance from the rows the streamingDiff onOnlyB hook COLLECTED. That
+// verdict is only sound if the collected array is EVERY onlyB row the diff counted. The backstop
+// cross-checks the collected COUNT against the diff's own onlyB count: a silent hook-wiring drop (a
+// skipped call, a lost row) leaves classifyOnlyBDiff deciding on an INCOMPLETE set → HARD FAIL that
+// names itself (collectorMismatch). Only fires on the UN-capped path (a capped gap is expected).
+
+test('crossCheckOnlyBCollector: collected count === diff.onlyB (not capped) → ok', () => {
+  assert.deepEqual(crossCheckOnlyBCollector(89, 89, false), { ok: true });
+});
+
+test('crossCheckOnlyBCollector: collected count !== diff.onlyB (not capped) → HARD FAIL that names itself', () => {
+  // The diff counted 89 onlyB rows but the collector only holds 44 — some were silently dropped before
+  // classification. MUTATION (compare against collectedCount itself, or drop the count-mismatch clause)
+  // → this fails: the backstop no longer catches the silent drop.
+  const r = crossCheckOnlyBCollector(89, 44, false);
+  assert.equal(r.ok, false);
+  assert.deepEqual(r.collectorMismatch, { expected: 89, collected: 44 });
+});
+
+test('crossCheckOnlyBCollector: a count mismatch while CAPPED is expected → ok (the capped→FAIL path covers it)', () => {
+  // When capped, collected < onlyB is BY DESIGN (the cap stopped collecting) — the separate capped→FAIL
+  // path already fails the table, so the backstop must NOT double-fire here. MUTATION (fire the
+  // cross-check even when capped) → this asserts ok:true and fails.
+  const r = crossCheckOnlyBCollector(1_000_000, ONLYB_ROW_CAP, true);
+  assert.deepEqual(r, { ok: true });
+});
+
+test('crossCheckOnlyBCollector: a nullish diff.onlyB with zero collected → ok (0 === 0)', () => {
+  assert.deepEqual(crossCheckOnlyBCollector(undefined, 0, false), { ok: true });
+});
+
+// D1 HOOK INTEGRATION, mutation h1 in situ: a collector that SKIPS EVERY 2ND B-only row (the exact shape
+// of the streamingDiff onOnlyB-skip mutation) yields collector.onlyBRows.length < diff.onlyB — which the
+// D1 backstop catches as a HARD FAIL. This proves the backstop, not just the pure classifier, is what
+// closes the "hook wiring has no backstop" gap: without D1 this drop would be silent.
+test('D1 hook integration: a collector that skips every 2nd B-only row is caught by the backstop (HARD FAIL)', async () => {
+  const hashRow = (block, logIndex, h) => ({
+    key: [BigInt(block), BigInt(logIndex)],
+    hash: h,
+  });
+  const keyOf = (r) => r.key;
+  const a = [hashRow(ISSUE_36_FLOOR_1, 0, 'shared0')];
+  const b = [
+    hashRow(ISSUE_36_FLOOR_1, 0, 'shared0'),
+    hashRow(ISSUE_36_FLOOR_1 + 1, 0, 'b1'),
+    hashRow(ISSUE_36_FLOOR_1 + 2, 0, 'b2'),
+    hashRow(ISSUE_36_FLOOR_1 + 3, 0, 'b3'),
+    hashRow(ISSUE_36_FLOOR_1 + 4, 0, 'b4'),
+  ];
+
+  // A DELIBERATELY LOSSY collector standing in for mutation h1: it forwards only every 2nd B-only row.
+  const collected = [];
+  let seen = 0;
+  const lossyOnOnlyB = (row) => {
+    seen += 1;
+    if (seen % 2 === 0) {
+      return; // skip every 2nd row — the h1 shape
+    }
+
+    const key = row.key ?? [];
+    collected.push({ blockNumber: Number(key[0]) });
+  };
+
+  const diff = await mergeCompare(a, b, {
+    keyFn: keyOf,
+    mode: 'strict',
+    onOnlyB: lossyOnOnlyB,
+  });
+
+  assert.equal(diff.onlyB, 4, 'the diff independently counts all 4 B-only rows');
+  assert.equal(collected.length, 2, 'the lossy collector dropped every 2nd row');
+  // The backstop catches the drop: collected (2) !== diff.onlyB (4) → HARD FAIL that names itself.
+  const back = crossCheckOnlyBCollector(diff.onlyB, collected.length, false);
+  assert.equal(back.ok, false, 'the backstop FAILs on the incomplete collection');
+  assert.deepEqual(back.collectorMismatch, { expected: 4, collected: 2 });
 });

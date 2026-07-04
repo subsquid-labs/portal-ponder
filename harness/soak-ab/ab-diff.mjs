@@ -205,6 +205,32 @@ export function classifyOnlyBDiff(diff, onlyBRows, chain, classes) {
   };
 }
 
+// BACKSTOP CROSS-CHECK for the onlyB collector wiring. classifyOnlyBDiff classifies the rows the
+// streamingDiff onOnlyB hook COLLECTED (onlyBRows); its verdict is only trustworthy if that array is
+// EVERY onlyB row the diff counted. `diff.onlyB` is the diff's own independent COUNT of B-only rows.
+// If the two disagree while the collector was NOT capped, some onlyB rows were silently dropped before
+// classification (a wiring bug — a skipped hook call, a lost row) — so the collector's per-row
+// tolerance verdict is built on an INCOMPLETE set and MUST NOT be trusted: this is a HARD FAIL that
+// NAMES itself in the status JSON (collectorMismatch: { expected, collected }). When capped, a
+// collected < onlyB gap is EXPECTED (the cap stopped collecting past ONLYB_ROW_CAP) and the existing
+// capped→FAIL path already covers it — so the cross-check only fires on the un-capped path. Pure +
+// exported so the backstop is mutation-verified in isolation (neuter it → a test must fail).
+export function crossCheckOnlyBCollector(diffOnlyB, collectedCount, capped) {
+  if (capped) {
+    return { ok: true };
+  }
+
+  const expected = diffOnlyB ?? 0;
+  if (expected !== collectedCount) {
+    return {
+      ok: false,
+      collectorMismatch: { expected, collected: collectedCount },
+    };
+  }
+
+  return { ok: true };
+}
+
 // AUDITABILITY (issue #36 candor): the maximum sample size of tolerated onlyB block numbers surfaced
 // in the status JSON. Small on purpose — it is a spot-audit anchor for a human/script to cross-check a
 // handful of leg-B rows against a third-party node, NOT the full set (which stays out of the status
@@ -1080,8 +1106,23 @@ async function compareChain(
     blocksRes.onlyBRows,
     chain,
   );
-  const logsFail = logsClass.fail || logsRes.capped;
-  const blocksFail = blocksClass.fail || blocksRes.capped;
+  // BACKSTOP: the tolerance verdict above trusts logsRes.onlyBRows / blocksRes.onlyBRows to be EVERY
+  // onlyB row the diff counted. Cross-check that collected array against the diff's own onlyB COUNT: a
+  // silent hook-wiring drop (some onlyB row never reached the collector) would leave classifyOnlyBDiff
+  // deciding on an INCOMPLETE set — so a mismatch (when NOT capped) is a HARD FAIL that names itself.
+  const logsCollector = crossCheckOnlyBCollector(
+    logsRes.diff.onlyB,
+    logsRes.onlyBRows.length,
+    logsRes.capped,
+  );
+  const blocksCollector = crossCheckOnlyBCollector(
+    blocksRes.diff.onlyB,
+    blocksRes.onlyBRows.length,
+    blocksRes.capped,
+  );
+  const logsFail = logsClass.fail || logsRes.capped || !logsCollector.ok;
+  const blocksFail =
+    blocksClass.fail || blocksRes.capped || !blocksCollector.ok;
 
   // The tolerated onlyB LOG rows (block-table onlyB rows have no log_index and do not affect the log
   // bucket hashes) — the set to remove from leg B's buckets when attributing a bucket mismatch. Only
@@ -1135,6 +1176,11 @@ async function compareChain(
       // to the raw diff (the ONLY control that distinguishes leg-A loss from a hypothetical leg-B
       // fabrication of the same shape — see TOLERATED_ONLYB_CLASSES).
       toleratedIssue36Sample: sampleToleratedOnlyB(toleratedLogRows),
+      // Present ONLY when the backstop fired — a silent onlyB collector drop names itself here so the
+      // HARD FAIL cannot be mistaken for anything else.
+      ...(logsCollector.ok
+        ? {}
+        : { collectorMismatch: logsCollector.collectorMismatch }),
     },
     blocks: {
       fail: blocksFail,
@@ -1146,6 +1192,9 @@ async function compareChain(
       capped: blocksRes.capped,
       // Bounded spot-audit sample of the tolerated onlyB block numbers (issue #36), as for logs above.
       toleratedIssue36Sample: sampleToleratedOnlyB(toleratedBlockRows),
+      ...(blocksCollector.ok
+        ? {}
+        : { collectorMismatch: blocksCollector.collectorMismatch }),
     },
     transactions: tx,
     checkpointBuckets: {
