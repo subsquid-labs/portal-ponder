@@ -346,6 +346,16 @@ export async function* portalRealtimeEvents(
     finalizedHead: () => Promise<FinalizedHead | undefined>;
     finalizePollMs?: number;
     /**
+     * Upper bound (ms) on how long the B1 hash-unverifiable finalize deferral may persist before it is
+     * declared fatal. The defer branch below skips a poll whose canonical finalized head sits ABOVE the
+     * local window tip (no local hash to verify it against). Under a Portal brownout — /stream delivery
+     * below the chain's block rate — that head can stay ABOVE the window forever, so EVERY poll defers,
+     * the anchor never advances, and `unfinalized` grows without bound while ponder's finalized checkpoint
+     * silently freezes. When the deferral has run for this whole bound we THROW instead: a restart re-syncs
+     * from the finalized head. Injectable for tests; production default 10 min. (delta review B1)
+     */
+    finalizeDeferMaxMs?: number;
+    /**
      * The last FINALIZED block at startup (syncProgress.finalized as a Light) — the reconcile anchor.
      * Advanced to each finalize's tip. Absent ⇒ the empty-window blind-append behavior (legacy).
      */
@@ -363,6 +373,13 @@ export async function* portalRealtimeEvents(
   let anchor = args.anchor;
   let lastFinalizePoll = 0;
   const pollMs = args.finalizePollMs ?? 4000;
+  // B1 defer-streak watchdog: `deferStreakStart` is the Date.now() of the FIRST poll in an unbroken run of
+  // hash-unverifiable-finalize deferrals (undefined ⇒ not armed). Set when a poll defers and the streak is
+  // not already armed; cleared whenever a finalize poll does NOT defer (finalize emitted, no finalizedTip,
+  // or no probe result). If it ever runs longer than the bound the deferral is fatal — see the branch.
+  // (delta review B1)
+  const deferMaxMs = args.finalizeDeferMaxMs ?? 600_000;
+  let deferStreakStart: number | undefined;
 
   for await (const { header, logs, transactions } of streamHotBlocks(args)) {
     const light = toLight(header);
@@ -447,11 +464,19 @@ export async function* portalRealtimeEvents(
       const fh = await args.finalizedHead().catch(() => undefined);
       const fhNumber = typeof fh === 'number' ? fh : fh?.number;
       const fhHash = typeof fh === 'object' ? fh?.hash : undefined;
+      // No probe result this poll: the streak of deferrals (if any) is broken — clear it so a later,
+      // hash-unverifiable deferral times its OWN run, not a run interleaved with probe outages. (B1)
+      if (fhNumber === undefined) deferStreakStart = undefined;
+
       if (fhNumber !== undefined) {
         const { finalizedTip, remaining } = takeFinalized(
           unfinalized,
           fhNumber,
         );
+        // No block at/below the finalized height yet — nothing to finalize, and not a hash-unverifiable
+        // deferral either. This poll did NOT defer, so clear the streak. (B1)
+        if (!finalizedTip) deferStreakStart = undefined;
+
         if (finalizedTip) {
           // Wrong-fork finalize guard: `takeFinalized` splits by NUMBER, so the finalizedTip is only
           // hash-VERIFIABLE against the probe when it sits at the probe's exact height. Two cases when the
@@ -472,8 +497,25 @@ export async function* portalRealtimeEvents(
                 `Portal realtime: local block ${finalizedTip.number} (${finalizedTip.hash}) diverges from the canonical finalized block (${fhHash}) — the unfinalized window is on a losing fork at/below finality. Cannot finalize safely; restart to re-sync from the finalized head.`,
               );
           } else if (fhHash !== undefined && finalizedTip.number < fhNumber) {
+            // Hash-unverifiable finalize: the canonical head sits ABOVE our window tip, so we cannot
+            // confirm the local finalizedTip descends from it. Deferring is correct for a window that is
+            // merely catching up — but a persistent Portal brownout (delivery below the chain rate) keeps
+            // the head ABOVE the window forever, so EVERY poll defers, the anchor never advances, and
+            // `unfinalized` grows without bound while ponder's finalized checkpoint silently freezes. Bound
+            // the streak: arm it on the first deferral, and if it has run for the whole bound, fail loud —
+            // number-only fallback would reopen the wrong-fork hole this branch exists to close. A restart
+            // re-syncs from the finalized head. (delta review B1)
+            if (deferStreakStart === undefined) deferStreakStart = now;
+            else if (now - deferStreakStart >= deferMaxMs)
+              throw new Error(
+                `Portal realtime: the unfinalized window has lagged the hash-carrying finalized head (${fhNumber}, ${fhHash}) for ${now - deferStreakStart}ms (local tip ${finalizedTip.number}) — /stream delivery is below the chain's finalization rate, so finality cannot be hash-verified and the finalized checkpoint has stopped advancing. Cannot finalize safely; restart to re-sync from the finalized head.`,
+              );
+
             continue; // hash-unverifiable finalize deferred until the window reaches fhNumber
           }
+          // This poll finalizes (or applies a number-only head) — it did NOT defer, so the streak is
+          // broken; clear it. (B1)
+          deferStreakStart = undefined;
 
           anchor = finalizedTip; // the reconcile anchor advances with finality
           unfinalized.length = 0;

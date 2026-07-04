@@ -1,5 +1,5 @@
 import { getEventListeners } from 'node:events';
-import { expect, test } from 'vitest';
+import { afterEach, expect, test, vi } from 'vitest';
 import { TX_FIELDS } from './portal-filters.js';
 import {
   type Light,
@@ -516,6 +516,139 @@ test('portalRealtimeEvents: a hash-carrying finalize ABOVE the local tip is DEFE
   // EXACTLY ONE finalize, at block 12 — the polls at heights 10 and 11 deferred (no finalize(10)/(11)).
   expect(finalizes.map((f: any) => f.block.number)).toEqual([12]);
   expect(finalizes[0]!.block.hash).toBe('c');
+});
+
+// A /stream fetch that lazily yields an UNBOUNDED, strictly-increasing block chain (never 204s), so the
+// window keeps advancing but never catches a finalized head that also keeps climbing above it. Used for the
+// B1 starvation test — the block chain is infinite, so only the watchdog throw terminates the generator.
+function unboundedFetch(fromBlock: number) {
+  return (async (_url: string, init: any) => {
+    const start = Math.max(
+      JSON.parse(init.body).fromBlock as number,
+      fromBlock,
+    );
+    let n = start;
+    const enc = new TextEncoder();
+    const body = new ReadableStream({
+      pull(c) {
+        const header = {
+          number: n,
+          hash: `h${n}`,
+          parentHash: n === fromBlock ? 'z' : `h${n - 1}`,
+          timestamp: n,
+        };
+        c.enqueue(enc.encode(`${JSON.stringify({ header, logs: [] })}\n`));
+        n += 1;
+      },
+    });
+    return { status: 200, ok: true, body };
+  }) as any;
+}
+
+afterEach(() => {
+  vi.restoreAllMocks();
+});
+
+test('portalRealtimeEvents: a MOVING hash-carrying finalized head that stays ABOVE the window forever is bounded — the B1 deferral fails loud instead of starving finality (delta review B1)', async () => {
+  // Portal brownout: /stream delivery lags the chain, so the canonical finalized head keeps climbing ABOVE
+  // the local window tip on EVERY poll. takeFinalized returns the window tip (always < fhNumber), so every
+  // poll defers — the anchor never advances, `unfinalized` grows without bound, and ponder's finalized
+  // checkpoint silently freezes. The streak watchdog must turn this into a LOUD fatal.
+  //
+  // Deterministic clock: each finalizedHead() call (exactly one per poll) advances Date.now by 40ms; with a
+  // 100ms bound the streak arms on the first defer and trips a few polls later. Without a real wall clock the
+  // streak-start delta would stay 0 and the loop would spin forever, so the clock drive IS the test.
+  let clock = 1_000_000;
+  vi.spyOn(Date, 'now').mockImplementation(() => clock);
+  const ac = new AbortController();
+  const iter = portalRealtimeEvents({
+    portalUrl: 'http://portal',
+    headers: {},
+    fromBlock: 10,
+    logs: [],
+    fetchImpl: unboundedFetch(10),
+    signal: ac.signal,
+    // hash-carrying head, ALWAYS far above whatever height the window has crawled to → takeFinalized's tip
+    // is forever < fhNumber and hash-unverifiable ⇒ perpetual defer. Advance the clock once per poll here.
+    finalizedHead: async () => {
+      clock += 40;
+      return { number: 1_000_000, hash: 'canon' };
+    },
+    finalizePollMs: 0, // poll every block so the streak is exercised
+    finalizeDeferMaxMs: 100, // tiny bound: a few deferrals exceed it
+  });
+  // Drain with a hard iteration cap so a REGRESSION (streak bound removed) surfaces as a clean, distinct
+  // failure (the sentinel) instead of an infinite hang: with the fix the watchdog throws within a handful of
+  // polls, far under the cap; without it the deferral loop would spin forever (the starvation bug itself).
+  await expect(
+    (async () => {
+      let seen = 0;
+      for await (const _ of iter) {
+        seen += 1;
+        if (seen > 5000) {
+          throw new Error(
+            'NEVER-THROWN: the deferral was not bounded — finality starved without a fatal (regression)',
+          );
+        }
+      }
+    })(),
+  ).rejects.toThrow(/lagged the hash-carrying finalized head/i);
+  ac.abort();
+});
+
+test('portalRealtimeEvents: a deferral that CATCHES UP clears the streak — later deferrals do NOT accumulate into a false watchdog throw even past the bound (delta review B1)', async () => {
+  // Guards the reset side. Two defer-then-catch-up rounds:
+  //   • head = 11: the window defers ONCE at block 10, then REACHES 11 → finalize(11) (streak clears).
+  //   • head jumps to 13: defers ONCE at 12, then REACHES 13 → finalize(13).
+  // The TOTAL wall clock across the whole run far exceeds the bound, but no single unbroken defer streak
+  // does — so a correctly-RESETTING streak never throws. (A streak that never reset would fire at the
+  // second round, since its start would still hold the first round's timestamp.)
+  let clock = 2_000_000;
+  vi.spyOn(Date, 'now').mockImplementation(() => {
+    const t = clock;
+    clock += 60; // 60ms/call: one defer gap < the 100ms bound, but the full run spans >100ms total
+    return t;
+  });
+  const batches = [
+    {
+      header: { number: 10, hash: 'a', parentHash: 'z', timestamp: 10 },
+      logs: [],
+    },
+    {
+      header: { number: 11, hash: 'b', parentHash: 'a', timestamp: 11 },
+      logs: [],
+    },
+    {
+      header: { number: 12, hash: 'c', parentHash: 'b', timestamp: 12 },
+      logs: [],
+    },
+    {
+      header: { number: 13, hash: 'd', parentHash: 'c', timestamp: 13 },
+      logs: [],
+    },
+  ];
+  // Head advances 11 → 13 once the window has passed 11, so round 2 defers at 12 then finalizes at 13.
+  let head: { number: number; hash: string } = { number: 11, hash: 'b' };
+  const ac = new AbortController();
+  const events: any[] = [];
+  for await (const e of portalRealtimeEvents({
+    portalUrl: 'http://portal',
+    headers: {},
+    fromBlock: 10,
+    logs: [],
+    fetchImpl: mockFetch(batches, () => ac.abort()),
+    signal: ac.signal,
+    finalizedHead: async () => head,
+    finalizePollMs: 0,
+    finalizeDeferMaxMs: 100, // single defer gap (60ms) < bound; cumulative run (>200ms) > bound
+  })) {
+    events.push(e);
+    if (e.type === 'finalize' && e.block.number === 11)
+      head = { number: 13, hash: 'd' };
+  }
+  const finalizes = events.filter((e) => e.type === 'finalize');
+  // both hash-verifiable boundaries finalized, no false fatal — the streak reset at each catch-up
+  expect(finalizes.map((f: any) => f.block.number)).toEqual([11, 13]);
 });
 
 test('sleep: does not leak an abort listener per call on a shared long-lived signal (issue #28)', async () => {
