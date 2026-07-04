@@ -5,6 +5,7 @@ import { join } from 'node:path';
 import { test } from 'node:test';
 import { mergeCompare } from '../validate/diff-batched.mjs';
 import {
+  AB_STAGNATION_DEFAULT_MAX_SKEW_S,
   aggregateKnownBadRows,
   aggregateToleratedIssue27,
   aggregateToleratedIssue36,
@@ -31,9 +32,12 @@ import {
   knownBadRows,
   ONLYB_ROW_CAP,
   psqlExitVerdict,
+  readStagnationThreshold,
   restartStats,
   sampleToleratedOnlyB,
   sanitizeSchemaIdent,
+  stagnationAlerts,
+  stagnationDecision,
   TOLERATED_CLASSES,
   TOLERATED_ONLYB_CLASSES,
   TOLERATED_SAMPLE_SIZE,
@@ -1551,4 +1555,339 @@ test('D1 hook integration: a collector that skips every 2nd B-only row is caught
   const back = crossCheckOnlyBCollector(diff.onlyB, collected.length, false);
   assert.equal(back.ok, false, 'the backstop FAILs on the incomplete collection');
   assert.deepEqual(back.collectorMismatch, { expected: 4, collected: 2 });
+});
+
+// ── persist-stagnation guard (issue #38) ─────────────────────────────────────────────────────────
+
+// AB_STAGNATION_MAX_SKEW_S is interpolated into a numeric threshold the guard fails against, so a
+// present-but-garbage or non-positive value MUST fail loud (a config guard never silently disables
+// itself) — the same idiom as AB_SCHEMA_B / sanitizeSchemaIdent. Unset ⇒ the documented default.
+// MUTATION: change the guard `n > 0` to `n >= 0` → the `readStagnationThreshold('0')` throws-assertion
+// below fails (0 no longer rejected, silently disabling the guard since no skew can exceed 0... wait,
+// a 0 threshold makes EVERY positive skew fail — a different, equally-wrong footgun; either way the
+// value must be rejected). MUTATION: drop the `Number.isFinite(n)` conjunct → 'abc'→NaN passes the
+// `n > 0`? no (NaN > 0 is false) — but 'Infinity'→Infinity passes `n > 0`, so the Infinity-rejection
+// assertion fails.
+test('readStagnationThreshold: default when unset, fail-loud on garbage / non-positive naming the var', () => {
+  // unset / empty ⇒ the documented default (2h), never a silent 0
+  assert.equal(
+    readStagnationThreshold(undefined),
+    AB_STAGNATION_DEFAULT_MAX_SKEW_S,
+  );
+  assert.equal(readStagnationThreshold(null), AB_STAGNATION_DEFAULT_MAX_SKEW_S);
+  assert.equal(readStagnationThreshold(''), AB_STAGNATION_DEFAULT_MAX_SKEW_S);
+  assert.equal(AB_STAGNATION_DEFAULT_MAX_SKEW_S, 7200);
+
+  // a valid positive value is taken verbatim (string or number)
+  assert.equal(readStagnationThreshold('3600'), 3600);
+  assert.equal(readStagnationThreshold(1800), 1800);
+  // a large threshold is accepted as-is (intentional widen), never silently capped
+  assert.equal(readStagnationThreshold('999999999'), 999_999_999);
+
+  // 0 (disables the guard), a negative, NaN, Infinity, and non-numeric text ALL fail loud, and the
+  // error names the env var so an operator knows exactly what to fix.
+  for (const bad of ['0', '-1', '-0.5', 'NaN', 'abc', '1h', 'Infinity', '  ']) {
+    assert.throws(
+      () => readStagnationThreshold(bad),
+      /AB_STAGNATION_MAX_SKEW_S must be a positive number of seconds/,
+      `garbage/non-positive ${JSON.stringify(bad)} must fail loud`,
+    );
+  }
+});
+
+// The core: from the two legs' newest-row block TIMESTAMPS, a one-sided skew past threshold is a FAIL
+// naming the OLDER leg; a below-threshold skew is PASS. maxA/maxB are carried through for the counters
+// JSON. This is the whole guard — every clause is mutated below.
+test('stagnationDecision: both legs populated — fail past threshold, name the older leg, pass under it', () => {
+  const t = 7200; // 2h
+
+  // leg B is 3h behind leg A (tsB older) → FAIL, stale side B
+  const bStale = stagnationDecision({
+    maxA: '100',
+    tsA: 1_000_000,
+    maxB: '90',
+    tsB: 1_000_000 - 10_800,
+    threshold: t,
+  });
+  // MUTATION: `fail = skew > threshold` → `skew >= threshold` does NOT flip this (skew 10800 > 7200
+  // either way); the strict-boundary case is asserted in its own test below.
+  assert.equal(bStale.fail, true, '3h one-sided skew exceeds the 2h threshold');
+  // MUTATION: name the stale side by the LARGER ts (`a > b ? 'A' : 'B'`) instead of the smaller →
+  // this asserts 'B' (the older leg), so the mutant reads 'A' and fails.
+  assert.equal(bStale.staleSide, 'B', 'the OLDER-timestamp leg is the stalled one');
+  assert.equal(bStale.skew, 10_800, 'skew is the absolute timestamp delta in seconds');
+  // maxA/maxB surfaced for the counters JSON even on a FAIL
+  assert.equal(bStale.maxA, 100);
+  assert.equal(bStale.maxB, 90);
+
+  // symmetric: leg A older → stale side A (direction matters for NAMING)
+  const aStale = stagnationDecision({
+    maxA: '90',
+    tsA: 1_000_000 - 10_800,
+    maxB: '100',
+    tsB: 1_000_000,
+    threshold: t,
+  });
+  assert.equal(aStale.fail, true);
+  assert.equal(aStale.staleSide, 'A', 'the OLDER leg is A here');
+  assert.equal(aStale.skew, 10_800);
+
+  // below threshold (1h skew < 2h) → PASS, and NO stale side is named (a below-threshold lag is not a
+  // stall). MUTATION: return `staleSide` unconditionally (drop the `fail ? … : null`) → this asserts
+  // null on a PASS, so the mutant that names the older leg anyway fails.
+  const ok = stagnationDecision({
+    maxA: '100',
+    tsA: 1_000_000,
+    maxB: '99',
+    tsB: 1_000_000 - 3600,
+    threshold: t,
+  });
+  assert.equal(ok.fail, false, '1h skew is under the 2h threshold');
+  assert.equal(ok.staleSide, null, 'a below-threshold lag names no stalled side');
+  assert.equal(ok.skew, 3600, 'the skew is still surfaced for the counters JSON');
+});
+
+// Equal timestamps ⇒ skew 0 ⇒ PASS, no stale side — the benign steady state (both legs at the same
+// newest block). MUTATION: use `>=` for the fail comparison → skew 0 >= 0 would FAIL, so this test's
+// `fail === false` assertion catches it.
+test('stagnationDecision: equal timestamps → skew 0, PASS, no stale side', () => {
+  const eq = stagnationDecision({
+    maxA: '500',
+    tsA: 1_700_000_000,
+    maxB: '500',
+    tsB: 1_700_000_000,
+    threshold: 7200,
+  });
+  assert.equal(eq.fail, false);
+  assert.equal(eq.skew, 0);
+  assert.equal(eq.staleSide, null);
+});
+
+// The threshold boundary is STRICT (`>`), not `>=`: a skew EXACTLY equal to the threshold PASSes.
+// MUTATION: change `skew > threshold` to `skew >= threshold` → the exactly-at-threshold case flips to
+// FAIL and this test's `atThreshold.fail === false` assertion fails.
+test('stagnationDecision: skew exactly at the threshold passes (strict >)', () => {
+  const t = 7200;
+  const atThreshold = stagnationDecision({
+    maxA: '10',
+    tsA: 1_000_000,
+    maxB: '9',
+    tsB: 1_000_000 - t,
+    threshold: t,
+  });
+  assert.equal(atThreshold.fail, false, 'skew == threshold is NOT a failure');
+  assert.equal(atThreshold.skew, t);
+
+  const overByOne = stagnationDecision({
+    maxA: '10',
+    tsA: 1_000_000,
+    maxB: '9',
+    tsB: 1_000_000 - t - 1,
+    threshold: t,
+  });
+  assert.equal(overByOne.fail, true, 'one second past threshold fails');
+});
+
+// Empty-vs-populated is INDETERMINATE from timestamps alone (cold start vs wedge are indistinguishable
+// — see the helper header), so it does NOT alarm; skew is null and neither side is named. Both maxes
+// are still surfaced so the empty leg is legible. This is the conscious residual documented in the PR.
+// MUTATION: coalesce a missing ts to 0 (instead of returning early on null) → skew becomes ~1.7e9,
+// which exceeds any threshold, so the `fail === false` assertions below fail (the cold-start false
+// alarm this branch exists to prevent).
+test('stagnationDecision: one leg empty (no rows) → indeterminate, PASS, skew null, no side', () => {
+  // leg B empty (SQL NULL ts), leg A at a real recent block ts (~1.7e9 Unix seconds)
+  const bEmpty = stagnationDecision({
+    maxA: '12345',
+    tsA: 1_700_000_000,
+    maxB: null,
+    tsB: null,
+    threshold: 7200,
+  });
+  assert.equal(bEmpty.fail, false, 'empty-vs-populated must NOT false-alarm at cold start');
+  assert.equal(bEmpty.skew, null, 'skew is unmeasurable with one leg empty');
+  assert.equal(bEmpty.staleSide, null, 'no stalled side can be named from one timestamp');
+  assert.equal(bEmpty.maxA, 12_345, 'the populated leg max is still surfaced');
+  assert.equal(bEmpty.maxB, null, 'the empty leg max is null in the counters');
+  assert.equal(bEmpty.tsB, null, 'the empty leg newest timestamp is null');
+
+  // symmetric: leg A empty
+  const aEmpty = stagnationDecision({
+    maxA: null,
+    tsA: null,
+    maxB: '12345',
+    tsB: 1_700_000_000,
+    threshold: 7200,
+  });
+  assert.equal(aEmpty.fail, false);
+  assert.equal(aEmpty.skew, null);
+  assert.equal(aEmpty.staleSide, null);
+  assert.equal(aEmpty.tsA, null);
+});
+
+// Both legs empty ⇒ mutual not-started / sparse-app quiet — benign, PASS, no signal. MUTATION: as
+// above, coalescing null→0 would make skew 0 and could read as a spurious PASS-for-the-wrong-reason;
+// the explicit skew===null here pins that both-empty yields the indeterminate branch, not a 0 skew.
+test('stagnationDecision: both legs empty → PASS, skew null, no side (mutual freeze / not started)', () => {
+  const both = stagnationDecision({
+    maxA: null,
+    tsA: null,
+    maxB: null,
+    tsB: null,
+    threshold: 7200,
+  });
+  assert.equal(both.fail, false);
+  assert.equal(both.skew, null);
+  assert.equal(both.staleSide, null);
+  assert.equal(both.maxA, null);
+  assert.equal(both.maxB, null);
+});
+
+// A NULL/NaN/empty-string timestamp is treated as "no rows" for that leg — never coerced to a phantom
+// 0 (which would be ~1.7e9 seconds behind any real block and false-alarm). Numeric-string timestamps
+// (psql returns bigint as text) are parsed. MUTATION: drop the `Number.isFinite` guard in tsToSeconds
+// so a non-numeric string coerces to NaN and flows on → `NaN > 0`/skew math yields NaN, and the
+// no-alarm assertion below fails.
+test('stagnationDecision: NULL / unparseable timestamps are "no rows", numeric strings parse', () => {
+  // psql bigint-as-text timestamps within threshold → PASS, parsed correctly
+  const parsed = stagnationDecision({
+    maxA: '100',
+    tsA: '1700000000',
+    maxB: '100',
+    tsB: '1699999000',
+    threshold: 7200,
+  });
+  assert.equal(parsed.fail, false);
+  assert.equal(parsed.skew, 1000, 'numeric-string timestamps parse to a numeric skew');
+
+  // an unparseable ts on one leg is treated as no-rows (indeterminate), never a phantom 0
+  const garbageTs = stagnationDecision({
+    maxA: '100',
+    tsA: 'not-a-number',
+    maxB: '100',
+    tsB: '1700000000',
+    threshold: 7200,
+  });
+  assert.equal(garbageTs.fail, false, 'an unparseable ts never becomes a phantom 0 skew');
+  assert.equal(garbageTs.skew, null);
+  assert.equal(garbageTs.tsA, null);
+});
+
+// The alert layer turns a fired guard into one loud, self-describing line per stalled chain, and
+// stays SILENT for a passing/absent guard — the alert must fire even though this is glued onto results
+// whose windowed verdict could be PASS. MUTATION: emit a line for `s.fail === false` too (drop the
+// `!s.fail` continue) → the passing-chain case below produces a line and the `length === 1` assertion
+// fails. MUTATION: name the wrong leg (map 'A'→'leg B') → the "leg A" substring assertion fails.
+test('stagnationAlerts: one loud line per stalled chain naming the older leg, silent otherwise', () => {
+  const results = [
+    // chain 1: guard fired, leg A stalled
+    {
+      chain: 1,
+      classes: {
+        persistStagnation: {
+          fail: true,
+          staleSide: 'A',
+          skewSeconds: 10_800,
+          thresholdSeconds: 7200,
+          maxA: 90,
+          maxB: 100,
+          tsA: 989_200,
+          tsB: 1_000_000,
+        },
+      },
+    },
+    // chain 8453: below threshold → PASS, no alert
+    {
+      chain: 8453,
+      classes: {
+        persistStagnation: {
+          fail: false,
+          staleSide: null,
+          skewSeconds: 60,
+          thresholdSeconds: 7200,
+          maxA: 5,
+          maxB: 5,
+          tsA: 1,
+          tsB: 1,
+        },
+      },
+    },
+    // an ERROR result with no persistStagnation contributes nothing
+    { chain: 42_161, classes: { error: 'boom' } },
+  ];
+
+  const lines = stagnationAlerts(results);
+  assert.equal(lines.length, 1, 'only the stalled chain emits an alert');
+  assert.match(lines[0], /persist-stagnation: chain 1/);
+  assert.match(lines[0], /leg A has stopped persisting rows/);
+  assert.match(lines[0], /skew 10800s > 7200s/);
+  assert.match(lines[0], /maxA=90 maxB=100 tsA=989200 tsB=1000000/);
+
+  // a leg-B stall names leg B
+  const bLine = stagnationAlerts([
+    {
+      chain: 5,
+      classes: {
+        persistStagnation: {
+          fail: true,
+          staleSide: 'B',
+          skewSeconds: 9000,
+          thresholdSeconds: 7200,
+          maxA: 100,
+          maxB: 90,
+          tsA: 1_000_000,
+          tsB: 991_000,
+        },
+      },
+    },
+  ]);
+  assert.equal(bLine.length, 1);
+  assert.match(bLine[0], /leg B has stopped persisting rows/);
+
+  // no results / all-passing → no alerts
+  assert.deepEqual(stagnationAlerts([]), []);
+});
+
+// The WHOLE POINT of the guard: it fires on a chain whose WINDOWED diff would read PASS. This is the
+// issue #36 shape — leg A stopped persisting, the window `hi` froze at leg A's max, so the diff inside
+// [lo, hi] is clean (PASS) while ~17h of divergence sits above hi, invisible. We reproduce the exact
+// compareChain composition (decide → attach persistStagnation → alert) WITHOUT a DB: the decision must
+// FAIL and the alert must fire even though nothing inside the window diverged.
+// MUTATION: gate the guard on the windowed verdict (only run stagnationDecision when the window diff
+// FAILs) → this frozen-window PASS chain reads clean and the FAIL/alert assertions below fail — the
+// precise regression this guard exists to prevent.
+test('stagnationDecision + alert: fire on a frozen-window chain whose windowed verdict is PASS (issue #36 shape)', () => {
+  // leg A wedged 17h behind leg B; the window froze at leg A's max so the in-window diff is PASS
+  const decision = stagnationDecision({
+    maxA: '100000', // leg A's frozen max — this is what pinned the window `hi`
+    tsA: 1_700_000_000 - 17 * 3600,
+    maxB: '132825', // leg B kept advancing (32,825 blocks ahead — the issue #36 measurement)
+    tsB: 1_700_000_000,
+    threshold: 7200,
+  });
+  assert.equal(decision.fail, true, 'a 17h one-sided freeze FAILs regardless of a clean window');
+  assert.equal(decision.staleSide, 'A', 'leg A (older newest row) is the stalled side');
+
+  // the exact per-chain class compareChain attaches, then the alert layer over it
+  const chainResult = {
+    chain: 8453,
+    // a windowed verdict of PASS is IRRELEVANT — the guard overrides it in compareChain; here we prove
+    // the alert fires purely from the persistStagnation class the guard produced.
+    verdict: 'PASS',
+    classes: {
+      persistStagnation: {
+        fail: decision.fail,
+        staleSide: decision.staleSide,
+        skewSeconds: decision.skew,
+        thresholdSeconds: 7200,
+        maxA: decision.maxA,
+        maxB: decision.maxB,
+        tsA: decision.tsA,
+        tsB: decision.tsB,
+      },
+    },
+  };
+  const lines = stagnationAlerts([chainResult]);
+  assert.equal(lines.length, 1, 'the frozen-window chain emits a loud alert despite a PASS window');
+  assert.match(lines[0], /chain 8453 — leg A has stopped persisting rows/);
+  assert.match(lines[0], /skew 61200s > 7200s/);
 });

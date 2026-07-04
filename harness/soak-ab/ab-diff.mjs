@@ -9,6 +9,9 @@
 //     by an A-side log. Any B-extra tx, or an A-only tx no log references, is a FAIL.
 //   • per-1000-block ordered md5 checkpoint hashes both sides (persisted for drift tracking)
 //   • _ponder_checkpoint monotonicity across runs
+//   • persist-stagnation guard (issue #38): a one-sided freeze of the newest-persisted-row block
+//     TIMESTAMP between the two legs is a HARD per-chain FAIL — it fires even when the WINDOWED diff
+//     reads PASS/PENDING, closing the frozen-window blind spot that hid issue #36's real blast radius.
 // Writes soak-ab-status.json {ts, chains, verdict, diffClasses, lagA, lagB, counters} for the monitor.
 //
 // Two "PG connections" = two `psql` processes (no npm driver → runs on the box with node + psql).
@@ -22,6 +25,11 @@
 // AB_SCHEMA_B to Soak B's DATABASE_SCHEMA value. Empty ⇒ unqualified `_ponder_checkpoint` (the
 // legacy behavior, for a store on the default search_path). The identifier is sanitized before it
 // reaches SQL.
+//
+// AB_STAGNATION_MAX_SKEW_S (optional): max tolerated skew, in seconds, between the two legs' newest
+// persisted-row block timestamps before the persist-stagnation guard (issue #38) FAILs the chain.
+// Unset ⇒ 2h (AB_STAGNATION_DEFAULT_MAX_SKEW_S). A garbage/non-positive value fails loud (like
+// AB_SCHEMA_B) rather than silently disabling the guard.
 
 import { spawn } from 'node:child_process';
 import { readFileSync, renameSync, writeFileSync } from 'node:fs';
@@ -520,6 +528,138 @@ export function sanitizeSchemaIdent(schema) {
   return schema;
 }
 
+// ── persist-stagnation guard (issue #38) ─────────────────────────────────────────────────────────
+//
+// The finalized-overlap window is [lo, min(maxA, maxB) - margin]. If ONE leg stops persisting sync
+// rows (crash wedge, silent blindness like issue #36, an ingest stall), the window `hi` FREEZES at
+// the stalled leg's block max, so every row of divergence ABOVE hi is out of scope by construction —
+// the per-chain verdict stays PASS while real loss accumulates invisibly (issue #36: chain 8453 read
+// PASS for ~17h with 32,825 blocks / ~476 log rows of real divergence sitting above the frozen hi).
+//
+// A MUTUAL freeze is BENIGN: `max(number)` only advances when the app's filters match a new event, so
+// a sparse app can leave BOTH legs quiet on the same chain at the same time (chain 1 did exactly
+// that). Absolute staleness is therefore NOT the signal — the signal is ONE-SIDED SKEW between the
+// two legs' progress. We measure that skew with the newest-row block TIMESTAMPS, not block-number
+// deltas: 32k blocks is ~17h on chain 8453 but ~2h on chain 42161, so a block-count threshold cannot
+// be chain-agnostic, whereas ponder_sync.blocks.timestamp (on-chain time, Unix seconds) is one clock
+// across every chain.
+
+/**
+ * Default max tolerated skew between the two legs' newest-row block timestamps, in SECONDS.
+ * 7200s = 2h — a CONSCIOUS choice comfortably above the worst crash-recovery time we expect
+ * (~45–60 min: a Soak B restart re-syncs its realtime lag before its newest block timestamp catches
+ * back up), so a healthy leg recovering from a restart never trips the guard, while a genuine
+ * one-sided wedge (a leg that has stopped persisting for hours) is caught long before issue #36's
+ * ~17h blind window could reopen. Tunable via AB_STAGNATION_MAX_SKEW_S for chains/apps with a
+ * different recovery profile.
+ */
+export const AB_STAGNATION_DEFAULT_MAX_SKEW_S = 7200;
+
+// Parse AB_STAGNATION_MAX_SKEW_S. Unset ⇒ the documented default. A present-but-garbage value
+// (non-numeric, non-finite, or non-positive — 0 disables the guard, a negative is nonsense) FAILS
+// LOUD naming the var, exactly as sanitizeSchemaIdent does for AB_SCHEMA_B: a config guard must never
+// silently disable itself. Pure + exported so every branch is asserted without touching the env.
+export function readStagnationThreshold(raw) {
+  if (raw === undefined || raw === null || raw === '') {
+    return AB_STAGNATION_DEFAULT_MAX_SKEW_S;
+  }
+
+  const n = Number(raw);
+  if (!(Number.isFinite(n) && n > 0)) {
+    throw new Error(
+      `AB_STAGNATION_MAX_SKEW_S must be a positive number of seconds: ${JSON.stringify(raw)}`,
+    );
+  }
+
+  return n;
+}
+
+// Pure per-chain persist-stagnation decision from the two legs' newest-row block TIMESTAMPS (Unix
+// seconds). `maxA`/`maxB` are the newest-row block NUMBERS (carried through only for the counters
+// JSON, so a frozen window is legible even below threshold). `tsA`/`tsB` are the newest-row block
+// timestamps, or null/undefined when that leg has NO rows for the chain (SQL max(timestamp) → NULL).
+//
+// Returns { fail, staleSide, skew, tsA, tsB, maxA, maxB }:
+//   • staleSide — the leg whose newest row is OLDER (the stalled side), or null when neither is stale.
+//   • skew      — |tsB − tsA| in seconds when BOTH legs have rows; null when it is not computable
+//                 (one/both legs empty — see below).
+//   • fail      — true iff the skew exceeds `threshold`.
+//
+// Edge cases (all handled here so the caller is a thin wiring):
+//   • BOTH legs empty (both ts null) — a mutual freeze / not-started chain. Benign → PASS, no side.
+//   • ONE leg empty, the other populated — NOT decidable as a stall from {ts} alone: at genuine cold
+//     start one leg legitimately races ahead by seconds before the other's first row lands, and a
+//     chain one leg simply has not begun looks identical to a wedge. Alarming on it would false-FAIL
+//     every soak startup (block timestamps are ~1.7e9, so any "empty vs populated" delta dwarfs any
+//     threshold). We therefore do NOT alarm on empty-vs-populated here; the caller surfaces the empty
+//     leg's null timestamp in the counters JSON so it is legible, and the guard fires the moment the
+//     empty leg persists its FIRST row and its timestamp is > threshold behind the other leg's — the
+//     wedge is caught then, once it is distinguishable from cold start. See the PR body's residuals.
+//   • EQUAL timestamps — skew 0 → PASS, no stale side.
+//   • NULL/NaN after coercion is treated as "no rows" for that leg (never a phantom 0 timestamp).
+// Pure + exported so every branch is mutation-verified without a DB.
+export function stagnationDecision({ maxA, tsA, maxB, tsB, threshold }) {
+  const a = tsToSeconds(tsA);
+  const b = tsToSeconds(tsB);
+
+  // one or both legs have no newest-row timestamp → not a decidable one-sided stall (see header)
+  if (a === null || b === null) {
+    return {
+      fail: false,
+      staleSide: null,
+      skew: null,
+      tsA: a,
+      tsB: b,
+      maxA: maxToNumber(maxA),
+      maxB: maxToNumber(maxB),
+    };
+  }
+
+  const skew = Math.abs(b - a);
+  const fail = skew > threshold;
+  // the stalled side is the one whose newest row is OLDER; equal ⇒ no side
+  let staleSide = null;
+  if (a < b) {
+    staleSide = 'A';
+  } else if (b < a) {
+    staleSide = 'B';
+  }
+
+  return {
+    fail,
+    // name a side only WHEN it fails — a below-threshold skew has an older leg but no stall
+    staleSide: fail ? staleSide : null,
+    skew,
+    tsA: a,
+    tsB: b,
+    maxA: maxToNumber(maxA),
+    maxB: maxToNumber(maxB),
+  };
+}
+
+// Coerce a newest-row block timestamp to a finite number of seconds, or null when the leg has no rows
+// (SQL NULL, empty string, or an unparseable value). Never returns a phantom 0 for a missing row.
+function tsToSeconds(ts) {
+  if (ts === undefined || ts === null || ts === '') {
+    return null;
+  }
+
+  const n = Number(ts);
+
+  return Number.isFinite(n) ? n : null;
+}
+
+// Coerce a newest-row block number for the counters JSON; null when absent/unparseable.
+function maxToNumber(max) {
+  if (max === undefined || max === null || max === '') {
+    return null;
+  }
+
+  const n = Number(max);
+
+  return Number.isFinite(n) ? n : null;
+}
+
 // Compare per-bucket checkpoint hashes: shared buckets must match (determinism); buckets on only one
 // side are reported (overlap edges), not failed.
 export function compareBucketHashes(aBuckets, bBuckets) {
@@ -714,6 +854,30 @@ async function overlapBound(url, chain) {
   );
 
   return Number(v ?? 0);
+}
+
+// Newest persisted row for the chain: the max block NUMBER and its block TIMESTAMP (Unix seconds).
+// Both use a bare max(...) — NO coalesce — so an EMPTY store returns NULL, letting stagnationDecision
+// tell "no rows" apart from a legitimate block/timestamp of 0 (never a phantom 0). ponder_sync.blocks
+// persists blocks in on-chain order and both number and timestamp are monotonic there, so max(number)
+// and max(timestamp) are the newest block's height and time. Returns { maxBlock, ts } as strings|null
+// (the pure decision helper coerces them). Used ONLY by the issue #38 persist-stagnation guard; the
+// window hi still comes from overlapBound's coalesce(...,0), unchanged.
+async function legNewestRow(url, chain) {
+  let row = null;
+  for await (const r of psqlRows(
+    url,
+    `select max(number)::text, max(timestamp)::text ` +
+      `from ponder_sync.blocks where chain_id=${chain}`,
+  )) {
+    row = r;
+    break;
+  }
+
+  return {
+    maxBlock: row?.[0] ?? null,
+    ts: row?.[1] ?? null,
+  };
 }
 
 // Real indexing progress for the monotonicity guard: ponder's own `_ponder_checkpoint` row (in the
@@ -1064,13 +1228,17 @@ async function compareChain(
   margin,
   bucket,
   schemaB,
+  stagnationThreshold,
 ) {
-  const [boundA, boundB, progressB] = await Promise.all([
+  const [boundA, boundB, progressB, newestA, newestB] = await Promise.all([
     overlapBound(urlA, chain),
     overlapBound(urlB, chain),
     // Soak B's COMMITTED indexing progress from `_ponder_checkpoint` — the real value the
     // monotonicity guard asserts, not merely how far the sync store reached (see checkpointProgress).
     checkpointProgress(urlB, chain, schemaB),
+    // Newest persisted (block, timestamp) per leg — for the issue #38 persist-stagnation guard.
+    legNewestRow(urlA, chain),
+    legNewestRow(urlB, chain),
   ]);
   const hi = Math.min(boundA, boundB) - margin;
   const lo = cutover;
@@ -1088,6 +1256,37 @@ async function compareChain(
   };
   out.lagA = boundA - Math.min(boundA, boundB);
   out.lagB = boundB - Math.min(boundA, boundB);
+
+  // Persist-stagnation guard (issue #38). Computed BEFORE the window check so it fires regardless of
+  // window state: a one-sided wedge is exactly the state where `hi` can be frozen or below `lo`, and
+  // the whole point is that this FAILs when the WINDOWED diff would read PASS/PENDING. maxA/maxB and
+  // both newest-row timestamps are surfaced in the per-chain classes (and thus the counters JSON) so
+  // a frozen window is legible at a glance even below threshold.
+  const stagnation = stagnationDecision({
+    maxA: newestA.maxBlock,
+    tsA: newestA.ts,
+    maxB: newestB.maxBlock,
+    tsB: newestB.ts,
+    threshold: stagnationThreshold,
+  });
+  const persistStagnation = {
+    fail: stagnation.fail,
+    staleSide: stagnation.staleSide,
+    skewSeconds: stagnation.skew,
+    thresholdSeconds: stagnationThreshold,
+    maxA: stagnation.maxA,
+    maxB: stagnation.maxB,
+    tsA: stagnation.tsA,
+    tsB: stagnation.tsB,
+  };
+  out.classes.persistStagnation = persistStagnation;
+  if (stagnation.fail) {
+    // A one-sided persist stall is a HARD FAIL that overrides any window-derived verdict (PENDING or a
+    // clean windowed PASS) — the frozen window is precisely why the windowed diff cannot see the loss.
+    out.verdict = 'FAIL';
+
+    return out;
+  }
 
   if (hi < lo) {
     out.verdict = 'PENDING';
@@ -1173,6 +1372,10 @@ async function compareChain(
   const bucketsFail = !bucketClass.ok;
 
   out.classes = {
+    // Carried through the window path too (issue #38): a PASSing windowed diff still surfaces the
+    // per-chain persist-stagnation counters so a below-threshold one-sided skew (a frozen window that
+    // has not yet crossed the guard) is legible at a glance in the status JSON.
+    persistStagnation,
     logs: {
       fail: logsFail,
       onlyA: logsRes.diff.onlyA,
@@ -1243,6 +1446,12 @@ async function main() {
   // value). Unset ⇒ unqualified (default search_path). Sanitized — it goes into SQL. A bad identifier
   // fails loud here (before any per-chain query) rather than silently disabling the checkpoint guard.
   const schemaB = sanitizeSchemaIdent(process.env.AB_SCHEMA_B ?? '');
+  // Max tolerated one-sided persist skew (issue #38), in seconds. Garbage/non-positive fails loud
+  // here (before any per-chain query), same as AB_SCHEMA_B above — a config guard never silently
+  // disables itself. Unset ⇒ the documented 2h default.
+  const stagnationThreshold = readStagnationThreshold(
+    process.env.AB_STAGNATION_MAX_SKEW_S,
+  );
   const statusFile = process.env.STATUS_FILE ?? 'soak-ab-status.json';
   const checkpointFile =
     process.env.CHECKPOINT_FILE ?? 'soak-ab-checkpoints.json';
@@ -1251,7 +1460,16 @@ async function main() {
   for (const chain of chains) {
     try {
       results.push(
-        await compareChain(urlA, urlB, chain, cutover, margin, bucket, schemaB),
+        await compareChain(
+          urlA,
+          urlB,
+          chain,
+          cutover,
+          margin,
+          bucket,
+          schemaB,
+          stagnationThreshold,
+        ),
       );
     } catch (e) {
       results.push({ chain, verdict: 'ERROR', classes: { error: e.message } });
@@ -1316,7 +1534,19 @@ async function main() {
       `checkpoint-regression: chain ${reg.chain} rewound ${reg.prev} → ${reg.cur} between runs`,
     );
   }
-  if (verdict === 'FAIL' && regressions.length === 0) {
+  // Persist-stagnation alerts (issue #38) — one NAMED line per stalled chain, so a one-sided wedge
+  // that a frozen window would otherwise hide behind a PASS is loud and self-describing.
+  const stagnations = stagnationAlerts(results);
+  for (const line of stagnations) {
+    alerts.push(line);
+  }
+  // The generic finalized-diff line covers the WINDOWED failure modes; a stagnation-only FAIL already
+  // has its own precise alert above, so don't also emit the vague generic line for it.
+  if (
+    verdict === 'FAIL' &&
+    regressions.length === 0 &&
+    stagnations.length === 0
+  ) {
     alerts.push(
       'finalized-diff: an unexpected finalized-overlap divergence (see diffClasses)',
     );
@@ -1466,6 +1696,30 @@ export function formatToleratedIssue36Line(tolerated) {
     `TOLERATED (known issue #36 — REMOVE when issue #36 is resolved (A repaired or leg retired)): ` +
     `${tolerated.count} onlyB rows leg A lost (logs:${tolerated.logs?.count ?? 0} blocks:${tolerated.blocks?.count ?? 0}; per-chain ${breakdown})`
   );
+}
+
+// One loud alert line per chain whose persist-stagnation guard FIRED (issue #38) — the stalled leg
+// named, the skew and threshold shown. Reads the per-chain persistStagnation class each compareChain
+// attaches. Pure + exported so the alert wording and the "only fires on FAIL" contract are asserted
+// directly, without a DB. A chain result with no persistStagnation (e.g. an ERROR before the guard
+// ran) contributes nothing.
+export function stagnationAlerts(results) {
+  const lines = [];
+  for (const r of results) {
+    const s = r?.classes?.persistStagnation;
+    if (!s || !s.fail) {
+      continue;
+    }
+
+    const stalled = s.staleSide === 'A' ? 'leg A' : 'leg B';
+    lines.push(
+      `persist-stagnation: chain ${r.chain} — ${stalled} has stopped persisting rows ` +
+        `(newest-row timestamp skew ${s.skewSeconds}s > ${s.thresholdSeconds}s; ` +
+        `maxA=${s.maxA} maxB=${s.maxB} tsA=${s.tsA} tsB=${s.tsB})`,
+    );
+  }
+
+  return lines;
 }
 
 // Sum the per-chain knownBadRows (issue #32) tallies from every chain result into one
