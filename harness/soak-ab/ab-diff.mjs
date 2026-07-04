@@ -708,14 +708,16 @@ async function checkpointProgress(url, chain, schema) {
 // bounded by the onlyB count — small by construction for the tolerated class (issue #36 measured 89 log
 // + 18 block rows) and, if it ever exploded past ONLYB_ROW_CAP, that is a NEW divergence shape that must
 // FAIL LOUD anyway, never a silently-tolerated one; the cap keeps memory bounded while flipping to a
-// hard fail. Returns { onlyBRows: [{ blockNumber, logIndex? }], capped }.
+// hard fail. `cap` is injectable (default ONLYB_ROW_CAP) so the capped→FAIL path is testable WITHOUT
+// lowering the production constant. Exported so the collector wiring is driven directly in a test.
+// Returns { onlyBRows: [{ blockNumber, logIndex? }], capped: () => boolean, onOnlyB }.
 export const ONLYB_ROW_CAP = 100_000;
 
-function collectOnlyB(diffResultRef) {
+export function collectOnlyB(cap = ONLYB_ROW_CAP) {
   const onlyBRows = [];
   let capped = false;
   const onOnlyB = (row) => {
-    if (onlyBRows.length >= ONLYB_ROW_CAP) {
+    if (onlyBRows.length >= cap) {
       capped = true;
 
       return;
@@ -728,7 +730,7 @@ function collectOnlyB(diffResultRef) {
     });
   };
 
-  return { onlyBRows, capped: () => capped, onOnlyB, diffResultRef };
+  return { onlyBRows, capped: () => capped, onOnlyB };
 }
 
 async function diffLogs(urlA, urlB, chain, lo, hi) {

@@ -3,6 +3,7 @@ import { existsSync, mkdtempSync, readdirSync, readFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { test } from 'node:test';
+import { mergeCompare } from '../validate/diff-batched.mjs';
 import {
   aggregateKnownBadRows,
   aggregateToleratedIssue27,
@@ -19,6 +20,7 @@ import {
   classifyOnlyBRow,
   classifySharedTx,
   classifyTxDiff,
+  collectOnlyB,
   collectReferenced,
   compareBucketHashes,
   extractCheckpointBlock,
@@ -26,6 +28,7 @@ import {
   formatToleratedIssue27Line,
   formatToleratedIssue36Line,
   knownBadRows,
+  ONLYB_ROW_CAP,
   psqlExitVerdict,
   restartStats,
   sanitizeSchemaIdent,
@@ -1311,4 +1314,101 @@ test('formatToleratedIssue36Line: empty string when nothing tolerated (never a n
   assert.equal(formatToleratedIssue36Line({ count: 0, perChain: {} }), '');
   assert.equal(formatToleratedIssue36Line(null), '');
   assert.equal(formatToleratedIssue36Line(undefined), '');
+});
+
+// ── D2: collectOnlyB — the injectable-cap capped path, and the REAL streaming-integration hook test ──
+
+test('collectOnlyB: collects each onlyB row (block + logIndex) under the default cap, not capped', () => {
+  const c = collectOnlyB();
+  c.onOnlyB({ key: [100n, 5n] });
+  c.onOnlyB({ key: [101n] }); // block-table shape: no log_index
+  assert.equal(c.capped(), false);
+  assert.deepEqual(c.onlyBRows, [
+    { blockNumber: 100, logIndex: 5 },
+    { blockNumber: 101, logIndex: undefined },
+  ]);
+});
+
+test('collectOnlyB: an injectable cap flips capped() and stops collecting past the cap (default is ONLYB_ROW_CAP)', () => {
+  // Parameterize the cap rather than lowering the production constant. With cap=2, the 3rd onlyB row
+  // trips the cap: capped() flips true and the row is NOT collected. MUTATION (ignore the injected cap /
+  // never set capped) → capped() stays false and this fails.
+  const c = collectOnlyB(2);
+  c.onOnlyB({ key: [1n, 0n] });
+  c.onOnlyB({ key: [2n, 0n] });
+  assert.equal(c.capped(), false, 'at the cap, not yet over');
+  c.onOnlyB({ key: [3n, 0n] }); // over the cap
+  assert.equal(c.capped(), true, 'the 3rd row trips the injected cap');
+  assert.equal(c.onlyBRows.length, 2, 'the over-cap row is NOT collected');
+  // the default cap is the production constant, unchanged
+  assert.equal(ONLYB_ROW_CAP, 100_000);
+});
+
+// D2 HOOK INTEGRATION: drive the REAL mergeCompare/streamingDiff (from diff-batched.mjs) with a
+// collectOnlyB collector as onOnlyB, over a fixture with B-only rows (a) in the MIDDLE of the merge, (b)
+// in the TAIL DRAIN (after A's iterator is exhausted), and (c) at least one BELOW-floor row. Assert the
+// collector received EVERY B-only row (count + identities) AND classifyOnlyBDiff FAILs on the below-floor
+// row. This is the test that catches verifier mutation h1 ("streamingDiff onOnlyB skips every 2nd B-only
+// row"), which the pure classifyOnlyBDiff unit tests alone do NOT — they feed a hand-built onlyBRows
+// array and never exercise the streamingDiff hook wiring.
+const HASH_ROW = (block, logIndex, h) => ({
+  key: [BigInt(block), BigInt(logIndex)],
+  hash: h,
+});
+const KEY_OF = (r) => r.key;
+
+test('D2 hook integration: the REAL streamingDiff onOnlyB streams EVERY B-only row (middle + tail-drain), collector + classify catch the below-floor one', async () => {
+  // Leg A holds a shared prefix; leg B additionally holds B-only rows scattered in the MIDDLE and, after
+  // A is exhausted, a run of them in the TAIL DRAIN — plus one BELOW the chain-1 floor.
+  const belowFloor = ISSUE_36_FLOOR_1 - 10; // (c) below-floor B-only row
+  const a = [
+    HASH_ROW(ISSUE_36_FLOOR_1, 0, 'shared0'),
+    HASH_ROW(ISSUE_36_FLOOR_1 + 5, 0, 'shared1'),
+    HASH_ROW(ISSUE_36_FLOOR_1 + 9, 0, 'shared2'),
+  ];
+  const b = [
+    HASH_ROW(belowFloor, 0, 'bBelow'), // (c) B-only, below floor, sorts FIRST
+    HASH_ROW(ISSUE_36_FLOOR_1, 0, 'shared0'), // shared
+    HASH_ROW(ISSUE_36_FLOOR_1 + 2, 0, 'bMid1'), // (a) B-only in the middle
+    HASH_ROW(ISSUE_36_FLOOR_1 + 5, 0, 'shared1'), // shared
+    HASH_ROW(ISSUE_36_FLOOR_1 + 7, 0, 'bMid2'), // (a) B-only in the middle
+    HASH_ROW(ISSUE_36_FLOOR_1 + 9, 0, 'shared2'), // shared (last A row)
+    HASH_ROW(ISSUE_36_FLOOR_1 + 20, 0, 'bTail1'), // (b) B-only in the tail drain
+    HASH_ROW(ISSUE_36_FLOOR_1 + 21, 1, 'bTail2'), // (b) B-only in the tail drain
+  ];
+
+  const collector = collectOnlyB();
+  const diff = await mergeCompare(a, b, {
+    keyFn: KEY_OF,
+    mode: 'strict',
+    onOnlyB: collector.onOnlyB,
+  });
+
+  // The diff's own onlyB count and the collected array must AGREE.
+  assert.equal(diff.onlyB, 5, 'five B-only rows: below-floor + 2 middle + 2 tail');
+  assert.equal(
+    collector.onlyBRows.length,
+    5,
+    'the collector received EVERY B-only row, including both tail-drain rows',
+  );
+  assert.equal(collector.capped(), false);
+
+  // Exact identities (block numbers) of every collected B-only row, in key order.
+  assert.deepEqual(
+    collector.onlyBRows.map((r) => r.blockNumber),
+    [
+      belowFloor,
+      ISSUE_36_FLOOR_1 + 2,
+      ISSUE_36_FLOOR_1 + 7,
+      ISSUE_36_FLOOR_1 + 20,
+      ISSUE_36_FLOOR_1 + 21,
+    ],
+  );
+
+  // classifyOnlyBDiff over the collected rows FAILs on the below-floor row (the 4 at/above floor are
+  // tolerated; the 1 below floor is a hard onlyB). This is the wiring the pure unit tests never touch.
+  const cls = classifyOnlyBDiff(diff, collector.onlyBRows, 1);
+  assert.equal(cls.fail, true, 'the below-floor B-only row FAILs the table');
+  assert.equal(cls.hardOnlyB, 1);
+  assert.equal(cls.toleratedOnlyB.count, 4);
 });
