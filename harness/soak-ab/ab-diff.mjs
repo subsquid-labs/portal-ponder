@@ -29,11 +29,70 @@ import { streamingDiff } from '../validate/diff-batched.mjs';
 
 // ── pure, unit-tested core ─────────────────────────────────────────────────────────────────────
 
+// KNOWN, FULLY-TOLERATED shared-tx divergence classes. Each entry is a NARROW, reportable, removable
+// exception to the otherwise-strict shared-tx byte-identity check — never a general mask. Deleting an
+// entry restores full strictness with no other code change (classifySharedTx returns 'mismatch' for
+// anything not matched by a live entry).
+//
+// issue27AccessListNull — issue #27, root-caused in its authoritative comment: a non-compliant RPC
+// provider omits the `accessList` key on typed realtime txs; upstream ponder tolerates the missing key
+// and persists NULL (`encode.ts`: `accessList ? JSON.stringify(...) : null`) permanently. Side A
+// (RPC-transport realtime) therefore stores access_list NULL for a span of realtime-ingested typed txs
+// while side B (Portal /stream) stored the chain-true value. Every OTHER column of those rows is
+// byte-identical (proven: md5 over `to_jsonb(t) - 'access_list'` equal on all three chains). The
+// tolerance is scoped to EXACTLY that shape (see classifySharedTx) — A-side NULL, B-side non-null, all
+// other columns identical, at/above the measured realtime-span floor per chain, within the (currently
+// open) window. `perChainFloor` values are the measured min block_number of the class per chain;
+// `toBlock` is null until the fork-side fix deploys and the realtime window closes — set it then, and
+// once the whole span is finalized-and-past, DELETE this entry to restore full strictness.
+export const TOLERATED_CLASSES = {
+  issue27AccessListNull: {
+    issue: 'https://github.com/subsquid-labs/portal-ponder/issues/27',
+    perChainFloor: { 1: 25445239, 8453: 48092254, 42161: 479635494 },
+    toBlock: null,
+  },
+};
+
+// KNOWN-BAD single rows — a DIFFERENT, even narrower tolerance than the issue #27 class above. Where
+// TOLERATED_CLASSES.issue27AccessListNull covers a whole span keyed by shape (A-side NULL vs B non-null),
+// this list pins EXACT individual tx hashes for one-off, fully-evidenced divergences that are NOT the
+// issue #27 shape. Each entry tolerates a single already-diverged row ONLY while the divergence stays
+// access_list-only (every OTHER column still byte-identical: ex-access_list md5s equal). If ANY second
+// column ever diverges on the row, classifySharedTx stops tolerating it and returns 'mismatch' → hard
+// FAIL, so the pin can never protect a row that rots further.
+//
+// issue #32 — a single fabricated-empty access_list row surfaced by the A/B cross-validation differ:
+// chain 42161 (Arbitrum One), block 469300066, tx
+// 0x0af5f9831bff6430dca4197962554f7f4779da2bb4f533844b4224953e7ab5fe. Side A stored access_list='[]'
+// (a fabricated empty list); side B stored the chain-true 63-entry list; ALL other columns are
+// byte-identical. UNLIKE issue #27, BOTH sides are NON-NULL here ('[]' is a concrete value, not NULL) —
+// so the predicate does NOT reuse issue #27's `aAccessListNull === true` clause. It DOES, however,
+// enforce the EVIDENCED shape by requiring BOTH sides concrete: aAccessListNull === false AND
+// bAccessListNull === false. That both-non-null guard (see classifySharedTx) is what stops the pin from
+// tolerating an A-NULL / B-non-null drift (or a B-side rot to NULL) on this exact hash — the pin
+// protects ONLY the '[]'-vs-concrete-list shape it was measured for, never any access_list divergence.
+// The A-side row is left in place as evidence (see the issue). DELETE this entry when the row is
+// repaired or its mechanism is explained.
+export const knownBadRows = [
+  {
+    hash: '0x0af5f9831bff6430dca4197962554f7f4779da2bb4f533844b4224953e7ab5fe',
+    chain: 42161,
+    issue: 'https://github.com/subsquid-labs/portal-ponder/issues/32',
+  },
+];
+
 // The expected-class assertion for the transactions table. `onlyA` = txs A has but B lacks; `onlyB`
 // = txs B has but A lacks; `referenced` = the subset of onlyA that an A-side log points at;
 // `sharedMismatch` = txs present on BOTH sides whose full-row hash diverges (default 0). A tx that
 // EXISTS in both A and B must be byte-identical — the same finalized transaction indexed two ways.
-export function classifyTxDiff(onlyA, onlyB, referenced, sharedMismatch = 0) {
+export function classifyTxDiff(
+  onlyA,
+  onlyB,
+  referenced,
+  sharedMismatch = 0,
+  toleratedIssue27 = { count: 0, perChain: {} },
+  knownBadRowsTally = { count: 0, perChain: {}, perHash: {} },
+) {
   const ref = referenced instanceof Set ? referenced : new Set(referenced);
   const unexpectedB = [...onlyB];
   const unreferencedA = onlyA.filter((h) => !ref.has(h));
@@ -47,7 +106,94 @@ export function classifyTxDiff(onlyA, onlyB, referenced, sharedMismatch = 0) {
     unexpectedB,
     unreferencedA,
     sharedMismatch,
+    // Reported, never fails: shared txs whose ONLY divergence is issue #27 (access_list NULL on A,
+    // chain-true on B). Counted here so the run verdict is PASS-compatible while still visible.
+    toleratedIssue27,
+    // Reported, never fails: shared txs pinned in `knownBadRows` (issue #32) — a single evidenced,
+    // access_list-only divergence per exact hash. SEPARATE from toleratedIssue27; PASS-compatible.
+    knownBadRows: knownBadRowsTally,
   };
+}
+
+// Classify ONE shared tx whose FULL-row md5 diverges between side A and side B. Returns:
+//   • 'knownBadRow' — the tx hash is pinned in `knownBadRows` (issue #32) AND the chain matches AND
+//     BOTH sides are concrete (neither access_list NULL) AND only access_list differs (ex-AL md5s
+//     equal). Reported + PASS-compatible, counted SEPARATELY.
+//   • 'tolerated'   — the exact, fully-root-caused issue #27 shape (span-keyed, see below).
+//   • 'mismatch'    — ANYTHING else → a hard sharedMismatch → FAIL, exactly as before either class.
+// Pure + exported so every adversarial case is unit-tested and mutation-verified in isolation.
+//
+// knownBadRow is checked FIRST and is deliberately NARROWER on identity (exact hash + chain) than
+// issue #27, and pins a DIFFERENT null-shape: issue #32's row has BOTH sides NON-NULL (A='[]',
+// B chain-true). So instead of issue #27's `aAccessListNull === true`, its predicate requires BOTH
+// concrete — aAccessListNull === false AND bAccessListNull === false — which refuses to tolerate an
+// A-NULL / B-non-null drift or a B-side rot to NULL on this hash (only the measured '[]'-vs-list shape
+// is pinned). Its other structural guard is exAlMd5A === exAlMd5B — every OTHER column still
+// byte-identical. If a second column ever diverges on that row (ex-AL md5s differ), OR either side goes
+// NULL, the pin stops protecting it → 'mismatch' → hard FAIL, so a rotting row is never masked.
+//
+// The issue #27 predicate is a conjunction of five clauses, each refusing to mask a distinct thing:
+//   1. exAlMd5A === exAlMd5B   — md5 over `to_jsonb(t) - 'access_list'`. If ANY second column also
+//      differs, these differ → 'mismatch'. This is what stops the tolerance widening to "any diff on a
+//      row that also happens to have an access_list gap".
+//   2. aAccessListNull === true — the loss is on side A (the RPC-realtime leg that nulled the key). If
+//      A is non-null-but-different from B, this is false → 'mismatch' (a real access_list divergence).
+//   3. bAccessListNull === false — side B holds a concrete value (the chain-true one). An inverted
+//      asymmetry (B null, A non-null) is NOT this class → 'mismatch'.
+//   4. blockNumber >= floor      — at/above the measured realtime-span floor for THIS chain. A missing
+//      floor entry (unknown chain) is an explicit HARD FAIL, never a default-tolerate.
+//   5. toBlock === null || blockNumber <= toBlock — within the (open) window; once toBlock is set, a
+//      row past it is NOT tolerated → 'mismatch'.
+// A missing/deleted TOLERATED_CLASSES.issue27AccessListNull entry → no floors → 'mismatch' for all.
+export function classifySharedTx(
+  { hash, blockNumber, exAlMd5A, exAlMd5B, aAccessListNull, bAccessListNull },
+  chain,
+  classes = TOLERATED_CLASSES,
+  badRows = knownBadRows,
+) {
+  // knownBadRows (issue #32): an EXACT-hash pin. Tolerated IFF the hash is listed for THIS chain AND
+  // BOTH sides are concrete (neither access_list NULL — the measured '[]'-vs-list shape) AND only
+  // access_list differs (ex-AL md5s equal). The both-non-null guard refuses to tolerate an A-NULL /
+  // B-non-null drift or a B-side rot to NULL on this hash — it is the DIFFERENT null-shape from
+  // issue #27 (which requires aAccessListNull === true), not the absence of a null check.
+  const pinned = (badRows ?? []).find(
+    (r) => r.hash === hash && r.chain === chain,
+  );
+  if (
+    pinned &&
+    aAccessListNull === false &&
+    bAccessListNull === false &&
+    exAlMd5A === exAlMd5B
+  ) {
+    return 'knownBadRow';
+  }
+
+  const entry = classes?.issue27AccessListNull;
+  if (!entry) {
+    return 'mismatch';
+  }
+
+  // Missing floor for this chain ⇒ HARD FAIL — never default-tolerate an unknown chain.
+  const floor = entry.perChainFloor?.[chain];
+  if (!Number.isFinite(floor)) {
+    return 'mismatch';
+  }
+
+  const block = Number(blockNumber);
+  const withinWindow =
+    entry.toBlock === null ||
+    entry.toBlock === undefined ||
+    block <= Number(entry.toBlock);
+
+  const tolerated =
+    exAlMd5A === exAlMd5B &&
+    aAccessListNull === true &&
+    bAccessListNull === false &&
+    Number.isFinite(block) &&
+    block >= floor &&
+    withinWindow;
+
+  return tolerated ? 'tolerated' : 'mismatch';
 }
 
 // A psql child is only a trustworthy data source if it exited cleanly. A non-zero exit (bad SQL,
@@ -439,6 +585,54 @@ async function diffBlocks(urlA, urlB, chain, lo, hi) {
   );
 }
 
+// The tx-stream SELECT column contract, in ORDER. This is the SINGLE source of truth binding the SQL
+// projection to the positional args diffTx feeds classifySharedTx: the array index here IS the row[]
+// index consumed downstream. Reordering the SELECT without reordering these — or vice versa — silently
+// feeds classifySharedTx the wrong column (e.g. block_number read as the hash, the null-flag read as an
+// md5), corrupting the tolerance classification with no error. The tripwire test asserts buildTxSql's
+// SELECT list matches this order AND that these indices equal diffTx's destructuring contract, so any
+// permutation of either fails a cheap unit test instead of surfacing as a mis-tolerated production row.
+//   0 hash            → classifySharedTx `hash`          + the merge/onlyA/onlyB key
+//   1 fullRowMd5      → the shared-tx byte-identity check (a.value[1] !== b.value[1])
+//   2 blockNumber     → classifySharedTx `blockNumber`   (issue #27 floor/window)
+//   3 exAccessListMd5 → classifySharedTx `exAlMd5A/B`    (md5 over `to_jsonb(t)-'access_list'`)
+//   4 accessListNull  → classifySharedTx `aAccessListNull/bAccessListNull` (psql 't'/'f' flag)
+export const TX_SELECT_COLUMNS = [
+  { name: 'hash', sql: '"hash"' },
+  { name: 'fullRowMd5', sql: 'md5(to_jsonb(t)::text)' },
+  { name: 'blockNumber', sql: 'block_number' },
+  { name: 'exAccessListMd5', sql: "md5((to_jsonb(t)-'access_list')::text)" },
+  { name: 'accessListNull', sql: '(access_list is null)' },
+];
+
+// Positional row[] indices classifySharedTx's args are destructured from — the contract diffTx and the
+// tripwire test both bind to, so the two can never drift apart unnoticed. Each MUST equal the
+// TX_SELECT_COLUMNS position of the same field.
+export const TX_COL = {
+  hash: 0,
+  fullRowMd5: 1,
+  blockNumber: 2,
+  exAccessListMd5: 3,
+  accessListNull: 4,
+};
+
+// Build the per-side per-tx query from TX_SELECT_COLUMNS (the ONLY place the projection is spelled), so
+// the column ORDER can never drift from the destructuring contract without the tripwire test catching
+// it. Pure over (chain, lo, hi) + exported: the test asserts the SELECT list, in order, without psql.
+// Per side per tx: hash, full-row md5, block_number, ex-access_list md5 (the jsonb-minus idiom used for
+// total_difficulty in diffBlocks), and (access_list IS NULL) as psql's t/f flag. The extra columns are
+// what classifySharedTx needs to tell the tolerated issue #27 shape apart from any real divergence
+// WITHOUT loosening the strict full-row identity for every other column.
+export function buildTxSql(chain, lo, hi) {
+  const projection = TX_SELECT_COLUMNS.map((c) => c.sql).join(', ');
+
+  return (
+    `select ${projection} ` +
+    `from ponder_sync.transactions t ` +
+    `where chain_id=${chain} and block_number between ${lo} and ${hi} order by "hash"`
+  );
+}
+
 // tx class: merge the two tx streams (each row = [hash, md5(full row)]) to onlyA/onlyB AND to a
 // SHARED set whose row hashes must be byte-identical, then ask A which onlyA hashes a log references.
 // A tx present on both sides is the SAME finalized transaction indexed two ways — every field must
@@ -447,19 +641,22 @@ async function diffBlocks(urlA, urlB, chain, lo, hi) {
 // between the RPC-sourced A store and the Portal-sourced B store — both write the same ponder_sync
 // schema from the same finalized chain data).
 async function diffTx(urlA, urlB, chain, lo, hi) {
-  const txSql =
-    `select "hash", md5(to_jsonb(t)::text) from ponder_sync.transactions t ` +
-    `where chain_id=${chain} and block_number between ${lo} and ${hi} order by "hash"`;
+  const txSql = buildTxSql(chain, lo, hi);
   const onlyA = [];
   const onlyB = [];
   let sharedMismatch = 0;
+  const toleratedIssue27 = { count: 0, perChain: {} };
+  // perHash carries the EXACT pin identity a chain-only tally loses: which pinned hash fired, so
+  // aggregateKnownBadRows can mark a specific configured pin unmatched (its (hash, chain) fired 0
+  // times) rather than treating the whole chain as matched. perChain stays for the human breakdown.
+  const knownBadRowsTally = { count: 0, perChain: {}, perHash: {} };
   const ia = psqlRows(urlA, txSql)[Symbol.asyncIterator]();
   const ib = psqlRows(urlB, txSql)[Symbol.asyncIterator]();
   let a = await ia.next();
   let b = await ib.next();
   while (!a.done || !b.done) {
-    const ha = a.done ? null : a.value[0];
-    const hb = b.done ? null : b.value[0];
+    const ha = a.done ? null : a.value[TX_COL.hash];
+    const hb = b.done ? null : b.value[TX_COL.hash];
     if (hb === null || (ha !== null && ha < hb)) {
       onlyA.push(ha);
       a = await ia.next();
@@ -467,9 +664,36 @@ async function diffTx(urlA, urlB, chain, lo, hi) {
       onlyB.push(hb);
       b = await ib.next();
     } else {
-      // shared tx (same hash on both sides) — the full-row md5 must be identical.
-      if (a.value[1] !== b.value[1]) {
-        sharedMismatch += 1;
+      // shared tx (same hash on both sides) — the full-row md5 must be identical, EXCEPT for the one
+      // fully-root-caused, reported tolerated class (issue #27); anything else is a hard mismatch.
+      if (a.value[TX_COL.fullRowMd5] !== b.value[TX_COL.fullRowMd5]) {
+        const verdict = classifySharedTx(
+          {
+            hash: a.value[TX_COL.hash],
+            blockNumber: a.value[TX_COL.blockNumber],
+            exAlMd5A: a.value[TX_COL.exAccessListMd5],
+            exAlMd5B: b.value[TX_COL.exAccessListMd5],
+            aAccessListNull: a.value[TX_COL.accessListNull] === 't',
+            bAccessListNull: b.value[TX_COL.accessListNull] === 't',
+          },
+          chain,
+        );
+        if (verdict === 'tolerated') {
+          toleratedIssue27.count += 1;
+          toleratedIssue27.perChain[chain] =
+            (toleratedIssue27.perChain[chain] ?? 0) + 1;
+        } else if (verdict === 'knownBadRow') {
+          knownBadRowsTally.count += 1;
+          knownBadRowsTally.perChain[chain] =
+            (knownBadRowsTally.perChain[chain] ?? 0) + 1;
+          // Tally per HASH too so a specific pin's fate is exact (not merely "some pin on this chain
+          // fired"). Keyed by the shared tx hash — identical on both sides for a knownBadRow.
+          const firedHash = a.value[TX_COL.hash];
+          knownBadRowsTally.perHash[firedHash] =
+            (knownBadRowsTally.perHash[firedHash] ?? 0) + 1;
+        } else {
+          sharedMismatch += 1;
+        }
       }
 
       a = await ia.next();
@@ -491,7 +715,14 @@ async function diffTx(urlA, urlB, chain, lo, hi) {
     );
   });
 
-  return classifyTxDiff(onlyA, onlyB, referenced, sharedMismatch);
+  return classifyTxDiff(
+    onlyA,
+    onlyB,
+    referenced,
+    sharedMismatch,
+    toleratedIssue27,
+    knownBadRowsTally,
+  );
 }
 
 async function bucketHashes(url, chain, lo, hi, bucket) {
@@ -681,6 +912,9 @@ async function main() {
     );
   }
 
+  const toleratedIssue27 = aggregateToleratedIssue27(results);
+  const knownBadRowsAgg = aggregateKnownBadRows(results);
+
   const status = {
     ts: new Date().toISOString(),
     chains: results.map((r) => r.chain),
@@ -693,6 +927,14 @@ async function main() {
     lagA: Object.fromEntries(results.map((r) => [r.chain, r.lagA ?? null])),
     lagB: Object.fromEntries(results.map((r) => [r.chain, r.lagB ?? null])),
     checkpointRegressions: regressions,
+    // Aggregate of the reported-but-tolerated issue #27 shared-tx class across all chains. A run whose
+    // only divergence is this class is PASS (never fails the verdict); the count keeps it VISIBLE.
+    toleratedIssue27,
+    // Aggregate of the reported knownBadRows pins (issue #32) across all chains — a SEPARATE counter
+    // from toleratedIssue27. Also PASS-compatible; kept VISIBLE so the pinned rows never go quiet. Carries
+    // perHash (per-pin fire counts) and unmatched (pins whose exact (hash, chain) fired 0 times) so each
+    // pin's fate is exact in the status JSON, not merely a chain-level roll-up.
+    knownBadRows: knownBadRowsAgg,
     counters: Object.fromEntries(
       results.map((r) => [r.chain, { lo: r.lo, hi: r.hi, verdict: r.verdict }]),
     ),
@@ -705,7 +947,126 @@ async function main() {
   // ever sees only the old complete file or the new complete file, never a partial one.
   writeJsonAtomic(checkpointFile, nextCheckpoints);
   console.log(JSON.stringify(status, null, 2));
+  const toleratedLine = formatToleratedIssue27Line(toleratedIssue27);
+  if (toleratedLine) {
+    console.log(toleratedLine);
+  }
+
+  const knownBadRowsLine = formatKnownBadRowsLine(knownBadRowsAgg);
+  if (knownBadRowsLine) {
+    console.log(knownBadRowsLine);
+  }
+
   process.exit(verdict === 'FAIL' ? 1 : 0);
+}
+
+// Sum the per-chain issue #27 tolerated tallies from every chain result into one {count, perChain}.
+// Pure + exported: the status JSON's top-level counter and the human line both read this, so a
+// mutation that miscounts is caught directly rather than only through a full run.
+export function aggregateToleratedIssue27(results) {
+  const perChain = {};
+  let count = 0;
+  for (const r of results) {
+    const tol = r?.classes?.transactions?.toleratedIssue27;
+    if (!tol) {
+      continue;
+    }
+
+    count += tol.count ?? 0;
+    for (const [chain, n] of Object.entries(tol.perChain ?? {})) {
+      perChain[chain] = (perChain[chain] ?? 0) + n;
+    }
+  }
+
+  return { count, perChain };
+}
+
+// One human-readable line for a run that carried tolerated issue #27 rows (empty string ⇒ print
+// nothing). The wording is deliberately loud about REMOVAL so the class cannot quietly become
+// permanent. Pure + exported so the message contract is asserted.
+export function formatToleratedIssue27Line(tolerated) {
+  if (!tolerated || (tolerated.count ?? 0) <= 0) {
+    return '';
+  }
+
+  const breakdown = Object.entries(tolerated.perChain ?? {})
+    .map(([chain, n]) => `${chain}:${n}`)
+    .join(', ');
+
+  return (
+    `TOLERATED (known issue #27 — REMOVE when the fix deploys and the window closes): ` +
+    `${tolerated.count} access_list-null rows (${breakdown})`
+  );
+}
+
+// Sum the per-chain knownBadRows (issue #32) tallies from every chain result into one
+// {count, perChain, perHash} AND flag any CONFIGURED pin that matched NOTHING this run. A pin matches
+// nothing when its row was repaired (no longer diverges) or was on a chain the run didn't diff — that
+// is NOT a failure, but it MUST stay visible so a stale pin cannot rot silently (it should then be
+// REMOVED). `unmatched` is the subset of `pins` whose EXACT (hash, chain) fired zero times, so the
+// status JSON always shows every pin's fate — even when two pins share a chain, a repaired one is
+// surfaced while its co-chain sibling that DID fire is not. SEPARATE from aggregateToleratedIssue27 —
+// the two counters are threaded independently. Pure + exported so the status JSON's top-level counter,
+// the aggregated perHash, the unmatched set, and the human line are mutation-verified directly.
+export function aggregateKnownBadRows(results, pins = knownBadRows) {
+  const perChain = {};
+  const perHash = {};
+  let count = 0;
+  for (const r of results) {
+    const tol = r?.classes?.transactions?.knownBadRows;
+    if (!tol) {
+      continue;
+    }
+
+    count += tol.count ?? 0;
+    for (const [chain, n] of Object.entries(tol.perChain ?? {})) {
+      perChain[chain] = (perChain[chain] ?? 0) + n;
+    }
+    // Aggregate per-hash fire counts so pin fate is exact: a pin is matched IFF its OWN hash fired,
+    // never merely because some other pin on the same chain did.
+    for (const [hash, n] of Object.entries(tol.perHash ?? {})) {
+      perHash[hash] = (perHash[hash] ?? 0) + n;
+    }
+  }
+
+  // A configured pin is "unmatched" when its EXACT (hash, chain) contributed zero matches this run.
+  // diffTx tallies per hash for the chain it diffed, so a nonzero perHash[hash] proves that specific
+  // pin fired — no chain-level over-count. (A hash is a global identifier; the (hash, chain) pairing in
+  // the pin is what the classifier matched on, so a fired hash unambiguously identifies its pin.)
+  const unmatched = (pins ?? []).filter((p) => (perHash[p.hash] ?? 0) === 0);
+
+  return { count, perChain, perHash, unmatched };
+}
+
+// One human-readable line for a run that carried knownBadRows pins (empty string ⇒ print nothing). Loud
+// about REMOVAL and names issue #32 so a pinned single row cannot quietly become permanent. Also loud
+// about UNMATCHED pins (a pin that fired zero times this run — its row was likely repaired) so a stale
+// pin is never silent: it prints even when the matched count is 0, precisely so a repaired-but-not-yet-
+// removed entry stays VISIBLE. Pure + exported so the message contract is asserted.
+export function formatKnownBadRowsLine(tolerated) {
+  const count = tolerated?.count ?? 0;
+  const unmatched = tolerated?.unmatched ?? [];
+  if (count <= 0 && unmatched.length === 0) {
+    return '';
+  }
+
+  const breakdown = Object.entries(tolerated?.perChain ?? {})
+    .map(([chain, n]) => `${chain}:${n}`)
+    .join(', ');
+
+  const matchedPart =
+    count > 0 ? `${count} pinned access_list-only rows (${breakdown})` : 'none';
+
+  let line =
+    `KNOWN-BAD ROWS (issue #32 — REMOVE the knownBadRows entry when the row is repaired or explained): ` +
+    matchedPart;
+
+  if (unmatched.length > 0) {
+    const stale = unmatched.map((p) => `${p.chain}:${p.hash}`).join(', ');
+    line += ` — ${unmatched.length} UNMATCHED pin(s) fired 0 times this run (repaired? REMOVE): ${stale}`;
+  }
+
+  return line;
 }
 
 // Atomic JSON write: serialize to a sibling temp file, then rename over the target (rename is atomic
