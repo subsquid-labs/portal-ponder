@@ -3,27 +3,40 @@ import { existsSync, mkdtempSync, readdirSync, readFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { test } from 'node:test';
+import { mergeCompare } from '../validate/diff-batched.mjs';
 import {
   aggregateKnownBadRows,
   aggregateToleratedIssue27,
+  aggregateToleratedIssue36,
+  buildBucketExclusionFilter,
   buildTxSql,
   CHECKPOINT_BLOCK_LEN,
   CHECKPOINT_BLOCK_OFFSET_0,
   checkpointDecision,
   checkpointMonotonic,
   chunk,
+  classifyBucketMismatches,
+  classifyOnlyBDiff,
+  classifyOnlyBRow,
   classifySharedTx,
   classifyTxDiff,
+  collectOnlyB,
   collectReferenced,
   compareBucketHashes,
+  crossCheckOnlyBCollector,
   extractCheckpointBlock,
   formatKnownBadRowsLine,
   formatToleratedIssue27Line,
+  formatToleratedIssue36Line,
   knownBadRows,
+  ONLYB_ROW_CAP,
   psqlExitVerdict,
   restartStats,
+  sampleToleratedOnlyB,
   sanitizeSchemaIdent,
   TOLERATED_CLASSES,
+  TOLERATED_ONLYB_CLASSES,
+  TOLERATED_SAMPLE_SIZE,
   TX_COL,
   TX_SELECT_COLUMNS,
   writeJsonAtomic,
@@ -997,4 +1010,545 @@ test('FINDING 3 — buildTxSql SELECT column order matches the classifySharedTx 
   // and the query is still ordered by hash (the merge-join precondition) and bounds by the args.
   assert.match(sql, /order by "hash"$/);
   assert.match(sql, /chain_id=42161 and block_number between 100 and 200/);
+});
+
+// ── issue #36: tolerated onlyB row-loss class for the LOGS and BLOCKS tables ──────────────────────
+//
+// Leg A (RPC realtime) silently lost on-chain log rows + block rows leg B (Portal stream, chain-true)
+// holds — onlyB rows inside the finalized overlap. classifyOnlyBRow tolerates ONE such row ONLY at/above
+// the per-chain realtime-era floor, within the open window; classifyOnlyBDiff tolerates a whole table
+// diff ONLY when EVERY onlyB row is tolerated AND there is no onlyA and no shared mismatch;
+// classifyBucketMismatches only excuses a bucket md5 mismatch that is EXACTLY the tolerated onlyB rows.
+// Each adversarial case below is its own test; the PR body records which clause each mutation guards.
+
+// The shipped chain-1 realtime-era floor (issue #36). Tolerated cases sit at/above it; sub-floor below.
+const ISSUE_36_FLOOR_1 = 25445239; // TOLERATED_ONLYB_CLASSES.issue36OnlyBRowLoss.perChainFloor[1]
+
+test('classifyOnlyBRow: config ships chain 1 ONLY at the measured realtime-era floor', () => {
+  assert.equal(
+    TOLERATED_ONLYB_CLASSES.issue36OnlyBRowLoss.perChainFloor[1],
+    ISSUE_36_FLOOR_1,
+  );
+  // ship chain 1 ONLY — 8453/42161 are currently clean on this class and must NOT be pre-tolerated.
+  assert.deepEqual(
+    Object.keys(TOLERATED_ONLYB_CLASSES.issue36OnlyBRowLoss.perChainFloor),
+    ['1'],
+  );
+  // open-ended window by design (the class grows while leg A stays lossy).
+  assert.equal(TOLERATED_ONLYB_CLASSES.issue36OnlyBRowLoss.toBlock, null);
+});
+
+test('classifyOnlyBRow: an onlyB row at/above the chain-1 floor → tolerated', () => {
+  assert.equal(
+    classifyOnlyBRow({ blockNumber: ISSUE_36_FLOOR_1 }, 1),
+    'tolerated',
+  );
+  assert.equal(
+    classifyOnlyBRow({ blockNumber: ISSUE_36_FLOOR_1 + 100_000 }, 1),
+    'tolerated',
+  );
+});
+
+test('classifyOnlyBRow: an onlyB row BELOW the chain-1 floor → mismatch (HARD FAIL)', () => {
+  // Below the floor leg A's store came from the complete-by-construction historical backfill, so an
+  // A-missing row there is a real, hard gap. MUTATION (drop the `block >= floor` clause) → this fails.
+  assert.equal(
+    classifyOnlyBRow({ blockNumber: ISSUE_36_FLOOR_1 - 1 }, 1),
+    'mismatch',
+  );
+});
+
+test('classifyOnlyBRow: a chain with NO configured floor → mismatch (HARD FAIL, the #30 missing-floor semantic)', () => {
+  // chains 8453 and 42161 are NOT in the shipped config → an onlyB row there is a hard fail, never a
+  // default-tolerate. MUTATION (default-tolerate an unknown chain) → this fails.
+  assert.equal(
+    classifyOnlyBRow({ blockNumber: ISSUE_36_FLOOR_1 }, 8453),
+    'mismatch',
+  );
+  assert.equal(
+    classifyOnlyBRow({ blockNumber: 999_999_999 }, 42161),
+    'mismatch',
+  );
+});
+
+test('classifyOnlyBRow: a deleted/absent config entry → mismatch for all (full strictness restored)', () => {
+  // Removing the entry (the removal step when issue #36 is resolved) must restore strictness with no
+  // other change. MUTATION (ignore a missing entry) → this fails.
+  assert.equal(
+    classifyOnlyBRow({ blockNumber: ISSUE_36_FLOOR_1 }, 1, {}),
+    'mismatch',
+  );
+});
+
+test('classifyOnlyBRow: a CLOSED window (toBlock set) rejects rows past it', () => {
+  const closed = {
+    issue36OnlyBRowLoss: {
+      perChainFloor: { 1: ISSUE_36_FLOOR_1 },
+      toBlock: ISSUE_36_FLOOR_1 + 10,
+    },
+  };
+  assert.equal(
+    classifyOnlyBRow({ blockNumber: ISSUE_36_FLOOR_1 + 10 }, 1, closed),
+    'tolerated',
+  );
+  // one past the closed window is NOT tolerated. MUTATION (drop the withinWindow clause) → this fails.
+  assert.equal(
+    classifyOnlyBRow({ blockNumber: ISSUE_36_FLOOR_1 + 11 }, 1, closed),
+    'mismatch',
+  );
+});
+
+// classifyOnlyBDiff: the whole-table verdict. A logs/blocks diff is tolerated ONLY when every onlyB row
+// is tolerated AND there is no onlyA and no shared mismatch.
+
+const onlyBRow = (blockNumber, logIndex) => ({ blockNumber, logIndex });
+
+test('classifyOnlyBDiff: pure onlyB loss, all rows at/above floor → PASS-compatible (fail=false), counted', () => {
+  const diff = { onlyA: 0, onlyB: 3, mismatch: 0 };
+  const rows = [
+    onlyBRow(ISSUE_36_FLOOR_1, 5),
+    onlyBRow(ISSUE_36_FLOOR_1 + 1, 0),
+    onlyBRow(ISSUE_36_FLOOR_1 + 700, 9),
+  ];
+  const r = classifyOnlyBDiff(diff, rows, 1);
+  assert.equal(r.fail, false);
+  assert.equal(r.toleratedOnlyB.count, 3);
+  assert.deepEqual(r.toleratedOnlyB.perChain, { 1: 3 });
+  assert.equal(r.hardOnlyB, 0);
+});
+
+test('classifyOnlyBDiff: any onlyA row → HARD FAIL (the class NEVER tolerates onlyA — refuses the inverted asymmetry)', () => {
+  // leg B has a row leg A lacks is the tolerated shape; leg A has a row leg B lacks (onlyA) is the
+  // OPPOSITE and a real divergence. MUTATION (drop the `onlyA > 0` clause) → this fails.
+  const diff = { onlyA: 1, onlyB: 1, mismatch: 0 };
+  const r = classifyOnlyBDiff(diff, [onlyBRow(ISSUE_36_FLOOR_1, 0)], 1);
+  assert.equal(r.fail, true);
+});
+
+test('classifyOnlyBDiff: any shared mismatch → HARD FAIL (a shared-row field divergence is a different class)', () => {
+  // MUTATION (drop the `mismatch > 0` clause) → this fails.
+  const diff = { onlyA: 0, onlyB: 1, mismatch: 1 };
+  const r = classifyOnlyBDiff(diff, [onlyBRow(ISSUE_36_FLOOR_1, 0)], 1);
+  assert.equal(r.fail, true);
+});
+
+test('classifyOnlyBDiff: 88 tolerated + 1 below-floor onlyB → HARD FAIL (the below-floor row is not masked by its siblings)', () => {
+  const rows = [onlyBRow(ISSUE_36_FLOOR_1 - 1, 0)]; // one below floor
+  for (let i = 0; i < 88; i++) {
+    rows.push(onlyBRow(ISSUE_36_FLOOR_1 + i, i));
+  }
+  const diff = { onlyA: 0, onlyB: rows.length, mismatch: 0 };
+  const r = classifyOnlyBDiff(diff, rows, 1);
+  assert.equal(r.fail, true, 'a single below-floor row FAILs the whole table');
+  assert.equal(r.hardOnlyB, 1);
+  assert.equal(r.toleratedOnlyB.count, 88, 'the 88 siblings are still counted');
+});
+
+test('classifyOnlyBDiff: onlyB rows on an unconfigured chain → HARD FAIL (missing floor)', () => {
+  const diff = { onlyA: 0, onlyB: 2, mismatch: 0 };
+  const rows = [
+    onlyBRow(ISSUE_36_FLOOR_1, 0),
+    onlyBRow(ISSUE_36_FLOOR_1 + 1, 1),
+  ];
+  const r = classifyOnlyBDiff(diff, rows, 8453);
+  assert.equal(r.fail, true);
+  assert.equal(r.hardOnlyB, 2);
+  assert.equal(r.toleratedOnlyB.count, 0);
+});
+
+test('classifyOnlyBDiff: no divergence at all → PASS (fail=false, zero tolerated)', () => {
+  const r = classifyOnlyBDiff({ onlyA: 0, onlyB: 0, mismatch: 0 }, [], 1);
+  assert.equal(r.fail, false);
+  assert.equal(r.toleratedOnlyB.count, 0);
+});
+
+// classifyBucketMismatches: the checkpointBuckets knock-on. A bucket md5 mismatch is EXPLAINED only when
+// removing the tolerated onlyB rows from leg B's bucket makes it byte-identical to leg A's bucket — EXACT
+// attribution, never a count heuristic. A bucket with any OTHER cause stays a hard FAIL.
+
+test('classifyBucketMismatches: a mismatch fully explained by tolerated onlyB rows → ok (not failed)', () => {
+  // bucket '42' diverged (A=hAlpha, B=hBeta). Recomputing B WITHOUT the tolerated onlyB rows yields
+  // hAlpha === A's md5 → the tolerated rows are the ENTIRE difference → explained.
+  const compare = { mismatches: [{ bucket: '42', a: 'hAlpha', b: 'hBeta' }] };
+  const bExcl = new Map([['42', 'hAlpha']]);
+  const r = classifyBucketMismatches(compare, bExcl);
+  assert.equal(r.ok, true);
+  assert.deepEqual(r.explained, ['42']);
+  assert.deepEqual(r.unexplained, []);
+});
+
+test('classifyBucketMismatches: a mismatch NOT fully explained (a second cause) → FAIL (the compensating-pair hole is closed)', () => {
+  // bucket '42' has a tolerated onlyB row AND some OTHER divergence (a shared-row md5 drift). Removing
+  // only the tolerated row leaves the bucket STILL different from A (hOther !== hAlpha) → unexplained →
+  // FAIL. This is the exact hole a count-delta heuristic (one onlyB + one shared mismatch nets the same
+  // row count) would let through. MUTATION (accept a bucket merely PRESENT in exB regardless of md5
+  // equality) → this fails.
+  const compare = { mismatches: [{ bucket: '42', a: 'hAlpha', b: 'hBeta' }] };
+  const bExcl = new Map([['42', 'hOther']]); // B-minus-tolerated STILL differs from A
+  const r = classifyBucketMismatches(compare, bExcl);
+  assert.equal(r.ok, false);
+  assert.deepEqual(r.explained, []);
+  assert.equal(r.unexplained.length, 1);
+  assert.equal(r.unexplained[0].bucket, '42');
+});
+
+test('classifyBucketMismatches: a mismatched bucket with NO tolerated onlyB row (absent from exB) → FAIL', () => {
+  // bucket '7' diverged but had NO tolerated onlyB row removed (it is absent from the recomputed map),
+  // so nothing about the tolerated class explains it → unexplained → FAIL. MUTATION (treat an absent
+  // bucket as explained) → this fails.
+  const compare = { mismatches: [{ bucket: '7', a: 'hA', b: 'hB' }] };
+  const bExcl = new Map(); // no bucket '7' — no tolerated row fell in it
+  const r = classifyBucketMismatches(compare, bExcl);
+  assert.equal(r.ok, false);
+  assert.deepEqual(r.unexplained, [{ bucket: '7', a: 'hA', b: 'hB' }]);
+});
+
+test('classifyBucketMismatches: mixed — one explained, one not → FAIL (the unexplained one survives)', () => {
+  const compare = {
+    mismatches: [
+      { bucket: '10', a: 'hX', b: 'hXb' }, // explained (exB '10' === 'hX')
+      { bucket: '20', a: 'hY', b: 'hYb' }, // NOT explained (exB '20' !== 'hY')
+    ],
+  };
+  const bExcl = new Map([
+    ['10', 'hX'],
+    ['20', 'hStillDifferent'],
+  ]);
+  const r = classifyBucketMismatches(compare, bExcl);
+  assert.equal(r.ok, false);
+  assert.deepEqual(r.explained, ['10']);
+  assert.equal(r.unexplained.length, 1);
+  assert.equal(r.unexplained[0].bucket, '20');
+});
+
+test('classifyBucketMismatches: no mismatches at all → ok', () => {
+  const r = classifyBucketMismatches({ mismatches: [] }, new Map());
+  assert.equal(r.ok, true);
+  assert.deepEqual(r.explained, []);
+  assert.deepEqual(r.unexplained, []);
+});
+
+// buildBucketExclusionFilter: the SQL predicate that removes EXACTLY the tolerated onlyB log rows when
+// recomputing leg B's bucket md5. Over- or under-exclusion would mis-attribute a bucket.
+
+test('buildBucketExclusionFilter: excludes exactly the given (block_number, log_index) pairs', () => {
+  const filter = buildBucketExclusionFilter([
+    onlyBRow(25455946, 989),
+    onlyBRow(25455946, 990),
+    onlyBRow(25455045, 3),
+  ]);
+  assert.equal(
+    filter,
+    ' and not ((block_number, log_index) in ((25455946, 989), (25455946, 990), (25455045, 3)))',
+  );
+});
+
+test('buildBucketExclusionFilter: an empty set → empty string (no exclusion)', () => {
+  assert.equal(buildBucketExclusionFilter([]), '');
+  assert.equal(buildBucketExclusionFilter(undefined), '');
+});
+
+test('buildBucketExclusionFilter: rows without a finite (block, index) are dropped, never injected', () => {
+  // a block-table onlyB row has no logIndex; a NaN/garbage key must never leak into the SQL.
+  const filter = buildBucketExclusionFilter([
+    { blockNumber: 25455946 }, // no logIndex → dropped
+    { blockNumber: 'x', logIndex: 5 }, // non-finite block → dropped
+    onlyBRow(25455946, 989), // the only real pair
+  ]);
+  assert.equal(
+    filter,
+    ' and not ((block_number, log_index) in ((25455946, 989)))',
+  );
+});
+
+// aggregateToleratedIssue36 + formatToleratedIssue36Line: the LOUD, VISIBLE reporting contract.
+
+test('aggregateToleratedIssue36: sums logs + blocks per table and per chain into a grand total', () => {
+  const results = [
+    {
+      chain: 1,
+      classes: {
+        logs: { toleratedIssue36: { count: 89, perChain: { 1: 89 } } },
+        blocks: { toleratedIssue36: { count: 18, perChain: { 1: 18 } } },
+      },
+    },
+    {
+      chain: 8453,
+      classes: {
+        logs: { toleratedIssue36: { count: 0, perChain: {} } },
+        blocks: { toleratedIssue36: { count: 0, perChain: {} } },
+      },
+    },
+  ];
+  const agg = aggregateToleratedIssue36(results);
+  assert.equal(agg.count, 107, 'grand total = 89 logs + 18 blocks');
+  assert.equal(agg.logs.count, 89);
+  assert.equal(agg.blocks.count, 18);
+  assert.deepEqual(agg.perChain, { 1: 107 });
+});
+
+test('aggregateToleratedIssue36: a run with no issue #36 rows → zeros', () => {
+  const agg = aggregateToleratedIssue36([
+    { chain: 1, classes: { logs: {}, blocks: {} } },
+  ]);
+  assert.equal(agg.count, 0);
+  assert.deepEqual(agg.perChain, {});
+});
+
+test('formatToleratedIssue36Line: loud REMOVE line naming issue #36 + removal condition when count>0', () => {
+  const line = formatToleratedIssue36Line({
+    count: 107,
+    logs: { count: 89 },
+    blocks: { count: 18 },
+    perChain: { 1: 107 },
+  });
+  assert.match(line, /^TOLERATED \(known issue #36 — REMOVE/);
+  assert.match(
+    line,
+    /REMOVE when issue #36 is resolved \(A repaired or leg retired\)/,
+  );
+  assert.match(line, /107 onlyB rows leg A lost/);
+  assert.match(line, /logs:89 blocks:18/);
+  assert.match(line, /1:107/);
+});
+
+test('formatToleratedIssue36Line: empty string when nothing tolerated (never a noisy zero line)', () => {
+  // MUTATION (the LOUD counter always prints / prints on 0) → these fail.
+  assert.equal(formatToleratedIssue36Line({ count: 0, perChain: {} }), '');
+  assert.equal(formatToleratedIssue36Line(null), '');
+  assert.equal(formatToleratedIssue36Line(undefined), '');
+});
+
+// ── D2: collectOnlyB — the injectable-cap capped path, and the REAL streaming-integration hook test ──
+
+test('collectOnlyB: collects each onlyB row (block + logIndex) under the default cap, not capped', () => {
+  const c = collectOnlyB();
+  c.onOnlyB({ key: [100n, 5n] });
+  c.onOnlyB({ key: [101n] }); // block-table shape: no log_index
+  assert.equal(c.capped(), false);
+  assert.deepEqual(c.onlyBRows, [
+    { blockNumber: 100, logIndex: 5 },
+    { blockNumber: 101, logIndex: undefined },
+  ]);
+});
+
+test('collectOnlyB: an injectable cap flips capped() and stops collecting past the cap (default is ONLYB_ROW_CAP)', () => {
+  // Parameterize the cap rather than lowering the production constant. With cap=2, the 3rd onlyB row
+  // trips the cap: capped() flips true and the row is NOT collected. MUTATION (ignore the injected cap /
+  // never set capped) → capped() stays false and this fails.
+  const c = collectOnlyB(2);
+  c.onOnlyB({ key: [1n, 0n] });
+  c.onOnlyB({ key: [2n, 0n] });
+  assert.equal(c.capped(), false, 'at the cap, not yet over');
+  c.onOnlyB({ key: [3n, 0n] }); // over the cap
+  assert.equal(c.capped(), true, 'the 3rd row trips the injected cap');
+  assert.equal(c.onlyBRows.length, 2, 'the over-cap row is NOT collected');
+  // the default cap is the production constant, unchanged
+  assert.equal(ONLYB_ROW_CAP, 100_000);
+});
+
+// D2 HOOK INTEGRATION: drive the REAL mergeCompare/streamingDiff (from diff-batched.mjs) with a
+// collectOnlyB collector as onOnlyB, over a fixture with B-only rows (a) in the MIDDLE of the merge, (b)
+// in the TAIL DRAIN (after A's iterator is exhausted), and (c) at least one BELOW-floor row. Assert the
+// collector received EVERY B-only row (count + identities) AND classifyOnlyBDiff FAILs on the below-floor
+// row. This is the test that catches verifier mutation h1 ("streamingDiff onOnlyB skips every 2nd B-only
+// row"), which the pure classifyOnlyBDiff unit tests alone do NOT — they feed a hand-built onlyBRows
+// array and never exercise the streamingDiff hook wiring.
+const HASH_ROW = (block, logIndex, h) => ({
+  key: [BigInt(block), BigInt(logIndex)],
+  hash: h,
+});
+const KEY_OF = (r) => r.key;
+
+test('D2 hook integration: the REAL streamingDiff onOnlyB streams EVERY B-only row (middle + tail-drain), collector + classify catch the below-floor one', async () => {
+  // Leg A holds a shared prefix; leg B additionally holds B-only rows scattered in the MIDDLE and, after
+  // A is exhausted, a run of them in the TAIL DRAIN — plus one BELOW the chain-1 floor.
+  const belowFloor = ISSUE_36_FLOOR_1 - 10; // (c) below-floor B-only row
+  const a = [
+    HASH_ROW(ISSUE_36_FLOOR_1, 0, 'shared0'),
+    HASH_ROW(ISSUE_36_FLOOR_1 + 5, 0, 'shared1'),
+    HASH_ROW(ISSUE_36_FLOOR_1 + 9, 0, 'shared2'),
+  ];
+  const b = [
+    HASH_ROW(belowFloor, 0, 'bBelow'), // (c) B-only, below floor, sorts FIRST
+    HASH_ROW(ISSUE_36_FLOOR_1, 0, 'shared0'), // shared
+    HASH_ROW(ISSUE_36_FLOOR_1 + 2, 0, 'bMid1'), // (a) B-only in the middle
+    HASH_ROW(ISSUE_36_FLOOR_1 + 5, 0, 'shared1'), // shared
+    HASH_ROW(ISSUE_36_FLOOR_1 + 7, 0, 'bMid2'), // (a) B-only in the middle
+    HASH_ROW(ISSUE_36_FLOOR_1 + 9, 0, 'shared2'), // shared (last A row)
+    HASH_ROW(ISSUE_36_FLOOR_1 + 20, 0, 'bTail1'), // (b) B-only in the tail drain
+    HASH_ROW(ISSUE_36_FLOOR_1 + 21, 1, 'bTail2'), // (b) B-only in the tail drain
+  ];
+
+  const collector = collectOnlyB();
+  const diff = await mergeCompare(a, b, {
+    keyFn: KEY_OF,
+    mode: 'strict',
+    onOnlyB: collector.onOnlyB,
+  });
+
+  // The diff's own onlyB count and the collected array must AGREE.
+  assert.equal(diff.onlyB, 5, 'five B-only rows: below-floor + 2 middle + 2 tail');
+  assert.equal(
+    collector.onlyBRows.length,
+    5,
+    'the collector received EVERY B-only row, including both tail-drain rows',
+  );
+  assert.equal(collector.capped(), false);
+
+  // Exact identities (block numbers) of every collected B-only row, in key order.
+  assert.deepEqual(
+    collector.onlyBRows.map((r) => r.blockNumber),
+    [
+      belowFloor,
+      ISSUE_36_FLOOR_1 + 2,
+      ISSUE_36_FLOOR_1 + 7,
+      ISSUE_36_FLOOR_1 + 20,
+      ISSUE_36_FLOOR_1 + 21,
+    ],
+  );
+
+  // classifyOnlyBDiff over the collected rows FAILs on the below-floor row (the 4 at/above floor are
+  // tolerated; the 1 below floor is a hard onlyB). This is the wiring the pure unit tests never touch.
+  const cls = classifyOnlyBDiff(diff, collector.onlyBRows, 1);
+  assert.equal(cls.fail, true, 'the below-floor B-only row FAILs the table');
+  assert.equal(cls.hardOnlyB, 1);
+  assert.equal(cls.toleratedOnlyB.count, 4);
+});
+
+// ── D3: sampleToleratedOnlyB — the BOUNDED, spot-auditable sample for the status JSON ──
+// Within the tolerated span cross-validation alone cannot distinguish leg-A loss from a leg-B
+// fabrication of the same shape; the control is a third-party spot audit. This surfaces a bounded
+// sample of tolerated block numbers so that audit is possible without psql access to the raw diff.
+
+test('sampleToleratedOnlyB: bounded at TOLERATED_SAMPLE_SIZE, with min/max over the WHOLE set', () => {
+  // 12 tolerated rows (block numbers out of order) → the sample is the FIRST 5, but min/max bracket ALL
+  // 12. MUTATION (unbound the sample → returns all 12; or break min/max → wrong bracket) → this fails.
+  const rows = [
+    { blockNumber: 500 },
+    { blockNumber: 100 },
+    { blockNumber: 900 },
+    { blockNumber: 300 },
+    { blockNumber: 700 },
+    { blockNumber: 200 },
+    { blockNumber: 800 },
+    { blockNumber: 400 },
+    { blockNumber: 600 },
+    { blockNumber: 1000 },
+    { blockNumber: 50 },
+    { blockNumber: 1100 },
+  ];
+  const s = sampleToleratedOnlyB(rows);
+  assert.equal(TOLERATED_SAMPLE_SIZE, 5);
+  assert.equal(
+    s.sample.length,
+    5,
+    'the sample is bounded at TOLERATED_SAMPLE_SIZE, never the whole set',
+  );
+  assert.deepEqual(s.sample, [500, 100, 900, 300, 700], 'first 5, in order');
+  assert.equal(s.min, 50, 'min over the WHOLE set, not just the sample');
+  assert.equal(s.max, 1100, 'max over the WHOLE set, not just the sample');
+  assert.equal(s.count, 12, 'the full tolerated count is reported alongside');
+});
+
+test('sampleToleratedOnlyB: fewer than the cap → sample is the whole (small) set; empty → null', () => {
+  const s = sampleToleratedOnlyB([{ blockNumber: 42 }, { blockNumber: 7 }]);
+  assert.deepEqual(s.sample, [42, 7]);
+  assert.equal(s.min, 7);
+  assert.equal(s.max, 42);
+  assert.equal(s.count, 2);
+
+  // nothing tolerated ⇒ null (no noisy empty sample in the status JSON)
+  assert.equal(sampleToleratedOnlyB([]), null);
+  assert.equal(sampleToleratedOnlyB(undefined), null);
+});
+
+test('sampleToleratedOnlyB: non-finite block numbers are dropped (never leak into the audit sample)', () => {
+  const s = sampleToleratedOnlyB([
+    { blockNumber: 10 },
+    { blockNumber: 'x' }, // dropped
+    { blockNumber: 20 },
+  ]);
+  assert.deepEqual(s.sample, [10, 20]);
+  assert.equal(s.min, 10);
+  assert.equal(s.max, 20);
+  assert.equal(s.count, 2);
+});
+
+// ── D1: crossCheckOnlyBCollector — the BACKSTOP that refuses to trust an incomplete onlyB collector ──
+// classifyOnlyBDiff decides tolerance from the rows the streamingDiff onOnlyB hook COLLECTED. That
+// verdict is only sound if the collected array is EVERY onlyB row the diff counted. The backstop
+// cross-checks the collected COUNT against the diff's own onlyB count: a silent hook-wiring drop (a
+// skipped call, a lost row) leaves classifyOnlyBDiff deciding on an INCOMPLETE set → HARD FAIL that
+// names itself (collectorMismatch). Only fires on the UN-capped path (a capped gap is expected).
+
+test('crossCheckOnlyBCollector: collected count === diff.onlyB (not capped) → ok', () => {
+  assert.deepEqual(crossCheckOnlyBCollector(89, 89, false), { ok: true });
+});
+
+test('crossCheckOnlyBCollector: collected count !== diff.onlyB (not capped) → HARD FAIL that names itself', () => {
+  // The diff counted 89 onlyB rows but the collector only holds 44 — some were silently dropped before
+  // classification. MUTATION (compare against collectedCount itself, or drop the count-mismatch clause)
+  // → this fails: the backstop no longer catches the silent drop.
+  const r = crossCheckOnlyBCollector(89, 44, false);
+  assert.equal(r.ok, false);
+  assert.deepEqual(r.collectorMismatch, { expected: 89, collected: 44 });
+});
+
+test('crossCheckOnlyBCollector: a count mismatch while CAPPED is expected → ok (the capped→FAIL path covers it)', () => {
+  // When capped, collected < onlyB is BY DESIGN (the cap stopped collecting) — the separate capped→FAIL
+  // path already fails the table, so the backstop must NOT double-fire here. MUTATION (fire the
+  // cross-check even when capped) → this asserts ok:true and fails.
+  const r = crossCheckOnlyBCollector(1_000_000, ONLYB_ROW_CAP, true);
+  assert.deepEqual(r, { ok: true });
+});
+
+test('crossCheckOnlyBCollector: a nullish diff.onlyB with zero collected → ok (0 === 0)', () => {
+  assert.deepEqual(crossCheckOnlyBCollector(undefined, 0, false), { ok: true });
+});
+
+// D1 HOOK INTEGRATION, mutation h1 in situ: a collector that SKIPS EVERY 2ND B-only row (the exact shape
+// of the streamingDiff onOnlyB-skip mutation) yields collector.onlyBRows.length < diff.onlyB — which the
+// D1 backstop catches as a HARD FAIL. This proves the backstop, not just the pure classifier, is what
+// closes the "hook wiring has no backstop" gap: without D1 this drop would be silent.
+test('D1 hook integration: a collector that skips every 2nd B-only row is caught by the backstop (HARD FAIL)', async () => {
+  const hashRow = (block, logIndex, h) => ({
+    key: [BigInt(block), BigInt(logIndex)],
+    hash: h,
+  });
+  const keyOf = (r) => r.key;
+  const a = [hashRow(ISSUE_36_FLOOR_1, 0, 'shared0')];
+  const b = [
+    hashRow(ISSUE_36_FLOOR_1, 0, 'shared0'),
+    hashRow(ISSUE_36_FLOOR_1 + 1, 0, 'b1'),
+    hashRow(ISSUE_36_FLOOR_1 + 2, 0, 'b2'),
+    hashRow(ISSUE_36_FLOOR_1 + 3, 0, 'b3'),
+    hashRow(ISSUE_36_FLOOR_1 + 4, 0, 'b4'),
+  ];
+
+  // A DELIBERATELY LOSSY collector standing in for mutation h1: it forwards only every 2nd B-only row.
+  const collected = [];
+  let seen = 0;
+  const lossyOnOnlyB = (row) => {
+    seen += 1;
+    if (seen % 2 === 0) {
+      return; // skip every 2nd row — the h1 shape
+    }
+
+    const key = row.key ?? [];
+    collected.push({ blockNumber: Number(key[0]) });
+  };
+
+  const diff = await mergeCompare(a, b, {
+    keyFn: keyOf,
+    mode: 'strict',
+    onOnlyB: lossyOnOnlyB,
+  });
+
+  assert.equal(diff.onlyB, 4, 'the diff independently counts all 4 B-only rows');
+  assert.equal(collected.length, 2, 'the lossy collector dropped every 2nd row');
+  // The backstop catches the drop: collected (2) !== diff.onlyB (4) → HARD FAIL that names itself.
+  const back = crossCheckOnlyBCollector(diff.onlyB, collected.length, false);
+  assert.equal(back.ok, false, 'the backstop FAILs on the incomplete collection');
+  assert.deepEqual(back.collectorMismatch, { expected: 4, collected: 2 });
 });
