@@ -301,18 +301,22 @@ export async function* streamHotBlocks(
   }
 }
 
-const sleep = (ms: number, signal?: AbortSignal) =>
+// `{ once: true }` removes the abort listener only when `abort` FIRES — on the normal timer path it was
+// never removed, so streamHotBlocks leaked one listener per poll (~3600/h) onto the long-lived per-chain
+// signal (MaxListenersExceededWarning storms + a real memory leak). Remove it when the timer fires normally.
+// Exported for the leak regression test. (issue #28)
+export const sleep = (ms: number, signal?: AbortSignal) =>
   new Promise<void>((resolve) => {
     if (signal?.aborted) return resolve();
-    const t = setTimeout(resolve, ms);
-    signal?.addEventListener(
-      'abort',
-      () => {
-        clearTimeout(t);
-        resolve();
-      },
-      { once: true },
-    );
+    const onAbort = (): void => {
+      clearTimeout(t);
+      resolve();
+    };
+    const t = setTimeout(() => {
+      signal?.removeEventListener('abort', onAbort);
+      resolve();
+    }, ms);
+    signal?.addEventListener('abort', onAbort, { once: true });
   });
 
 // ─────────────────────────────── event producer ───────────────────────────────

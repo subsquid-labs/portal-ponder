@@ -1,9 +1,11 @@
+import { getEventListeners } from 'node:events';
 import { expect, test } from 'vitest';
 import { TX_FIELDS } from './portal-filters.js';
 import {
   type Light,
   portalRealtimeEvents,
   reconcile,
+  sleep,
   streamHotBlocks,
   takeFinalized,
 } from './portal-realtime.js';
@@ -514,6 +516,20 @@ test('portalRealtimeEvents: a hash-carrying finalize ABOVE the local tip is DEFE
   // EXACTLY ONE finalize, at block 12 — the polls at heights 10 and 11 deferred (no finalize(10)/(11)).
   expect(finalizes.map((f: any) => f.block.number)).toEqual([12]);
   expect(finalizes[0]!.block.hash).toBe('c');
+});
+
+test('sleep: does not leak an abort listener per call on a shared long-lived signal (issue #28)', async () => {
+  // streamHotBlocks passes the same per-chain AbortSignal into sleep() on every poll for the life of the
+  // process; `{ once: true }` only removes the listener when abort FIRES, so the normal timer path leaked
+  // one listener per call (~3600/h → a MaxListenersExceededWarning storm + a real memory leak). After the
+  // timers fire, the listener count on the signal must return to baseline, not grow with the call count.
+  const ac = new AbortController();
+  const before = getEventListeners(ac.signal, 'abort').length;
+  await Promise.all(Array.from({ length: 200 }, () => sleep(1, ac.signal)));
+  const after = getEventListeners(ac.signal, 'abort').length;
+  // every call deregistered on its normal timer path → no accumulation (pre-fix: 200 dangling listeners)
+  expect(after).toBe(before);
+  ac.abort();
 });
 
 test('streamHotBlocks: a deterministic 4xx from /stream is FATAL, not an infinite silent retry loop', async () => {

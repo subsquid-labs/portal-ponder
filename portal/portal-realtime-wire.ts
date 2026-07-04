@@ -482,6 +482,13 @@ export async function* getPortalRealtimeEventGenerator(params: {
         // otherwise every later log from that address is indexed as a phantom child event until restart.
         // Only stream-discovered children can sit above the common ancestor (historical children are at/
         // below finality), so this never touches the preloaded map entries. Narrow the server filter too.
+        //
+        // No one-block phantom window here (review, refuted): a post-reorg batch delivered on the old
+        // (pre-prune) connection cannot carry a log from a now-pruned child. The Portal serves only
+        // NEW-canonical blocks after a fork (the premise the whole reconcile design rests on); a pruned
+        // address was created ONLY on the orphaned fork, so it has no contract on the new fork and cannot
+        // emit a log there. A same-address RE-DEPLOY on the new fork emits a fresh factory event that
+        // in-order discovery re-adds — including the same-block case via this PR's redelivery handshake.
         const ancestor = ev.block.number;
         let pruned = false;
         for (const [, rec] of childAddresses)
