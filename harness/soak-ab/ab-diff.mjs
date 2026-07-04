@@ -9,6 +9,9 @@
 //     by an A-side log. Any B-extra tx, or an A-only tx no log references, is a FAIL.
 //   • per-1000-block ordered md5 checkpoint hashes both sides (persisted for drift tracking)
 //   • _ponder_checkpoint monotonicity across runs
+//   • persist-stagnation guard (issue #38): a one-sided freeze of the newest-persisted-row block
+//     TIMESTAMP between the two legs is a HARD per-chain FAIL — it fires even when the WINDOWED diff
+//     reads PASS/PENDING, closing the frozen-window blind spot that hid issue #36's real blast radius.
 // Writes soak-ab-status.json {ts, chains, verdict, diffClasses, lagA, lagB, counters} for the monitor.
 //
 // Two "PG connections" = two `psql` processes (no npm driver → runs on the box with node + psql).
@@ -22,6 +25,11 @@
 // AB_SCHEMA_B to Soak B's DATABASE_SCHEMA value. Empty ⇒ unqualified `_ponder_checkpoint` (the
 // legacy behavior, for a store on the default search_path). The identifier is sanitized before it
 // reaches SQL.
+//
+// AB_STAGNATION_MAX_SKEW_S (optional): max tolerated skew, in seconds, between the two legs' newest
+// persisted-row block timestamps before the persist-stagnation guard (issue #38) FAILs the chain.
+// Unset ⇒ 2h (AB_STAGNATION_DEFAULT_MAX_SKEW_S). A garbage/non-positive value fails loud (like
+// AB_SCHEMA_B) rather than silently disabling the guard.
 
 import { spawn } from 'node:child_process';
 import { readFileSync, renameSync, writeFileSync } from 'node:fs';
@@ -520,6 +528,545 @@ export function sanitizeSchemaIdent(schema) {
   return schema;
 }
 
+// ── persist-stagnation guard (issue #38) ─────────────────────────────────────────────────────────
+//
+// The finalized-overlap window is [lo, min(maxA, maxB) - margin]. If ONE leg stops persisting sync
+// rows (crash wedge, silent blindness like issue #36, an ingest stall), the window `hi` FREEZES at
+// the stalled leg's block max, so every row of divergence ABOVE hi is out of scope by construction —
+// the per-chain verdict stays PASS while real loss accumulates invisibly (issue #36: chain 8453 read
+// PASS for ~17h with 32,825 blocks / ~476 log rows of real divergence sitting above the frozen hi).
+//
+// A MUTUAL freeze is BENIGN: `max(number)` only advances when the app's filters match a new event, so
+// a sparse app can leave BOTH legs quiet on the same chain at the same time (chain 1 did exactly
+// that). Absolute staleness is therefore NOT the signal — the signal is ONE-SIDED SKEW between the
+// two legs' progress. We measure that skew with the newest-row block TIMESTAMPS, not block-number
+// deltas: 32k blocks is ~17h on chain 8453 but ~2h on chain 42161, so a block-count threshold cannot
+// be chain-agnostic, whereas ponder_sync.blocks.timestamp (on-chain time, Unix seconds) is one clock
+// across every chain.
+
+/**
+ * Default max tolerated skew between the two legs' newest-row block timestamps, in SECONDS.
+ * 7200s = 2h — a CONSCIOUS choice comfortably above the worst crash-recovery time we expect
+ * (~45–60 min: a Soak B restart re-syncs its realtime lag before its newest block timestamp catches
+ * back up), so a healthy leg recovering from a restart never trips the guard, while a genuine
+ * one-sided wedge (a leg that has stopped persisting for hours) is caught long before issue #36's
+ * ~17h blind window could reopen. Tunable via AB_STAGNATION_MAX_SKEW_S for chains/apps with a
+ * different recovery profile.
+ */
+export const AB_STAGNATION_DEFAULT_MAX_SKEW_S = 7200;
+
+// Parse AB_STAGNATION_MAX_SKEW_S. Unset ⇒ the documented default. A present-but-garbage value
+// (non-numeric, non-finite, or non-positive — 0 disables the guard, a negative is nonsense) FAILS
+// LOUD naming the var, exactly as sanitizeSchemaIdent does for AB_SCHEMA_B: a config guard must never
+// silently disable itself. Pure + exported so every branch is asserted without touching the env.
+export function readStagnationThreshold(raw) {
+  if (raw === undefined || raw === null || raw === '') {
+    return AB_STAGNATION_DEFAULT_MAX_SKEW_S;
+  }
+
+  const n = Number(raw);
+  if (!(Number.isFinite(n) && n > 0)) {
+    throw new Error(
+      `AB_STAGNATION_MAX_SKEW_S must be a positive number of seconds: ${JSON.stringify(raw)}`,
+    );
+  }
+
+  return n;
+}
+
+// Pure per-chain persist-stagnation decision from the two legs' newest-row block TIMESTAMPS (Unix
+// seconds), a WALL-CLOCK `nowMs`, and the CROSS-RUN state persisted from the prior run (`prev`, or
+// null on the first run / for a chain with no prior state). `maxA`/`maxB` are the newest-row block
+// NUMBERS (carried through for the counters JSON, so a frozen window is legible even below
+// threshold). `tsA`/`tsB` are the newest-row block timestamps, or null/undefined when that leg has NO
+// rows for the chain (SQL max(timestamp) → NULL).
+//
+// WHY CROSS-RUN STATE (review findings 1 High + 4 Med, one mechanism). A one-shot skew reading cannot
+// tell a TRANSIENT lag (a leg mid-recovery, catching up) from a genuine WEDGE (a leg that has stopped
+// and stays stopped). Two run observations tell them apart by DIRECTION:
+//   • a wedged leg's newest-row ts does NOT advance between runs (frozen), or the skew keeps GROWING
+//     (falling further behind) → a real one-sided stall → FAIL.
+//   • a recovering leg's newest-row ts DOES advance AND the skew SHRINKS → catching up → non-fail.
+// So the FIRST run to observe an over-threshold skew ARMS (records this run's ts) and defers the
+// verdict one run rather than FAILing blind — a conscious ONE-RUN detection delay (see the PR candor
+// section). This cannot fail-open on a slow/trickling wedge: a leg persisting a trickle still falls
+// further behind a healthy leg, so the skew GROWS run over run and the growing-skew clause catches it.
+// In-window divergence (both legs live, drifting inside [lo,hi]) is NOT this guard's job — that is the
+// windowed row/bucket diff's; this guard only closes the FROZEN-WINDOW blind spot above `hi`.
+//
+// ── UNIFIED EVIDENCE RECORD (review delta 3, ruling D1) ──────────────────────────────────────────────
+//
+// The prior design carried TWO DISJOINT state shapes — a both-populated { tsA, tsB, skew } and a
+// one-leg-empty { emptySide, firstEmptyAtMs, populatedTs } — and switched on which one `prev` happened
+// to be. That switching LAUNDERED evidence across SHAPE flips (delta-3 HOLE 1): an empty↔populated
+// oscillation could FAIL once, then every shape flip read `prev` in "the wrong shape", found no usable
+// prior, and re-armed from scratch — so a stuck leg oscillating empty↔one-stale-row read non-fail
+// FOREVER while the other leg advanced. Same bug CLASS as the round-2 stale-side-flip, now across state
+// shapes. And the non-fail labels never checked advancement (HOLE 2): 'lagging-constant' was emitted for
+// a BOTH-FROZEN pair (comment claimed "both advanced"), and 'catching-up' for an A-frozen/B-regressed
+// pair (skew shrank via a one-sided regression, nobody advancing).
+//
+// The fix is ONE per-chain state shape, written EVERY run, regime derived from the CURRENT observation
+// only, prior evidence used REGARDLESS of the prior run's regime:
+//   { tsA, tsB, skew, emptySinceA: { atMs } | null, emptySinceB: { atMs } | null,
+//     wedgeFailedSince: ms | null, wedgeStaleSide: 'A' | 'B' | null, wedgeReason: string | null }
+//   • tsA / tsB — each leg's LAST-KNOWN newest-row ts (null only if that leg has NEVER had a row). When
+//     a leg is EMPTY this run, its ts is CARRIED FORWARD from prior evidence (D1 carry-forward rule) so
+//     a shape flip never drops what we knew — the advancement check still has a baseline to compare.
+//   • skew — |tsA − tsB| when both are known this run, else null (unmeasurable with an empty leg).
+//   • emptySinceA / emptySinceB — PER-LEG (review delta 4, F5): { atMs } for a leg that is empty this
+//     run and has been since `atMs` (armed on the FIRST empty observation for THAT leg, preserved while
+//     it stays empty, cleared when it is observed populated). Per-leg so a flip on the OTHER side never
+//     resets this leg's timer — alternating-empty-sides can no longer re-arm forever.
+//   • wedgeFailedSince — the wall-clock ms of the FIRST fail in the current unrecovered wedge episode,
+//     or null when not wedged. STICKY (D2): once set it persists across every regime/shape until a
+//     GENUINE RECOVERY clears it.
+//   • wedgeStaleSide — the leg identified as stalled at the FIRST fail of the current wedge episode,
+//     carried forward UNCHANGED while the wedge is live (review delta 4, F1/N1). Recovery/attribution
+//     read THIS carried side, never a per-run recomputed olderSide — so a wiped-while-ahead leg cannot
+//     flip the recovery check onto the wrong leg.
+//   • wedgeReason — the TRUE first-fail reason of the current wedge episode ('frozen', 'skew-growing',
+//     'one-sided-empty'), written ONCE at the first fail and carried forward (review delta 4, N2). The
+//     sticky 'wedge-unrecovered' returns render `originalReason` from this carried field, so the alert
+//     reads the wedge it actually WAS — not a reason re-derived from the current shape.
+// INVARIANT (D1): NO branch may discard evidence fields it does not itself use. Every return builds
+// `nextState` from the carried-forward fields, so a shape or regime transition PRESERVES everything. A
+// field is null ONLY where genuinely unobservable, never because a branch "didn't need it".
+//
+// ── STICKY WEDGE FAIL (ruling D2 + review delta 4 restructure) ───────────────────────────────────────
+//
+// The FIRST branch of the decision is the sticky-wedge gate: if `prev.wedgeFailedSince` is set there are
+// EXACTLY TWO exits, and every shape-handling branch (empty-arming, both-empty, fresh over-threshold)
+// runs ONLY AFTER it — so NO future branch can bypass stickiness by construction (this kills the whole
+// class of round-1..4 findings where some shape branch laundered a live wedge).
+//   (a) GENUINE RECOVERY — provable ONLY with FINITE current evidence: BOTH legs populated this run AND
+//       (skew ≤ threshold, OR the CARRIED wedge-stale leg strictly advanced vs its last-known ts AND the
+//       skew did not grow). Clears the wedge → 'catching-up' / 'both-populated-in-skew'.
+//   (b) OTHERWISE — FAIL 'wedge-unrecovered', carrying ALL evidence forward unchanged (wedgeFailedSince,
+//       wedgeStaleSide, wedgeReason, and both carried ts). An EMPTY observation (one leg or both empty)
+//       can NEVER reach (a): it lacks the finite both-populated evidence recovery requires, so it always
+//       lands in (b). This is what kills the oscillation and the wiped-while-ahead / both-empty-transient
+//       holes: the empty↔stale-row flip never presents both-populated recovery evidence, so it stays FAIL
+//       at r3/r4/r5, exactly as intended. A reappearing leg that genuinely advances with a non-growing
+//       skew recovers via (a).
+//
+// ── LABEL HONESTY + ADVANCEMENT (ruling D3, no wedgeFailedSince set) ─────────────────────────────────
+//
+// Over-threshold, not (yet) a sticky fail, prev evidence present:
+//   • 'catching-up'        — the OLDER (stale) leg STRICTLY advanced AND the skew SHRANK. Non-fail.
+//   • 'lagging-constant'   — BOTH legs strictly advanced AND the skew neither shrank nor grew (a steady
+//                            lag; the stale leg IS moving so `hi` advances with it and the WINDOWED diff
+//                            owns that regime — this guard is only for FROZEN windows).
+//   • FAIL 'frozen'        — one leg frozen since prev while the OTHER advanced (a one-sided wedge).
+//   • FAIL 'skew-growing'  — both moved but the gap widened (a trickling wedge losing ground).
+//   • 'mutually-quiescent' — NEITHER leg strictly advanced over threshold (a MUTUAL freeze). Non-fail:
+//                            this is the pre-existing mutual-freeze exemption — both legs down is an
+//                            OPS-LEVEL alarm (an ingest/box outage), OUT OF SCOPE for an A-vs-B DIVERGENCE
+//                            guard, which exists only to catch ONE leg stalling while the OTHER advances.
+//                            A LEADER-REGRESSION + FROZEN-STALE pair (skew shrank because the leading leg
+//                            REGRESSED newest-ts — a legitimate one-sided realtime reorg-prune — while the
+//                            stale leg did NOT advance) lands here too, NOT 'catching-up': nobody advanced,
+//                            so the gap "closing" is an artefact of a reorg, not recovery. The NEXT run's
+//                            advancement check discriminates (if the stale leg is truly frozen it FAILs
+//                            'frozen' once the leader re-advances) — a conscious ONE-RUN delay.
+//
+// Returns { fail, reason, staleSide, skew, tsA, tsB, maxA, maxB, nextState, originalReason? }.
+// `nextState` is the unified evidence record to persist for THIS chain for the next run (never mutates
+// `prev`); it is null only when there is NOTHING to carry (both legs empty AND no live wedge). `reason`
+// is a short machine tag (e.g. 'frozen', 'skew-growing', 'lagging-constant', 'mutually-quiescent',
+// 'wedge-unrecovered', 'skew-above-threshold-arming', 'catching-up', 'one-sided-empty', 'empty-arming',
+// 'both-populated-in-skew', 'both-empty'). A sticky 'wedge-unrecovered' return also carries
+// `originalReason` (the true first-fail reason of the wedge episode). Pure + exported so every branch is
+// mutation-verified without a DB.
+//
+// STATE SHAPE VERSIONING (review delta 4, F4 candor): the `nextState` shape above is v1 as of the FIRST
+// deploy of this guard. The deployed differ runs merged main, which has NO `_stagnation` checkpoint key,
+// so NO intermediate state shape was ever persisted in production — there is nothing to migrate. An
+// UNKNOWN or legacy `prev` shape (e.g. a hand-edited checkpoint) reads as all-null evidence and DELIBERATELY
+// re-arms: a documented ONE-RUN detection delay in the FAIL-SAFE direction (a wedge is re-detected the next
+// run; it is never fabricated). We intentionally do NOT write migration code for a shape that was never shipped.
+export function stagnationDecision({
+  maxA,
+  tsA,
+  maxB,
+  tsB,
+  threshold,
+  prev = null,
+  nowMs = Date.now(),
+}) {
+  const a = tsToSeconds(tsA);
+  const b = tsToSeconds(tsB);
+  const mA = maxToNumber(maxA);
+  const mB = maxToNumber(maxB);
+  const base = { tsA: a, tsB: b, maxA: mA, maxB: mB };
+
+  // Prior evidence, read from the UNIFIED shape regardless of the prior run's regime. `prev` may be an
+  // unknown/legacy shape or corrupt — read defensively, treating any missing/non-finite field as
+  // unobservable (null), never as a phantom. Missing/corrupt prev ⇒ every prior field null ⇒ fail-safe
+  // ARMING (D1 carry-forward: null baseline defers, never fails-open).
+  const prevTsA = prev && Number.isFinite(prev.tsA) ? prev.tsA : null;
+  const prevTsB = prev && Number.isFinite(prev.tsB) ? prev.tsB : null;
+  // NOTE (review delta 5, finding 1): we deliberately do NOT read `prev.skew` for growth comparison.
+  // The MEASURED skew is stored in state for telemetry, but it is null after any empty-run gap, so
+  // direction is judged from the CARRIED gap (prevGap/curGap below) which persists through empty gaps.
+  const prevWedgeFailedSince =
+    prev && Number.isFinite(prev.wedgeFailedSince)
+      ? prev.wedgeFailedSince
+      : null;
+  // The CARRIED wedge attribution (review delta 4, F1/N1/N2): the stalled leg and the true first-fail
+  // reason of the LIVE wedge episode, written once at the first fail and threaded forward UNCHANGED.
+  // Recovery and sticky attribution read THESE — never a per-run recomputed olderSide (which a
+  // wiped-while-ahead leg would flip onto the wrong leg).
+  const prevWedgeStaleSide =
+    prev && (prev.wedgeStaleSide === 'A' || prev.wedgeStaleSide === 'B')
+      ? prev.wedgeStaleSide
+      : null;
+  const prevWedgeReason =
+    prev && typeof prev.wedgeReason === 'string' ? prev.wedgeReason : null;
+
+  // D1 carry-forward: a leg empty THIS run keeps its last-known ts from prior evidence (null if never
+  // observed) so the advancement check always has a baseline. A populated leg uses this run's reading.
+  const carriedA = a === null ? prevTsA : a;
+  const carriedB = b === null ? prevTsB : b;
+
+  // Per-leg emptiness timers (review delta 4, F5). Each leg's `emptySince.atMs` is armed on the FIRST
+  // run it is observed empty (and not already armed), preserved while it stays empty, cleared when it is
+  // observed populated. A flip on the OTHER leg never touches this one — alternating-empty-sides can no
+  // longer re-arm forever. Read the prior arms defensively.
+  const prevEmptySinceA =
+    prev?.emptySinceA && Number.isFinite(prev.emptySinceA.atMs)
+      ? prev.emptySinceA
+      : null;
+  const prevEmptySinceB =
+    prev?.emptySinceB && Number.isFinite(prev.emptySinceB.atMs)
+      ? prev.emptySinceB
+      : null;
+  // CONSCIOUS CHOICE (review delta 5, finding 3 — SUSTAINED as fail-closed): a BOTH-empty run arms BOTH
+  // per-leg timers, so a mutual outage CONSUMES the one-sided-empty grace window before any one-sided
+  // condition exists. This is the INTENDED F5 semantic and is fail-closed: each timer factually measures
+  // THAT leg's emptiness duration, and a leg still empty past the grace window while the OTHER leg has
+  // recovered and advances genuinely SHOULD alarm — the emptiness that a downstream consumer sees is
+  // real regardless of whether the sibling was also down earlier. CAVEAT (accepted): on a bootstrap
+  // deploy where A starts first and B a few minutes later, B's timer arms during the both-empty window,
+  // so the first run after A advances can produce ONE false one-sided-empty FAIL — self-clearing once B
+  // persists a row. Fail-closed and one-shot, so this stands; the pinning test locks the behavior.
+  const emptySinceA = a === null ? (prevEmptySinceA ?? { atMs: nowMs }) : null;
+  const emptySinceB = b === null ? (prevEmptySinceB ?? { atMs: nowMs }) : null;
+
+  // MEASURED skew is |a − b| only when BOTH legs are populated THIS run; unmeasurable (null) with an
+  // empty leg. This is the TELEMETRY / THRESHOLD number: it is stored in nextState and drives the
+  // skew ≤ threshold recovery check and the skew clauses. It is NOT used for growth comparison — see
+  // the CARRIED-GAP basis below (review delta 5, finding 1).
+  const skew = a !== null && b !== null ? Math.abs(b - a) : null;
+
+  // Did each leg's LAST-KNOWN ts strictly advance vs the prior run's last-known ts? An empty leg (ts
+  // carried forward unchanged) is by construction NOT advancing. A regression (reorg-prune) is NOT
+  // advancing — the fail-closed reading. A leg with no prior baseline cannot be judged advanced.
+  const aAdvanced = prevTsA !== null && carriedA !== null && carriedA > prevTsA;
+  const bAdvanced = prevTsB !== null && carriedB !== null && carriedB > prevTsB;
+
+  // CARRIED-GAP basis for growth/shrink direction (review delta 5, finding 1). Growth must be judged
+  // from the last-known gap between the CARRIED timestamps, NOT the measured `skew`: `skew` is null on
+  // any run with an empty leg, and `prev.skew` is therefore null after an empty-run gap — using it
+  // throws away a genuinely GROWN last-known gap (the carried tsA/tsB persist through empty gaps and
+  // prove the gap widened). `gap(x, y)` = |x − y| only when BOTH are finite, else null (unknown, never
+  // coerced to 0). prevGap is the gap at the END of the prior run (prev carried ts); curGap is this
+  // run's carried gap. Both persist through empty legs, so growth is visible across an empty-run gap.
+  const prevGap = gap(prevTsA, prevTsB);
+  const curGap = gap(carriedA, carriedB);
+
+  // Direction from the CARRIED gap, null-safe (review delta 5, finding 1): `gapGrew` is true ONLY when
+  // BOTH gaps are finite and the current strictly exceeds the prior — a null (unknown) gap on either
+  // side defers rather than fails/clears open. `gapShrank` is the null-safe mirror. These replace the
+  // former `skew`-based comparisons at every growth/shrink site so an empty-run gap can no longer mask
+  // a grown last-known gap (the fail-open) nor manufacture a false shrink.
+  const gapGrew = gapGrewFrom(prevGap, curGap);
+  const gapShrank = gapShrankFrom(prevGap, curGap);
+
+  // Assemble the unified nextState from carried-forward evidence. The wedge fields are threaded per
+  // branch (a fresh fail sets them; a recovery clears them; an unrecovered run preserves them). The
+  // INVARIANT (D1): every return path funnels through `evidence(...)` so no field is silently dropped.
+  const evidence = (wedgeFailedSince, wedgeStaleSide, wedgeReason) => ({
+    tsA: carriedA,
+    tsB: carriedB,
+    skew,
+    emptySinceA,
+    emptySinceB,
+    wedgeFailedSince,
+    wedgeStaleSide,
+    wedgeReason,
+  });
+
+  // ─────────────────────────────────────────────────────────────────────────────────────────────────
+  // STICKY-WEDGE GATE (review delta 4 restructure) — the FIRST branch. If a wedge is live, there are
+  // EXACTLY TWO exits, and no shape-handling branch below can be reached without passing here first. So
+  // stickiness cannot be bypassed by construction.
+  // ─────────────────────────────────────────────────────────────────────────────────────────────────
+  if (prevWedgeFailedSince !== null) {
+    // GENUINE RECOVERY requires FINITE current evidence: BOTH legs populated this run. An empty
+    // observation (one leg or both empty) lacks that evidence and can NEVER clear a wedge.
+    const bothPopulated = a !== null && b !== null;
+    // The wedged/stale leg, from CARRIED evidence — never a per-run recomputed side. Did IT advance?
+    const wedgeStaleAdvanced =
+      prevWedgeStaleSide === 'A'
+        ? aAdvanced
+        : prevWedgeStaleSide === 'B'
+          ? bAdvanced
+          : false;
+    const skewWithinThreshold = skew !== null && skew <= threshold;
+    // Recovery via stale-leg advance requires the CARRIED gap to NOT be growing (review delta 5,
+    // finding 1). `!gapGrew` reads the carried-timestamp gap, which survives the empty-run gap that
+    // makes `prev.skew` null — so a stale leg that ticked forward while the overall gap kept WIDENING
+    // no longer counts as recovery (the former `!skewGrew` fail-open cleared it).
+    const genuinelyRecovered =
+      bothPopulated &&
+      (skewWithinThreshold || (wedgeStaleAdvanced && !gapGrew));
+
+    if (!genuinelyRecovered) {
+      // (b) still wedged — FAIL, carrying ALL evidence forward unchanged.
+      return {
+        fail: true,
+        reason: 'wedge-unrecovered',
+        staleSide: prevWedgeStaleSide,
+        skew,
+        ...base,
+        nextState: evidence(
+          prevWedgeFailedSince,
+          prevWedgeStaleSide,
+          prevWedgeReason,
+        ),
+        originalReason: prevWedgeReason ?? 'frozen',
+      };
+    }
+
+    // (a) genuine recovery — the wedge clears. Fall through into the shape branches below with the wedge
+    // cleared: they will label this run's regime honestly ('catching-up' / 'both-populated-in-skew' /
+    // 'lagging-constant') and set nextState.wedgeFailedSince = null. (Both-populated is guaranteed here.)
+  }
+
+  // ── both legs empty → benign mutual/not-started ──
+  // A both-empty run cannot be reached with a LIVE wedge (the sticky gate FAILed it above). With no
+  // wedge and nothing persisted on EITHER leg there is no one-sided divergence to point at (an ops-level
+  // "everything is down" state, out of scope). Carry forward whatever last-known ts we had (may be null).
+  if (a === null && b === null) {
+    const nextState = evidence(null, null, null);
+    // nextState is null ONLY when there is genuinely nothing to carry (no ts ever seen, no wedge).
+    const nothingToCarry = carriedA === null && carriedB === null;
+
+    return {
+      fail: false,
+      reason: 'both-empty',
+      staleSide: null,
+      skew: null,
+      ...base,
+      nextState: nothingToCarry ? null : nextState,
+    };
+  }
+
+  // ── one leg empty, the other populated ──
+  // A LIVE wedge cannot be here either (the sticky gate FAILed an empty run above — an empty run never
+  // presents both-populated recovery evidence). So this only ever ARMS a FRESH one-sided-empty wedge.
+  if (a === null || b === null) {
+    const emptySide = a === null ? 'A' : 'B';
+    const emptySince = emptySide === 'A' ? emptySinceA : emptySinceB;
+    const emptyLongEnough = nowMs - emptySince.atMs > threshold * 1000;
+    // The populated (live) leg's motion: did it advance vs its own last-known ts? A MUTUAL freeze
+    // (the live leg also not advancing) is NOT a one-sided wedge.
+    const liveAdvanced = emptySide === 'A' ? bAdvanced : aAdvanced;
+
+    // FRESH one-sided-empty wedge: empty past the grace window AND the live leg advanced. If the live
+    // leg is also frozen, that is a mutual freeze → non-fail (armed, not failed).
+    const fail = emptyLongEnough && liveAdvanced;
+
+    return {
+      fail,
+      reason: fail ? 'one-sided-empty' : 'empty-arming',
+      staleSide: fail ? emptySide : null,
+      skew: null,
+      ...base,
+      nextState: fail
+        ? evidence(nowMs, emptySide, 'one-sided-empty')
+        : evidence(null, null, null),
+    };
+  }
+
+  // ── both legs populated ──
+  if (skew <= threshold) {
+    // Healthy / within tolerance. Skew ≤ threshold is a GENUINE RECOVERY (D2), so a wedge that cleared
+    // in the sticky gate lands here. Surface the real computed skew (finding 3: telemetry, not null).
+    // staleSide null (a below-threshold lag has an older leg but no stall). Emptiness arms clear.
+    return {
+      fail: false,
+      reason: 'both-populated-in-skew',
+      staleSide: null,
+      skew,
+      ...base,
+      nextState: evidence(null, null, null),
+    };
+  }
+
+  // skew > threshold, both populated, and no live wedge (the sticky gate either FAILed or recovered).
+  // Whether we have a prior baseline to judge direction:
+  const haveBaseline = prevTsA !== null && prevTsB !== null;
+
+  // No prior baseline (first over-threshold observation, or prev never had both legs) → ARM, defer the
+  // verdict one run (candor: one-run detection delay).
+  if (!haveBaseline) {
+    return {
+      fail: false,
+      reason: 'skew-above-threshold-arming',
+      staleSide: null,
+      skew,
+      ...base,
+      nextState: evidence(null, null, null),
+    };
+  }
+
+  // We have a baseline and no live wedge (or it just recovered). Decide THIS run's regime from
+  // advancement (D3 honesty). A leg that regressed or held still did NOT advance (fail-closed).
+  const oneLegFrozenWhileOtherAdvanced =
+    (!aAdvanced && bAdvanced) || (!bAdvanced && aAdvanced);
+  // The stale (older-ts) leg THIS run, used only for 'catching-up' attribution below (recovery no longer
+  // depends on it — the sticky gate owns recovery). Equal / unknown ⇒ no side.
+  let olderSide = null;
+  if (carriedA < carriedB) {
+    olderSide = 'A';
+  } else if (carriedB < carriedA) {
+    olderSide = 'B';
+  }
+  const staleAdvanced =
+    olderSide === 'A' ? aAdvanced : olderSide === 'B' ? bAdvanced : false;
+  // Growth/shrink from the CARRIED gap (review delta 5, finding 1), NOT the measured `skew`: `prev.skew`
+  // is null after any empty-run gap, so a genuinely GROWN last-known gap would be invisible (the former
+  // fail-open) and a shrink could be manufactured. `gapGrew`/`gapShrank` read the carried tsA/tsB gap,
+  // which persists through empty gaps, and are null-safe (unknown gap ⇒ neither grew nor shrank).
+  const skewIncreased = gapGrew;
+  const skewDecreased = gapShrank;
+  const bothAdvanced = aAdvanced && bAdvanced;
+  const neitherAdvanced = !aAdvanced && !bAdvanced;
+
+  // FAIL iff a one-sided wedge (one frozen, other advancing) OR the skew grew (trickling wedge losing
+  // ground). Both fail-closed. A fresh fail sets a new wedge episode (sticky from here). N1: staleSide
+  // names the leg that FAILED TO ADVANCE — the frozen one — computed from per-leg advancement, NOT
+  // olderSide (which mis-names the newer-but-frozen leg).
+  //
+  // CONSCIOUS RULING (review delta 5, finding 2 — SUSTAINED as fail-closed): this `frozen` predicate
+  // fires even in the "leader frozen while the STALE leg catches up" shape — a sticky wedge can recover
+  // in the gate above and then this fresh predicate immediately names the (now-frozen) former leader.
+  // At the deployment's HOURLY cadence this is CORRECT, not laundering: a leg whose newest-row timestamp
+  // does not advance across a FULL inter-run interval has genuinely stopped persisting for that interval,
+  // so N1 names the truly-frozen leg and the recovery-then-fresh-wedge is an honest NEW episode (a fresh
+  // wedgeFailedSince). CAVEAT (accepted): back-to-back MANUAL runs seconds apart can false-alarm here —
+  // a leg that simply had no new block in those seconds reads "frozen". The timer cadence is hourly and
+  // a false FAIL is the SAFE direction for a differ, so this stands; the pinning test locks the exact
+  // behavior so any future change to it is a conscious decision.
+  const fail = oneLegFrozenWhileOtherAdvanced || skewIncreased;
+  let reason;
+  let freshStaleSide = null;
+  if (fail) {
+    if (oneLegFrozenWhileOtherAdvanced) {
+      reason = 'frozen';
+      // The frozen leg is the one that did NOT advance while the other did.
+      freshStaleSide = aAdvanced ? 'B' : 'A';
+    } else {
+      reason = 'skew-growing';
+      // A trickling wedge losing ground: the stale (older) leg is the one falling behind.
+      freshStaleSide = olderSide;
+    }
+  } else if (neitherAdvanced) {
+    // NEITHER leg advanced over threshold → a MUTUAL freeze (D3): out of scope for an A-vs-B divergence
+    // guard (both legs down is an ops alarm). A leader-regression + frozen-stale pair (skew shrank but
+    // nobody advanced) also lands here, NOT 'catching-up' — the next run's advancement check
+    // discriminates (a conscious one-run delay).
+    reason = 'mutually-quiescent';
+  } else if (staleAdvanced && skewDecreased) {
+    // The OLDER (stale) leg strictly advanced AND the gap narrowed → genuine recovery in progress.
+    reason = 'catching-up';
+  } else if (bothAdvanced && !skewDecreased && !skewIncreased) {
+    // BOTH legs advanced and the skew held flat → a steady lag, non-fail (the stale leg IS moving so
+    // `hi` advances with it; the WINDOWED diff owns that regime — this guard is only for frozen windows).
+    reason = 'lagging-constant';
+  } else {
+    // Remaining non-fail shape: only the LEADER advanced (skew shrank without the stale leg advancing —
+    // e.g. the stale leg held still while the leader raced ahead is caught above as 'frozen'; the only
+    // way to reach here is skew-shrank-without-stale-advance where the leader's motion narrowed the gap
+    // via a leader ts that moved toward the stale one, i.e. a leader regression already routed to
+    // 'mutually-quiescent'). Fold to 'mutually-quiescent' (nobody-of-interest advanced) — never a
+    // silent mislabel. Kept explicit so no advancement pattern falls through unnamed.
+    reason = 'mutually-quiescent';
+  }
+
+  return {
+    fail,
+    staleSide: fail ? freshStaleSide : null,
+    reason,
+    skew,
+    ...base,
+    nextState: fail
+      ? evidence(nowMs, freshStaleSide, reason)
+      : evidence(null, null, null),
+  };
+}
+
+// The last-known gap between two CARRIED timestamps: |x − y| ONLY when BOTH are finite, else null
+// (review delta 5, finding 1). Growth/shrink direction is judged from THIS gap, not the measured
+// `skew`, because carried timestamps persist through an empty-run gap where `skew` (and hence
+// `prev.skew`) is null. A null return means UNKNOWN — never coerced to 0 — so a comparison against it
+// defers rather than fabricating or clearing a wedge.
+function gap(x, y) {
+  return Number.isFinite(x) && Number.isFinite(y) ? Math.abs(x - y) : null;
+}
+
+// One null-safe gap-GREW comparison, used at EVERY growth site (review delta 5, finding 1): returns
+// true ONLY when BOTH the prior and current carried gap are finite numbers and the current STRICTLY
+// exceeds the prior. A null (unknown) gap on either side is NOT "growing" — this defers rather than
+// manufacturing a false skew-growing FAIL (F3) or masking a real one behind a null prev.skew.
+function gapGrewFrom(prevGap, curGap) {
+  return (
+    typeof prevGap === 'number' &&
+    Number.isFinite(prevGap) &&
+    typeof curGap === 'number' &&
+    Number.isFinite(curGap) &&
+    curGap > prevGap
+  );
+}
+
+// The null-safe MIRROR (review delta 5, finding 1): gap strictly SHRANK — true ONLY when BOTH carried
+// gaps are finite and the current is strictly below the prior. A null (unknown) gap on either side is
+// NOT "shrinking", so a 'catching-up' label is never inferred from an unmeasurable prior gap.
+function gapShrankFrom(prevGap, curGap) {
+  return (
+    typeof prevGap === 'number' &&
+    Number.isFinite(prevGap) &&
+    typeof curGap === 'number' &&
+    Number.isFinite(curGap) &&
+    curGap < prevGap
+  );
+}
+
+// Coerce a newest-row block timestamp to a finite number of seconds, or null when the leg has no rows
+// (SQL NULL, empty string, or an unparseable value). Never returns a phantom 0 for a missing row.
+function tsToSeconds(ts) {
+  if (ts === undefined || ts === null || ts === '') {
+    return null;
+  }
+
+  const n = Number(ts);
+
+  return Number.isFinite(n) ? n : null;
+}
+
+// Coerce a newest-row block number for the counters JSON; null when absent/unparseable.
+function maxToNumber(max) {
+  if (max === undefined || max === null || max === '') {
+    return null;
+  }
+
+  const n = Number(max);
+
+  return Number.isFinite(n) ? n : null;
+}
+
 // Compare per-bucket checkpoint hashes: shared buckets must match (determinism); buckets on only one
 // side are reported (overlap edges), not failed.
 export function compareBucketHashes(aBuckets, bBuckets) {
@@ -714,6 +1261,32 @@ async function overlapBound(url, chain) {
   );
 
   return Number(v ?? 0);
+}
+
+// Newest persisted row for the chain: its block NUMBER and block TIMESTAMP (Unix seconds). A SINGLE-ROW
+// `order by number desc limit 1` (NOT two independent max() aggregates) so the number and timestamp
+// come from the SAME row — the actual newest block, its true height AND its true time, never a max
+// height paired with a max timestamp from a different row (finding 7). An EMPTY store yields ZERO rows
+// → both null, letting stagnationDecision tell "no rows" apart from a legitimate block/timestamp of 0
+// (never a phantom 0). ponder_sync.blocks persists blocks in on-chain order, so the highest-number row
+// is the newest block. Returns { maxBlock, ts } as strings|null (the pure decision helper coerces
+// them). Used ONLY by the issue #38 persist-stagnation guard; the window hi still comes from
+// overlapBound's coalesce(...,0), unchanged.
+async function legNewestRow(url, chain) {
+  let row = null;
+  for await (const r of psqlRows(
+    url,
+    `select number::text, timestamp::text ` +
+      `from ponder_sync.blocks where chain_id=${chain} order by number desc limit 1`,
+  )) {
+    row = r;
+    break;
+  }
+
+  return {
+    maxBlock: row?.[0] ?? null,
+    ts: row?.[1] ?? null,
+  };
 }
 
 // Real indexing progress for the monotonicity guard: ponder's own `_ponder_checkpoint` row (in the
@@ -1056,7 +1629,23 @@ async function bucketHashesExcluding(url, chain, lo, hi, bucket, excludeRows) {
   return map;
 }
 
-async function compareChain(
+// The real module functions compareChain calls, gathered into one deps object so a test can drive the
+// REAL compareChain with stubs (D3 wiring coverage). The production call sites pass nothing, so `deps`
+// defaults to these and behaviour is unchanged; a test overrides only the seams it needs. Every DB-
+// touching adapter compareChain uses is here — swapping them for in-memory stubs makes compareChain's
+// verdict composition (OR-of-stagnation-and-windowed) testable without a psql.
+export const COMPARE_CHAIN_DEPS = {
+  overlapBound,
+  checkpointProgress,
+  legNewestRow,
+  diffLogs,
+  diffBlocks,
+  diffTx,
+  bucketHashes,
+  bucketHashesExcluding,
+};
+
+export async function compareChain(
   urlA,
   urlB,
   chain,
@@ -1064,13 +1653,21 @@ async function compareChain(
   margin,
   bucket,
   schemaB,
+  stagnationThreshold,
+  // Cross-run stagnation state for THIS chain from the prior run (or null); wall clock; deps seam.
+  prevStagnation = null,
+  nowMs = Date.now(),
+  deps = COMPARE_CHAIN_DEPS,
 ) {
-  const [boundA, boundB, progressB] = await Promise.all([
-    overlapBound(urlA, chain),
-    overlapBound(urlB, chain),
+  const [boundA, boundB, progressB, newestA, newestB] = await Promise.all([
+    deps.overlapBound(urlA, chain),
+    deps.overlapBound(urlB, chain),
     // Soak B's COMMITTED indexing progress from `_ponder_checkpoint` — the real value the
     // monotonicity guard asserts, not merely how far the sync store reached (see checkpointProgress).
-    checkpointProgress(urlB, chain, schemaB),
+    deps.checkpointProgress(urlB, chain, schemaB),
+    // Newest persisted (block, timestamp) per leg — for the issue #38 persist-stagnation guard.
+    deps.legNewestRow(urlA, chain),
+    deps.legNewestRow(urlB, chain),
   ]);
   const hi = Math.min(boundA, boundB) - margin;
   const lo = cutover;
@@ -1089,21 +1686,57 @@ async function compareChain(
   out.lagA = boundA - Math.min(boundA, boundB);
   out.lagB = boundB - Math.min(boundA, boundB);
 
+  // Persist-stagnation guard (issue #38). Computed alongside the window so it fires regardless of
+  // window state: a one-sided wedge is exactly the state where `hi` can be frozen or below `lo`, and
+  // the whole point is that this FAILs when the WINDOWED diff would read PASS/PENDING. It takes the
+  // prior run's per-chain state (direction-aware decision) + the wall clock (empty-leg timing). maxA/
+  // maxB and both newest-row timestamps are surfaced in the per-chain classes (and thus the counters
+  // JSON) so a frozen window is legible at a glance even below threshold.
+  const stagnation = stagnationDecision({
+    maxA: newestA.maxBlock,
+    tsA: newestA.ts,
+    maxB: newestB.maxBlock,
+    tsB: newestB.ts,
+    threshold: stagnationThreshold,
+    prev: prevStagnation,
+    nowMs,
+  });
+  const persistStagnation = {
+    fail: stagnation.fail,
+    reason: stagnation.reason,
+    // The original wedge reason carried through a sticky 'wedge-unrecovered' fail (D2), so the alert
+    // layer can render what the wedge WAS. Absent for a fresh (non-sticky) reason.
+    originalReason: stagnation.originalReason,
+    staleSide: stagnation.staleSide,
+    skewSeconds: stagnation.skew,
+    thresholdSeconds: stagnationThreshold,
+    maxA: stagnation.maxA,
+    maxB: stagnation.maxB,
+    tsA: stagnation.tsA,
+    tsB: stagnation.tsB,
+  };
+  out.classes.persistStagnation = persistStagnation;
+  // The state to persist for this chain for the next run (loaded/saved via CHECKPOINT_FILE by main).
+  out.stagnationState = stagnation.nextState;
+
   if (hi < lo) {
-    out.verdict = 'PENDING';
+    // No finalized overlap yet — the windowed diff cannot run. This is PENDING on the window axis, but
+    // the stagnation guard still stands: OR-compose so a fired guard FAILs even here (a one-sided wedge
+    // is precisely a state that can hold hi below lo). classes.persistStagnation is already attached.
+    out.verdict = stagnation.fail ? 'FAIL' : 'PENDING';
     out.classes.note = `no finalized overlap yet (lo=${lo} hi=${hi})`;
 
     return out;
   }
 
   const [logsRes, blocksRes, tx] = await Promise.all([
-    diffLogs(urlA, urlB, chain, lo, hi),
-    diffBlocks(urlA, urlB, chain, lo, hi),
-    diffTx(urlA, urlB, chain, lo, hi),
+    deps.diffLogs(urlA, urlB, chain, lo, hi),
+    deps.diffBlocks(urlA, urlB, chain, lo, hi),
+    deps.diffTx(urlA, urlB, chain, lo, hi),
   ]);
   const [ba, bb] = await Promise.all([
-    bucketHashes(urlA, chain, lo, hi, bucket),
-    bucketHashes(urlB, chain, lo, hi, bucket),
+    deps.bucketHashes(urlA, chain, lo, hi, bucket),
+    deps.bucketHashes(urlB, chain, lo, hi, bucket),
   ]);
   const buckets = compareBucketHashes(ba, bb);
 
@@ -1160,7 +1793,7 @@ async function compareChain(
     unexplained: buckets.mismatches,
   };
   if (!buckets.ok && toleratedLogRows.length > 0) {
-    const bbExcl = await bucketHashesExcluding(
+    const bbExcl = await deps.bucketHashesExcluding(
       urlB,
       chain,
       lo,
@@ -1173,6 +1806,10 @@ async function compareChain(
   const bucketsFail = !bucketClass.ok;
 
   out.classes = {
+    // Carried through the window path too (issue #38): a PASSing windowed diff still surfaces the
+    // per-chain persist-stagnation counters so a below-threshold one-sided skew (a frozen window that
+    // has not yet crossed the guard) is legible at a glance in the status JSON.
+    persistStagnation,
     logs: {
       fail: logsFail,
       onlyA: logsRes.diff.onlyA,
@@ -1218,7 +1855,13 @@ async function compareChain(
       unexplained: bucketClass.unexplained.length,
     },
   };
-  if (logsFail || blocksFail || tx.fail || bucketsFail) {
+  // OR-composition of the verdict (D1 — no early return on a fired guard): the FULL windowed diff runs
+  // even when the stagnation guard fires, so its tolerated classes / pins / bucket hashes are all still
+  // computed and reported. A fired guard FORCES FAIL (stagnation FAIL wins over a windowed PASS/PENDING)
+  // but NEVER suppresses a windowed failure's own reporting — a stagnation-only FAIL and a windowed FAIL
+  // compose to one FAIL, each visible in its own class. classes.persistStagnation is attached in every
+  // path above.
+  if (logsFail || blocksFail || tx.fail || bucketsFail || stagnation.fail) {
     out.verdict = 'FAIL';
   }
 
@@ -1243,15 +1886,44 @@ async function main() {
   // value). Unset ⇒ unqualified (default search_path). Sanitized — it goes into SQL. A bad identifier
   // fails loud here (before any per-chain query) rather than silently disabling the checkpoint guard.
   const schemaB = sanitizeSchemaIdent(process.env.AB_SCHEMA_B ?? '');
+  // Max tolerated one-sided persist skew (issue #38), in seconds. Garbage/non-positive fails loud
+  // here (before any per-chain query), same as AB_SCHEMA_B above — a config guard never silently
+  // disables itself. Unset ⇒ the documented 2h default.
+  const stagnationThreshold = readStagnationThreshold(
+    process.env.AB_STAGNATION_MAX_SKEW_S,
+  );
   const statusFile = process.env.STATUS_FILE ?? 'soak-ab-status.json';
   const checkpointFile =
     process.env.CHECKPOINT_FILE ?? 'soak-ab-checkpoints.json';
+
+  // The CHECKPOINT_FILE is the cross-run ledger: it holds the per-chain checkpoint monotonicity series
+  // AND (new, issue #38) a per-chain persist-stagnation state section under the `_stagnation` top-level
+  // key. An ABSENT `_stagnation` key ⇒ no prior state (fully backward compatible with existing files —
+  // the key is numeric-chain-disjoint, so the monotonicity loop below never treats it as a chain). Load
+  // it ONCE here and pass each chain's prior state into compareChain (direction-aware decision).
+  const prior = loadPriorCheckpoints(checkpointFile);
+  const priorStagnation =
+    prior && typeof prior._stagnation === 'object' && prior._stagnation !== null
+      ? prior._stagnation
+      : {};
+  const nowMs = Date.now();
 
   const results = [];
   for (const chain of chains) {
     try {
       results.push(
-        await compareChain(urlA, urlB, chain, cutover, margin, bucket, schemaB),
+        await compareChain(
+          urlA,
+          urlB,
+          chain,
+          cutover,
+          margin,
+          bucket,
+          schemaB,
+          stagnationThreshold,
+          priorStagnation[chain] ?? null,
+          nowMs,
+        ),
       );
     } catch (e) {
       results.push({ chain, verdict: 'ERROR', classes: { error: e.message } });
@@ -1261,10 +1933,16 @@ async function main() {
   // Checkpoint monotonicity across runs: Soak B's per-chain progress must never rewind between
   // hourly runs. A regression (a resume/restart that lost ground) is a hard FAIL, wired into both
   // the verdict/exit code and the alerts — not merely logged.
-  const prior = loadPriorCheckpoints(checkpointFile);
   const nextCheckpoints = { ...prior };
   const regressions = [];
+  const nextStagnation = {};
   for (const r of results) {
+    // Carry forward this chain's persist-stagnation state for the next run's direction check. A chain
+    // that errored before the guard ran leaves stagnationState undefined → nothing to carry.
+    if (r.stagnationState) {
+      nextStagnation[r.chain] = r.stagnationState;
+    }
+
     if (r.progressB === undefined) {
       continue;
     }
@@ -1281,6 +1959,9 @@ async function main() {
     // keep a bounded tail so the file does not grow unbounded across a long soak
     nextCheckpoints[r.chain] = series.slice(-64);
   }
+  // Persist the new per-chain stagnation state section (replaces the prior one wholesale — each run
+  // recomputes every diffed chain's nextState from scratch, so a chain no longer armed clears itself).
+  nextCheckpoints._stagnation = nextStagnation;
 
   const verdict = results.some(
     (r) => r.verdict === 'FAIL' || r.verdict === 'ERROR',
@@ -1305,22 +1986,7 @@ async function main() {
     // no restart log yet — Soak B not started, or first boot
   }
 
-  const alerts = [];
-  if (restarts.crashLoop) {
-    alerts.push(
-      `crash-loop: ${restarts.restartsLastHour} restarts in the last hour (>3)`,
-    );
-  }
-  for (const reg of regressions) {
-    alerts.push(
-      `checkpoint-regression: chain ${reg.chain} rewound ${reg.prev} → ${reg.cur} between runs`,
-    );
-  }
-  if (verdict === 'FAIL' && regressions.length === 0) {
-    alerts.push(
-      'finalized-diff: an unexpected finalized-overlap divergence (see diffClasses)',
-    );
-  }
+  const alerts = composeAlerts(results, regressions, restarts);
 
   const toleratedIssue27 = aggregateToleratedIssue27(results);
   const knownBadRowsAgg = aggregateKnownBadRows(results);
@@ -1352,7 +2018,7 @@ async function main() {
     // table (logs/blocks) and per chain so the growth is legible at a glance.
     toleratedIssue36,
     counters: Object.fromEntries(
-      results.map((r) => [r.chain, { lo: r.lo, hi: r.hi, verdict: r.verdict }]),
+      results.map((r) => [r.chain, chainCounters(r)]),
     ),
   };
 
@@ -1466,6 +2132,154 @@ export function formatToleratedIssue36Line(tolerated) {
     `TOLERATED (known issue #36 — REMOVE when issue #36 is resolved (A repaired or leg retired)): ` +
     `${tolerated.count} onlyB rows leg A lost (logs:${tolerated.logs?.count ?? 0} blocks:${tolerated.blocks?.count ?? 0}; per-chain ${breakdown})`
   );
+}
+
+// One loud alert line per chain whose persist-stagnation guard FIRED (issue #38) — the stalled leg
+// named, the skew and threshold shown. Reads the per-chain persistStagnation class each compareChain
+// attaches. Pure + exported so the alert wording and the "only fires on FAIL" contract are asserted
+// directly, without a DB. A chain result with no persistStagnation (e.g. an ERROR before the guard
+// ran) contributes nothing.
+export function stagnationAlerts(results) {
+  const lines = [];
+  for (const r of results) {
+    const s = r?.classes?.persistStagnation;
+    if (!s?.fail) {
+      continue;
+    }
+
+    const stalled = s.staleSide === 'A' ? 'leg A' : 'leg B';
+    // Say what was PROVEN — the reason tag drives a self-describing clause. A frozen or skew-growing
+    // wedge is a two-leg-populated freeze (skew shown); a one-sided-empty wedge is the empty leg
+    // persisting nothing for N seconds while the other advances (no skew — the leg has no rows). A
+    // sticky 'wedge-unrecovered' fail (D2) resolves through its carried originalReason so it reads as
+    // the wedge it still is, plus an explicit "still unrecovered" note. F6: if a wedge-unrecovered fail
+    // carries no originalReason (a robustness gap), fall back to the reason itself rather than rendering
+    // an undefined-driven generic clause.
+    const effectiveReason =
+      s.reason === 'wedge-unrecovered'
+        ? (s.originalReason ?? s.reason)
+        : s.reason;
+    const unrecovered =
+      s.reason === 'wedge-unrecovered' ? ' (still unrecovered)' : '';
+    // F6: only show the skew clause when the skew is a finite measured number. A null skew (an empty-leg
+    // wedge has no measurable skew) must NOT render as "skew nulls > Ns" — omit the clause entirely.
+    const hasSkew =
+      typeof s.skewSeconds === 'number' && Number.isFinite(s.skewSeconds);
+    const skewClause = hasSkew
+      ? `; skew ${s.skewSeconds}s > ${s.thresholdSeconds}s`
+      : '';
+    let what;
+    if (effectiveReason === 'one-sided-empty') {
+      // Review delta 5, finding 3: claim only what is KNOWN. Emptiness duration is per-leg (this leg
+      // has persisted no rows for over the window); the other leg's advancement is the CURRENT
+      // observation, not a claim about the whole window — the window may have overlapped a both-empty
+      // outage, so we do not assert the other leg advanced for its entirety.
+      what =
+        `has persisted NO rows for over ${s.thresholdSeconds}s (empty leg) and the other leg is ` +
+        `advancing (one-sided wedge)${unrecovered}`;
+    } else if (effectiveReason === 'skew-growing' && hasSkew) {
+      what =
+        `is falling further behind — newest-row timestamp skew GROWING to ${s.skewSeconds}s ` +
+        `> ${s.thresholdSeconds}s${unrecovered}`;
+    } else {
+      // 'frozen' (or any other fail reason): the stale leg's newest row is not advancing. Show the skew
+      // clause only when a finite skew is present (F6: a null skew omits it, never "skew nulls > Ns").
+      what = `has stopped persisting rows (newest-row timestamp FROZEN${skewClause})${unrecovered}`;
+    }
+    lines.push(
+      `persist-stagnation: chain ${r.chain} — ${stalled} ${what}; ` +
+        `maxA=${s.maxA} maxB=${s.maxB} tsA=${s.tsA} tsB=${s.tsB}`,
+    );
+  }
+
+  return lines;
+}
+
+// Whether a chain result FAILed for a WINDOWED reason — a hard divergence in its OWN diff classes
+// (logs / blocks / transactions / checkpoint buckets), as opposed to a stagnation-only or checkpoint-
+// regression FAIL. Finding 3: the generic 'finalized-diff' alert must be emitted iff at least one chain
+// FAILed for a windowed reason, regardless of stagnation lines on other chains — with D1 (no early
+// return) every FAILing chain's windowed classes are present, so we can decide this per chain from the
+// classes. An ERROR result (no classes) counts as a windowed hard-fail (the diff could not complete —
+// exactly the kind of unexpected failure the generic line points a human at). Pure + exported.
+export function chainWindowedFail(r) {
+  if (r?.verdict === 'ERROR') {
+    return true;
+  }
+  if (r?.verdict !== 'FAIL') {
+    return false;
+  }
+
+  const c = r.classes ?? {};
+
+  return Boolean(
+    c.logs?.fail ||
+      c.blocks?.fail ||
+      c.transactions?.fail ||
+      (c.checkpointBuckets && c.checkpointBuckets.ok === false),
+  );
+}
+
+// Compose the FULL alert list from the run results, the checkpoint regressions, and the restart stats.
+// Pure + exported (D3/D4): the alert composition — crash-loop, checkpoint-regression lines, per-chain
+// stagnation lines, and the generic finalized-diff line's SUPPRESSION logic — is asserted directly.
+//
+// The generic 'finalized-diff' line (finding 3) is emitted IFF at least one chain FAILed for a WINDOWED
+// reason (chainWindowedFail), regardless of stagnation lines on OTHER chains: a stagnation-only FAIL has
+// its own precise line and must NOT also trigger the vague generic one, but a real windowed FAIL on
+// chain Y must still surface it even while chain X carries a stagnation line. Checkpoint regressions
+// have their own precise lines and are NOT a windowed-diff cause, so they do not (by themselves) emit
+// the generic line either.
+export function composeAlerts(results, regressions, restarts) {
+  const alerts = [];
+  if (restarts?.crashLoop) {
+    alerts.push(
+      `crash-loop: ${restarts.restartsLastHour} restarts in the last hour (>3)`,
+    );
+  }
+  for (const reg of regressions ?? []) {
+    alerts.push(
+      `checkpoint-regression: chain ${reg.chain} rewound ${reg.prev} → ${reg.cur} between runs`,
+    );
+  }
+  // One NAMED line per stalled chain (issue #38) — a one-sided wedge a frozen window would hide behind
+  // a PASS is loud and self-describing.
+  for (const line of stagnationAlerts(results)) {
+    alerts.push(line);
+  }
+  // The generic finalized-diff line: emit iff SOME chain has a windowed hard-fail. Per-chain from the
+  // classes (D1 makes every FAILing chain's windowed classes present) — so chain X stagnation-only +
+  // chain Y windowed FAIL emits BOTH the X stagnation line above AND this generic line.
+  if ((results ?? []).some(chainWindowedFail)) {
+    alerts.push(
+      'finalized-diff: an unexpected finalized-overlap divergence (see diffClasses)',
+    );
+  }
+
+  return alerts;
+}
+
+// The per-chain `counters` status-JSON entry: the window bounds + verdict, PLUS the persist-stagnation
+// summary (issue #38 finding 6 — the PR body already claimed maxA/maxB/tsA/tsB/skew live here; this
+// aligns the code with the body). A frozen window is legible at a glance from the counters alone, even
+// below threshold. A result with no persistStagnation class (an ERROR before the guard ran) omits the
+// stagnation fields. Pure + exported so the counters contract is asserted.
+export function chainCounters(r) {
+  const base = { lo: r.lo, hi: r.hi, verdict: r.verdict };
+  const s = r?.classes?.persistStagnation;
+  if (!s) {
+    return base;
+  }
+
+  return {
+    ...base,
+    maxA: s.maxA,
+    maxB: s.maxB,
+    tsA: s.tsA,
+    tsB: s.tsB,
+    stagnationSkewSeconds: s.skewSeconds,
+    stagnationReason: s.reason,
+  };
 }
 
 // Sum the per-chain knownBadRows (issue #32) tallies from every chain result into one
