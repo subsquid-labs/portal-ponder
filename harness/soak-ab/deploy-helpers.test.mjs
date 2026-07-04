@@ -12,17 +12,21 @@ import { dirname, join } from 'node:path';
 import { test } from 'node:test';
 import { fileURLToPath } from 'node:url';
 import {
+  assertNoMultilineValues,
   CHAIN_ALIASES,
+  effectiveOverriddenKeys,
   filterCarriedEnv,
   loadKnownChains,
   OVERRIDDEN_KEYS,
   parseEnvLine,
+  parseUnitEnvironmentKeys,
   resolveEulerChains,
 } from './deploy-helpers.mjs';
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const CHAINS_JSON = join(HERE, '..', 'euler-multichain', 'chains.json');
 const DEPLOY_SH = join(HERE, 'deploy-soak-b.sh');
+const UNIT_TEMPLATE = join(HERE, 'soak-b.service');
 const KNOWN = loadKnownChains(CHAINS_JSON);
 
 // ── parseEnvLine ─────────────────────────────────────────────────────────────────────────────────
@@ -146,6 +150,207 @@ test('filterCarriedEnv: comments, blanks and malformed lines are dropped', () =>
     'GOOD=y',
   ]);
   assert.deepEqual(carried, ['GOOD=y']);
+});
+
+// ── F1: unit-template Environment= keys must never be carried (systemd EnvironmentFile precedence) ──
+//
+// systemd: an EnvironmentFile= value OVERRIDES an Environment= value. So any key the unit renders via
+// Environment= must be in the carry-exclusion set — otherwise a STALE carried copy silently shadows
+// the unit's freshly-rendered value (e.g. a stale SOAK_B_RESTART_LOG could point the restart-log
+// write outside ReadWritePaths). We DERIVE the exclusion from the template so it can't drift.
+
+test('parseUnitEnvironmentKeys: extracts every Environment=KEY from the unit text', () => {
+  const unit = [
+    '[Service]',
+    'Environment=PORTAL_REALTIME=stream',
+    'Environment=PONDER_LOG_LEVEL=info',
+    'Environment=CI=true',
+    'EnvironmentFile=/x/soak-b.env', // NOT an Environment= line — must be ignored
+    '# Environment=COMMENTED=out', // a comment — must be ignored
+  ].join('\n');
+  const keys = parseUnitEnvironmentKeys(unit);
+  assert.deepEqual([...keys].sort(), [
+    'CI',
+    'PONDER_LOG_LEVEL',
+    'PORTAL_REALTIME',
+  ]);
+  assert.ok(
+    !keys.has('EnvironmentFile'),
+    'EnvironmentFile= is not an Environment= key',
+  );
+});
+
+test('parseUnitEnvironmentKeys: handles several assignments on one Environment= line', () => {
+  const keys = parseUnitEnvironmentKeys('Environment=A=1 B=2 C=3');
+  assert.deepEqual([...keys].sort(), ['A', 'B', 'C']);
+});
+
+test('parseUnitEnvironmentKeys: honors systemd double/single quoting (no dropped keys)', () => {
+  // systemd lets an assignment be wrapped in "…"/'…' so the value can contain spaces. A naive
+  // whitespace split would parse `"FOO` (invalid identifier → silently dropped) and the tripwire
+  // would then MISS FOO — the exact drift the derivation exists to prevent.
+  const dq = parseUnitEnvironmentKeys('Environment="FOO=a b" BAR=c');
+  assert.deepEqual([...dq].sort(), ['BAR', 'FOO']);
+  const sq = parseUnitEnvironmentKeys("Environment='X=y z'");
+  assert.deepEqual([...sq], ['X']);
+});
+
+test('parseUnitEnvironmentKeys: a backslash-escaped quote inside a "…" item does not end it', () => {
+  // systemd honors \" inside double quotes — the item continues past it. A tokenizer that closed on
+  // the \" would splinter the line and drop the keys AFTER it (BAR, BAZ), a silent tripwire miss.
+  const bs = String.fromCharCode(92);
+  const keys = parseUnitEnvironmentKeys(
+    `Environment="FOO=a${bs}" b" BAR=c BAZ=d`,
+  );
+  assert.deepEqual([...keys].sort(), ['BAR', 'BAZ', 'FOO']);
+});
+
+test('effectiveOverriddenKeys: unions OVERRIDDEN_KEYS with the unit Environment= keys', () => {
+  const unit = 'Environment=PONDER_LOG_LEVEL=info\nEnvironment=NEW_UNIT_KNOB=x';
+  const eff = effectiveOverriddenKeys(unit);
+  for (const k of OVERRIDDEN_KEYS) {
+    assert.ok(eff.has(k), `${k} from OVERRIDDEN_KEYS must remain excluded`);
+  }
+  assert.ok(
+    eff.has('PONDER_LOG_LEVEL'),
+    'a unit Environment= key must be excluded',
+  );
+  assert.ok(
+    eff.has('NEW_UNIT_KNOB'),
+    'a NEW unit Environment= key must be excluded (no drift)',
+  );
+});
+
+test('effectiveOverriddenKeys: with no unit text falls back to OVERRIDDEN_KEYS alone', () => {
+  assert.deepEqual(
+    [...effectiveOverriddenKeys()].sort(),
+    [...OVERRIDDEN_KEYS].sort(),
+  );
+});
+
+// TRIPWIRE: parse the REAL committed unit template and assert every Environment=-rendered key is in
+// the effective exclusion set. Adding an `Environment=NEW=…` line to soak-b.service without it being
+// covered by the derived exclusion fails HERE — this is the anti-drift guarantee for F1.
+test('TRIPWIRE: every Environment= key in the real soak-b.service is excluded from the carry', () => {
+  const unit = readFileSync(UNIT_TEMPLATE, 'utf8');
+  const unitKeys = parseUnitEnvironmentKeys(unit);
+  assert.ok(
+    unitKeys.size > 0,
+    'the unit template must render at least one Environment= key',
+  );
+  const eff = effectiveOverriddenKeys(unit);
+  for (const key of unitKeys) {
+    assert.ok(
+      eff.has(key),
+      `Environment= key ${key} rendered by soak-b.service must be excluded from the env carry ` +
+        '(systemd EnvironmentFile= overrides Environment=; a stale carried copy would shadow it)',
+    );
+  }
+  // And that a real carry using this exclusion drops those keys even when the source env has them stale.
+  const staleSrc = [...unitKeys].map((k) => `${k}=STALE_${k}`);
+  const carried = filterCarriedEnv(staleSrc, eff);
+  assert.deepEqual(
+    carried,
+    [],
+    'no unit Environment= key may survive the carry',
+  );
+});
+
+// ── F3: multi-line / unterminated-quote source values must fail loud (never a truncated line) ──────
+
+test('assertNoMultilineValues: a single-line env passes', () => {
+  assert.doesNotThrow(() =>
+    assertNoMultilineValues(
+      'FOO=bar\nBAZ="quoted value"\nQ=\'single quoted\'\n',
+    ),
+  );
+});
+
+test("assertNoMultilineValues: a FOO='a<newline>b' value FAILS LOUD naming FOO", () => {
+  const text = "PORTAL_API_KEY=k\nFOO='a\nb'\nBAR=ok\n";
+  assert.throws(
+    () => assertNoMultilineValues(text),
+    (err) => {
+      assert.match(
+        err.message,
+        /env var FOO has an unterminated ' quote \/ multi-line value/,
+      );
+
+      return true;
+    },
+  );
+});
+
+test('assertNoMultilineValues: an unterminated double quote FAILS LOUD naming the key', () => {
+  assert.throws(
+    () => assertNoMultilineValues('X=1\nMSG="hello\nworld"\n'),
+    /env var MSG has an unterminated " quote/,
+  );
+});
+
+test('assertNoMultilineValues: an unquoted value containing a stray quote-like char is fine', () => {
+  // No LEADING quote → single-line token, cannot straddle a newline → must not trip the guard.
+  assert.doesNotThrow(() =>
+    assertNoMultilineValues("URL=https://a.example/x'y\n"),
+  );
+});
+
+// A closing double-quote ESCAPED by a backslash does NOT terminate the value (its real content
+// continues on the next line) — a bare last-char check would wrongly pass it. Backslash escaping is
+// honored only inside double quotes; inside single quotes `\` is literal so `'a\'` DOES close.
+const BS = String.fromCharCode(92); // backslash, built by code to avoid escaping confusion
+const DQ = '"';
+const SQ = "'";
+
+test('assertNoMultilineValues: a double-quoted value whose final quote is backslash-escaped FAILS LOUD', () => {
+  // D="abc\  → the final " is escaped by the \, so the value is unterminated (continues next line).
+  assert.throws(
+    () => assertNoMultilineValues(`D=${DQ}abc${BS}${DQ}\nNEXT=line\n`),
+    /env var D has an unterminated " quote/,
+  );
+});
+
+test('assertNoMultilineValues: an escaped inner quote with a real closing quote is fine', () => {
+  // D="a\"b" → the inner \" is escaped, the trailing " is a real close → single-line, must not trip.
+  assert.doesNotThrow(() =>
+    assertNoMultilineValues(`D=${DQ}a${BS}${DQ}b${DQ}\n`),
+  );
+});
+
+test("assertNoMultilineValues: single-quoted 'a\\' closes (backslash is literal in single quotes)", () => {
+  // S='a\' → single quotes don't process the backslash, so the quote closes → must not trip.
+  assert.doesNotThrow(() => assertNoMultilineValues(`S=${SQ}a${BS}${SQ}\n`));
+});
+
+test('assertNoMultilineValues: an UNQUOTED value ending in a trailing backslash FAILS LOUD (continuation)', () => {
+  // FOO=abc\ + newline → systemd/shell splice the next line on; emitted truncated → refuse it.
+  assert.throws(
+    () => assertNoMultilineValues(`FOO=abc${BS}\nNEXT=line\n`),
+    /env var FOO ends in a line-continuation backslash \/ multi-line value/,
+  );
+});
+
+test('assertNoMultilineValues: an unquoted value ending in an EVEN run of backslashes is fine', () => {
+  // FOO=abc\\ → an escaped literal backslash, not a continuation → must not trip.
+  assert.doesNotThrow(() =>
+    assertNoMultilineValues(`FOO=abc${BS}${BS}\nNEXT=line\n`),
+  );
+});
+
+test('assertNoMultilineValues: a CLOSED quote followed by a trailing backslash FAILS LOUD (continuation)', () => {
+  // FOO="abc"\ + newline → the quote closes but the value still ends in a continuation backslash, so
+  // it splices the next line on. The quote-branch must not short-circuit past the backslash check.
+  assert.throws(
+    () => assertNoMultilineValues(`FOO=${DQ}abc${DQ}${BS}\nNEXT=line\n`),
+    /env var FOO ends in a line-continuation backslash \/ multi-line value/,
+  );
+});
+
+test('assertNoMultilineValues: a plainly-closed quoted value with a space is fine (no false positive)', () => {
+  // The full-value trailing-backslash check must not trip a normal `KEY="a b"` (ends in a quote char).
+  assert.doesNotThrow(() =>
+    assertNoMultilineValues(`BAZ=${DQ}quoted value${DQ}\n`),
+  );
 });
 
 // ── resolveEulerChains (defect 4: SOAK_CHAINS short names never matched) ──────────────────────────
@@ -323,28 +528,29 @@ test('deploy-soak-b.sh invokes the pure helpers (integration is wired)', () => {
 // no SOAK_A_DIR skips the npm/psql work, and psql is absent (a benign warning). This exercises the
 // real env-carry, schema/chain rendering and — critically — the $RENDER lifetime.
 
-function runDeploy(env, { chains } = {}) {
+function runDeploy(env, { chains, srcEnvLines, noNode } = {}) {
   const sandbox = mkdtempSync(join(tmpdir(), 'deploy-e2e-'));
   const tarball = join(sandbox, 'fake.tgz');
   writeFileSync(tarball, 'not-a-real-tarball');
   const srcEnv = join(sandbox, 'src.env');
   // A source env exercising every carry class: bare PORTAL_URL, underscore variant, per-chain RPC,
-  // a Portal tunable, NODE_OPTIONS, plus overridden vars that MUST be dropped (stale schema/chains).
-  writeFileSync(
-    srcEnv,
-    [
-      '# operator env',
-      'PORTAL_API_KEY=secretkey',
-      'PORTAL_URL=https://portal.example',
-      'PORTAL_URL_1=https://portal-1.example',
-      'PONDER_RPC_URL_8453=https://rpc-base.example',
-      'PORTAL_MAX_BATCH=50',
-      'NODE_OPTIONS=--max-old-space-size=4096',
-      'DATABASE_SCHEMA=stale_schema',
-      'EULER_CHAINS=stale,chains',
-      '',
-    ].join('\n'),
-  );
+  // a Portal tunable, NODE_OPTIONS, plus overridden vars that MUST be dropped (stale schema/chains)
+  // AND a stale copy of a unit Environment= key (SOAK_B_RESTART_LOG) that must not shadow the render.
+  const defaultLines = [
+    '# operator env',
+    'PORTAL_API_KEY=secretkey',
+    'PORTAL_URL=https://portal.example',
+    'PORTAL_URL_1=https://portal-1.example',
+    'PONDER_RPC_URL_8453=https://rpc-base.example',
+    'PORTAL_MAX_BATCH=50',
+    'NODE_OPTIONS=--max-old-space-size=4096',
+    'DATABASE_SCHEMA=stale_schema',
+    'EULER_CHAINS=stale,chains',
+    'SOAK_B_RESTART_LOG=/stale/outside/readwritepaths.log',
+    'PONDER_LOG_LEVEL=trace',
+    '',
+  ];
+  writeFileSync(srcEnv, (srcEnvLines ?? defaultLines).join('\n'));
   const workdir = join(sandbox, 'wd');
   const unitDir = join(sandbox, 'unit-readonly');
   const envFile = join(sandbox, 'soak-b.env');
@@ -359,24 +565,69 @@ function runDeploy(env, { chains } = {}) {
     writeFileSync(stub, '#!/bin/sh\nexit 0\n');
     chmodSync(stub, 0o755);
   }
+  // noNode (M2): run with a PATH that has every coreutil the script needs EXCEPT `node`, to prove the
+  // deploy FAILS LOUD when node is absent (the removed grep fallback). Build an isolated bin dir of
+  // symlinks to the real tools (node deliberately omitted) rather than trying to prune node out of the
+  // real PATH — node lives in the same dir as the coreutils here, so a subtractive PATH is impossible.
+  let pathValue = `${stubBin}:${process.env.PATH}`;
+  if (noNode) {
+    const nodelessBin = join(sandbox, 'nodeless-bin');
+    execFileSync('mkdir', ['-p', nodelessBin]);
+    for (const tool of [
+      'bash',
+      'sh',
+      'sed',
+      'grep',
+      'mktemp',
+      'id',
+      'chmod',
+      'touch',
+      'cp',
+      'rm',
+      'mkdir',
+      'date',
+      'dirname',
+      'tr',
+      'cat',
+      'env',
+    ]) {
+      const real = execFileSync('sh', ['-c', `command -v ${tool} || true`], {
+        encoding: 'utf8',
+      }).trim();
+      if (real) {
+        execFileSync('ln', ['-s', real, join(nodelessBin, tool)]);
+      }
+    }
+    // stubBin (psql/systemctl/npm stubs) is on the path so those steps stay inert; `node` is NOT.
+    pathValue = `${stubBin}:${nodelessBin}`;
+  }
   // A UNIT_DIR that does not exist and is under an unwritable parent → not writable → non-root path.
-  const result = execFileSync('bash', [DEPLOY_SH, tarball], {
-    encoding: 'utf8',
-    env: {
-      ...process.env,
-      SOAK_B_WORKDIR: workdir,
-      SOAK_B_ENVFILE: envFile,
-      SOAK_A_CONFIG_DIR: join(sandbox, 'no-such-soak-a'),
-      SOAK_A_ENV: srcEnv,
-      SYSTEMD_DIR: unitDir,
-      SOAK_B_RESTART_LOG: restartLog,
-      SOAK_B_USER: 'op',
-      SOAK_B_GROUP: 'grp',
-      ...(chains ? { SOAK_CHAINS: chains } : {}),
-      ...env,
-      PATH: `${stubBin}:${process.env.PATH}`,
-    },
-  });
+  let result;
+  try {
+    result = execFileSync('bash', [DEPLOY_SH, tarball], {
+      encoding: 'utf8',
+      env: {
+        ...process.env,
+        SOAK_B_WORKDIR: workdir,
+        SOAK_B_ENVFILE: envFile,
+        SOAK_A_CONFIG_DIR: join(sandbox, 'no-such-soak-a'),
+        SOAK_A_ENV: srcEnv,
+        SYSTEMD_DIR: unitDir,
+        SOAK_B_RESTART_LOG: restartLog,
+        SOAK_B_USER: 'op',
+        SOAK_B_GROUP: 'grp',
+        ...(chains ? { SOAK_CHAINS: chains } : {}),
+        ...env,
+        PATH: pathValue,
+      },
+    });
+  } catch (err) {
+    // Surface the sandbox paths on the failure path so abort-behavior tests can assert on them (e.g.
+    // that a failed carry left NO partial env file behind).
+    err.envFile = envFile;
+    err.sandbox = sandbox;
+    throw err;
+  }
 
   return { stdout: result, envFile, unitDir };
 }
@@ -427,4 +678,83 @@ test('e2e: an unknown chain name fails the deploy loud (defect 4)', () => {
     assert.match(out, /unknown chain name\(s\): notachain/);
   }
   assert.ok(threw, 'a bad chain name must abort the deploy');
+});
+
+// F1 (M1) end-to-end: the deploy passes the unit template to carry-env, so a stale carried copy of a
+// key the unit renders via Environment= (SOAK_B_RESTART_LOG, PONDER_LOG_LEVEL — both in the default
+// source env above) must NOT land in the written env file. systemd's EnvironmentFile= would override
+// the unit's Environment=, so a survivor here would silently shadow the freshly-rendered value.
+test('e2e: stale copies of unit Environment= keys are dropped from the written env (F1)', () => {
+  const { envFile } = runDeploy(
+    { SOAK_B_SCHEMA: 'euler_rt_b' },
+    { chains: 'eth,base' },
+  );
+  const env = readFileSync(envFile, 'utf8');
+  // The env file legitimately re-authors PONDER_* / DATABASE_* itself; what must NOT survive is the
+  // STALE carried value that would shadow the unit render.
+  assert.doesNotMatch(
+    env,
+    /^SOAK_B_RESTART_LOG=\/stale\/outside\/readwritepaths\.log$/m,
+    'a stale SOAK_B_RESTART_LOG must never be carried (unit renders it via Environment=)',
+  );
+  assert.doesNotMatch(
+    env,
+    /^PONDER_LOG_LEVEL=trace$/m,
+    'a stale PONDER_LOG_LEVEL must never be carried (unit renders it via Environment=)',
+  );
+  // Sanity: the carry still works for a normal operative var alongside the dropped ones.
+  assert.match(env, /^PORTAL_URL=https:\/\/portal\.example$/m);
+});
+
+// M2 end-to-end: node is REQUIRED. With node absent from PATH the deploy must FAIL LOUD (no silent
+// grep fallback) — before it creates the DB or writes the env file.
+test('e2e: node absent → deploy fails loud, no silent grep fallback (M2)', () => {
+  let threw = false;
+  try {
+    runDeploy(
+      { SOAK_B_SCHEMA: 'euler_rt_b' },
+      { chains: 'eth,base', noNode: true },
+    );
+  } catch (err) {
+    threw = true;
+    const out = `${err.stdout ?? ''}${err.stderr ?? ''}`;
+    assert.match(out, /node not found on PATH/);
+  }
+  assert.ok(
+    threw,
+    'a missing node must abort the deploy (the grep fallback was removed)',
+  );
+});
+
+// L (F3) end-to-end: a multi-line / unterminated-quote value in the source env must abort the deploy
+// naming the offending key, rather than emitting a truncated env line.
+test('e2e: a multi-line source env value fails the deploy loud naming the key (F3)', () => {
+  const srcEnvLines = [
+    'PORTAL_API_KEY=secretkey',
+    'PORTAL_URL=https://portal.example',
+    "MULTILINE='line-one",
+    "line-two'",
+    '',
+  ];
+  let threw = false;
+  try {
+    runDeploy(
+      { SOAK_B_SCHEMA: 'euler_rt_b' },
+      { chains: 'eth,base', srcEnvLines },
+    );
+  } catch (err) {
+    threw = true;
+    const out = `${err.stdout ?? ''}${err.stderr ?? ''}`;
+    assert.match(
+      out,
+      /env var MULTILINE has an unterminated ' quote \/ multi-line value/,
+    );
+    // And the aborted carry must leave NO partial secrets file behind: the env file is built in a
+    // temp and mv'd into place only on success, so on this failure $ENVFILE must not exist at all.
+    assert.ok(
+      !existsSync(err.envFile),
+      'a failed carry must not leave a partial env file behind',
+    );
+  }
+  assert.ok(threw, 'a multi-line env value must abort the deploy');
 });

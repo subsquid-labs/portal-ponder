@@ -56,15 +56,22 @@ esac
 case "$RUN_SCHEMA" in *[!A-Za-z0-9_]*) echo "✗ SOAK_B_SCHEMA is not a valid SQL identifier: $RUN_SCHEMA"; exit 1 ;; esac
 case "$SOAK_A_ENV" in *euler-rt.env|*.env) : ;; *) echo "✗ SOAK_A_ENV must be an .env file"; exit 1 ;; esac
 
+# node is REQUIRED: the app this script deploys IS a node process, so the deploy target always has
+# node. The two correctness-sensitive helpers (chain validation, env-carry) run through node; a
+# silently-different degraded path (a narrower grep allowlist that drops operative vars and mangles
+# `export ` lines) is worse than a clear error, so FAIL LOUD if node is missing rather than falling
+# back. Checked before the DB or any file is created.
+command -v node >/dev/null || {
+  echo "✗ node not found on PATH — required to validate chains + carry the env file safely."
+  echo "  Install node (the soak app itself is a node process) and re-run the deploy."
+  exit 1
+}
+
 # Resolve + validate the chains knob to full EULER_CHAINS names NOW (fail loud before creating the DB
 # or writing files). The pure resolver lives in deploy-helpers.mjs (node --test covered).
-if command -v node >/dev/null; then
-  RUN_CHAINS="$(node "$HELPERS" resolve-chains "$RUN_CHAINS" "$CHAINS_JSON")" || {
-    echo "✗ GUARDRAIL: invalid chains knob (SOAK_CHAINS/EULER_CHAINS) — see message above"; exit 1;
-  }
-else
-  echo "⚠ node not found — cannot validate chain names; writing EULER_CHAINS=$RUN_CHAINS as given"
-fi
+RUN_CHAINS="$(node "$HELPERS" resolve-chains "$RUN_CHAINS" "$CHAINS_JSON")" || {
+  echo "✗ GUARDRAIL: invalid chains knob (SOAK_CHAINS/EULER_CHAINS) — see message above"; exit 1;
+}
 if grep -qiE 'DATABASE_URL=.*/euler(\b|["'\'' ])' "$SOAK_A_ENV" 2>/dev/null; then
   : # Soak A's env legitimately references its own DB; we DERIVE a new one below and never reuse it.
 fi
@@ -108,7 +115,15 @@ else
 fi
 
 # ── 3. secrets: derive a fresh chmod-600 env file from Soak A's (never print, never commit) ──
+# Build into a temp file, then mv into place ONLY after the whole block succeeds. `{ … } > "$ENVFILE"`
+# truncates $ENVFILE the instant the redirection opens, so a mid-block carry-env failure (the F3
+# multi-line abort) under `set -e` would leave a partial/empty secrets file behind. The temp lives in
+# $ENVFILE's own directory (same filesystem → atomic mv) and is created under umask 077, so it is
+# never world-readable even transiently; it is cleaned up on any failure by the EXIT trap.
 umask 077
+ENVDIR="$(dirname "$ENVFILE")"
+ENVFILE_TMP="$(mktemp "${ENVDIR}/.soak-b.env.XXXXXX")"
+trap 'rm -f "$ENVFILE_TMP"' EXIT
 {
   echo "# Soak B env — chmod 600, generated $(date -u +%FT%TZ). DO NOT COMMIT."
   # Carry the operative env vars from the source env file: PRESERVE-ALL-THEN-OVERRIDE. Every
@@ -116,13 +131,13 @@ umask 077
   # OVERRIDDEN_KEYS in deploy-helpers.mjs) — so PORTAL_URL (no underscore), EULER_CHAINS,
   # DATABASE_SCHEMA, NODE_OPTIONS, PORTAL_* tunables, keys and per-chain URLs are all preserved,
   # not silently dropped, while the vars we author below always win. Pure + node --test covered.
+  #
+  # node is required (guarded above). Passing the unit template makes carry-env ALSO exclude every key
+  # the unit renders via Environment= (F1) — systemd EnvironmentFile= OVERRIDES Environment=, so a
+  # stale carried copy would shadow the unit's fresh render — and fail loud on any multi-line/
+  # unterminated-quote value (F3). No `|| true`: a carry failure must abort, not write a partial file.
   if [ -f "$SOAK_A_ENV" ]; then
-    if command -v node >/dev/null; then
-      node "$HELPERS" carry-env "$SOAK_A_ENV" || true
-    else
-      # Fallback when node is unavailable: widened allowlist covering the operative variables.
-      grep -E '^(export[[:space:]]+)?(PORTAL_API_KEY|SQD_RPC_KEY|PORTAL_URL|PONDER_RPC_URL_|EULER_CHAINS|DATABASE_SCHEMA|NODE_OPTIONS|PORTAL_)' "$SOAK_A_ENV" || true
-    fi
+    node "$HELPERS" carry-env "$SOAK_A_ENV" "$HERE/soak-b.service"
   fi
   # Authoritative overrides (these always win over any carried value; keep in sync with
   # OVERRIDDEN_KEYS in deploy-helpers.mjs).
@@ -131,8 +146,10 @@ umask 077
   echo "EULER_CHAINS=${RUN_CHAINS}"
   echo "PORTAL_REALTIME=stream"
   echo "PORTAL_CHECKS=on"
-} > "$ENVFILE"
-chmod 600 "$ENVFILE"
+} > "$ENVFILE_TMP"
+chmod 600 "$ENVFILE_TMP"
+mv -f "$ENVFILE_TMP" "$ENVFILE"
+trap - EXIT
 echo "  wrote $ENVFILE (chmod 600)"
 
 # ── 4. render + install the unit; enable but DO NOT start ──

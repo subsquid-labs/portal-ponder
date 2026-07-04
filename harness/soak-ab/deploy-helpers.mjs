@@ -30,6 +30,126 @@ export const OVERRIDDEN_KEYS = new Set([
   'EULER_CHAINS', // re-derived from the validated SOAK_CHAINS/EULER_CHAINS knob
 ]);
 
+// The unit template renders several fixed knobs via `Environment=KEY=value` lines (PONDER_LOG_LEVEL,
+// CI, SOAK_B_RESTART_LOG, …). systemd precedence is a footgun here: an `EnvironmentFile=` value
+// OVERRIDES an `Environment=` value, so a STALE carried copy of any Environment=-rendered key would
+// silently shadow the unit's freshly-rendered one (e.g. a stale SOAK_B_RESTART_LOG could point the
+// restart-log write outside ReadWritePaths). Rather than duplicate that list by hand (which drifts
+// the moment someone adds an Environment= line), DERIVE the excluded keys from the unit template
+// itself and union them with OVERRIDDEN_KEYS. `parseUnitEnvironmentKeys` extracts them; the deploy
+// script passes the rendered/template path to the carry-env CLI so the two can never diverge.
+// Tokenize the RHS of an `Environment=` line into individual assignments, honoring systemd's
+// double/single-quote wrapping (a quoted region may contain the separating whitespace) and stripping
+// one surrounding quote pair from each yielded token. Not a full shell parser — just enough that a
+// quoted `KEY=value with spaces` yields the whole `KEY=value with spaces` (so the KEY is recoverable)
+// instead of splintering on the inner space. Unquoted runs split on whitespace as before.
+function splitUnitAssignments(rhs) {
+  const tokens = [];
+  let current = '';
+  let quote = null;
+  let inToken = false;
+  let escaped = false;
+  for (const ch of rhs) {
+    if (quote) {
+      // Inside a "…" item systemd honors backslash escapes (\" does NOT close the quote); inside a
+      // '…' item the backslash is literal (matches hasUnescapedClosingQuote / the systemd manual).
+      if (escaped) {
+        current += ch;
+        escaped = false;
+
+        continue;
+      }
+
+      if (quote === '"' && ch === '\\') {
+        current += ch;
+        escaped = true;
+
+        continue;
+      }
+
+      if (ch === quote) {
+        quote = null;
+      } else {
+        current += ch;
+      }
+
+      continue;
+    }
+
+    if (ch === '"' || ch === "'") {
+      quote = ch;
+      inToken = true;
+
+      continue;
+    }
+
+    if (/\s/.test(ch)) {
+      if (inToken) {
+        tokens.push(current);
+        current = '';
+        inToken = false;
+      }
+
+      continue;
+    }
+
+    current += ch;
+    inToken = true;
+  }
+
+  if (inToken) {
+    tokens.push(current);
+  }
+
+  return tokens;
+}
+
+export function parseUnitEnvironmentKeys(unitText) {
+  const keys = new Set();
+  for (const rawLine of String(unitText).split('\n')) {
+    const line = rawLine.trim();
+    // Match `Environment=KEY=value` (systemd allows multiple space-separated assignments per line).
+    const m = line.match(/^Environment=(.+)$/);
+    if (!m) {
+      continue;
+    }
+
+    // A single Environment= line can carry several assignments. systemd permits an assignment (or its
+    // value) to be wrapped in "…" or '…' so it can contain spaces — tokenize RESPECTING those quotes
+    // rather than a naive whitespace split, else `Environment="FOO=a b" BAR=c` would parse `"FOO` (an
+    // invalid identifier, silently dropped) and the tripwire would miss FOO. Each yielded token then
+    // has any surrounding quote pair stripped before the KEY is extracted.
+    for (const assignment of splitUnitAssignments(m[1])) {
+      const eq = assignment.indexOf('=');
+      if (eq <= 0) {
+        continue;
+      }
+
+      const key = assignment.slice(0, eq);
+      if (/^[A-Za-z_][A-Za-z0-9_]*$/.test(key)) {
+        keys.add(key);
+      }
+    }
+  }
+
+  return keys;
+}
+
+// The effective set of keys a redeploy must NOT carry: the vars deploy-soak-b.sh authors itself
+// (OVERRIDDEN_KEYS) UNION every key the unit template renders via Environment= (derived, so it can
+// never drift from the template). `unitText` is the soak-b.service source; omit it to fall back to
+// the static OVERRIDDEN_KEYS alone (kept for the pure unit tests of filterCarriedEnv).
+export function effectiveOverriddenKeys(unitText) {
+  const keys = new Set(OVERRIDDEN_KEYS);
+  if (unitText != null) {
+    for (const key of parseUnitEnvironmentKeys(unitText)) {
+      keys.add(key);
+    }
+  }
+
+  return keys;
+}
+
 // Parse one env-file line into { key, value } or null (comment/blank/malformed). Accepts optional
 // `export ` prefix and surrounding whitespace; the key must be a POSIX-shell env identifier.
 export function parseEnvLine(line) {
@@ -48,6 +168,104 @@ export function parseEnvLine(line) {
   }
 
   return { key, value: stripped.slice(eq + 1), line: stripped };
+}
+
+// Guard against multi-line / unterminated-quote values in the source env (defect: the carry splits
+// the raw file on `\n`, so a quoted value spanning newlines — `FOO='a<newline>b'` — would be emitted
+// truncated on the first line and its continuation misparsed as garbage lines). systemd
+// EnvironmentFile semantics don't round-trip such values through this script anyway, so the correct
+// behavior is to FAIL LOUD naming the offending key rather than silently emit a broken line. Scans
+// the RAW file text (before the `\n` split) and throws on the first assignment whose value opens a
+// quote it never closes on the same line.
+export function assertNoMultilineValues(text) {
+  const lines = String(text).split('\n');
+  for (const line of lines) {
+    const stripped = line.replace(/^\s*export\s+/, '').trim();
+    if (stripped === '' || stripped.startsWith('#')) {
+      continue;
+    }
+
+    const eq = stripped.indexOf('=');
+    if (eq <= 0) {
+      continue;
+    }
+
+    const key = stripped.slice(0, eq);
+    if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(key)) {
+      continue;
+    }
+
+    // Two ways a value legally spans lines (and must be refused, not emitted truncated):
+    const value = stripped.slice(eq + 1);
+    const quote = value[0];
+
+    //  (a) it OPENS with a quote that never closes on this line (the quote's content continues on the
+    //      next line). Only checked for a leading quote; a properly-closed quote ends with the closing
+    //      quote char, so it can't also trip the trailing-backslash check below.
+    if (
+      (quote === '"' || quote === "'") &&
+      !hasUnescapedClosingQuote(value, quote)
+    ) {
+      throw new Error(
+        `env var ${key} has an unterminated ${quote} quote / multi-line value — ` +
+          'multi-line env values are not supported by this deploy carry; put the value on one line',
+      );
+    }
+
+    //  (b) the value ends in an unescaped trailing `\` — a line continuation (systemd/shell splice the
+    //      next line on, dropping the newline). Applies to unquoted values AND to a trailing backslash
+    //      AFTER a closing quote (e.g. `FOO="abc"\`): a closed quoted value ends in its quote char, so
+    //      this only fires when a real dangling continuation backslash follows. `endsWithOddBackslashes`
+    //      is true only for a real, unescaped continuation (a trailing `\\` is an escaped literal).
+    if (endsWithOddBackslashes(value)) {
+      throw new Error(
+        `env var ${key} ends in a line-continuation backslash / multi-line value — ` +
+          'multi-line env values are not supported by this deploy carry; put the value on one line',
+      );
+    }
+  }
+}
+
+// Does the string end with an ODD number of backslashes (so a trailing `\` is unescaped → a real line
+// continuation)? `x\` → true (continuation); `x\\` → false (escaped literal backslash, no splice).
+function endsWithOddBackslashes(s) {
+  let count = 0;
+  for (let i = s.length - 1; i >= 0 && s[i] === '\\'; i--) {
+    count++;
+  }
+
+  return count % 2 === 1;
+}
+
+// Does the quoted value (opening with `quote`) close with a MATCHING, UNESCAPED quote on this line?
+// A bare last-char check is wrong: `FOO="abc\"` ends in `"` but that quote is backslash-escaped, so
+// the value is actually unterminated (its continuation is on the next line). Backslash escaping
+// applies ONLY inside DOUBLE quotes — inside single quotes `\` is literal and `'…\'` DOES close (so
+// we must not treat that `\` as an escape, or we'd false-positive on a valid single-quoted value).
+// The value is closed iff we reach a matching quote that is not backslash-escaped (double-quote only).
+function hasUnescapedClosingQuote(value, quote) {
+  const honorsBackslash = quote === '"';
+  let escaped = false;
+  for (let i = 1; i < value.length; i++) {
+    const ch = value[i];
+    if (escaped) {
+      escaped = false;
+
+      continue;
+    }
+
+    if (honorsBackslash && ch === '\\') {
+      escaped = true;
+
+      continue;
+    }
+
+    if (ch === quote) {
+      return true;
+    }
+  }
+
+  return false;
 }
 
 // Filter the lines of an existing env file down to the ones a redeploy should carry over verbatim.
@@ -153,20 +371,33 @@ export function loadKnownChains(chainsJsonPath) {
 // ── CLI wrapper ──────────────────────────────────────────────────────────────────────────────────
 //
 // Invoked by deploy-soak-b.sh. Subcommands:
-//   carry-env <envfile>              → prints the KEY=value lines to carry (one per line) to stdout.
+//   carry-env <envfile> [unitfile]   → prints the KEY=value lines to carry (one per line) to stdout.
+//                                      With <unitfile>, excludes every key the unit renders via
+//                                      Environment= (F1) in addition to OVERRIDDEN_KEYS, and fails
+//                                      loud on any multi-line/unterminated-quote value (F3).
 //   resolve-chains <chains> <json>   → prints the canonical EULER_CHAINS value to stdout; exits
 //                                      non-zero with a loud message on stderr for unknown names.
 // All errors go to stderr and exit 1 so the shell's `$(…)` + `set -e` propagate the failure.
 export function runCli(argv) {
   const [cmd, ...rest] = argv;
   if (cmd === 'carry-env') {
-    const file = rest[0];
+    const [file, unitFile] = rest;
     if (!file) {
-      throw new Error('usage: deploy-helpers.mjs carry-env <envfile>');
+      throw new Error(
+        'usage: deploy-helpers.mjs carry-env <envfile> [unitfile]',
+      );
     }
-    const lines = readFileSync(file, 'utf8').split('\n');
+    const text = readFileSync(file, 'utf8');
+    // F3: refuse to carry a source env with a multi-line/unterminated-quote value (would be emitted
+    // truncated) — fail loud naming the key instead.
+    assertNoMultilineValues(text);
+    // F1: exclude keys the unit template renders via Environment= (derived, never drifts) on top of
+    // OVERRIDDEN_KEYS, so a stale carried copy can't shadow the unit's freshly-rendered value.
+    const overridden = unitFile
+      ? effectiveOverriddenKeys(readFileSync(unitFile, 'utf8'))
+      : OVERRIDDEN_KEYS;
 
-    return filterCarriedEnv(lines).join('\n');
+    return filterCarriedEnv(text.split('\n'), overridden).join('\n');
   }
   if (cmd === 'resolve-chains') {
     const [chains, jsonPath] = rest;
