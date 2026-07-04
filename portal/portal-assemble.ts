@@ -180,6 +180,24 @@ const buildMatchers = (
   };
 };
 
+/**
+ * Stream-seam parity for `runStreams`' needed-field growth check (wave-4 log re-match). The Portal's
+ * server-side log filter over-returns rows that assembly then DROPS — a factory child's PRE-CREATION logs
+ * and a bounded filter's OUT-OF-RANGE logs (see `logMatched` above) — so counting raw returned logs toward
+ * "matched data this call added" would arm the needed-field fatal for data the indexer never keeps → G1
+ * evict → crash-loop. This returns a predicate over RAW logs that mirrors `assembleRange`'s per-log
+ * re-match EXACTLY (same `buildMatchers` + `toSyncLog`, over the same discovery-complete `childAddresses`),
+ * so the seam count and assembly agree by construction.
+ */
+export const buildRawLogMatcher = (
+  spec: FetchSpec,
+  childAddresses: ChildAddresses,
+): ((raw: RawLog, hdr: RawHeader, bn: number) => boolean) => {
+  const { logMatched } = buildMatchers(spec, childAddresses);
+
+  return (raw, hdr, bn) => logMatched(toSyncLog(raw, hdr), bn);
+};
+
 /** Per-chunk trace assembly: full-tree ranking then client-side filtering (INV-5). `onReceipt` (FIX 4)
  * is invoked with each MATCHED trace's parent transaction so the caller can emit a receipt when a
  * trace/transfer filter has `hasTransactionReceipt` — the log/tx branches never see these txs. */

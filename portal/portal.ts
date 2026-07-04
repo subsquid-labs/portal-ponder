@@ -29,6 +29,7 @@ import { createHistoricalSync, type HistoricalSync } from './index.js';
 import {
   type AssembledRange,
   assembleRange,
+  buildRawLogMatcher,
   type ChunkData,
   createChunkData,
 } from './portal-assemble.js';
@@ -231,17 +232,24 @@ export const createPortalHistoricalSync = (
     token: RowToken,
   ): Promise<void> => {
     const neededMissing = new Set<string>();
-    // FIX 3: the needed-field crash check must consider ONLY the rows THIS call adds. On a frontier EXTEND
-    // `cd` already carries the base chunk's data; the tail streams the disjoint range (coveredTo, desiredTo]
-    // whose block numbers are all > coveredTo (new map keys), so a size delta captures exactly the tail's
-    // matched rows. Inspecting the whole accumulated `cd` (as before) let a data-bearing base + an
-    // event-less tail whose dataset lacks a needed column throw fatally → evict → crash-loop on retry.
-    const matchedSize = (): number =>
-      cd.logs.size +
-      cd.traceBlocks.size +
-      cd.txBlocks.size +
-      cd.blockHeaders.size;
-    const matchedBefore = matchedSize();
+    // FIX 3 + wave-4 log re-match: the needed-field crash check must consider ONLY the rows THIS call adds
+    // that assembly will actually KEEP. On a frontier EXTEND `cd` already carries the base chunk's data; the
+    // tail streams the disjoint range (coveredTo, desiredTo] whose block numbers are all > coveredTo (new
+    // map keys), so a size delta over the append-only trace/tx/block maps captures exactly the tail's added
+    // rows (inspecting the whole accumulated `cd`, as before FIX 3, let a data-bearing base + an event-less
+    // tail whose dataset lacks a needed column throw fatally → evict → crash-loop). LOGS need more: the
+    // Portal's server-side log filter over-returns rows assembly re-matches AWAY — a factory child's
+    // pre-creation logs and a bounded filter's out-of-range logs — so a raw `cd.logs.size` delta would count
+    // logs the indexer never keeps and arm the same false fatal (the exact class of #20's trace/transfer
+    // residual, created here by the new re-match boundary). Count only logs surviving the SAME re-match
+    // assembly applies; discovery is complete through this range (asserted below), so the seam agrees.
+    const logMatchedRaw = spec.logFilters.length
+      ? buildRawLogMatcher(spec, args.childAddresses)
+      : undefined;
+    let matchedLogsAdded = 0;
+    const otherMatchedSize = (): number =>
+      cd.traceBlocks.size + cd.txBlocks.size + cd.blockHeaders.size;
+    const otherMatchedBefore = otherMatchedSize();
     const onRows = (n: number): void => {
       if (token.freed) return;
 
@@ -268,6 +276,10 @@ export const createPortalHistoricalSync = (
                 (cd.txs.get(b.header.number) ?? []).concat(b.transactions),
               );
             stats.logs += b.logs.length;
+            if (logMatchedRaw)
+              matchedLogsAdded += b.logs.filter((raw) =>
+                logMatchedRaw(raw, b.header, b.header.number),
+              ).length;
           }
       }
     const tq = spec.traceQuery();
@@ -327,9 +339,13 @@ export const createPortalHistoricalSync = (
           }
       }
     // A NEEDED field the dataset lacked on THIS range: crash ONLY IF this call added MATCHED data — an
-    // event the indexer processes would be incomplete. An event-less (old/irrelevant) range — or an
-    // event-less EXTEND tail over a data-bearing base (FIX 3) — proceeds.
-    if (neededMissing.size && matchedSize() > matchedBefore) {
+    // event the indexer processes would be incomplete. Logs count post-re-match (kept-only, wave 4);
+    // trace/tx/block sources by size delta. An event-less (old/irrelevant) range — or an event-less /
+    // all-re-match-dropped EXTEND tail over a data-bearing base (FIX 3) — proceeds.
+    if (
+      neededMissing.size &&
+      (matchedLogsAdded > 0 || otherMatchedSize() > otherMatchedBefore)
+    ) {
       throw new Error(
         `Portal dataset for ${chain.name} is missing [${[...neededMissing].join(', ')}] on blocks [${from},${to}], which contain matched data your indexer needs — a Portal dataset-completeness gap. Failing fast rather than serving incomplete data; report the gap to SQD, or start your indexer past the affected range.`,
       );

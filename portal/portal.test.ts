@@ -859,6 +859,182 @@ test('regression (FIX 3): an extend tail that DOES add matched rows while lackin
   }
 });
 
+// ── wave 4: the needed-field growth check counts logs POST-re-match, not raw cd.logs.size ─────────────
+// The log re-match (INV-6 store parity) lets assembly DROP logs the Portal's merged server-side filter
+// over-returns — a factory child's pre-creation logs, or a bounded filter's out-of-range logs. If those
+// still counted toward "matched data this call added", a tail of ALL-dropped logs over a dataset missing a
+// NEEDED field would arm the needed-field fatal → evict → crash-loop for data the indexer never keeps
+// (the exact class of #20's trace/transfer residual, created by the new re-match boundary). Only logs
+// surviving `logMatched` count. This server serves the base block (matched by filter A, WITH logsBloom),
+// then over the newly-finalized tail 400s the logsBloom column and — once it's dropped — returns a log
+// matching bounded filter B ABOVE B.toBlock (out of range → re-matched away by assembly).
+const mkTopicBlock = (n: number, topic0: string) => ({
+  ...FIXTURE_BLOCK,
+  header: {
+    ...FIXTURE_BLOCK.header,
+    number: n,
+    hash: `0x${n.toString(16).padStart(64, '0')}`,
+  },
+  logs: [
+    {
+      ...FIXTURE_BLOCK.logs[0],
+      topics: [topic0, ...FIXTURE_BLOCK.logs[0].topics.slice(1)],
+      transactionHash: `0x${(n + 3_000_000).toString(16).padStart(64, '0')}`,
+    },
+  ],
+  transactions: [
+    {
+      ...FIXTURE_BLOCK.transactions[0],
+      hash: `0x${(n + 3_000_000).toString(16).padStart(64, '0')}`,
+    },
+  ],
+});
+const extendReMatchDropServer = (opts: {
+  headFn: () => number;
+  baseBlock: number;
+  baseTopic0: string;
+  tailBlock: number;
+  tailTopic0: string;
+  tailFrom: number; // the extend tail starts here (coveredTo+1); only this region degrades logsBloom
+}) =>
+  http.createServer((req, res) => {
+    let body = '';
+    req.on('data', (c) => {
+      body += c;
+    });
+    req.on('end', () => {
+      if (req.url?.includes('finalized-head')) {
+        res.writeHead(200, { 'content-type': 'application/json' });
+        res.end(JSON.stringify({ number: opts.headFn() }));
+        return;
+      }
+      const q = body ? JSON.parse(body) : {};
+      const from = q.fromBlock ?? 0;
+      const to = Math.min(q.toBlock ?? 1e12, opts.headFn());
+      const wantsBloom = q.fields?.transaction?.logsBloom !== undefined;
+      const isTail = from >= opts.tailFrom;
+      // The EXTEND tail lacks logsBloom → 400 while it's requested (the BASE region never degrades).
+      if (isTail && wantsBloom) {
+        res.writeHead(400);
+        res.end(
+          "Bad request: couldn't parse request: column 'logs_bloom' is not found in 'transactions'",
+        );
+        return;
+      }
+      // BASE: a log matched by filter A (cached under the base fetch, WITH logsBloom).
+      if (!isTail && from <= opts.baseBlock && to >= opts.baseBlock) {
+        res.writeHead(200, { 'content-type': 'application/x-ndjson' });
+        res.end(
+          JSON.stringify(mkTopicBlock(opts.baseBlock, opts.baseTopic0)) + '\n',
+        );
+        return;
+      }
+      // TAIL (logsBloom dropped): a log the merged request returns but assembly re-matches away.
+      if (isTail && from <= opts.tailBlock && to >= opts.tailBlock) {
+        res.writeHead(200, { 'content-type': 'application/x-ndjson' });
+        res.end(
+          JSON.stringify(mkTopicBlock(opts.tailBlock, opts.tailTopic0)) + '\n',
+        );
+        return;
+      }
+      res.writeHead(204).end();
+    });
+  });
+
+test('regression (wave 4): an extend tail whose only new logs are RE-MATCH-DROPPED while lacking a needed field is TOLERATED (not crash-looped)', async () => {
+  // Base block 50 (matched by unbounded filter A, WITH logsBloom) is cached truncated at head H1=100. The
+  // head advances to H2=200 and interval B extends chunk 0 over (100, 200]. The tail lacks logsBloom (400s)
+  // and — once it's dropped — returns ONLY a log matching bounded filter B (topic OTHER) at block 150,
+  // ABOVE B.toBlock=50: assembly's `logMatched` re-matches it AWAY (out of B's range; not A's topic).
+  // BEFORE the wave-4 seam fix: runStreams counted raw cd.logs.size, which grew by the tail block →
+  // neededMissing={logsBloom} armed → threw "missing … matched data" → evict → crash-loop for a log the
+  // indexer never keeps. AFTER: only logMatched-surviving logs count → the tail contributes 0 → tolerated.
+  delete process.env.PORTAL_FINALIZED_HEAD; // probe the mock so the head advances
+  const OTHER_TOPIC0 = `0x${'bb'.repeat(32)}`;
+  let head = 100;
+  const srv = extendReMatchDropServer({
+    headFn: () => head,
+    baseBlock: 50,
+    baseTopic0: DEPOSIT_TOPIC0, // base log matches filter A → cached
+    tailBlock: 150,
+    tailTopic0: OTHER_TOPIC0, // tail log matches only bounded filter B, above its range → dropped
+    tailFrom: 101, // the extend tail is (H1=100, H2]; only it degrades logsBloom
+  });
+  const p: number = await new Promise((r) =>
+    srv.listen(0, () => r((srv.address() as AddressInfo).port)),
+  );
+  try {
+    const inserted = { logs: [] as any[] };
+    const syncStore: any = {
+      insertLogs: (x: any) => inserted.logs.push(...x.logs),
+      insertBlocks: () => {},
+      insertTransactions: () => {},
+      insertTransactionReceipts: () => {},
+      insertTraces: () => {},
+    };
+    const filterA: any = {
+      type: 'log',
+      chainId: 1,
+      sourceId: 'a',
+      address: VAULT,
+      topic0: DEPOSIT_TOPIC0,
+      topic1: null,
+      topic2: null,
+      topic3: null,
+      fromBlock: 0,
+      toBlock: undefined, // unbounded → the frontier chunk that extends as the head advances
+      hasTransactionReceipt: true, // ← makes logsBloom a NEEDED field
+      include: [],
+    };
+    const filterB: any = {
+      type: 'log',
+      chainId: 1,
+      sourceId: 'b',
+      address: VAULT,
+      topic0: OTHER_TOPIC0,
+      topic1: null,
+      topic2: null,
+      topic3: null,
+      fromBlock: 0,
+      toBlock: 50, // bounded at 50 → its topic rides the merged request but a 150 log is out of range
+      hasTransactionReceipt: true,
+      include: [],
+    };
+    const sync = createPortalHistoricalSync({
+      common: {
+        logger: { debug() {}, info() {}, warn() {}, error() {}, trace() {} },
+      } as any,
+      chain: { id: 1, name: 'mainnet', portal: `http://localhost:${p}` } as any,
+      childAddresses: new Map(),
+      eventCallbacks: [{ filter: filterA }, { filter: filterB }],
+    } as any);
+
+    const iA: [number, number] = [50, 50];
+    await sync.syncBlockRangeData({
+      interval: iA,
+      requiredIntervals: [{ interval: iA, filter: filterA }],
+      requiredFactoryIntervals: [],
+      syncStore,
+    });
+    expect(inserted.logs).toHaveLength(1); // base block 50 (filter A) cached
+
+    head = 200; // Portal advances → interval B extends chunk 0 over the re-match-dropped tail
+
+    const iB: [number, number] = [150, 150];
+    // MUST NOT throw — the tail's only new log is re-match-dropped, so the missing logsBloom is tolerated.
+    await sync.syncBlockRangeData({
+      interval: iB,
+      requiredIntervals: [{ interval: iB, filter: filterA }],
+      requiredFactoryIntervals: [],
+      syncStore,
+    });
+    // no crash; the out-of-range B log contributed nothing (assembly drops it too)
+    expect(inserted.logs).toHaveLength(1);
+  } finally {
+    srv.close();
+  }
+});
+
 test('regression: a dataset that starts after genesis (TAC starts at block 1) is clamped forward, not crashed on', async () => {
   // The Portal 400s "dataset starts from block N" when queried below its first block. The fork must
   // clamp the cursor to N and continue — NOT throw an unhandledRejection (which killed the whole
