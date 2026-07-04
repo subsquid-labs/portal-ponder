@@ -336,6 +336,347 @@ test('streamHotBlocks: re-opens the /stream with the widened filter the moment t
   ac.abort();
 });
 
+// ─────────────────────────────── /stream parentBlockHash + 409 fork negotiation (issue #33) ───────────────────────────────
+
+// A scripted Portal /stream mock: one entry per connection, each either a 200 that streams blocks then
+// closes, or a 409 that returns { previousBlocks }. Captures every request body so per-connection
+// fromBlock / parentBlockHash assertions are hermetic. 204s past the last entry (→ the caller aborts).
+type Conn =
+  | { status: 200; blocks: any[] }
+  | { status: 409; previousBlocks: Array<{ number: number; hash: string }> };
+function mockForkFetch(
+  conns: Conn[],
+  bodies: any[],
+  onExhausted?: () => void,
+): typeof fetch {
+  const enc = new TextEncoder();
+  let i = 0;
+  return (async (_url: string, init: any) => {
+    bodies.push(JSON.parse(init.body));
+    if (i >= conns.length) {
+      onExhausted?.();
+
+      return { status: 204, ok: false, body: null };
+    }
+    const conn = conns[i++]!;
+    if (conn.status === 409) {
+      const text = JSON.stringify({ previousBlocks: conn.previousBlocks });
+      const body = new ReadableStream({
+        start(c) {
+          c.enqueue(enc.encode(text));
+          c.close();
+        },
+      });
+
+      return { status: 409, ok: false, body };
+    }
+    const lines = conn.blocks.map((b) => `${JSON.stringify(b)}\n`).join('');
+    const body = new ReadableStream({
+      start(c) {
+        c.enqueue(enc.encode(lines));
+        c.close();
+      },
+    });
+
+    return { status: 200, ok: true, body };
+  }) as any;
+}
+
+const hdr = (n: number, hash: string, parentHash: string) => ({
+  header: { number: n, hash, parentHash, timestamp: n },
+  logs: [],
+});
+
+test('portalRealtimeEvents: a 1-block orphan at tip heals via 409 fork negotiation — orphan N−1 then canonical N becomes reorg + appends, no gap fatal (issue #33 T1)', async () => {
+  // The exact instance-4 shape. conn1 serves canonical 674 then the ORPHAN 675 (a non-canonical sibling)
+  // and closes; conn2 resumes at 676 carrying parentBlockHash=675-orphan → the server sees it orphaned and
+  // 409s with the canonical replacement chain [674, 675]; conn3 resumes at 675 (rewound to just above the
+  // matched 674) carrying parentBlockHash=674 → serves canonical 675 then 676. reconcile surfaces the
+  // canonical 675 (parent 674, forking off the orphan) as a reorg off 674, pops the orphan, and appends.
+  const anchor = {
+    number: 673,
+    hash: 'h673',
+    parentHash: 'h672',
+    timestamp: 673,
+  };
+  const conns: Conn[] = [
+    {
+      status: 200,
+      blocks: [hdr(674, 'h674', 'h673'), hdr(675, 'h675o', 'h674')],
+    },
+    {
+      status: 409,
+      previousBlocks: [
+        { number: 674, hash: 'h674' },
+        { number: 675, hash: 'h675c' },
+      ],
+    },
+    {
+      status: 200,
+      blocks: [hdr(675, 'h675c', 'h674'), hdr(676, 'h676', 'h675c')],
+    },
+  ];
+  const bodies: any[] = [];
+  const ac = new AbortController();
+  const events: any[] = [];
+  for await (const e of portalRealtimeEvents({
+    portalUrl: 'http://portal',
+    headers: {},
+    fromBlock: 674,
+    logs: [],
+    anchor,
+    fetchImpl: mockForkFetch(conns, bodies, () => ac.abort()),
+    signal: ac.signal,
+    finalizedHead: async () => 673, // floor stays at the anchor; nothing new finalizes
+    finalizePollMs: 999999,
+  })) {
+    events.push(e);
+  }
+  // exact event sequence: block 674, block 675o, reorg{674, [675o]}, block 675c, block 676
+  const kinds = events.map((e) =>
+    e.type === 'block'
+      ? `block ${e.block.number}`
+      : e.type === 'reorg'
+        ? `reorg ${e.block.number}:[${e.reorgedBlocks.map((b: Light) => b.hash).join(',')}]`
+        : `finalize ${e.block.number}`,
+  );
+  expect(kinds).toEqual([
+    'block 0x2a2', // 674
+    'block 0x2a3', // 675 (orphan)
+    'reorg 674:[h675o]', // rollback to 674, reorging the orphan
+    'block 0x2a3', // 675 (canonical, re-delivered)
+    'block 0x2a4', // 676
+  ]);
+  // per-connection wire assertions: fromBlock + parentBlockHash
+  const stream = bodies.filter((b) => b.fromBlock !== undefined);
+  expect(stream[0].fromBlock).toBe(674);
+  expect(stream[0].parentBlockHash).toBe('h673'); // first request carries the anchor hash
+  expect(stream[1].fromBlock).toBe(676);
+  expect(stream[1].parentBlockHash).toBe('h675o'); // resume past the orphan → its hash
+  expect(stream[2].fromBlock).toBe(675); // rewound to just above the matched common ancestor 674
+  expect(stream[2].parentBlockHash).toBe('h674'); // the canonical 674 hash the ring confirmed
+});
+
+test('streamHotBlocks: every /stream request carries parentBlockHash — first = anchor hash, post-reconnect = last delivered hash (issue #33 T2 conformance)', async () => {
+  const bodies: any[] = [];
+  const ac = new AbortController();
+  const conns: Conn[] = [
+    { status: 200, blocks: [hdr(100, 'h100', 'h99')] }, // conn1: one block, then close
+    { status: 200, blocks: [hdr(101, 'h101', 'h100')] }, // conn2: resume carries h100
+  ];
+  const gen = streamHotBlocks({
+    portalUrl: 'http://portal',
+    headers: {},
+    fromBlock: 100,
+    logs: [],
+    seedRing: { number: 99, hash: 'h99' }, // the startup anchor seeds the ring
+    fetchImpl: mockForkFetch(conns, bodies, () => ac.abort()),
+    signal: ac.signal,
+  });
+  const first = await gen.next();
+  expect(first.value?.header.number).toBe(100);
+  expect(bodies[0].fromBlock).toBe(100);
+  expect(bodies[0].parentBlockHash).toBe('h99'); // FIRST request carries the seeded anchor hash
+
+  const second = await gen.next();
+  expect(second.value?.header.number).toBe(101);
+  expect(bodies[1].fromBlock).toBe(101);
+  expect(bodies[1].parentBlockHash).toBe('h100'); // post-reconnect carries the LAST delivered hash
+  await gen.return(undefined);
+  ac.abort();
+});
+
+test('streamHotBlocks: the finding-4 redelivery reopen (cursor = number) sends the AWAITED block’s parentHash, not its own hash (issue #33 T2 redelivery)', async () => {
+  // The finding-4 same-block child reopen resumes FROM N (not N+1). The parentBlockHash must be the ring
+  // entry at N−1 (the awaited block's parentHash), so the server re-serves N as a normal resume — NOT N's
+  // own hash (which would ask for N+1 and skip the redelivery this handshake exists to force).
+  const enc = new TextEncoder();
+  const streamOf = (block: any, close: boolean) =>
+    new ReadableStream({
+      start(c) {
+        c.enqueue(enc.encode(`${JSON.stringify(block)}\n`));
+        if (close) c.close();
+      },
+    });
+  const bodies: any[] = [];
+  let conn = 0;
+  const fetchImpl = (async (_url: string, init: any) => {
+    bodies.push(JSON.parse(init.body));
+    conn += 1;
+    if (conn === 1)
+      return {
+        status: 200,
+        ok: true,
+        body: streamOf(hdr(100, 'h100', 'h99'), false), // deliver 100, stay open
+      };
+    if (conn === 2)
+      return {
+        status: 200,
+        ok: true,
+        body: streamOf(hdr(100, 'h100', 'h99'), true), // redelivered 100
+      };
+    return { status: 204, ok: false, body: null };
+  }) as any;
+  let rev = 0;
+  const ac = new AbortController();
+  const gen = streamHotBlocks({
+    portalUrl: 'http://portal',
+    headers: {},
+    fromBlock: 100,
+    logs: [],
+    seedRing: { number: 99, hash: 'h99' },
+    getLogsRevision: () => rev,
+    fetchImpl,
+    signal: ac.signal,
+  });
+  const first = await gen.next();
+  expect(first.value?.header.number).toBe(100);
+  expect(bodies[0].parentBlockHash).toBe('h99');
+
+  rev = 1; // a child was discovered in block 100 → force the reopen FROM 100
+  const second = await gen.next();
+  expect(second.value?.header.number).toBe(100); // redelivered
+  expect(bodies[1].fromBlock).toBe(100); // reopened FROM 100, not 101
+  expect(bodies[1].parentBlockHash).toBe('h99'); // the AWAITED block's parentHash (ring[99]), not h100
+  await gen.return(undefined);
+  ac.abort();
+});
+
+test('streamHotBlocks: a 409 whose previousBlocks match NOTHING steps the cursor down one block per retry and fatals at the finalized floor — nothing yielded past the fork (issue #33 T3 step-down)', async () => {
+  const bodies: any[] = [];
+  // conn1 delivers 101,102,103 so the ring holds every delivered height (100 seed + 101,102,103) — as in
+  // production, where the ring mirrors the whole unfinalized window down to the floor. Then every 409 names
+  // a fork point the ring can't confirm (hashes it never delivered), so no rewind matches and the cursor
+  // steps DOWN one block per retry, re-sending the ring hash at each new cursor−1, until cursor−1 reaches
+  // the floor (100) → fatal. Blocks 101–103 were delivered first; nothing is accepted PAST the fork.
+  const conns: Conn[] = [
+    {
+      status: 200,
+      blocks: [
+        hdr(101, 'h101', 'h100'),
+        hdr(102, 'h102', 'h101'),
+        hdr(103, 'h103', 'h102'),
+      ],
+    },
+    { status: 409, previousBlocks: [{ number: 103, hash: 'x103' }] },
+    { status: 409, previousBlocks: [{ number: 102, hash: 'x102' }] },
+    { status: 409, previousBlocks: [{ number: 101, hash: 'x101' }] },
+    { status: 409, previousBlocks: [{ number: 100, hash: 'x100' }] },
+  ];
+  const gen = streamHotBlocks({
+    portalUrl: 'http://portal',
+    headers: {},
+    fromBlock: 101,
+    logs: [],
+    seedRing: { number: 100, hash: 'h100' },
+    getFinalizedFloor: () => 100,
+    fetchImpl: mockForkFetch(conns, bodies),
+  });
+  const yielded: any[] = [];
+  await expect(
+    (async () => {
+      for await (const b of gen) yielded.push(b.header.number);
+    })(),
+  ).rejects.toThrow(/fork point is at or below the finalized floor/i);
+  expect(yielded).toEqual([101, 102, 103]); // the pre-fork deliveries; nothing accepted past the fork
+  // resume at 104, then step DOWN 104→103→102→101 with the ring hash at each new cursor−1 until the floor
+  const stream = bodies.filter((b) => b.fromBlock !== undefined);
+  expect(stream.map((b) => b.fromBlock)).toEqual([101, 104, 103, 102, 101]);
+  // the stepped-down requests each carried the ring hash at cursor−1 (real delivered hashes)
+  expect(stream[1].parentBlockHash).toBe('h103'); // resume at 104 → ring[103]
+  expect(stream[2].parentBlockHash).toBe('h102'); // stepped to 103 → ring[102]
+  expect(stream[3].parentBlockHash).toBe('h101'); // stepped to 102 → ring[101]
+  expect(stream[4].parentBlockHash).toBe('h100'); // stepped to 101 → ring[100] (the floor/anchor)
+});
+
+test('streamHotBlocks: an unbounded 409 loop (server keeps re-409ing a rewind the ring confirms) fatals at the 10-cap (issue #33 T3 cap)', async () => {
+  const bodies: any[] = [];
+  // conn1 delivers 101..105 (ring holds 100..105). Then EVERY connection 409s with a previousBlocks the
+  // ring CONFIRMS ({103, ring[103]}) — so each 409 rewinds the cursor to 104 and reconnects, only to 409
+  // again at the same spot: an infinite rewind loop (the fork point never resolves). consecutive409 never
+  // resets (no 200 delivered after the first), so the 10-cap must break it rather than spin forever.
+  const conns: Conn[] = [
+    {
+      status: 200,
+      blocks: [
+        hdr(101, 'h101', 'h100'),
+        hdr(102, 'h102', 'h101'),
+        hdr(103, 'h103', 'h102'),
+        hdr(104, 'h104', 'h103'),
+        hdr(105, 'h105', 'h104'),
+      ],
+    },
+    // 14 identical 409s: with the cap, only 11 negotiations fire before the fatal, well under this bound;
+    // WITHOUT the cap the loop would exhaust these and hit the sentinel throw below (a clean, distinct
+    // failure instead of an infinite hang → a cap-removal regression surfaces unambiguously).
+    ...Array.from({ length: 14 }, () => ({
+      status: 409 as const,
+      previousBlocks: [{ number: 103, hash: 'h103' }], // a MATCH → rewind to 104, then 409 again
+    })),
+  ];
+  let onExhausted: (() => void) | undefined;
+  const sentinel = new Promise<never>((_, reject) => {
+    onExhausted = () =>
+      reject(
+        new Error(
+          'NEVER-EXHAUSTED: the 409 loop was not cap-bounded — it consumed every scripted 409 (regression)',
+        ),
+      );
+  });
+  const gen = streamHotBlocks({
+    portalUrl: 'http://portal',
+    headers: {},
+    fromBlock: 101,
+    logs: [],
+    seedRing: { number: 100, hash: 'h100' },
+    getFinalizedFloor: () => 0, // floor far below so the floor guard never fires — only the 10-cap can
+    fetchImpl: mockForkFetch(conns, bodies, () => onExhausted?.()),
+  });
+  const yielded: any[] = [];
+  await expect(
+    Promise.race([
+      (async () => {
+        for await (const b of gen) yielded.push(b.header.number);
+      })(),
+      sentinel,
+    ]),
+  ).rejects.toThrow(/consecutive .*409 fork-negotiations/i);
+  expect(yielded).toEqual([101, 102, 103, 104, 105]); // only the pre-loop deliveries
+  // exactly 11 409s reach the loop (the 11th trips consecutive409 > 10). The FIRST resumed at the tip
+  // (106) and 409ed; every subsequent one rewound to 104 (just above the confirmed common ancestor 103)
+  // and re-sent the confirmed ring hash h103, only to 409 again.
+  const stream = bodies.filter((b) => b.fromBlock !== undefined);
+  const negotiations = stream.slice(1); // drop the initial fromBlock=101 request
+  expect(negotiations.length).toBe(11);
+  expect(negotiations[0]!.fromBlock).toBe(106); // first 409 was at the tip
+  for (const r of negotiations.slice(1)) {
+    expect(r.fromBlock).toBe(104); // rewound to just above the confirmed ancestor 103
+    expect(r.parentBlockHash).toBe('h103');
+  }
+});
+
+test('streamHotBlocks: a 409 fork point BELOW the finalized floor is FATAL with no rewind (issue #33 T4 below-finality)', async () => {
+  const bodies: any[] = [];
+  // The server names a canonical replacement whose fork point (500) is BELOW the finalized floor (600).
+  // Finalized data can't be rolled back, so there is no safe recovery — fatal immediately, no step-down.
+  const conns: Conn[] = [
+    { status: 409, previousBlocks: [{ number: 500, hash: 'h500' }] },
+  ];
+  const gen = streamHotBlocks({
+    portalUrl: 'http://portal',
+    headers: {},
+    fromBlock: 700,
+    logs: [],
+    seedRing: { number: 699, hash: 'h699' },
+    getFinalizedFloor: () => 600,
+    fetchImpl: mockForkFetch(conns, bodies),
+  });
+  await expect(gen.next()).rejects.toThrow(/at or below the finalized floor/i);
+  // exactly ONE request went out — no step-down below finality
+  const stream = bodies.filter((b) => b.fromBlock !== undefined);
+  expect(stream).toHaveLength(1);
+});
+
 // ─────────────────────────────── reconcile anchor (finality boundary) ───────────────────────────────
 
 test('reconcile: an EMPTY window with an anchor appends ONLY a child of the anchor (else duplicate/gap)', () => {
