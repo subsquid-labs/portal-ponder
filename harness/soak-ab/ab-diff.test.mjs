@@ -1627,7 +1627,16 @@ test('stagnationDecision: both legs populated, skew ≤ threshold → PASS, clea
   assert.equal(r.staleSide, null, 'a below-threshold lag names no stalled side');
   // FINDING 3: the real skew IS surfaced below threshold (telemetry), not nulled.
   assert.equal(r.skew, 3600, 'the below-threshold skew is surfaced for telemetry');
-  assert.equal(r.nextState, null, 'a healthy run CLEARS any prior armed state');
+  // D1/D2: a healthy (skew ≤ threshold) run clears the wedge and the emptiness arm, but carries the
+  // last-known ts + skew forward as evidence — the unified record, not null.
+  assert.deepEqual(r.nextState, {
+    tsA: 1_700_000_000,
+    tsB: 1_700_000_000 - 3600,
+    skew: 3600,
+    emptySince: null,
+    wedgeFailedSince: null,
+  });
+  assert.equal(r.nextState.wedgeFailedSince, null, 'skew ≤ threshold is a recovery (D2): wedge cleared');
   // maxA/maxB carried through for the counters JSON
   assert.equal(r.maxA, 100);
   assert.equal(r.maxB, 99);
@@ -1652,11 +1661,13 @@ test('stagnationDecision: both populated, skew > threshold, NO prev → ARM (non
   assert.equal(r.staleSide, null, 'no side named on the deferred (armed) run');
   assert.equal(r.skew, 10_800, 'the skew is surfaced (loud info), just not yet a fail');
   // nextState carries BOTH legs' ts + skew (finding 2: NOT keyed on the stale side) for the next run's
-  // direction check.
+  // direction check, in the unified evidence shape (D1). No prior arm, no wedge → both null.
   assert.deepEqual(r.nextState, {
     tsA: 1_700_000_000,
     tsB: 1_700_000_000 - 10_800,
     skew: 10_800,
+    emptySince: null,
+    wedgeFailedSince: null,
   });
 });
 
@@ -1776,7 +1787,10 @@ test('stagnationDecision: skew exactly at the threshold is in tolerance (PASS, c
   });
   assert.equal(r.fail, false, 'skew == threshold is within tolerance, not a stall');
   assert.equal(r.reason, 'both-populated-in-skew');
-  assert.equal(r.nextState, null, 'in-tolerance clears prior armed state');
+  // in-tolerance clears the wedge + emptiness arm (D2 recovery) but carries the ts/skew evidence (D1)
+  assert.equal(r.nextState.wedgeFailedSince, null, 'in-tolerance clears any prior wedge');
+  assert.equal(r.nextState.emptySince, null, 'in-tolerance clears any prior emptiness arm');
+  assert.equal(r.nextState.skew, t, 'the exactly-at-threshold skew is carried as evidence');
 });
 
 // EQUAL timestamps → skew 0 → in tolerance → PASS. (skew 0 can never exceed a positive threshold.)
@@ -1826,7 +1840,13 @@ test('FINDING 2: the exact 4-run alternating adversarial sequence FAILs at run 2
   const r1 = run(1000, 20_000, null);
   assert.equal(r1.fail, false, 'run1 is the first over-threshold observation → arms');
   assert.equal(r1.reason, 'skew-above-threshold-arming');
-  assert.deepEqual(r1.nextState, { tsA: 1000, tsB: 20_000, skew: 19_000 });
+  assert.deepEqual(r1.nextState, {
+    tsA: 1000,
+    tsB: 20_000,
+    skew: 19_000,
+    emptySince: null,
+    wedgeFailedSince: null,
+  });
 
   // run2: A=50000, B=20000 → B FROZEN (unchanged 20000) while A advanced; skew grew 19000 → 30000.
   // The stale side FLIPPED A→B, but the fix does NOT re-arm: it FAILs (B frozen, A advanced).
@@ -1862,11 +1882,12 @@ test('FINDING 2: a stale-side flip while both legs stay HEALTHY does not false-F
       nowMs: NOW,
     });
 
-  // run1: A older by 100 (under threshold) — PASS, state cleared
+  // run1: A older by 100 (under threshold) — PASS, no wedge/emptiness armed (D1: evidence still carried)
   const r1 = run(1_700_000_000, 1_700_000_100, null);
   assert.equal(r1.fail, false);
   assert.equal(r1.reason, 'both-populated-in-skew');
-  assert.equal(r1.nextState, null, 'a below-threshold run clears state (no armed carry)');
+  assert.equal(r1.nextState.wedgeFailedSince, null, 'a below-threshold run arms no wedge');
+  assert.equal(r1.nextState.emptySince, null, 'a below-threshold run arms no emptiness');
 
   // run2: the older side FLIPS to B, still under threshold, both advanced — PASS, no fail
   const r2 = run(1_700_000_300, 1_700_000_150, r1.nextState);
@@ -1987,10 +2008,14 @@ test('stagnationDecision: one leg empty, FIRST observation → arm firstEmptyAtM
   assert.equal(r.reason, 'empty-arming');
   assert.equal(r.skew, null, 'skew is unmeasurable with one leg empty');
   assert.equal(r.staleSide, null);
+  // D1 unified record: emptySince arms {side, atMs}; the populated leg's ts is carried, the empty
+  // leg's is null (never observed); no wedge.
   assert.deepEqual(r.nextState, {
-    emptySide: 'B',
-    firstEmptyAtMs: NOW,
-    populatedTs: 1_700_000_000,
+    tsA: 1_700_000_000,
+    tsB: null,
+    skew: null,
+    emptySince: { side: 'B', atMs: NOW },
+    wedgeFailedSince: null,
   });
   // the populated leg's max is still surfaced for the counters JSON; the empty leg's is null
   assert.equal(r.maxA, 12_345);
@@ -2003,14 +2028,18 @@ test('stagnationDecision: one leg empty, FIRST observation → arm firstEmptyAtM
 // `populatedAdvanced` clause → it would fire even on a mutual freeze (below). Either flips an assertion.
 test('stagnationDecision: one leg empty PAST the grace window while the other advances → FAIL one-sided-empty', () => {
   const t = 7200; // → grace = 7_200_000 ms
+  // Unified prev (D1): B empty since armAt (> threshold ago), A last-known 1_700_000_000, no wedge yet.
+  const armAt = NOW - (t * 1000 + 60_000);
   const prev = {
-    emptySide: 'B',
-    firstEmptyAtMs: NOW - (t * 1000 + 60_000), // armed > threshold ago
-    populatedTs: 1_700_000_000,
+    tsA: 1_700_000_000,
+    tsB: null,
+    skew: null,
+    emptySince: { side: 'B', atMs: armAt },
+    wedgeFailedSince: null,
   };
   const r = stagnationDecision({
     maxA: '12500',
-    tsA: 1_700_050_000, // populated leg ADVANCED since prev.populatedTs
+    tsA: 1_700_050_000, // populated leg ADVANCED since prev.tsA
     maxB: null,
     tsB: null, // leg B still empty
     threshold: t,
@@ -2020,9 +2049,13 @@ test('stagnationDecision: one leg empty PAST the grace window while the other ad
   assert.equal(r.fail, true, 'empty past the grace window while the other leg advances is a wedge');
   assert.equal(r.reason, 'one-sided-empty');
   assert.equal(r.staleSide, 'B', 'the empty leg is the stalled side');
-  // firstEmptyAtMs is preserved from prev (not re-armed), and populatedTs updated
-  assert.equal(r.nextState.firstEmptyAtMs, prev.firstEmptyAtMs);
-  assert.equal(r.nextState.populatedTs, 1_700_050_000);
+  // emptySince.atMs is preserved from prev (not re-armed); the live leg's advanced ts is carried; the
+  // fresh fail arms the sticky wedge (D2).
+  assert.equal(r.nextState.emptySince.atMs, armAt);
+  assert.equal(r.nextState.emptySince.side, 'B');
+  assert.equal(r.nextState.tsA, 1_700_050_000);
+  assert.equal(r.nextState.tsB, null, 'the empty leg has no prior ts to carry');
+  assert.equal(r.nextState.wedgeFailedSince, NOW, 'a fresh one-sided-empty wedge sets wedgeFailedSince');
 });
 
 // MUTUAL-FREEZE EXEMPTION: empty long enough, but the populated leg is ALSO frozen (did NOT advance
@@ -2031,9 +2064,11 @@ test('stagnationDecision: one leg empty PAST the grace window while the other ad
 test('stagnationDecision: one leg empty past grace but the OTHER leg is also frozen → non-fail (mutual freeze)', () => {
   const t = 7200;
   const prev = {
-    emptySide: 'B',
-    firstEmptyAtMs: NOW - (t * 1000 + 60_000),
-    populatedTs: 1_700_000_000,
+    tsA: 1_700_000_000,
+    tsB: null,
+    skew: null,
+    emptySince: { side: 'B', atMs: NOW - (t * 1000 + 60_000) },
+    wedgeFailedSince: null,
   };
   const r = stagnationDecision({
     maxA: '12345',
@@ -2047,17 +2082,20 @@ test('stagnationDecision: one leg empty past grace but the OTHER leg is also fro
   assert.equal(r.fail, false, 'a mutual freeze (both quiet) is benign, never a one-sided wedge');
   assert.equal(r.reason, 'empty-arming');
   assert.equal(r.staleSide, null);
+  assert.equal(r.nextState.wedgeFailedSince, null, 'a mutual freeze arms no wedge');
 });
 
-// EMPTY CLEARS ON FIRST ROW: the moment the empty leg gains rows, both legs are populated → the empty
-// state is gone (the branch is not even entered). Here the once-empty leg now has a ts within skew →
-// PASS with state cleared. MUTATION: carry firstEmptyAtMs forward once populated → the both-populated
-// branch returns nextState null, so a leaked firstEmptyAtMs would violate the deepEqual(null) below.
+// EMPTY CLEARS ON FIRST ROW: the moment the empty leg gains rows, both legs are populated → the
+// emptiness arm is dropped and (skew ≤ threshold) any prior wedge recovers. Here the once-empty leg now
+// has a ts within skew → PASS, emptySince/wedgeFailedSince cleared. MUTATION: carry emptySince forward
+// once populated → the assertion emptySince === null fails.
 test('stagnationDecision: the empty leg gains rows → clears emptiness state (both-populated branch)', () => {
   const prev = {
-    emptySide: 'B',
-    firstEmptyAtMs: NOW - 9_000_000,
-    populatedTs: 1_700_000_000,
+    tsA: 1_700_000_000,
+    tsB: null,
+    skew: null,
+    emptySince: { side: 'B', atMs: NOW - 9_000_000 },
+    wedgeFailedSince: null,
   };
   const r = stagnationDecision({
     maxA: '12500',
@@ -2070,7 +2108,8 @@ test('stagnationDecision: the empty leg gains rows → clears emptiness state (b
   });
   assert.equal(r.fail, false);
   assert.equal(r.reason, 'both-populated-in-skew');
-  assert.equal(r.nextState, null, 'gaining rows clears the armed emptiness state');
+  assert.equal(r.nextState.emptySince, null, 'gaining rows clears the armed emptiness state');
+  assert.equal(r.nextState.wedgeFailedSince, null, 'within-skew is a recovery, no wedge carried');
 });
 
 // BOTH EMPTY → benign mutual/not-started → PASS, no side, state cleared. MUTATION: coalesce null→0
@@ -2133,10 +2172,13 @@ test('stagnationDecision: NULL / unparseable timestamps are "no rows"; numeric s
 // leg advances, no grace) → this within-grace case false-FAILs and the `fail === false` assertion fails.
 test('stagnationDecision: one leg empty, populated leg advanced but WITHIN the grace window → non-fail', () => {
   const t = 7200; // grace = 7_200_000 ms
+  const armAt = NOW - 60_000; // armed only 60s ago — well within the 2h grace
   const prev = {
-    emptySide: 'B',
-    firstEmptyAtMs: NOW - 60_000, // armed only 60s ago — well within the 2h grace
-    populatedTs: 1_700_000_000,
+    tsA: 1_700_000_000,
+    tsB: null,
+    skew: null,
+    emptySince: { side: 'B', atMs: armAt },
+    wedgeFailedSince: null,
   };
   const r = stagnationDecision({
     maxA: '12500',
@@ -2149,7 +2191,211 @@ test('stagnationDecision: one leg empty, populated leg advanced but WITHIN the g
   });
   assert.equal(r.fail, false, 'within the grace window an advancing other leg is not yet a wedge');
   assert.equal(r.reason, 'empty-arming');
-  assert.equal(r.nextState.firstEmptyAtMs, prev.firstEmptyAtMs, 'the arm time is preserved');
+  assert.equal(r.nextState.emptySince.atMs, armAt, 'the arm time is preserved');
+});
+
+// ── DELTA-3 (ruling D1–D3): the unified evidence record kills the SHAPE-flip evidence-laundering bug ──
+//
+// Round-3 adversarial review found the two-shape state machine still laundered wedge evidence, now
+// across STATE SHAPES (empty↔populated flips) and via advancement-blind labels. These tests pin the
+// exact holes with the review's sequences; each is mutation-verified (the mutation named inline).
+
+// A tiny driver: thread the previous run's nextState into the next run, exactly as the differ persists.
+const runSeq = (t) => (tsA, tsB, prev, nowMs = NOW) =>
+  stagnationDecision({
+    maxA: tsA === null ? null : String(tsA),
+    tsA,
+    maxB: tsB === null ? null : String(tsB),
+    tsB,
+    threshold: t,
+    prev,
+    nowMs,
+  });
+
+// D4(a) — HOLE 1: the full 5-run empty↔populated oscillation MUST FAIL at r3, r4, r5. The stuck leg B
+// oscillates empty ↔ one-stale-row (tsB frozen at 1_700_000_000) while leg A advances every run. The
+// pre-fix machine FAILed once (r2) then re-armed on every shape flip and read non-fail forever. Under
+// D1+D2 the wedge is sticky and B never advances past its last-known ts, so r3/r4/r5 stay FAIL.
+// MUTATION 1 (revert D2 sticky-wedge — drop the `prevWedgeFailedSince !== null && !genuinelyRecovered`
+// short-circuit in BOTH populated and empty branches): r3 re-derives regime from the fresh both-
+// populated observation, finds prev without a usable baseline for B's freeze vs a stale row, and reads
+// non-fail → the `r3.fail === true` assertion fails.
+// MUTATION 2 (revert D1 carry-forward — set `carriedB = b` even when b is null): r4's empty run loses
+// B's last-known ts, the recovery/advancement check has no B baseline, and the machine mislabels →
+// the r4 fail/reason assertions fail.
+test('DELTA-3 D4(a): empty↔populated oscillation — one leg stuck — FAILs at r3, r4, r5 (sticky wedge)', () => {
+  const t = 7200; // grace/threshold
+  const run = runSeq(t);
+
+  // r1: A=1_700_000_000, B empty → first one-sided emptiness → arm (non-fail)
+  const r1 = run(1_700_000_000, null, null);
+  assert.equal(r1.fail, false, 'r1 arms the one-sided emptiness, no fail at first sight');
+  assert.equal(r1.reason, 'empty-arming');
+  assert.deepEqual(r1.nextState.emptySince, { side: 'B', atMs: NOW });
+
+  // r2: A advanced to 1_700_050_000, B STILL empty and now past the grace window → one-sided-empty FAIL.
+  // Force the grace to have elapsed by back-dating the arm through prev (emptySince.atMs > threshold ago).
+  const r2prev = {
+    ...r1.nextState,
+    emptySince: { side: 'B', atMs: NOW - (t * 1000 + 60_000) },
+  };
+  const r2 = run(1_700_050_000, null, r2prev);
+  assert.equal(r2.fail, true, 'r2: B empty past grace while A advances is a one-sided wedge → FAIL');
+  assert.equal(r2.reason, 'one-sided-empty');
+  assert.equal(r2.staleSide, 'B');
+  assert.ok(Number.isFinite(r2.nextState.wedgeFailedSince), 'r2 arms the sticky wedge');
+
+  // r3: B writes ONE STALE row tsB=1_700_000_000 (frozen), A=1_700_100_000 → both populated, skew huge.
+  // Pre-fix: the both-populated branch saw prev in "the empty shape" and re-armed → non-fail. Now: the
+  // wedge is sticky and B did NOT advance past its last-known ts → wedge-unrecovered FAIL.
+  const r3 = run(1_700_100_000, 1_700_000_000, r2.nextState);
+  assert.equal(r3.fail, true, 'r3: a single stale B row does not recover the wedge → FAIL');
+  assert.equal(r3.reason, 'wedge-unrecovered');
+  assert.equal(r3.originalReason, 'frozen', 'the both-populated unrecovered wedge reports frozen origin');
+  assert.equal(r3.staleSide, 'B', 'B (the older/frozen leg) is still the stalled side');
+  assert.ok(Number.isFinite(r3.nextState.wedgeFailedSince), 'the wedge stays armed through r3');
+
+  // r4: B empty again, A=1_700_150_000 → one leg empty. Pre-fix: the one-empty branch saw prev without
+  // emptySide and re-armed firstEmptyAtMs → non-fail. Now: sticky wedge, empty leg cannot recover → FAIL.
+  const r4 = run(1_700_150_000, null, r3.nextState);
+  assert.equal(r4.fail, true, 'r4: B empty again does not recover the wedge → FAIL');
+  assert.equal(r4.reason, 'wedge-unrecovered');
+  assert.equal(r4.originalReason, 'one-sided-empty', 'an empty-leg unrecovered wedge reports empty origin');
+  assert.equal(r4.staleSide, 'B');
+
+  // r5: repeats r3 (B one stale row, A advances) → still FAIL. The oscillation NEVER launders the wedge.
+  const r5 = run(1_700_200_000, 1_700_000_000, r4.nextState);
+  assert.equal(r5.fail, true, 'r5: the oscillation still FAILs — the wedge is never laundered');
+  assert.equal(r5.reason, 'wedge-unrecovered');
+});
+
+// D4(b) — HOLE 2: BOTH-FROZEN over threshold must NOT read 'lagging-constant' (whose comment claims
+// "both advanced"). r2 is IDENTICAL to r1 (neither leg advanced) with an over-threshold skew → this is
+// a mutual freeze, honestly 'mutually-quiescent', non-fail. MUTATION (route the neither-advanced case
+// to 'lagging-constant' — drop the `neitherAdvanced` branch): the `reason === 'mutually-quiescent'`
+// assertion fails, exposing the dishonest label.
+test('DELTA-3 D4(b): both legs FROZEN over threshold → mutually-quiescent (non-fail), NOT lagging-constant', () => {
+  const t = 7200;
+  const run = runSeq(t);
+  // r1 arms: A older by 20000, over threshold, no prev → arm
+  const r1 = run(1_700_000_000, 1_700_020_000, null);
+  assert.equal(r1.fail, false);
+  assert.equal(r1.reason, 'skew-above-threshold-arming');
+  // r2 IDENTICAL to r1 — neither leg advanced, skew unchanged at 20000 → mutual freeze, honest non-fail
+  const r2 = run(1_700_000_000, 1_700_020_000, r1.nextState);
+  assert.equal(r2.fail, false, 'a mutual freeze is out of scope for an A-vs-B divergence guard');
+  assert.equal(
+    r2.reason,
+    'mutually-quiescent',
+    'neither leg advanced → mutually-quiescent, never lagging-constant (which implies both advanced)',
+  );
+  assert.equal(r2.staleSide, null);
+});
+
+// D4(c) — LEADER-REGRESSION + FROZEN-STALE: the leader leg (A) REGRESSES newest-ts (a one-sided realtime
+// reorg-prune) while the stale leg (B) stays frozen — the skew SHRINKS but NOBODY advanced. This must be
+// 'mutually-quiescent' (non-fail), NOT 'catching-up' (which would launder a frozen stale leg on a leader
+// artefact). THEN the next run, the leader re-advances while the stale leg is STILL frozen → the honest
+// 'frozen' FAIL surfaces. MUTATION (the naive "catching-up on any skew shrink" — replace the
+// `neitherAdvanced → mutually-quiescent` + `staleAdvanced && skewDecreased → catching-up` pair with a
+// single leading `else if (skewDecreased) reason = 'catching-up'`): the leader reorg-prune shrinks the
+// skew with nobody advancing, so r2 mislabels 'catching-up' and the `reason === 'mutually-quiescent'`
+// assertion fails. Two barriers protect this — the `neitherAdvanced` branch order AND the
+// `staleAdvanced` conjunct — so the discriminating mutation drops BOTH (the anti-pattern D3 forbids).
+test('DELTA-3 D4(c): leader-regression + frozen stale → mutually-quiescent, then re-advance → frozen FAIL', () => {
+  const t = 7200;
+  const run = runSeq(t);
+  // r1 arms: A leader at 1_700_100_000, B stale/frozen at 1_700_000_000; skew 100000 > threshold
+  const r1 = run(1_700_100_000, 1_700_000_000, null);
+  assert.equal(r1.fail, false);
+  assert.equal(r1.reason, 'skew-above-threshold-arming');
+  // r2: A REGRESSES to 1_700_050_000 (reorg-prune of newest), B unchanged at 1_700_000_000. Skew shrank
+  // 100000 → 50000, but NEITHER leg advanced (A regressed, B frozen) → mutually-quiescent, non-fail.
+  const r2 = run(1_700_050_000, 1_700_000_000, r1.nextState);
+  assert.equal(r2.fail, false, 'a leader ts regression that shrinks the skew is not recovery');
+  assert.equal(
+    r2.reason,
+    'mutually-quiescent',
+    'nobody advanced — a leader reorg-prune is NOT catching-up',
+  );
+  // r3: leader A RE-ADVANCES to 1_700_120_000, stale B STILL frozen at 1_700_000_000 → one-sided wedge,
+  // the honest 'frozen' FAIL now surfaces (the one-run delay discriminated).
+  const r3 = run(1_700_120_000, 1_700_000_000, r2.nextState);
+  assert.equal(r3.fail, true, 'once the leader re-advances the frozen stale leg is a wedge → FAIL');
+  assert.equal(r3.reason, 'frozen');
+  assert.equal(r3.staleSide, 'B');
+});
+
+// D4(d) — STICKY-FAIL RECOVERY (D2): from a FAILed wedge, verify each recovery predicate.
+// MUTATION (drop the recovery clearing — never reset wedgeFailedSince to null): the genuine-recovery
+// assertions (fail === false) fail, since the wedge would stay stuck even after real recovery.
+test('DELTA-3 D4(d): sticky-fail recovery — advance+shrink clears, under-threshold clears, static does NOT', () => {
+  const t = 7200;
+  const run = runSeq(t);
+  // Reach a FAILed frozen wedge: r1 arms (B stale), r2 A advances while B frozen → FAIL frozen.
+  const r1 = run(1_700_100_000, 1_700_000_000, null);
+  const r2 = run(1_700_150_000, 1_700_000_000, r1.nextState);
+  assert.equal(r2.fail, true, 'precondition: a frozen wedge is live');
+  assert.ok(Number.isFinite(r2.nextState.wedgeFailedSince));
+
+  // RECOVERY 1 — the stale leg (B) STRICTLY ADVANCES and the skew SHRINKS (skew must not grow): clears.
+  // B 1_700_000_000 → 1_700_120_000 (advanced), A 1_700_150_000 → 1_700_160_000; skew 150000 → 40000.
+  const rec1 = run(1_700_160_000, 1_700_120_000, r2.nextState);
+  assert.equal(rec1.fail, false, 'the stale leg advancing with a shrinking skew is genuine recovery');
+  assert.equal(rec1.reason, 'catching-up');
+  assert.equal(rec1.nextState.wedgeFailedSince, null, 'genuine recovery clears the sticky wedge');
+
+  // RECOVERY 2 — from a fresh FAILed wedge, the skew drops UNDER threshold → clears regardless of motion.
+  const w2 = run(1_700_150_000, 1_700_000_000, r1.nextState); // FAIL again (frozen)
+  assert.equal(w2.fail, true);
+  const rec2 = run(1_700_150_000, 1_700_149_000, w2.nextState); // skew 1000 < threshold
+  assert.equal(rec2.fail, false, 'skew back under threshold is a genuine recovery');
+  assert.equal(rec2.reason, 'both-populated-in-skew');
+  assert.equal(rec2.nextState.wedgeFailedSince, null, 'under-threshold clears the wedge');
+
+  // NON-RECOVERY — a STATIC reappearance (the stale leg reappears with the SAME frozen ts, over
+  // threshold): NOT advancing → the wedge stays FAIL. This is the oscillation's core: static ≠ recovery.
+  const w3 = run(1_700_150_000, 1_700_000_000, r1.nextState); // FAIL (frozen)
+  assert.equal(w3.fail, true);
+  const stat = run(1_700_200_000, 1_700_000_000, w3.nextState); // B unchanged, A advanced
+  assert.equal(stat.fail, true, 'a static (unchanged) stale leg is NOT recovery — the wedge holds FAIL');
+  assert.equal(stat.reason, 'wedge-unrecovered');
+});
+
+// D4(e) — SHAPE TOGGLES PRESERVE EVIDENCE (D1 invariant): a run where one leg goes empty must carry the
+// OTHER leg's last-known ts, the emptiness arm, and any live wedge THROUGH the empty run — no field is
+// dropped on a shape transition. MUTATION (drop carry-forward — `carriedA = a`, `carriedB = b` with no
+// prev fallback): the empty run's nextState loses the empty leg's carried ts and the deepEqual fails.
+test('DELTA-3 D4(e): a shape toggle (populated → one-empty) carries every evidence field through', () => {
+  const t = 7200;
+  const run = runSeq(t);
+  // r1: both populated, over threshold, A older → arm. nextState carries tsA/tsB/skew.
+  const r1 = run(1_700_000_000, 1_700_020_000, null);
+  assert.equal(r1.reason, 'skew-above-threshold-arming');
+  assert.equal(r1.nextState.tsA, 1_700_000_000);
+  assert.equal(r1.nextState.tsB, 1_700_020_000);
+
+  // r2: leg A goes EMPTY, leg B still populated (advanced). D1 carry-forward: A's last-known ts
+  // (1_700_000_000) is preserved in nextState even though A is empty this run; B's live ts is recorded;
+  // emptySince arms for side A.
+  const r2 = run(null, 1_700_030_000, r1.nextState);
+  assert.equal(r2.nextState.tsA, 1_700_000_000, 'the now-empty leg A keeps its last-known ts (carry-forward)');
+  assert.equal(r2.nextState.tsB, 1_700_030_000, 'the live leg B records its current ts');
+  assert.deepEqual(r2.nextState.emptySince, { side: 'A', atMs: NOW }, 'emptiness arms for the empty side');
+
+  // r3: A REAPPEARS still frozen at its carried ts while B advanced past grace — because A's evidence
+  // survived the empty run, the machine can still judge A frozen. Here A reappears at 1_700_000_000
+  // (unchanged from its carried ts) with B advancing → the frozen wedge is detectable, not laundered.
+  const r3prev = {
+    ...r2.nextState,
+    emptySince: { side: 'A', atMs: NOW - (t * 1000 + 60_000) },
+  };
+  // A empty one more run past grace while B advances → one-sided-empty FAIL (A carried, never advanced).
+  const r3 = run(null, 1_700_060_000, r3prev);
+  assert.equal(r3.fail, true, 'A empty past grace while B advances is a wedge — evidence survived the toggle');
+  assert.equal(r3.reason, 'one-sided-empty');
+  assert.equal(r3.staleSide, 'A');
+  assert.equal(r3.nextState.tsA, 1_700_000_000, 'A last-known ts still carried through the second empty run');
 });
 
 // ── stagnationAlerts: one loud, self-describing line per stalled chain ───────────────────────────────
@@ -2275,6 +2521,61 @@ test('stagnationAlerts: a skew-growing wedge and a one-sided-empty wedge each ge
   assert.match(empty[0], /maxA=12500 maxB=null tsA=1700050000 tsB=null/);
 });
 
+// DELTA-3 (D2): a sticky 'wedge-unrecovered' fail resolves through its carried originalReason so the
+// alert reads as the wedge it STILL is (frozen / one-sided-empty) plus an explicit "still unrecovered"
+// note — the human sees the ongoing wedge, not an opaque tag. MUTATION (drop the effectiveReason
+// resolution — use s.reason directly): 'wedge-unrecovered' falls to the generic FROZEN clause with the
+// WRONG wording for an empty-origin wedge, and the empty-origin match below fails.
+test('DELTA-3 stagnationAlerts: a sticky wedge-unrecovered fail renders via its original wedge reason', () => {
+  const frozenOrigin = stagnationAlerts([
+    {
+      chain: 1,
+      classes: {
+        persistStagnation: {
+          fail: true,
+          reason: 'wedge-unrecovered',
+          originalReason: 'frozen',
+          staleSide: 'B',
+          skewSeconds: 30_000,
+          thresholdSeconds: 7200,
+          maxA: 100,
+          maxB: 90,
+          tsA: 1_700_000_000,
+          tsB: 1_699_970_000,
+        },
+      },
+    },
+  ]);
+  assert.match(frozenOrigin[0], /leg B has stopped persisting rows/);
+  assert.match(frozenOrigin[0], /\(still unrecovered\)/, 'a sticky wedge is flagged as still unrecovered');
+
+  const emptyOrigin = stagnationAlerts([
+    {
+      chain: 8453,
+      classes: {
+        persistStagnation: {
+          fail: true,
+          reason: 'wedge-unrecovered',
+          originalReason: 'one-sided-empty',
+          staleSide: 'B',
+          skewSeconds: null,
+          thresholdSeconds: 7200,
+          maxA: 12_500,
+          maxB: null,
+          tsA: 1_700_050_000,
+          tsB: null,
+        },
+      },
+    },
+  ]);
+  assert.match(
+    emptyOrigin[0],
+    /leg B has persisted NO rows for over 7200s while the other leg advances/,
+    'an empty-origin sticky wedge renders with the empty-leg wording, not the generic frozen clause',
+  );
+  assert.match(emptyOrigin[0], /\(still unrecovered\)/);
+});
+
 // ── D1: OR-composition of the verdict — the guard fires on a frozen-window PASS, windowed classes stay ─
 //
 // The WHOLE POINT of the guard: it FAILs a chain whose WINDOWED diff would read PASS (the issue #36
@@ -2363,12 +2664,16 @@ test('D1: compareChain — fired guard forces FAIL even when the windowed diff i
   assert.equal(out.classes.logs.fail, false, 'the windowed logs diff is clean');
   assert.equal(out.classes.transactions.fail, false);
 
-  // and the state to carry forward is the armed next-state — BOTH legs' ts + skew (finding 2)
-  assert.deepEqual(out.stagnationState, {
-    tsA,
-    tsB,
-    skew: 17 * 3600,
-  });
+  // and the state to carry forward is the unified evidence record — BOTH legs' ts + skew (finding 2),
+  // plus the fresh sticky wedge (D2) and no emptiness arm (both populated).
+  assert.equal(out.stagnationState.tsA, tsA);
+  assert.equal(out.stagnationState.tsB, tsB);
+  assert.equal(out.stagnationState.skew, 17 * 3600);
+  assert.equal(out.stagnationState.emptySince, null);
+  assert.ok(
+    Number.isFinite(out.stagnationState.wedgeFailedSince),
+    'a fired frozen wedge sets wedgeFailedSince (sticky, D2)',
+  );
 });
 
 test('D1: compareChain — a fired guard OR-composes to FAIL even on the NO-OVERLAP (hi<lo) PENDING path', async () => {
