@@ -21,7 +21,12 @@ import type {
   SyncLog,
   SyncTransaction,
 } from '@/internal/types.js';
-import { ndjsonLines } from './portal-client.js';
+import {
+  ndjsonLines,
+  parseSchemaFieldError,
+  readTextWithIdle,
+} from './portal-client.js';
+import { DROPPABLE_FIELDS } from './portal-filters.js';
 import { invariant } from './portal-invariant.js';
 import {
   type RawHeader,
@@ -169,8 +174,24 @@ export async function* streamHotBlocks(
 }> {
   const fetchImpl = args.fetchImpl ?? fetch;
   let cursor = args.fromBlock;
+  // Tx fields the dataset can't serve, dropped across reconnects. TX_FIELDS includes `accessList`, which is
+  // DROPPABLE (non-typed txs lack it) and which the HISTORICAL client degrades on a schema-field 400 — so a
+  // dataset historical handles fine (e.g. no access_list) must not make stream mode refuse to start. We
+  // degrade the SAME droppable tx fields here; a genuinely-unserveable (non-droppable) field stays fatal.
+  // (review B3)
+  const droppedTxFields = new Set<string>();
   for (;;) {
     if (args.signal?.aborted) return;
+    // strip any dropped tx field from the projection before building the body (the same fields the
+    // historical `stripFields` removes — keyed `transaction.<field>` in DROPPABLE_FIELDS).
+    let txFields = args.txFields;
+    if (txFields && droppedTxFields.size > 0) {
+      txFields = { ...txFields };
+      for (const key of droppedTxFields) {
+        const field = key.slice(key.indexOf('.') + 1);
+        delete txFields[field];
+      }
+    }
     const body = JSON.stringify({
       type: 'evm',
       fromBlock: cursor,
@@ -190,7 +211,7 @@ export async function* streamHotBlocks(
           transactionHash: true,
           transactionIndex: true,
         },
-        ...(args.txFields ? { transaction: args.txFields } : {}),
+        ...(txFields ? { transaction: txFields } : {}),
       },
       logs: args.txFields
         ? args.logs.map((r) => ({ ...r, transaction: true }))
@@ -213,15 +234,34 @@ export async function* streamHotBlocks(
       continue;
     } // no hot data yet; re-poll
     if (!res.ok) {
-      // A 4xx (except 429) is DETERMINISTIC — the same body will 400 forever (e.g. a dataset that can't
-      // serve a requested field). Retrying it every second is a silent, permanent tip outage; fail loud
-      // instead. 429/5xx are load — retry. Cancel the body either way so the socket doesn't leak.
-      void res.body?.cancel().catch(() => {});
-      if (res.status >= 400 && res.status < 500 && res.status !== 429)
-        throw new Error(
-          `Portal /stream rejected the realtime query (HTTP ${res.status}) — deterministic, not retried. PORTAL_REALTIME=stream cannot serve this configuration; unset it to use RPC realtime.`,
-        );
+      // A 4xx (except 429) is DETERMINISTIC — the same body will 400 forever. Retrying it every second is a
+      // silent, permanent tip outage; fail loud UNLESS it's a droppable-field 400 the historical path also
+      // degrades. 429/5xx are load — retry. (review B3)
+      if (res.status >= 400 && res.status < 500 && res.status !== 429) {
+        // Read the body (bounded, own-the-lock cancel-on-stall — a stalled 400 body can't hang forever) and
+        // parse it the SAME way the historical client does. A droppable tx field (e.g. `transaction.accessList`
+        // on a dataset with no access_list) → drop it and retry, mirroring the backfill; anything else is a
+        // genuinely-unserveable config → fatal.
+        const text = (
+          await readTextWithIdle(res, 10_000).catch(() => '')
+        ).slice(0, 300);
+        const schemaErr = parseSchemaFieldError(res.status, text, body);
+        if (
+          schemaErr &&
+          DROPPABLE_FIELDS.has(schemaErr.fieldKey) &&
+          schemaErr.tableKey === 'transaction' &&
+          droppedTxFields.has(schemaErr.fieldKey) === false
+        ) {
+          droppedTxFields.add(schemaErr.fieldKey);
+          continue; // retry immediately without the dropped field (no backoff — a config fix, not load)
+        }
 
+        throw new Error(
+          `Portal /stream rejected the realtime query (HTTP ${res.status})${schemaErr ? ` — dataset cannot serve ${schemaErr.fieldKey}` : ''} — deterministic, not retried. PORTAL_REALTIME=stream cannot serve this configuration; unset it to use RPC realtime.`,
+        );
+      }
+      // 429/5xx: load — cancel the body so the socket doesn't leak, then retry with backoff.
+      void res.body?.cancel().catch(() => {});
       await sleep(1000, args.signal);
       continue;
     }

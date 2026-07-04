@@ -1,4 +1,5 @@
 import { expect, test } from 'vitest';
+import { TX_FIELDS } from './portal-filters.js';
 import {
   type Light,
   portalRealtimeEvents,
@@ -489,4 +490,69 @@ test('streamHotBlocks: a deterministic 4xx from /stream is FATAL, not an infinit
     fetchImpl,
   });
   await expect(gen.next()).rejects.toThrow(/deterministic/);
+});
+
+test('streamHotBlocks: a DROPPABLE tx-field 400 (dataset lacks access_list) degrades like the historical path — drop the field and retry, not fatal (review B3)', async () => {
+  // TX_FIELDS projects accessList, which is DROPPABLE (non-typed txs lack it) and which the historical
+  // client degrades on a schema-field 400. Stream mode used to treat ANY non-429 4xx as fatal, so a dataset
+  // historical handles fine (no access_list) refused stream mode entirely. Now the /stream degrades the same
+  // droppable tx field and retries.
+  const textBody = (s: string) =>
+    new ReadableStream({
+      start(c) {
+        c.enqueue(new TextEncoder().encode(s));
+        c.close();
+      },
+    });
+  const bodies: any[] = [];
+  let conn = 0;
+  const fetchImpl = (async (_url: string, init: any) => {
+    bodies.push(JSON.parse(init.body));
+    conn += 1;
+    if (conn === 1)
+      // first request (with accessList) 400s exactly the way the Portal reports a missing parquet column
+      return {
+        status: 400,
+        ok: false,
+        body: textBody("column 'access_list' is not found in 'transactions'"),
+      };
+    if (conn === 2)
+      // retry (accessList dropped) succeeds and streams a block
+      return {
+        status: 200,
+        ok: true,
+        body: textBody(
+          `${JSON.stringify({
+            header: {
+              number: 100,
+              hash: 'h100',
+              parentHash: 'h99',
+              timestamp: 1,
+            },
+            logs: [],
+            transactions: [],
+          })}\n`,
+        ),
+      };
+    return { status: 204, ok: false, body: null };
+  }) as any;
+
+  const ac = new AbortController();
+  const gen = streamHotBlocks({
+    portalUrl: 'http://portal',
+    headers: {},
+    fromBlock: 100,
+    logs: [{ address: ['0xf'], topic0: ['0xt'] }],
+    txFields: TX_FIELDS,
+    fetchImpl,
+    signal: ac.signal,
+  });
+  const first = await gen.next(); // NOT a throw — the field is dropped and the retry delivers block 100
+  expect(first.value?.header.number).toBe(100);
+  // the first request carried accessList; the retry DROPPED it (kept the other tx fields)
+  expect(bodies[0].fields.transaction.accessList).toBe(true);
+  expect(bodies[1].fields.transaction.accessList).toBeUndefined();
+  expect(bodies[1].fields.transaction.hash).toBe(true); // only the droppable field was removed
+  await gen.return(undefined);
+  ac.abort();
 });
