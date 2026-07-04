@@ -417,13 +417,22 @@ export async function* portalRealtimeEvents(
 
     const block = toSyncBlockHeader(header);
     const syncLogs = logs.map((l) => toSyncLog(l, header));
+    // Dedupe parent txs by hash before emit — parity with the historical assembly's `seenTx` set (INV-2):
+    // two matched logs sharing a parent tx, or overlapping log requests, could each carry the same tx, and
+    // ponder's finalize insert must store exactly one row per hash. (review B4)
+    const seenTx = new Set<string>();
+    const syncTxs: SyncTransaction[] = [];
+    for (const t of transactions ?? []) {
+      if (t.hash !== undefined && seenTx.has(t.hash)) continue;
+
+      if (t.hash !== undefined) seenTx.add(t.hash);
+      syncTxs.push(toSyncTransaction(t, header));
+    }
     yield {
       type: 'block',
       block,
       logs: syncLogs,
-      transactions: (transactions ?? []).map((t) =>
-        toSyncTransaction(t, header),
-      ),
+      transactions: syncTxs,
       hasMatchedFilter: syncLogs.length > 0,
     };
 

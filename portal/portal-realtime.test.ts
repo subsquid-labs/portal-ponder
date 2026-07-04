@@ -130,6 +130,46 @@ test('portalRealtimeEvents: streams block events (header + logs) and emits final
   ).toBe(true);
 });
 
+test('portalRealtimeEvents: parent transactions are deduped by hash before emit (review B4)', async () => {
+  // Two matched logs sharing a parent tx (or overlapping log requests) can each carry the SAME tx in the
+  // batch; ponder's finalize insert must store exactly one row per hash. The historical assembly dedupes
+  // via `seenTx`; the realtime mapping must too.
+  const dupTx = { transactionIndex: 0, hash: '0xdup', from: '0xa', to: '0xb' };
+  const otherTx = { transactionIndex: 1, hash: '0xother', from: '0xc' };
+  const batches = [
+    {
+      header: { number: 100, hash: 'h100', parentHash: 'h99', timestamp: 1000 },
+      logs: [
+        { address: '0xv', topics: ['0xt'], data: '0x', logIndex: 0 },
+        { address: '0xv', topics: ['0xt'], data: '0x', logIndex: 1 },
+      ],
+      // 0xdup appears twice (both logs share it); 0xother once
+      transactions: [dupTx, dupTx, otherTx],
+    },
+  ];
+  const ac = new AbortController();
+  const events: any[] = [];
+  for await (const e of portalRealtimeEvents({
+    portalUrl: 'http://portal',
+    headers: {},
+    fromBlock: 100,
+    logs: [],
+    fetchImpl: mockFetch(batches, () => ac.abort()),
+    signal: ac.signal,
+    finalizedHead: async () => 0,
+    finalizePollMs: 999999,
+  })) {
+    events.push(e);
+  }
+  const block = events.find((e) => e.type === 'block');
+  expect(block).toBeDefined();
+  // exactly ONE row per hash — 0xdup collapsed from two occurrences to one, 0xother kept
+  expect(block.transactions.map((t: any) => t.hash).sort()).toEqual([
+    '0xdup',
+    '0xother',
+  ]);
+});
+
 test('portalRealtimeEvents: a re-streamed fork emits a reorg to the common ancestor', async () => {
   const batches = [
     {
