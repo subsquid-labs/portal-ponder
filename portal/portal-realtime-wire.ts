@@ -314,6 +314,14 @@ export async function* getPortalRealtimeEventGenerator(params: {
   childAddresses: Map<FactoryId, Map<Address, number>>;
   fetchImpl?: typeof fetch; // injected for tests
   finalizePollMs?: number; // injected for tests (prod: portal-realtime.ts default cadence)
+  /**
+   * Watchdog for a redelivery that never lands: after suppressing block N for its same-block child
+   * redelivery, streamHotBlocks re-opens FROM N and we await the complete N. On a HALTED chain (or any
+   * stream that never re-serves N) that await stalls SILENTLY forever. This bounds it — if the redelivery
+   * doesn't arrive within the timeout, fail loud (diagnosable) instead. Default 5 min; small values
+   * injected in tests. (recommended: redelivery watchdog)
+   */
+  redeliveryTimeoutMs?: number;
 }) {
   const { common, chain, eventCallbacks, syncProgress, childAddresses } =
     params;
@@ -363,6 +371,31 @@ export async function* getPortalRealtimeEventGenerator(params: {
   // hasn't seen N — finalizing it would mark the interval cached without N's data; the next poll
   // re-emits it) and a reorg that removes N clears the wait.
   let awaiting: { hash: string; number: number } | undefined;
+  // Redelivery watchdog: a redelivery that never lands (halted chain — the reopened stream 204s forever, so
+  // no event ever reaches this loop to trip a per-event check) would stall SILENTLY. Arm a timer whenever we
+  // start awaiting; on expiry, record a loud fatal and ABORT the stream so the generator unwinds and rethrows
+  // it (below). Disarmed the instant the wait clears. (recommended: redelivery watchdog)
+  const redeliveryTimeoutMs = params.redeliveryTimeoutMs ?? 300_000;
+  let watchdog: ReturnType<typeof setTimeout> | undefined;
+  let watchdogError: Error | undefined;
+  const setAwaiting = (
+    v: { hash: string; number: number } | undefined,
+  ): void => {
+    awaiting = v;
+    if (watchdog !== undefined) {
+      clearTimeout(watchdog);
+      watchdog = undefined;
+    }
+    if (v !== undefined) {
+      watchdog = setTimeout(() => {
+        watchdogError = new Error(
+          `Portal realtime: block ${v.number} (${v.hash}) was suppressed for its same-block child redelivery but the /stream never re-delivered it within ${redeliveryTimeoutMs}ms — the chain may be halted or the Portal is not re-serving it. Restart to re-sync from the finalized head.`,
+        );
+        controller.abort();
+      }, redeliveryTimeoutMs);
+      watchdog.unref?.();
+    }
+  };
   // A finalize that arrives WHILE awaiting a redelivery covers a block ponder hasn't received yet, so it
   // cannot be forwarded immediately. But portalRealtimeEvents has ALREADY applied it (anchor advanced,
   // window cleared) — dropping it means no later poll re-emits it, so at endBlock=N or on a halted chain
@@ -441,7 +474,7 @@ export async function* getPortalRealtimeEventGenerator(params: {
           awaiting !== undefined &&
           ev.reorgedBlocks.some((b) => b.hash === awaiting!.hash)
         ) {
-          awaiting = undefined;
+          setAwaiting(undefined);
           heldFinalize = undefined;
         }
         // Prune reorged-out factory children from the RUNNING map (stock createRealtimeSync does this via
@@ -472,7 +505,7 @@ export async function* getPortalRealtimeEventGenerator(params: {
           throw new Error(
             `Portal realtime: awaiting redelivery of block ${awaiting.number} (${awaiting.hash}) after child discovery, but received ${blockNumber} (${ev.block.hash}) — the suppressed block would be silently skipped. Restart to re-sync from the finalized head.`,
           );
-        awaiting = undefined;
+        setAwaiting(undefined);
       }
       const discovered = discoverChildAddresses(ev.logs, factories);
       if (applyDiscovered(discovered, childAddresses, blockNumber)) {
@@ -480,7 +513,7 @@ export async function* getPortalRealtimeEventGenerator(params: {
         // NEW children in THIS block: its own logs from them were server-side filtered out on the
         // connection it arrived on. Suppress the incomplete event and await the complete redelivery
         // (streamHotBlocks re-opens from this block; converges — the child set only grows).
-        awaiting = { hash: ev.block.hash as string, number: blockNumber };
+        setAwaiting({ hash: ev.block.hash as string, number: blockNumber });
         continue;
       }
 
@@ -507,7 +540,11 @@ export async function* getPortalRealtimeEventGenerator(params: {
         return;
       }
     }
+    // The stream ended. If the redelivery watchdog fired (it aborted the stream to unwind this loop), rethrow
+    // its loud fatal — a silent stall on a never-redelivering (e.g. halted) chain becomes diagnosable.
+    if (watchdogError !== undefined) throw watchdogError;
   } finally {
+    if (watchdog !== undefined) clearTimeout(watchdog);
     controller.abort();
   }
 }

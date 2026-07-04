@@ -731,6 +731,53 @@ test('getPortalRealtimeEventGenerator: emits a monotonic finalize (above the sta
   expect(hexToNumber(finalize.block.number)).toBe(100); // > startup finalized (99) → allowed
 });
 
+test('getPortalRealtimeEventGenerator: a redelivery that never lands is bounded by a watchdog and fails loud (recommended)', async () => {
+  // Block N discovers a child and is suppressed for its same-block redelivery; streamHotBlocks re-opens
+  // FROM N. On a HALTED chain the reopened stream 204s forever, so no event reaches the wire loop to trip a
+  // per-event check — the wait would stall SILENTLY. The watchdog bounds it: after redeliveryTimeoutMs it
+  // aborts the stream and the generator rethrows a diagnosable fatal instead of hanging.
+  process.env.PORTAL_REALTIME = 'stream';
+  const factory = eulerFactory();
+  const child = '0x5555555555555555555555555555555555555555';
+  const conn1 = [
+    {
+      // block 100 creates a child → suppressed, redelivery awaited. No further connection redelivers it
+      // (mockPortalConns 204s past the last entry), simulating a halted/non-re-serving stream.
+      header: { number: 100, hash: 'h100', parentHash: 'h99', timestamp: 1000 },
+      logs: [proxyLog(child, { blockNumber: 100 })],
+    },
+  ];
+  const run = (async () => {
+    for await (const _ of getPortalRealtimeEventGenerator({
+      common: {
+        logger: { info() {}, debug() {}, warn() {}, trace() {} },
+      } as any,
+      chain: { id: 1, name: 'mainnet', portal: 'http://portal' } as any,
+      rpc: {} as any,
+      eventCallbacks: [
+        { filter: logFilter({ address: factory as any }) } as any,
+      ],
+      syncProgress: {
+        finalized: {
+          number: '0x63',
+          hash: 'h99',
+          parentHash: 'h98',
+          timestamp: '0x1',
+        } as any,
+        end: { number: '0x66' } as any,
+      },
+      childAddresses: new Map<string, Map<Address, number>>([
+        ['euler-factory', new Map()],
+      ]),
+      fetchImpl: mockPortalConns([conn1], 0),
+      redeliveryTimeoutMs: 50, // tiny watchdog: the redelivery never comes → fail loud fast
+    })) {
+      /* drain */
+    }
+  })();
+  await expect(run).rejects.toThrow(/never re-delivered it within/i);
+});
+
 // like mockPortalConns but the /finalized-head carries the canonical HASH (arms the wrong-fork guard and
 // lets a finalize land at the exact height) — used for the held-finalize-during-redelivery case.
 function mockPortalConnsWithHead(
