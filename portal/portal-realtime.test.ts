@@ -20,22 +20,26 @@ const L = (number: number, hash: string, parentHash: string): Light => ({
   timestamp: number,
 });
 
-test('reconcile: append extends the tip (and the empty chain)', () => {
-  expect(reconcile([], L(10, 'a', 'z'))).toEqual({ kind: 'append' });
+// The reconcile anchor is REQUIRED since wave 4 (the optional blind-append legacy mode is gone);
+// A9 is the finalized block below these windows' base.
+const A9 = L(9, 'z', 'y');
+
+test('reconcile: append extends the tip (and the anchored empty chain)', () => {
+  expect(reconcile([], L(10, 'a', 'z'), A9)).toEqual({ kind: 'append' });
   expect(
-    reconcile([L(10, 'a', 'z'), L(11, 'b', 'a')], L(12, 'c', 'b')),
+    reconcile([L(10, 'a', 'z'), L(11, 'b', 'a')], L(12, 'c', 'b'), A9),
   ).toEqual({ kind: 'append' });
 });
 
 test('reconcile: duplicate tip is idempotent (re-delivery)', () => {
   expect(
-    reconcile([L(10, 'a', 'z'), L(11, 'b', 'a')], L(11, 'b', 'a')),
+    reconcile([L(10, 'a', 'z'), L(11, 'b', 'a')], L(11, 'b', 'a'), A9),
   ).toEqual({ kind: 'duplicate' });
 });
 
 test('reconcile: reorg forks off an earlier common ancestor, reorged blocks after it', () => {
   const chain = [L(10, 'a', 'z'), L(11, 'b', 'a'), L(12, 'c', 'b')];
-  const r = reconcile(chain, L(11, 'b2', 'a')); // 11' whose parent is block 10 (a)
+  const r = reconcile(chain, L(11, 'b2', 'a'), A9); // 11' whose parent is block 10 (a)
   expect(r.kind).toBe('reorg');
   if (r.kind === 'reorg') {
     expect(r.commonAncestor.hash).toBe('a');
@@ -45,7 +49,7 @@ test('reconcile: reorg forks off an earlier common ancestor, reorged blocks afte
 
 test('reconcile: deep-fork reorg to the base', () => {
   const chain = [L(10, 'a', 'z'), L(11, 'b', 'a'), L(12, 'c', 'b')];
-  const r = reconcile(chain, L(13, 'd2', 'a')); // parent jumps back to block 10
+  const r = reconcile(chain, L(13, 'd2', 'a'), A9); // parent jumps back to block 10
   expect(r.kind).toBe('reorg');
   if (r.kind === 'reorg')
     expect(r.reorgedBlocks.map((b) => b.hash)).toEqual(['b', 'c']);
@@ -53,7 +57,7 @@ test('reconcile: deep-fork reorg to the base', () => {
 
 test('reconcile: gap when the parent is unknown (beyond our window)', () => {
   expect(
-    reconcile([L(10, 'a', 'z'), L(11, 'b', 'a')], L(20, 'x', 'unknown')),
+    reconcile([L(10, 'a', 'z'), L(11, 'b', 'a')], L(20, 'x', 'unknown'), A9),
   ).toEqual({ kind: 'gap' });
 });
 
@@ -116,10 +120,11 @@ test('portalRealtimeEvents: streams block events (header + logs) and emits final
     portalUrl: 'http://portal',
     headers: {},
     fromBlock: 100,
+    anchor: L(99, 'h99', 'h98'),
     logs: [],
     fetchImpl: mockFetch(batches, () => ac.abort()),
     signal: ac.signal,
-    finalizedHead: async () => 100,
+    finalizedHead: async () => ({ number: 100 }),
     finalizePollMs: 0,
   })) {
     events.push(e);
@@ -158,10 +163,11 @@ test('portalRealtimeEvents: parent transactions are deduped by hash before emit 
     portalUrl: 'http://portal',
     headers: {},
     fromBlock: 100,
+    anchor: L(99, 'h99', 'h98'),
     logs: [],
     fetchImpl: mockFetch(batches, () => ac.abort()),
     signal: ac.signal,
-    finalizedHead: async () => 0,
+    finalizedHead: async () => ({ number: 0 }),
     finalizePollMs: 999999,
   })) {
     events.push(e);
@@ -196,10 +202,11 @@ test('portalRealtimeEvents: a re-streamed fork emits a reorg to the common ances
     portalUrl: 'http://portal',
     headers: {},
     fromBlock: 10,
+    anchor: L(9, 'z', 'y'),
     logs: [],
     fetchImpl: mockFetch(batches, () => ac.abort()),
     signal: ac.signal,
-    finalizedHead: async () => 0,
+    finalizedHead: async () => ({ number: 0 }),
     finalizePollMs: 999999,
   })) {
     events.push(e);
@@ -228,10 +235,11 @@ test('portalRealtimeEvents: an unknown-parent gap is FATAL, not silently skipped
     portalUrl: 'http://portal',
     headers: {},
     fromBlock: 10,
+    anchor: L(9, 'z', 'y'),
     logs: [],
     fetchImpl: mockFetch(batches, () => ac.abort()),
     signal: ac.signal,
-    finalizedHead: async () => 0,
+    finalizedHead: async () => ({ number: 0 }),
     finalizePollMs: 999999,
   });
   const seen: any[] = [];
@@ -965,8 +973,8 @@ test('reconcile: a depth-1 fork at the finality boundary reorgs off the ANCHOR i
     expect(r.commonAncestor.hash).toBe('a'); // the anchor is the known-safe common ancestor
     expect(r.reorgedBlocks.map((b) => b.hash)).toEqual(['b']); // the whole window is reorged
   }
-  // without the anchor this same shape was a fatal gap
-  expect(reconcile(window, L(11, 'b2', 'a')).kind).toBe('gap');
+  // under an anchor that is NOT the fork parent this same shape stays a fatal gap
+  expect(reconcile(window, L(11, 'b2', 'a'), L(8, 'w', 'v')).kind).toBe('gap');
 });
 
 // ─────────────────────────────── redelivery handshake + finalize guards ───────────────────────────────
@@ -1025,10 +1033,11 @@ test('portalRealtimeEvents: an AWAITED duplicate is re-emitted with the new logs
     portalUrl: 'http://portal',
     headers: {},
     fromBlock: 100,
+    anchor: L(99, 'h99', 'h98'),
     logs: [],
     fetchImpl: mockFetch(batches, () => ac.abort()),
     signal: ac.signal,
-    finalizedHead: async () => 0,
+    finalizedHead: async () => ({ number: 0 }),
     finalizePollMs: 999999,
     shouldRedeliver: (hash) => {
       if (awaitHash !== hash) return false;
@@ -1067,6 +1076,7 @@ test('portalRealtimeEvents: a finalize whose canonical hash mismatches the local
     portalUrl: 'http://portal',
     headers: {},
     fromBlock: 10,
+    anchor: L(9, 'z', 'y'),
     logs: [],
     fetchImpl: mockFetch(batches, () => ac.abort()),
     signal: ac.signal,
@@ -1107,6 +1117,7 @@ test('portalRealtimeEvents: a hash-carrying finalize ABOVE the local tip is DEFE
     portalUrl: 'http://portal',
     headers: {},
     fromBlock: 10,
+    anchor: L(9, 'z', 'y'),
     logs: [],
     fetchImpl: mockFetch(batches, () => ac.abort()),
     signal: ac.signal,
@@ -1169,6 +1180,7 @@ test('portalRealtimeEvents: a MOVING hash-carrying finalized head that stays ABO
     portalUrl: 'http://portal',
     headers: {},
     fromBlock: 10,
+    anchor: L(9, 'z', 'y'),
     logs: [],
     fetchImpl: unboundedFetch(10),
     signal: ac.signal,
@@ -1239,6 +1251,7 @@ test('portalRealtimeEvents: a deferral that CATCHES UP clears the streak — lat
     portalUrl: 'http://portal',
     headers: {},
     fromBlock: 10,
+    anchor: L(9, 'z', 'y'),
     logs: [],
     fetchImpl: mockFetch(batches, () => ac.abort()),
     signal: ac.signal,

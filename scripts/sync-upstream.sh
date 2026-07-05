@@ -35,9 +35,10 @@ CORE="$WORK/packages/core"
 SYNC="$CORE/src/sync-historical"
 echo "▶ applying Portal layer"
 # Copy the whole Portal layer by GLOB (source + tests together) so a newly added portal-*.ts /
-# realtime-*.ts module can never be silently missed. `config.ts` (deleted) and `vite.portal.config.ts`
-# are intentionally excluded by the prefix. The vite include globs (portal*.test.ts, realtime*.test.ts)
-# already pick up any new test file, so they need no change.
+# realtime-*.ts module can never be silently missed. The realtime*.ts glob currently matches only
+# realtime-standardize.test.ts (the dead realtime.ts probe module was removed — wave 4).
+# `vite.portal.config.ts` is intentionally excluded by the prefix. The vite include globs
+# (portal*.test.ts, realtime*.test.ts) already pick up any new test file, so they need no change.
 cp "$ROOT"/portal/portal*.ts "$ROOT"/portal/realtime*.ts "$SYNC/"
 mkdir -p "$SYNC/__fixtures__"; cp "$ROOT/portal/__fixtures__/"*.json "$SYNC/__fixtures__/"
 cp "$ROOT/portal/vite.portal.config.ts" "$CORE/"

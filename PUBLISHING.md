@@ -14,8 +14,7 @@ field per chain that routes the historical backfill through SQD Portal (realtime
 - **We don't hand-maintain a fork.** This repo holds only the **Portal layer** (`portal/`): the
   `portal-*.ts` modules (an invariant-first functional core behind the `portal.ts` shell — see
   `portal/INVARIANTS.md`) + a per-version `wiring/<ver>.patch` (the 4 one-line touch-points). That's
-  the entire diff against upstream. (`portal/config.ts` is a repo-side compat-harness utility — not
-  part of the published build.)
+  the entire diff against upstream.
 - **The fork is generated.** `scripts/sync-upstream.sh <ver>` clones `ponder@<ver>`, applies the layer,
   renames the package, and builds — producing the publishable package. Tracking a new ponder version is
   "author one small patch + run the script", not "merge a fork".
