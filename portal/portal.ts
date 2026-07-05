@@ -13,8 +13,9 @@
  *   assemble→ portal-assemble    metrics  → portal-metrics     transforms   → portal-transform
  *
  * The public seam is FROZEN: `createPortalHistoricalSync({common, chain, rpc, childAddresses,
- * eventCallbacks}) : HistoricalSync`. See portal/INVARIANTS.md for the invariant catalog (INV-1…INV-15).
+ * eventCallbacks}) : HistoricalSync`. See portal/INVARIANTS.md for the invariant catalog (INV-1…INV-17).
  */
+import type { Address } from 'viem';
 import type { Common } from '@/internal/common.js';
 import type {
   Chain,
@@ -43,7 +44,7 @@ import {
 } from './portal-chunks.js';
 import { createPortalClient } from './portal-client.js';
 import { loadPortalConfig } from './portal-config.js';
-import { createDiscovery } from './portal-discovery.js';
+import { createDiscovery, type PendingFlush } from './portal-discovery.js';
 import { type ChildAddresses, compileFetchSpec } from './portal-filters.js';
 import { sharedGate } from './portal-gate.js';
 import {
@@ -569,15 +570,41 @@ export const createPortalHistoricalSync = (
       const flush = discovery.takePendingInRange(interval[0], interval[1]);
       if (flush.length > 0) {
         try {
-          await Promise.all(
-            flush.map(([factory, children]) =>
-              syncStore.insertChildAddresses({
-                factory,
-                childAddresses: children,
-                chainId: chain.id,
-              }),
-            ),
-          );
+          // INV-17 (write-side idempotence, #53): dedupe each factory's flush against the store's
+          // already-persisted rows BEFORE inserting. Upstream's `insertChildAddresses` is a plain
+          // INSERT with no ON CONFLICT and `factory_addresses` has no UNIQUE on (factory, chain,
+          // address) — so a resumed/re-run writer that re-flushes an already-persisted child set would
+          // durably DUPLICATE those rows. This is the write-side analogue of the read side's min-merge
+          // in `getChildAddresses` (LEAST semantics): keep a child only if it is not yet persisted OR
+          // is re-discovered at a STRICTLY LOWER creation block (whose lower row wins the min-merge on
+          // read). Re-flushes at an equal/higher block become no-ops, so re-inserting the same set
+          // cannot grow the table. `getChildAddresses` returns the store's min-merged map, and the
+          // fork owns only this call site (the store method is upstream), so the guard lives here.
+          const deduped: PendingFlush = [];
+          for (const [factory, children] of flush) {
+            const persisted = await syncStore.getChildAddresses({ factory });
+            let toInsert: Map<Address, number> | undefined;
+            for (const [address, block] of children) {
+              const prev = persisted.get(address);
+              if (prev !== undefined && prev <= block) continue;
+
+              if (toInsert === undefined) toInsert = new Map();
+              toInsert.set(address, block);
+            }
+            if (toInsert !== undefined) deduped.push([factory, toInsert]);
+          }
+
+          if (deduped.length > 0) {
+            await Promise.all(
+              deduped.map(([factory, children]) =>
+                syncStore.insertChildAddresses({
+                  factory,
+                  childAddresses: children,
+                  chainId: chain.id,
+                }),
+              ),
+            );
+          }
         } catch (err) {
           discovery.restorePending(flush);
           throw err;
