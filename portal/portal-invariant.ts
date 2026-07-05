@@ -2,7 +2,7 @@
  * portal-invariant.ts — runtime invariant checks.
  *
  * The Portal layer is organised around explicit, provable invariants (portal/INVARIANTS.md,
- * INV-1…INV-16). This module lets the code ASSERT them at runtime and cross-reference the
+ * INV-1…INV-17). This module lets the code ASSERT them at runtime and cross-reference the
  * catalog by id, so a violated assumption is a loud, attributable crash rather than silent
  * data corruption.
  *

@@ -1928,13 +1928,38 @@ const factoryPortalServer = () =>
     });
   });
 
-const mkFactorySyncStore = (onInsertChildren: (p: any) => void): any => ({
+// The REAL sync store keys factory_addresses by STORE IDENTITY, not by factory.id: both
+// insertChildAddresses and getChildAddresses strip { id, sourceId } and upsert/select the factories
+// row on the remaining value (sync-store/index.ts, UNIQUE (factory)). So two factories that differ
+// ONLY in id/sourceId (aliases) share ONE row-set. The mock MUST mirror this identity — keying the
+// `persisted` map by factory.id (as it did before) would hide the alias-duplicate hole INV-17 closes,
+// because two aliased factories would read into different mock buckets and each look empty.
+const storeFactoryKey = (factory: any): string => {
+  const rest: Record<string, unknown> = {};
+  for (const key of Object.keys(factory).sort()) {
+    if (key === 'id' || key === 'sourceId') continue;
+
+    rest[key] = factory[key];
+  }
+
+  return JSON.stringify(rest);
+};
+
+// `persisted` models the store's factory_addresses rows keyed by STORE IDENTITY → child → block.
+// getChildAddresses returns the upstream min-merged view; the default is an empty store (fresh
+// backfill), so callers that don't pass it behave exactly as before the write-side dedupe (#53).
+const mkFactorySyncStore = (
+  onInsertChildren: (p: any) => void,
+  persisted?: Map<string, Map<string, number>>,
+): any => ({
   insertLogs: () => {},
   insertBlocks: () => {},
   insertTransactions: () => {},
   insertTransactionReceipts: () => {},
   insertTraces: () => {},
   insertChildAddresses: (p: any) => onInsertChildren(p),
+  getChildAddresses: async ({ factory }: any) =>
+    new Map(persisted?.get(storeFactoryKey(factory)) ?? []),
 });
 
 const mkFactorySync = (
@@ -2361,6 +2386,343 @@ test('regression (FIX 2, BUG-A): an EARLY spanning-chunk fetch with requiredFact
     // pending queue was empty because discovery never ran, so insertChildAddresses was never called.
     expect(calls).toHaveLength(1);
     expect(calls[0].childAddresses.get(CHILD_ADDR)).toBe(CHILD_CREATED_AT);
+  } finally {
+    srv.close();
+  }
+});
+
+test('regression (#53, write-side idempotence): a SECOND writer re-flushing an already-persisted child set does NOT re-insert it — the store keeps exactly one row at the min block', async () => {
+  // #53: factory_addresses has no UNIQUE and insertChildAddresses is a plain INSERT, so a
+  // resumed/concurrent writer that re-flushes an already-persisted child would durably DUPLICATE the
+  // row (the campaign SIGKILL/resume run ended with all children ×2). The in-memory min-merge guard
+  // (portal-discovery.ts prev===undefined||prev>bn) suppresses re-queueing WITHIN one process, but a
+  // second live process has a FRESH discovery queue and would re-queue+re-flush from scratch. The
+  // write-side dedupe reads the store (getChildAddresses) before inserting and drops any child already
+  // persisted at an equal/lower block — the write-side analogue of read-side LEAST. Modelled here as
+  // two independent syncs over one store: writer 1 discovers+persists; writer 2 (fresh queue) rediscovers
+  // the SAME child and must insert NOTHING.
+  const srv = factoryPortalServer();
+  const p: number = await new Promise((r) =>
+    srv.listen(0, () => r((srv.address() as AddressInfo).port)),
+  );
+  try {
+    const factory = mkFactory();
+    const filter = mkFactoryFilter(factory);
+    const interval: [number, number] = [0, FACTORY_RANGE_END];
+
+    // the shared store: getChildAddresses reads it, and each insert commits into it (min-merge, like
+    // upstream), so a duplicate re-insert would show up as a second write on the same child.
+    const store = new Map<string, Map<string, number>>();
+    const writes: any[] = [];
+    const commit = (x: any) => {
+      writes.push(x);
+      const key = storeFactoryKey(x.factory);
+      let rows = store.get(key);
+      if (rows === undefined) {
+        rows = new Map();
+        store.set(key, rows);
+      }
+      for (const [addr, block] of x.childAddresses as Map<string, number>) {
+        const prev = rows.get(addr);
+        if (prev === undefined || prev > block) rows.set(addr, block);
+      }
+    };
+
+    // writer 1: fresh backfill discovers CHILD_ADDR@100 and persists it (one write).
+    const w1 = mkFactorySync(
+      p,
+      factory,
+      filter,
+      new Map([[factory.id, new Map()]]),
+    );
+    await w1.syncBlockRangeData({
+      interval,
+      requiredIntervals: [{ interval, filter }],
+      requiredFactoryIntervals: [{ interval, factory }],
+      syncStore: mkFactorySyncStore(commit, store),
+    });
+    expect(writes).toHaveLength(1);
+    expect([
+      ...(store.get(storeFactoryKey(factory)) as Map<string, number>),
+    ]).toEqual([[CHILD_ADDR, CHILD_CREATED_AT]]);
+
+    // writer 2: an independent process with an EMPTY in-memory queue (childAddresses fresh) rediscovers
+    // the SAME child over the SAME range. Its in-memory guard does not suppress it — only the store-side
+    // dedupe can. THE REGRESSION: no second write, so the store still has exactly one row at the min block.
+    const w2 = mkFactorySync(
+      p,
+      factory,
+      filter,
+      new Map([[factory.id, new Map()]]),
+    );
+    await w2.syncBlockRangeData({
+      interval,
+      requiredIntervals: [{ interval, filter }],
+      requiredFactoryIntervals: [{ interval, factory }],
+      syncStore: mkFactorySyncStore(commit, store),
+    });
+    expect(writes).toHaveLength(1); // the second flush was fully deduped — no insertChildAddresses call
+    expect([
+      ...(store.get(storeFactoryKey(factory)) as Map<string, number>),
+    ]).toEqual([[CHILD_ADDR, CHILD_CREATED_AT]]);
+  } finally {
+    srv.close();
+  }
+});
+
+test('regression (#53, write-side idempotence): a re-discovery at a STRICTLY LOWER creation block is re-inserted so read-side LEAST resolves to the min (equal/higher blocks stay deduped)', async () => {
+  // The dedupe mirrors LEAST, not DO-NOTHING: a child re-found at a lower creation block than the one
+  // already persisted MUST be inserted (its lower row wins the read-side min-merge). Dropping it (as a
+  // blanket "already present → skip" would) could leave the store pinned at a too-high creation block,
+  // which read-side getChildAddresses would then report — the exact loss DO-NOTHING risks (#53 §2).
+  const srv = factoryPortalServer();
+  const p: number = await new Promise((r) =>
+    srv.listen(0, () => r((srv.address() as AddressInfo).port)),
+  );
+  try {
+    const factory = mkFactory();
+    const filter = mkFactoryFilter(factory);
+    const interval: [number, number] = [0, FACTORY_RANGE_END];
+    const writes: any[] = [];
+
+    // store pre-seeded (by STORE IDENTITY) with the child at a LATER block (200) than its real creation
+    // (100). Discovery rediscovers it at 100 < 200 → the write-side dedupe keeps it (strictly-lower) and
+    // re-inserts.
+    const store = new Map<string, Map<string, number>>([
+      [storeFactoryKey(factory), new Map([[CHILD_ADDR, 200]])],
+    ]);
+    const sync = mkFactorySync(
+      p,
+      factory,
+      filter,
+      new Map([[factory.id, new Map()]]),
+    );
+    await sync.syncBlockRangeData({
+      interval,
+      requiredIntervals: [{ interval, filter }],
+      requiredFactoryIntervals: [{ interval, factory }],
+      syncStore: mkFactorySyncStore((x) => writes.push(x), store),
+    });
+
+    expect(writes).toHaveLength(1);
+    expect(writes[0].childAddresses.get(CHILD_ADDR)).toBe(CHILD_CREATED_AT); // the lower block, re-inserted
+  } finally {
+    srv.close();
+  }
+});
+
+test('regression (#53, alias-hole): two sources whose factories differ ONLY in id/sourceId (store aliases) discovering the same child in one interval end with EXACTLY ONE store row — not two', async () => {
+  // The store keys factory_addresses by STORE IDENTITY (factory minus id/sourceId; sync-store/index.ts
+  // strips both and upserts the factories row by the remaining value under UNIQUE (factory)). So two
+  // sources sharing one factory contract — identical fields, different id/sourceId — map to ONE row-set.
+  // The INV-17 guard reads ALL pending factories, THEN inserts ALL. Keyed per factory.id (its state
+  // before this fix), the two aliases would each getChildAddresses the SAME (empty) row-set, both read
+  // absence, and BOTH insertChildAddresses the same child — a durable duplicate the guard exists to
+  // prevent. Canonicalizing the flush by store identity collapses them to one read + one insert.
+  const srv = factoryPortalServer();
+  const p: number = await new Promise((r) =>
+    srv.listen(0, () => r((srv.address() as AddressInfo).port)),
+  );
+  try {
+    // A and B are the SAME factory to the store: every field equal except id/sourceId.
+    const factoryA = mkFactory();
+    const factoryB = {
+      ...mkFactory(),
+      id: 'factory_evault_2',
+      sourceId: 'evault2',
+    };
+    expect(storeFactoryKey(factoryA)).toBe(storeFactoryKey(factoryB)); // same store row
+    expect(factoryA.id).not.toBe(factoryB.id); // distinct sources
+    const filterA = mkFactoryFilter(factoryA);
+    const filterB = mkFactoryFilter(factoryB);
+    const interval: [number, number] = [0, FACTORY_RANGE_END];
+
+    // one store, min-merged like upstream, keyed by store identity.
+    const store = new Map<string, Map<string, number>>();
+    const writes: any[] = [];
+    const commit = (x: any) => {
+      writes.push(x);
+      const key = storeFactoryKey(x.factory);
+      let rows = store.get(key);
+      if (rows === undefined) {
+        rows = new Map();
+        store.set(key, rows);
+      }
+      for (const [addr, block] of x.childAddresses as Map<string, number>) {
+        const prev = rows.get(addr);
+        if (prev === undefined || prev > block) rows.set(addr, block);
+      }
+    };
+
+    // ONE sync process configured with BOTH aliased factory sources (a legal user config). Discovery
+    // keys pendingChildren by the factory object, so both A and B produce a flush entry for the same
+    // child in the same interval.
+    const sync = createPortalHistoricalSync({
+      common: {
+        logger: { debug() {}, info() {}, warn() {}, error() {}, trace() {} },
+      },
+      chain: { id: 1, name: 'mainnet', portal: `http://localhost:${p}` },
+      childAddresses: new Map([
+        [factoryA.id, new Map()],
+        [factoryB.id, new Map()],
+      ]),
+      eventCallbacks: [{ filter: filterA }, { filter: filterB }],
+    } as any);
+
+    await sync.syncBlockRangeData({
+      interval,
+      requiredIntervals: [
+        { interval, filter: filterA },
+        { interval, filter: filterB },
+      ],
+      requiredFactoryIntervals: [
+        { interval, factory: factoryA },
+        { interval, factory: factoryB },
+      ],
+      syncStore: mkFactorySyncStore(commit, store),
+    });
+
+    // THE REGRESSION: the two aliases were canonicalized to one store row, so the child is inserted
+    // once — EXACTLY ONE row. Before the fix, both aliases read the empty row-set and each inserted,
+    // leaving the child ×2.
+    const rows = store.get(storeFactoryKey(factoryA)) as Map<string, number>;
+    expect([...rows]).toEqual([[CHILD_ADDR, CHILD_CREATED_AT]]);
+    let total = 0;
+    for (const x of writes)
+      total += (x.childAddresses as Map<string, number>).size;
+    expect(total).toBe(1); // one child inserted across all writes — not two
+  } finally {
+    srv.close();
+  }
+});
+
+test('regression (#53, case-normalization): a CHECKSUMMED pre-existing store row is deduped against the lowercased discovered child — the guard normalizes case before comparing', async () => {
+  // getChildAddresses returns stored address text VERBATIM and min-merges case-SENSITIVELY, while
+  // portal discovery lowercases every child and upstream runtime matching lowercases its lookups. If
+  // the guard compared verbatim, a checksummed pre-existing row would NOT match the lowercase discovered
+  // child, so the child would be re-inserted at the SAME block — a durable duplicate under a different
+  // case. Normalizing the persisted map to lowercase closes it.
+  const srv = factoryPortalServer();
+  const p: number = await new Promise((r) =>
+    srv.listen(0, () => r((srv.address() as AddressInfo).port)),
+  );
+  try {
+    const factory = mkFactory();
+    const filter = mkFactoryFilter(factory);
+    const interval: [number, number] = [0, FACTORY_RANGE_END];
+    const writes: any[] = [];
+
+    // pre-seed the store with the SAME child at the SAME creation block but CHECKSUMMED (mixed case).
+    // Discovery re-finds it lowercase at CHILD_CREATED_AT; the guard must treat them as the same row.
+    const checksummed = ('0x' + 'C1'.repeat(20)) as any;
+    expect(checksummed.toLowerCase()).toBe(CHILD_ADDR); // same address, different case
+    const store = new Map<string, Map<string, number>>([
+      [storeFactoryKey(factory), new Map([[checksummed, CHILD_CREATED_AT]])],
+    ]);
+    const sync = mkFactorySync(
+      p,
+      factory,
+      filter,
+      new Map([[factory.id, new Map()]]),
+    );
+    await sync.syncBlockRangeData({
+      interval,
+      requiredIntervals: [{ interval, filter }],
+      requiredFactoryIntervals: [{ interval, factory }],
+      syncStore: mkFactorySyncStore((x) => writes.push(x), store),
+    });
+
+    // THE REGRESSION: the checksummed persisted row is normalized and matched → equal block → no insert.
+    expect(writes).toHaveLength(0);
+  } finally {
+    srv.close();
+  }
+});
+
+test('regression (#21, INV-15 gate): a factory creation log BELOW factory.fromBlock is neither recorded in childAddresses nor queued/flushed (isLogFactoryMatched floor gate)', async () => {
+  // INV-15's interval-scoped flush is lossless only because scanWindow delegates creation-log matching
+  // to ponder's isLogFactoryMatched, which rejects any creation log below factory.fromBlock. A child
+  // "created" below the floor must never enter childAddresses or the pending queue — otherwise the
+  // min-merge guard would also suppress re-queueing at its in-range creation block, and the child would
+  // sit in memory forever, never persisted while its factory interval is marked cached (a restart loss).
+  // This pins the silent dependence: if the matcher seam is ever bypassed, the test fails loud. (#21 §1)
+  const factory = { ...mkFactory(), fromBlock: 100 }; // floor at 100 — a child "created" at 50 is sub-floor
+  const filter = { ...mkFactoryFilter(factory), fromBlock: 100 };
+  const BELOW_FLOOR_CHILD = '0x' + 'bf'.repeat(20);
+
+  // a Portal that emits a ProxyCreated log at block 50 (below the factory floor) for discovery requests.
+  const srv = http.createServer((req, res) => {
+    let body = '';
+    req.on('data', (c) => {
+      body += c;
+    });
+    req.on('end', () => {
+      if (req.url?.includes('finalized-head')) {
+        res.writeHead(200, { 'content-type': 'application/json' });
+        res.end(JSON.stringify({ number: 1_000_000_000 }));
+        return;
+      }
+      const q = body ? JSON.parse(body) : {};
+      const from = q.fromBlock ?? 0;
+      const to = q.toBlock ?? 1e12;
+      const isDiscovery = ((q.logs ?? []) as any[]).some((s) =>
+        (s.topic0 ?? [])
+          .map((x: string) => x.toLowerCase())
+          .includes(PROXY_CREATED_TOPIC0.toLowerCase()),
+      );
+      const out: any[] = [];
+      // emit the sub-floor creation log at 50 whenever the window covers it (the Portal has no floor
+      // knowledge — the matcher, not the source, must reject it).
+      if (isDiscovery && from <= 50 && to >= 50) {
+        out.push({
+          header: mkFactoryHeader(50),
+          logs: [
+            {
+              address: FACTORY_ADDR,
+              topics: [
+                PROXY_CREATED_TOPIC0,
+                '0x' + '00'.repeat(12) + BELOW_FLOOR_CHILD.slice(2),
+              ],
+              data: '0x',
+              transactionHash: '0x' + 'bb'.repeat(32),
+              transactionIndex: 0,
+              logIndex: 0,
+            },
+          ],
+        });
+      }
+      if (out.length === 0) {
+        res.writeHead(204).end();
+        return;
+      }
+      res.writeHead(200, { 'content-type': 'application/x-ndjson' });
+      res.end(out.map((b) => JSON.stringify(b)).join('\n') + '\n');
+    });
+  });
+  const p: number = await new Promise((r) =>
+    srv.listen(0, () => r((srv.address() as AddressInfo).port)),
+  );
+  try {
+    const calls: any[] = [];
+    const childAddresses = new Map([[factory.id, new Map<string, number>()]]);
+    const sync = mkFactorySync(p, factory, filter, childAddresses as any);
+    // The interval STARTS AT 0 (below the factory floor 100) — the per-call floor refinement
+    // (min(discFloorBlock, interval[0], …)) drags the discovery scan origin down to 0, so scanWindow
+    // ISSUES a window covering block 50 and the source DELIVERS the sub-floor creation log to the
+    // matcher. isLogFactoryMatched (factory.fromBlock=100 > 50) is the ONLY thing that discards it —
+    // pinning that gate. (Not a FIX-2 overscan test; #21 §2's floor-refinement change is left open.)
+    const interval: [number, number] = [0, FACTORY_RANGE_END];
+    await sync.syncBlockRangeData({
+      interval,
+      requiredIntervals: [{ interval, filter }],
+      requiredFactoryIntervals: [{ interval, factory }],
+      syncStore: mkFactorySyncStore((x) => calls.push(x)),
+    });
+
+    // the sub-floor child is NEITHER recorded in the in-memory map NOR flushed to the store.
+    expect(childAddresses.get(factory.id)?.has(BELOW_FLOOR_CHILD)).toBe(false);
+    expect(childAddresses.get(factory.id)?.size).toBe(0);
+    expect(calls).toHaveLength(0);
   } finally {
     srv.close();
   }
@@ -2838,6 +3200,7 @@ test('regression (FIX 1 discovery variant): a factory child CREATED in the newly
       insertTransactionReceipts: () => {},
       insertTraces: () => {},
       insertChildAddresses: () => {},
+      getChildAddresses: async () => new Map(),
     };
     const sync = createPortalHistoricalSync({
       common: {
@@ -2958,6 +3321,7 @@ test('regression: an undefined fromBlock is genesis — the [0, min) prefix of a
       insertTransactionReceipts: () => {},
       insertTraces: () => {},
       insertChildAddresses: () => {},
+      getChildAddresses: async () => new Map(),
     };
     const mkFilter = (
       sourceId: string,

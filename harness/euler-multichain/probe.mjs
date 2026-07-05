@@ -1,7 +1,8 @@
 #!/usr/bin/env node
-// Endpoint health probe for the realtime soak — evaluates each endpoint's latency / tip-freshness /
-// responsiveness. Standalone (no imports beyond node) so it survives an overnight run alongside ponder.
-// Mirrors portal/realtime.ts (unit-tested). Writes PROBE_METRICS_FILE (rolling JSON) + a .log trail.
+// Endpoint health probe for the realtime soak — polls each configured endpoint and records its
+// latency, tip-freshness (how far behind chain head it reports), and responsiveness. Standalone (no
+// imports beyond node) so it survives an overnight run alongside ponder. Writes PROBE_METRICS_FILE
+// (rolling JSON) + a .log trail.
 //
 //   REALTIME_RPC_KEY=... [SQD_RPC_KEY=...] [PROBE_INTERVAL_MS=15000] node probe.mjs
 import fs from 'node:fs';

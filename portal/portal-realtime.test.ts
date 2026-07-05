@@ -438,7 +438,7 @@ test('portalRealtimeEvents: a 1-block orphan at tip heals via 409 fork negotiati
     anchor,
     fetchImpl: mockForkFetch(conns, bodies, () => ac.abort()),
     signal: ac.signal,
-    finalizedHead: async () => 673, // floor stays at the anchor; nothing new finalizes
+    finalizedHead: async () => ({ number: 673 }), // floor stays at the anchor; nothing new finalizes
     finalizePollMs: 999999,
   })) {
     events.push(e);
@@ -884,7 +884,7 @@ test('portalRealtimeEvents: the unknown-parent gap fatal MESSAGE carries the win
     anchor,
     fetchImpl: mockFetch(batches, () => ac.abort()),
     signal: ac.signal,
-    finalizedHead: async () => 673,
+    finalizedHead: async () => ({ number: 673 }),
     finalizePollMs: 999999,
   });
   let msg = '';
