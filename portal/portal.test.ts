@@ -1928,7 +1928,24 @@ const factoryPortalServer = () =>
     });
   });
 
-// `persisted` models the store's factory_addresses rows keyed by factory.id → child → block.
+// The REAL sync store keys factory_addresses by STORE IDENTITY, not by factory.id: both
+// insertChildAddresses and getChildAddresses strip { id, sourceId } and upsert/select the factories
+// row on the remaining value (sync-store/index.ts, UNIQUE (factory)). So two factories that differ
+// ONLY in id/sourceId (aliases) share ONE row-set. The mock MUST mirror this identity — keying the
+// `persisted` map by factory.id (as it did before) would hide the alias-duplicate hole INV-17 closes,
+// because two aliased factories would read into different mock buckets and each look empty.
+const storeFactoryKey = (factory: any): string => {
+  const rest: Record<string, unknown> = {};
+  for (const key of Object.keys(factory).sort()) {
+    if (key === 'id' || key === 'sourceId') continue;
+
+    rest[key] = factory[key];
+  }
+
+  return JSON.stringify(rest);
+};
+
+// `persisted` models the store's factory_addresses rows keyed by STORE IDENTITY → child → block.
 // getChildAddresses returns the upstream min-merged view; the default is an empty store (fresh
 // backfill), so callers that don't pass it behave exactly as before the write-side dedupe (#53).
 const mkFactorySyncStore = (
@@ -1942,7 +1959,7 @@ const mkFactorySyncStore = (
   insertTraces: () => {},
   insertChildAddresses: (p: any) => onInsertChildren(p),
   getChildAddresses: async ({ factory }: any) =>
-    new Map(persisted?.get(factory.id) ?? []),
+    new Map(persisted?.get(storeFactoryKey(factory)) ?? []),
 });
 
 const mkFactorySync = (
@@ -2399,10 +2416,11 @@ test('regression (#53, write-side idempotence): a SECOND writer re-flushing an a
     const writes: any[] = [];
     const commit = (x: any) => {
       writes.push(x);
-      let rows = store.get(x.factory.id);
+      const key = storeFactoryKey(x.factory);
+      let rows = store.get(key);
       if (rows === undefined) {
         rows = new Map();
-        store.set(x.factory.id, rows);
+        store.set(key, rows);
       }
       for (const [addr, block] of x.childAddresses as Map<string, number>) {
         const prev = rows.get(addr);
@@ -2424,9 +2442,9 @@ test('regression (#53, write-side idempotence): a SECOND writer re-flushing an a
       syncStore: mkFactorySyncStore(commit, store),
     });
     expect(writes).toHaveLength(1);
-    expect([...(store.get(factory.id) as Map<string, number>)]).toEqual([
-      [CHILD_ADDR, CHILD_CREATED_AT],
-    ]);
+    expect([
+      ...(store.get(storeFactoryKey(factory)) as Map<string, number>),
+    ]).toEqual([[CHILD_ADDR, CHILD_CREATED_AT]]);
 
     // writer 2: an independent process with an EMPTY in-memory queue (childAddresses fresh) rediscovers
     // the SAME child over the SAME range. Its in-memory guard does not suppress it — only the store-side
@@ -2444,9 +2462,9 @@ test('regression (#53, write-side idempotence): a SECOND writer re-flushing an a
       syncStore: mkFactorySyncStore(commit, store),
     });
     expect(writes).toHaveLength(1); // the second flush was fully deduped — no insertChildAddresses call
-    expect([...(store.get(factory.id) as Map<string, number>)]).toEqual([
-      [CHILD_ADDR, CHILD_CREATED_AT],
-    ]);
+    expect([
+      ...(store.get(storeFactoryKey(factory)) as Map<string, number>),
+    ]).toEqual([[CHILD_ADDR, CHILD_CREATED_AT]]);
   } finally {
     srv.close();
   }
@@ -2467,10 +2485,11 @@ test('regression (#53, write-side idempotence): a re-discovery at a STRICTLY LOW
     const interval: [number, number] = [0, FACTORY_RANGE_END];
     const writes: any[] = [];
 
-    // store pre-seeded with the child at a LATER block (200) than its real creation (100). Discovery
-    // rediscovers it at 100 < 200 → the write-side dedupe keeps it (strictly-lower) and re-inserts.
+    // store pre-seeded (by STORE IDENTITY) with the child at a LATER block (200) than its real creation
+    // (100). Discovery rediscovers it at 100 < 200 → the write-side dedupe keeps it (strictly-lower) and
+    // re-inserts.
     const store = new Map<string, Map<string, number>>([
-      [factory.id, new Map([[CHILD_ADDR, 200]])],
+      [storeFactoryKey(factory), new Map([[CHILD_ADDR, 200]])],
     ]);
     const sync = mkFactorySync(
       p,
@@ -2487,6 +2506,134 @@ test('regression (#53, write-side idempotence): a re-discovery at a STRICTLY LOW
 
     expect(writes).toHaveLength(1);
     expect(writes[0].childAddresses.get(CHILD_ADDR)).toBe(CHILD_CREATED_AT); // the lower block, re-inserted
+  } finally {
+    srv.close();
+  }
+});
+
+test('regression (#53, alias-hole): two sources whose factories differ ONLY in id/sourceId (store aliases) discovering the same child in one interval end with EXACTLY ONE store row — not two', async () => {
+  // The store keys factory_addresses by STORE IDENTITY (factory minus id/sourceId; sync-store/index.ts
+  // strips both and upserts the factories row by the remaining value under UNIQUE (factory)). So two
+  // sources sharing one factory contract — identical fields, different id/sourceId — map to ONE row-set.
+  // The INV-17 guard reads ALL pending factories, THEN inserts ALL. Keyed per factory.id (its state
+  // before this fix), the two aliases would each getChildAddresses the SAME (empty) row-set, both read
+  // absence, and BOTH insertChildAddresses the same child — a durable duplicate the guard exists to
+  // prevent. Canonicalizing the flush by store identity collapses them to one read + one insert.
+  const srv = factoryPortalServer();
+  const p: number = await new Promise((r) =>
+    srv.listen(0, () => r((srv.address() as AddressInfo).port)),
+  );
+  try {
+    // A and B are the SAME factory to the store: every field equal except id/sourceId.
+    const factoryA = mkFactory();
+    const factoryB = {
+      ...mkFactory(),
+      id: 'factory_evault_2',
+      sourceId: 'evault2',
+    };
+    expect(storeFactoryKey(factoryA)).toBe(storeFactoryKey(factoryB)); // same store row
+    expect(factoryA.id).not.toBe(factoryB.id); // distinct sources
+    const filterA = mkFactoryFilter(factoryA);
+    const filterB = mkFactoryFilter(factoryB);
+    const interval: [number, number] = [0, FACTORY_RANGE_END];
+
+    // one store, min-merged like upstream, keyed by store identity.
+    const store = new Map<string, Map<string, number>>();
+    const writes: any[] = [];
+    const commit = (x: any) => {
+      writes.push(x);
+      const key = storeFactoryKey(x.factory);
+      let rows = store.get(key);
+      if (rows === undefined) {
+        rows = new Map();
+        store.set(key, rows);
+      }
+      for (const [addr, block] of x.childAddresses as Map<string, number>) {
+        const prev = rows.get(addr);
+        if (prev === undefined || prev > block) rows.set(addr, block);
+      }
+    };
+
+    // ONE sync process configured with BOTH aliased factory sources (a legal user config). Discovery
+    // keys pendingChildren by the factory object, so both A and B produce a flush entry for the same
+    // child in the same interval.
+    const sync = createPortalHistoricalSync({
+      common: {
+        logger: { debug() {}, info() {}, warn() {}, error() {}, trace() {} },
+      },
+      chain: { id: 1, name: 'mainnet', portal: `http://localhost:${p}` },
+      childAddresses: new Map([
+        [factoryA.id, new Map()],
+        [factoryB.id, new Map()],
+      ]),
+      eventCallbacks: [{ filter: filterA }, { filter: filterB }],
+    } as any);
+
+    await sync.syncBlockRangeData({
+      interval,
+      requiredIntervals: [
+        { interval, filter: filterA },
+        { interval, filter: filterB },
+      ],
+      requiredFactoryIntervals: [
+        { interval, factory: factoryA },
+        { interval, factory: factoryB },
+      ],
+      syncStore: mkFactorySyncStore(commit, store),
+    });
+
+    // THE REGRESSION: the two aliases were canonicalized to one store row, so the child is inserted
+    // once — EXACTLY ONE row. Before the fix, both aliases read the empty row-set and each inserted,
+    // leaving the child ×2.
+    const rows = store.get(storeFactoryKey(factoryA)) as Map<string, number>;
+    expect([...rows]).toEqual([[CHILD_ADDR, CHILD_CREATED_AT]]);
+    let total = 0;
+    for (const x of writes)
+      total += (x.childAddresses as Map<string, number>).size;
+    expect(total).toBe(1); // one child inserted across all writes — not two
+  } finally {
+    srv.close();
+  }
+});
+
+test('regression (#53, case-normalization): a CHECKSUMMED pre-existing store row is deduped against the lowercased discovered child — the guard normalizes case before comparing', async () => {
+  // getChildAddresses returns stored address text VERBATIM and min-merges case-SENSITIVELY, while
+  // portal discovery lowercases every child and upstream runtime matching lowercases its lookups. If
+  // the guard compared verbatim, a checksummed pre-existing row would NOT match the lowercase discovered
+  // child, so the child would be re-inserted at the SAME block — a durable duplicate under a different
+  // case. Normalizing the persisted map to lowercase closes it.
+  const srv = factoryPortalServer();
+  const p: number = await new Promise((r) =>
+    srv.listen(0, () => r((srv.address() as AddressInfo).port)),
+  );
+  try {
+    const factory = mkFactory();
+    const filter = mkFactoryFilter(factory);
+    const interval: [number, number] = [0, FACTORY_RANGE_END];
+    const writes: any[] = [];
+
+    // pre-seed the store with the SAME child at the SAME creation block but CHECKSUMMED (mixed case).
+    // Discovery re-finds it lowercase at CHILD_CREATED_AT; the guard must treat them as the same row.
+    const checksummed = ('0x' + 'C1'.repeat(20)) as any;
+    expect(checksummed.toLowerCase()).toBe(CHILD_ADDR); // same address, different case
+    const store = new Map<string, Map<string, number>>([
+      [storeFactoryKey(factory), new Map([[checksummed, CHILD_CREATED_AT]])],
+    ]);
+    const sync = mkFactorySync(
+      p,
+      factory,
+      filter,
+      new Map([[factory.id, new Map()]]),
+    );
+    await sync.syncBlockRangeData({
+      interval,
+      requiredIntervals: [{ interval, filter }],
+      requiredFactoryIntervals: [{ interval, factory }],
+      syncStore: mkFactorySyncStore((x) => writes.push(x), store),
+    });
+
+    // THE REGRESSION: the checksummed persisted row is normalized and matched → equal block → no insert.
+    expect(writes).toHaveLength(0);
   } finally {
     srv.close();
   }
