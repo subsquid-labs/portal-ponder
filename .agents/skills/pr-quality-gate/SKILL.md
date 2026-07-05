@@ -23,7 +23,7 @@ by `scripts/sync-upstream.sh`. Keep that in mind for Step 2.
 3. If tests are missing, **write them** (Step 3 conventions) before proceeding, or flag it explicitly
    in the PR body under a `## Missing tests` section.
 
-The current source ↔ test pairs are `portal.ts`, `portal-transform.ts`, `realtime.ts`,
+The current source ↔ test pairs are `portal.ts`, `portal-transform.ts`,
 `portal-realtime.ts`, `portal-realtime-wire.ts` — each with a matching `*.test.ts`.
 
 ## Step 2: Run the Portal tests (they must be green)
@@ -59,8 +59,8 @@ fixtures. Match the existing style rather than inventing utilities:
 - **Mock the Portal per test:** stand up a local `http` server or pass a `fetchImpl` stub that replays
   canned batches (see `mockPortal(...)` in `portal-realtime-wire.test.ts`). Model realistic Portal
   responses — `204`/`409`/`503`, finalized-head advances, chunk boundaries.
-- **Fixtures** live in `portal/__fixtures__/*.json` (`receipts.json`, `statediffs.json`,
-  `traces.json`), loaded with `readFileSync(join(__dirname, "__fixtures__"), ...)`.
+- **Fixtures** live in `portal/__fixtures__/*.json` (`receipts.json`, `traces.json`),
+  loaded with `readFileSync(join(__dirname, "__fixtures__"), ...)`.
 - **Matchers:** `toBe` / `toEqual` for values, `toMatch` for hex-shape checks, `toMatchInlineSnapshot`
   for large structured output. Assert against the **RPC shape** the Portal transform must reproduce
   (hex normalization, accessList shape, receipt/status fields) — that byte-for-byte parity vs RPC is
