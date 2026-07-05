@@ -6,10 +6,12 @@ import type {
   LightBlock,
   LogFilter,
 } from '@/internal/types.js';
+import { encodeCheckpoint, ZERO_CHECKPOINT } from '@/utils/checkpoint.js';
 import type { PortalRealtimeEvent } from './portal-realtime.js';
 import {
   assertStreamModeSupported,
   buildPortalLogRequests,
+  checkpointBlockNumber,
   clampFinalizedToPortalHead,
   discoverChildAddresses,
   getPortalRealtimeEventGenerator,
@@ -477,6 +479,148 @@ test('clampFinalizedToPortalHead: an explicit PORTAL_FINALIZED_HEAD pin below th
   expect(requested.method).toBe('eth_getBlockByNumber');
   expect(requested.params[0]).toBe('0x384'); // clamped to the PIN (900), not the un-probed live head
   expect(hexToNumber(out.number)).toBe(900);
+});
+
+// ─────────────────────────────── persisted-finality floor ───────────────────────────────
+
+// Shared scaffolding for the floor tests: RPC finalized at 1000, an rpc mock that records the block
+// request, and a floor passed in by the caller (as the wiring does from ponder's persisted checkpoint).
+const rpcFinalized1000 = {
+  number: '0x3e8',
+  hash: '0xh',
+  parentHash: '0xp',
+  timestamp: '0x1',
+} as LightBlock;
+const recordingRpc = (blockNumberHex: string) => {
+  const calls: any[] = [];
+  const rpc = {
+    request: async (req: any) => {
+      calls.push(req);
+      return {
+        number: blockNumberHex,
+        hash: '0xfloorblock',
+        parentHash: '0xpp',
+        timestamp: '0x2',
+        logsBloom: `0x${'0'.repeat(512)}`,
+        sha3Uncles: '0x0',
+        miner: '0x0',
+        stateRoot: '0x0',
+        transactionsRoot: '0x0',
+        receiptsRoot: '0x0',
+        gasUsed: '0x0',
+        gasLimit: '0x0',
+        extraData: '0x',
+        nonce: '0x0',
+        mixHash: '0x0',
+        difficulty: '0x0',
+        size: '0x0',
+        transactions: [],
+      };
+    },
+  } as any;
+
+  return { rpc, calls };
+};
+
+test('clampFinalizedToPortalHead: a probed head BELOW the persisted floor is clamped UP to the floor — a restart against a lagging replica must not re-stream already-finalized (unrevertable) blocks', async () => {
+  process.env.PORTAL_REALTIME = 'stream';
+  // Last run persisted finality at 950; this restart's probe hits a lagging replica reporting 900.
+  // Without the floor, realtime would stream from 901 and re-index (900, 950] — rows crash recovery
+  // cannot revert (their reorg-table rows were deleted at finalize).
+  const fetchImpl = (async () => ({
+    json: async () => ({ number: 900 }),
+  })) as any;
+  const { rpc, calls } = recordingRpc('0x3b6'); // 950
+  const out = await clampFinalizedToPortalHead({
+    chain: { portal: 'http://p', name: 'c' } as any,
+    rpc,
+    finalizedBlock: rpcFinalized1000,
+    floor: 950,
+    fetchImpl,
+  });
+  expect(calls[0]!.params[0]).toBe('0x3b6'); // the boundary block is fetched at the FLOOR (950), not 900
+  expect(hexToNumber(out.number)).toBe(950);
+});
+
+test('clampFinalizedToPortalHead: a floor at/below the probed head is inert — the head is adopted exactly as before', async () => {
+  process.env.PORTAL_REALTIME = 'stream';
+  const fetchImpl = (async () => ({
+    json: async () => ({ number: 900 }),
+  })) as any;
+  const { rpc, calls } = recordingRpc('0x384'); // 900
+  const out = await clampFinalizedToPortalHead({
+    chain: { portal: 'http://p', name: 'c' } as any,
+    rpc,
+    finalizedBlock: rpcFinalized1000,
+    floor: 900, // == head → no effect
+    fetchImpl,
+  });
+  expect(calls[0]!.params[0]).toBe('0x384'); // clamped to the head, same as the floorless behavior
+  expect(hexToNumber(out.number)).toBe(900);
+});
+
+test('clampFinalizedToPortalHead: a floor at/above the RPC finalized block returns it unchanged — the floor never RAISES the boundary past ponder’s own finality', async () => {
+  process.env.PORTAL_REALTIME = 'stream';
+  const fetchImpl = (async () => ({
+    json: async () => ({ number: 900 }),
+  })) as any;
+  const { rpc, calls } = recordingRpc('0x0');
+  const out = await clampFinalizedToPortalHead({
+    chain: { portal: 'http://p', name: 'c' } as any,
+    rpc,
+    finalizedBlock: rpcFinalized1000,
+    floor: 1_000, // floor == RPC finalized → pass-through, no block refetch
+    fetchImpl,
+  });
+  expect(out).toBe(rpcFinalized1000);
+  expect(calls.length).toBe(0);
+});
+
+test('clampFinalizedToPortalHead: the floor overrides a PORTAL_FINALIZED_HEAD pin below it — a pin below persisted finality must not re-open the double-indexing hole', async () => {
+  process.env.PORTAL_REALTIME = 'stream';
+  process.env.PORTAL_FINALIZED_HEAD = '900'; // operator pin BELOW the persisted floor 950
+  let probed = false;
+  const fetchImpl = (async () => {
+    probed = true;
+    return { json: async () => ({ number: 5000 }) };
+  }) as any;
+  const { rpc, calls } = recordingRpc('0x3b6'); // 950
+  const out = await clampFinalizedToPortalHead({
+    chain: { portal: 'http://p', name: 'c' } as any,
+    rpc,
+    finalizedBlock: rpcFinalized1000,
+    floor: 950,
+    fetchImpl,
+  });
+  expect(probed).toBe(false); // the pin still suppresses the live probe
+  expect(calls[0]!.params[0]).toBe('0x3b6'); // but the boundary is the FLOOR, not the pin
+  expect(hexToNumber(out.number)).toBe(950);
+});
+
+test('checkpointBlockNumber: decodes the block number out of a persisted checkpoint string; undefined stays undefined', () => {
+  const checkpoint = encodeCheckpoint({
+    ...ZERO_CHECKPOINT,
+    blockTimestamp: 1_700_000_000n,
+    chainId: 1n,
+    blockNumber: 12_345n,
+  });
+  expect(checkpointBlockNumber(checkpoint, 1)).toBe(12_345);
+  expect(checkpointBlockNumber(undefined, 1)).toBeUndefined();
+});
+
+test("checkpointBlockNumber: a FOREIGN-chain checkpoint yields NO floor — omnichain finalize writes the omnichain checkpoint verbatim to every chain's row, so its block height is another chain's", () => {
+  // finalizeOmnichain updates PONDER_CHECKPOINT with no per-chain where clause: chain 1's row can carry
+  // a checkpoint encoding chain 8453's block height. Used as chain 1's floor it either disables the
+  // Portal-head clamp (foreign height above the local RPC finalized → the stream-mode stale-head FATAL,
+  // a crash-loop) or silently under-protects (foreign height below the local safe point).
+  const foreign = encodeCheckpoint({
+    ...ZERO_CHECKPOINT,
+    blockTimestamp: 1_700_000_000n,
+    chainId: 8_453n,
+    blockNumber: 99_999_999n, // a Base-scale height, nonsense on an Ethereum-scale chain
+  });
+  expect(checkpointBlockNumber(foreign, 1)).toBeUndefined();
+  expect(checkpointBlockNumber(foreign, 8_453)).toBe(99_999_999); // same chain → still a valid floor
 });
 
 // ─────────────────────────────── end-to-end generator ───────────────────────────────
