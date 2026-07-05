@@ -185,7 +185,23 @@ SQD_PONDER_TARBALL=<tarball> RPC_URL_OVERRIDE=<free-eth-rpc> \
 
 ---
 
-## 4. Chaos / resume acceptance (Layer C) — ACCEPTED 2026-07-04
+## 4. Chaos / resume acceptance (Layer C)
+
+The crash/resume evidence runs in two tiers against the same block range, each proving a distinct
+property:
+
+- **Tier 0 — PGlite, byte-identity (ACCEPTED 2026-07-04, §4.1).** A throwaway PGlite store is killed
+  and resumed until complete, then **byte-diffed** against a clean baseline. Proves `SIGKILL`
+  atomicity, restart idempotence, and byte-identical completion — but, at its parameterization, **not**
+  attributable resume-from-partial-persisted-state.
+- **Tier 1 — native Postgres, logical-digest identity + partial-resume (ACCEPTED 2026-07-05, §4.2).**
+  A crash-durable Postgres store (fsync on) is killed and resumed under **small fixed chunks** so the
+  durable store advances in a staircase; each kill's durable coverage is snapshotted, and the resumed
+  store is checked for **logical-digest** identity against a baseline. This tier **closes the gap Tier
+  0 scopes out**: it records kills landing at genuine partial durable coverage and completions that
+  resumed from partial persisted state.
+
+### 4.1 Tier 0 — PGlite byte-identity (ACCEPTED 2026-07-04)
 
 The chaos kill-loop was accepted against the campaign's acceptance criteria. Aggregate result:
 
@@ -219,6 +235,14 @@ run (`kill-loop.sh` counts kills regardless of the durable coverage present at k
 [#50](../../issues/50)). So "resume from a persisted partial `ponder_sync` state" is **plausible but
 unproven here**; what is proven is atomicity, idempotence, and byte-identical completion.
 
+> **This gap is now closed by Tier 1 (§4.2, ACCEPTED 2026-07-05).** By re-parameterizing to small
+> fixed chunks the durable store advances in a staircase, and the Postgres-tier campaign recorded
+> **155 kills at partial durable coverage** and **17 completed backfills that resumed from partial
+> persisted state** to a logically-identical final store. The Tier-0 scoping above stands as the exact
+> record of what Tier 0 *alone* proves; attributable resume-from-partial is proven below. Issue #50
+> itself (the first-commit granularity / availability shape) remains **open and unaffected** — Tier 1
+> works *around* it with small chunks rather than fixing it.
+
 Conditions: Poisson kill schedule (mean 30 s), `MIN_KILLS=2` enforced per completed backfill (a run
 that finished without being killed proves nothing about resume and is rejected), chain 1 (ethereum)
 range `[20529207, 20579207]`, build `0.16.6-sqd.2`, PGlite throwaway stores, **public** Portal +
@@ -243,6 +267,109 @@ floor — so a stale baseline or an under-killed store cannot produce a silent f
 fault-injection proxy (`harness/chaos/proxy.mjs`: 429 bursts, 5xx storms, TCP reset mid-NDJSON,
 stalls, truncated gzip, malformed lines, finalized-head freeze/regression/flap) is available for the
 adversarial-network scenarios and is unit-tested (`proxy.test.mjs`).
+
+### 4.2 Tier 1 — native Postgres, attributable resume-from-partial (ACCEPTED 2026-07-05)
+
+Tier 0 proves atomicity, idempotence, and byte-identical completion, but — because its 50k range fits
+inside one 500k chunk — it cannot witness a resume from a *persisted partial* store ([#50](../../issues/50)).
+Tier 1 was built to close exactly that gap on a **crash-durable native Postgres backend** (`fsync=on`,
+`synchronous_commit=on`, `full_page_writes=on`), re-parameterized so the durable store advances in a
+**staircase** that kills can reliably land inside.
+
+**Why Postgres, and why a logical digest.** The earlier attempt to prove partial-resume ran on PGlite,
+which runs single-user Postgres with `fsync` **off** and is **not crash-durable** under repeated
+`SIGKILL` — its WAL tears after ~6–7 kill/resume cycles ([#52](../../issues/52)), so a PGlite-backed
+campaign stops on store durability before it can accumulate acceptance counts (a finding about the
+PGlite *backend*, not the fork). Tier 1 therefore uses a real Postgres cluster and kills only the
+**ponder app process** (never the database). On a crash-durable backend, a `SIGKILL` mid-write is
+recovered by **WAL replay** on the next start, which legitimately changes the **physical bytes** on
+disk (WAL segment offsets, checkpoint records, free-space map, hint bits, page LSNs) while the
+**logical row content** is identical. A byte-compare of two datadirs would therefore be *wrong* here —
+it would flag a correctly-recovered store as different. Store identity is a deterministic **logical
+digest** over `ponder_sync` row content (`harness/chaos/pg-digest.mjs`), plus the same intervals-tile-
+exactly SQL check as Tier 0.
+
+**Parameterization (staircase-forcing).** `PORTAL_CHUNK_BLOCKS=2000`, `PORTAL_CHUNK_FIXED=1`,
+`PORTAL_READAHEAD=1` — small, fixed chunks with no read-ahead, so each chunk commits durably before
+the next is fetched and the durable store climbs in ~2k-block steps rather than 0→100% in one
+transaction. Chain 1 (ethereum) range `[20529207, 20579207]`, build `0.16.6-sqd.2`, `PORTAL_CHECKS=strict`,
+**public** Portal + **public** RPC endpoints, Poisson kill schedule (per-run mean recalibrated toward
+landing kills mid-staircase). A per-kill **coverage snapshot** records the durable coverage at each
+kill; a kill with `0 < coverage < 100%` counts as a **kill at partial coverage**, and a completion
+whose resume started from partial persisted coverage counts as a **completion-from-partial**.
+
+**The logical-digest identity, precisely.** Per table, `md5` over the ordered concatenation of
+`md5(logical_jsonb(row))`, where `logical_jsonb(row) = to_jsonb(row)` **minus any surrogate serial
+`id`**, taken under a **total, natural-key `ORDER BY`** (natural-key columns first, then the full
+logical-jsonb text as a tie-break so rows tie only when their entire content is identical). The store
+digest is `md5` over the sorted `table=perTableDigest:rowcount` lines, so table set and per-table row
+**count** both bind into the identity. Cache/wall-clock tables (`rpc_request_results`,
+`kysely_migration*`) are excluded at the table level; a listed table that is **absent** is a hard
+error (fail-closed schema shape). The baseline digest's determinism is proven by digesting the
+completed store twice and once more **after a `pg_ctl` restart** — all three identical
+(`build-baseline-pg.sh`).
+
+**Aggregate result (status = pass):**
+
+- **203 `SIGKILL`s** delivered across **242 attempted / 27 completed-and-verified** backfill runs
+  (36 runs total: **27 pass / 8 neutral / 1 fail** — see the candor notes below on the neutral and
+  fail classes).
+- **155 kills landed at partial durable coverage** (`0 < coverage < 100%`) — the evidence Tier 0
+  structurally could not produce.
+- **17 completed backfills resumed from partial persisted state** and reached a **logically-identical**
+  final store (digest byte-equal to the unkilled baseline, intervals tiling `[20529207, 20579207]`
+  exactly).
+- Zero `InvariantViolation` under `PORTAL_CHECKS=strict`; zero store-durability failures (no post-kill
+  store was ever unreadable — the crash-durability the tier set out to test).
+
+Acceptance thresholds (all cleared): kills ≥ 200 (**203**), completed-verified ≥ 25 (**27**), kills at
+partial coverage ≥ 25 (**155**), completions-from-partial ≥ 1 (**17**).
+
+**Candor — the two runs the campaign kept as evidence.** The numeric totals above are computed over
+the valid runs; two runs carry an explicit story and are worth reading in full, because the story is
+the product.
+
+- **Run 2 — kept as a `fail`; its kills excluded from the totals.** Verify found `factory_addresses`
+  at exactly **2× rows** (16 vs 8, the content identical but duplicated). Root cause was a **driver
+  defect**, not a fork defect: the kill/reap path leaked a *rogue second concurrent ponder writer*, so
+  two live writers briefly shared the store. It is retained in the run ledger as a **`fail`** (candor —
+  it is evidence about the *harness*), but its 24 kills / 23 partial-coverage kills are **excluded from
+  the acceptance totals** (a two-writer store proves nothing about single-writer resume). The driver
+  was then hardened to a single-writer **DB-boundary gate** (a `pg_stat_activity` check that refuses to
+  (re)launch while any other backend is connected to the run DB). The *store-level* lesson was real and
+  separate: `sync-store` `factory_addresses` had **no idempotence/uniqueness story**, so a second
+  writer could durably duplicate the child set → filed as [#53](../../issues/53); the write-side fix
+  **merged in [#54](../../issues/54)** (2026-07-05).
+- **Run 20 — a digest false-FAIL, reclassified to `pass`.** A `SIGKILL` rolled back a
+  `factory_addresses` flush transaction (rows gone), but the Postgres **serial `SEQUENCE`** — which is
+  **non-transactional** — had already advanced; the resume re-flushed **identical content at shifted
+  serial ids** (ids 9–16 vs the baseline's 1–8). The *original* digest hashed `to_jsonb(row)` verbatim,
+  so it bound the surrogate id and reported a mismatch on a store that had in fact resumed **perfectly**.
+  The fix makes the digest exclude surrogate serial ids and order by the natural key (see the identity
+  definition above); the selftest was extended to assert **id-shift invariance** while a block-number
+  mutation and a run-2-style duplication **still diverge** (a negative control — run 2 still fails
+  post-fix). The baseline digest was recomputed (only the two id-bearing tables' per-table digests
+  changed), and run 20 re-verified **PASS** and was reclassified. This is a **methodology finding**, not
+  a fork finding: *logical* identity must exclude non-transactional surrogate serials — a companion to
+  the WAL-replay/physical-bytes caveat that motivates the logical digest in the first place.
+
+The 8 **neutral** runs are calibration misses — completions with fewer than the required minimum kills
+(a run that finishes without being sufficiently killed proves nothing about resume and is neither a
+pass nor a fail); they contribute no kills to the totals.
+
+Repro (per the harness; the campaign loop invokes many runs to reach the aggregate counts — see §7):
+
+```bash
+# build the crash-durable baseline once (small-fixed-chunk params; proves digest determinism)
+SQD_PONDER_TARBALL=<tarball> CHAOS_APP=<pg-app> \
+CHAOS_META_MJS=harness/chaos/chaos-meta.mjs \
+  bash harness/chaos/build-baseline-pg.sh
+
+# run the Postgres-tier kill/resume campaign (Poisson kills, per-kill coverage snapshots)
+SQD_PONDER_TARBALL=<tarball> CHAOS_APP=<pg-app> \
+CHAOS_PORTAL=<public-portal-dataset> CHAOS_RPC=<public-rpc> \
+  bash harness/chaos/chaos-pg-driver.sh
+```
 
 ---
 
@@ -303,13 +430,19 @@ tolerated block numbers per table specifically to keep that audit reproducible.
 | Issue | State | Finding | Attribution / layer |
 |-------|-------|---------|---------------------|
 | [#50](../../issues/50) | OPEN | **First-durable-commit granularity.** The fork's historical path makes its first durable sync-store commit only after **full-range factory discovery + the entire first data chunk** stream (default `PORTAL_CHUNK_BLOCKS` 500k); for a range inside one chunk the durable store goes **0% → 100% in one transaction, seconds before completion**. A restart loop shorter than that window makes **zero forward progress** and re-pays discovery + chunk re-stream each cycle (upstream, which commits proportionally to a 25-block first interval, creeps forward instead). An availability/progress regression vs upstream, with a zero-progress-livelock shape under sub-window crash loops. **Correctness is unaffected**: coverage never overstates and rows+intervals still commit atomically (that invariant held under all 203 chaos kills). | Discovered by the chaos campaign (Layer C): a 60-kill Poisson run (mean 5 s) ended with a **provably byte-empty store** — every restart began from zero — root-caused to the first-commit granularity and filed as [#50](../../issues/50). |
+| [#52](../../issues/52) | OPEN | **PGlite backend is not crash-durable under repeated `SIGKILL`.** The Tier-0 store (PGlite) runs single-user Postgres with `fsync` **off**; its WAL **tears after ~6–7 kill/resume cycles** (`InitWalRecovery → StartupXLOG` abort), so a PGlite-backed campaign cannot accumulate the counts needed for attributable resume-from-partial. | A finding about the **harness backend**, not the fork: it motivated the crash-durable native-Postgres Tier 1 (§4.2). Filed as [#52](../../issues/52). |
+| [#53](../../issues/53) | OPEN (write-side fix **merged [#54](../../issues/54)**) | **`sync-store` `factory_addresses` has no idempotence/uniqueness story.** A second concurrent writer durably **duplicates the child set** (`factory_addresses` ×2, identical content). | Surfaced by Tier 1 **run 2**, whose *driver* defect leaked a rogue second concurrent writer (since fixed with a single-writer DB-boundary gate). App-invisible but it breaks store-identity tooling; the **write-side hardening merged in [#54](../../issues/54)** (2026-07-05). Run 2 is retained candidly as a `fail` (§4.2); its kills are excluded from the acceptance totals. |
+| (methodology; no issue) | RESOLVED in-harness | **Logical store identity must exclude non-transactional surrogate serials.** A `SIGKILL` can roll back a `factory_addresses` flush while the Postgres serial **`SEQUENCE`** (non-transactional) has already advanced, so a correct resume re-flushes **identical content at shifted serial ids**. A digest over `to_jsonb(row)` verbatim binds the surrogate id and **false-FAILs** a perfectly-resumed store. | Surfaced by Tier 1 **run 20** (§4.2). Fixed by digesting `to_jsonb(row)` **minus surrogate serial ids**, ordered by the natural key (`pg-digest.mjs`); selftest extended for **id-shift invariance** with block-number mutation and run-2-style duplication as negative controls; baseline recomputed; run 20 re-verified **PASS**. A companion to the WAL-replay/physical-bytes caveat (§4.2) that motivates a *logical* rather than *physical* identity. |
 
-This finding also bounds what §4 can claim: because the 50k chaos range fits inside one 500k chunk,
-the campaign's kills overwhelmingly hit an empty-or-complete durable store, so *attributable*
-resume-from-partial state was not witnessed (see §4). A **re-parameterized chaos campaign** — small
-fixed chunks (`PORTAL_CHUNK_BLOCKS` on the order of 2k) that force staircase durable commits,
+This finding (#50) is what **Tier 0** (§4.1) could not see past: because the 50k Tier-0 range fits
+inside one 500k chunk, its kills overwhelmingly hit an empty-or-complete durable store, so
+*attributable* resume-from-partial state was not witnessed there. The **re-parameterized campaign** it
+called for — small fixed chunks (`PORTAL_CHUNK_BLOCKS` 2k) that force staircase durable commits,
 per-kill coverage snapshots, and an acceptance criterion requiring kills observed with
-`0 < coverage < 100%` at restart — is queued to close that evidence gap directly.
+`0 < coverage < 100%` — **ran and closed that gap on the crash-durable Postgres backend**: see
+**Tier 1 (§4.2, ACCEPTED 2026-07-05)** — 155 kills at partial coverage, 17 completions from partial
+persisted state, logically-identical final stores. Issue #50 itself remains open and unaffected; Tier 1
+works around it with small chunks rather than fixing it.
 
 ---
 
@@ -320,11 +453,16 @@ per-kill coverage snapshots, and an acceptance criterion requiring kills observe
 - The Portal layer's invariants (INV-1 … INV-16) hold under property-based tests **on both supported
   upstream Ponder versions** (`0.16.6`, `0.15.17`), and every fix is backed by a mutation-verified
   regression test.
-- **Crash/resume is byte-safe** at the accepted chaos scale: 203 kills across 41/41 completed
-  backfills, `SIGKILL`-atomic and restart-idempotent, byte-identical to an unkilled baseline across
-  all five row families, intervals tiling exactly, zero invariant violations (§4). *Attributable*
-  resume-from-partial-persisted-state is not yet proven at this parameterization — see the
-  [#50](../../issues/50) granularity property and §4.
+- **Crash/resume is safe, and resume-from-partial-persisted-state is now proven.** Tier 0 (PGlite,
+  §4.1): 203 kills across 41/41 completed backfills, `SIGKILL`-atomic and restart-idempotent,
+  byte-identical to an unkilled baseline across all five row families, intervals tiling exactly, zero
+  invariant violations. Tier 1 (crash-durable native Postgres, §4.2, ACCEPTED 2026-07-05) closes the
+  remaining gap: with small fixed chunks the durable store advances in a staircase, and the campaign
+  recorded **155 kills at partial durable coverage** and **17 completions that resumed from partial
+  persisted state** to a **logically-identical** final store (surrogate-id-excluding digest + exact
+  interval tiling). So *attributable* resume-from-partial is evidenced today — the property Tier 0
+  alone could not witness (the [#50](../../issues/50) granularity shape, which remains open and is
+  worked around by Tier 1's small chunks, not fixed).
 - The fork-vs-stock **byte-diff plumbing** is proven end-to-end by the SMOKE cell (byte-identical
   across all five row families on public endpoints, §3.1).
 - The A/B dual-implementation soak is **actively cross-validating** the Portal path against the RPC
@@ -341,8 +479,10 @@ per-kill coverage snapshots, and an acceptance criterion requiring kills observe
   path remains experimental while #33 and the longer soak are open.
 
 Read this document as: *the mechanical byte-equality of the Portal historical-backfill path is
-strongly evidenced and its crash-resume behavior is accepted; the full multi-chain paid matrix,
-benchmark parity, and long-soak/stream GA are still in flight and are called out honestly above.*
+strongly evidenced and its crash-resume behavior is accepted — including attributable
+resume-from-partial-persisted-state on a crash-durable backend (§4.2); the full multi-chain paid
+matrix, benchmark parity, and long-soak/stream GA are still in flight and are called out honestly
+above.*
 
 ---
 
@@ -353,13 +493,25 @@ All tooling is `bash` + `node` only (no extra dependencies) and lives in this re
 | Evidence | Tool | Doc |
 |----------|------|-----|
 | Unit + invariant suite (both versions) | `scripts/sync-upstream.sh <ver> --test` | `CLAUDE.md`, `portal/INVARIANTS.md` |
-| Chaos kill-loop + resume | `harness/chaos/kill-loop.sh`, `verify-resume.sh`, `proxy.mjs` | `harness/validate/README.md` §Chaos |
+| Chaos kill-loop + resume (Tier 0, PGlite byte-diff) | `harness/chaos/kill-loop.sh`, `verify-resume.sh`, `proxy.mjs` | `harness/validate/README.md` §Chaos |
+| Chaos resume-from-partial (Tier 1, Postgres logical-digest) | `harness/chaos/chaos-pg-driver.sh`, `build-baseline-pg.sh`, `pg-ctl-chaos.sh`, `verify-resume-pg.sh`, `pg-digest.mjs`, `snapshot-coverage-pg.mjs`, `check-intervals-pg.mjs` | §4.2 (this doc); tool headers |
 | Validation matrix (fork vs stock) | `harness/validate/run-cell.sh`, `ctrl-cell.sh`, `cells.json` | `harness/validate/README.md` |
 | A/B soak differ | `harness/soak-ab/ab-diff.mjs` | `harness/validate/README.md` §Soak, `ab-diff.mjs` header |
 
 Paid cells require operator-supplied endpoints (a Portal tarball and an RPC key); the harness meters
 every request and enforces a cumulative budget guard (`harness/validate/budget.json`,
 `budget-sum.mjs`). See `harness/validate/README.md` for the full environment contract.
+
+The Tier-1 (Postgres) chaos tools are fully env-parameterized — no absolute paths are baked in.
+`SQD_PONDER_TARBALL` (the tarball under test) and `CHAOS_APP` (a Postgres-backed ponder app dir whose
+store connection string is read from `CHAOS_PG_URL`) are required; everything else defaults
+(`CHAOS_PORTAL`/`CHAOS_RPC` public endpoints, `CHAOS_FROM`/`CHAOS_TO` the range, `CHAOS_CHUNK_BLOCKS`/
+`CHAOS_CHUNK_FIXED`/`CHAOS_READAHEAD` the staircase params, `CHAOS_PGPORT`/`CHAOS_WORK` the throwaway
+cluster on a dedicated port under a scratch workspace). `pg-ctl-chaos.sh` initializes and manages that
+crash-durable, single-purpose cluster; `build-baseline-pg.sh` builds the reusable baseline (and proves
+the digest is deterministic across a `pg_ctl` restart); `chaos-pg-driver.sh` runs the campaign loop and
+also has a `selftest` mode that exercises the digest's id-shift invariance / mutation / duplication
+detection against a live cluster with no backfill. Each tool's header documents its own env contract.
 
 ---
 
