@@ -100,3 +100,33 @@ export const shouldSkipCutoverRound = <TChain>(
   chains: readonly TChain[],
   perChainSync: Map<TChain, { syncProgress: CutoverSyncProgress }>,
 ): boolean => cutoverProbeIndices(chains, perChainSync).length === 0;
+
+/**
+ * Omnichain-only refinement of `shouldSkipCutoverRound` (INV-18): the all-capped `break` in
+ * `getHistoricalEventsOmnichain` must ALSO require that no fetched-but-parked events remain.
+ *
+ * The omnichain generator parks events whose checkpoint exceeds the omnichain finalized checkpoint
+ * (`omnichainTo`) — events between that shared boundary and their own chain's higher boundary — in
+ * `pendingEvents`, to preserve cross-chain ordering. Upstream drains them via the catchup path: the
+ * cutover probe adopts a raised finalized, `isCatchup` flips true, and the next loop iteration
+ * re-filters `pendingEvents` against the advanced `omnichainTo`. Breaking out unconditionally when
+ * every chain is end-capped skips that drain; the trailing `yield { type: "pending", result: … }`
+ * then hands the parked events to realtime — which skips every end-capped chain (`syncProgress.isEnd()`),
+ * so with all chains capped those events are silently DROPPED. This bites when one chain's end
+ * checkpoint exceeds the min-over-chains finalized checkpoint (a recently-capped end alongside lagging
+ * finality on another chain).
+ *
+ * So take the all-capped break ONLY when `pendingCount === 0`. With pending non-empty, fall through to
+ * the upstream probe/catchup path unchanged — it converges: finalized advances, `omnichainTo` rises,
+ * `pendingEvents` drains, and a later round (now with empty pending) breaks.
+ *
+ * `pendingCount` is passed in (rather than reading the buffer here) to keep this helper pure and the
+ * decision unit-testable at the seam. Multichain has no pending-events mechanism and keeps plain
+ * `shouldSkipCutoverRound`.
+ */
+export const shouldSkipOmnichainCutoverRound = <TChain>(
+  chains: readonly TChain[],
+  perChainSync: Map<TChain, { syncProgress: CutoverSyncProgress }>,
+  pendingCount: number,
+): boolean =>
+  pendingCount === 0 && shouldSkipCutoverRound(chains, perChainSync);

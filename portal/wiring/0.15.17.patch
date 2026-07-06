@@ -79,10 +79,10 @@ index 32ba7a8..ca44266 100644
        const error = new RpcProviderError(
          `Invalid RPC response: 'transaction.blockNumber' (${hexToBigInt(transaction.blockNumber)}) is larger than the maximum allowed value (${PG_BIGINT_MAX}).`,
 diff --git a/packages/core/src/runtime/historical.ts b/packages/core/src/runtime/historical.ts
-index 01b6288..e6ab6f0 100644
+index 01b6288..e22986e 100644
 --- a/packages/core/src/runtime/historical.ts
 +++ b/packages/core/src/runtime/historical.ts
-@@ -14,6 +14,13 @@ import { eth_getBlockByNumber } from "@/rpc/actions.js";
+@@ -14,6 +14,14 @@ import { eth_getBlockByNumber } from "@/rpc/actions.js";
  import type { Rpc } from "@/rpc/index.js";
  import { buildEvents, decodeEvents } from "@/runtime/events.js";
  import { createHistoricalSync } from "@/sync-historical/index.js";
@@ -91,12 +91,13 @@ index 01b6288..e6ab6f0 100644
 +  cutoverProbeIndices,
 +  isEndCappedAtCutover,
 +  shouldSkipCutoverRound,
++  shouldSkipOmnichainCutoverRound,
 +} from "@/sync-historical/portal-cutover-guard.js";
 +import { clampFinalizedToPortalHead } from "@/sync-historical/portal-realtime-wire.js";
  import { type SyncStore, createSyncStore } from "@/sync-store/index.js";
  import {
    MAX_CHECKPOINT,
-@@ -316,6 +323,22 @@ export async function* getHistoricalEventsOmnichain(params: {
+@@ -316,6 +324,32 @@ export async function* getHistoricalEventsOmnichain(params: {
        yield { type: "events", result: mergeResults };
      }
  
@@ -105,8 +106,18 @@ index 01b6288..e6ab6f0 100644
 +    // probed here (a flaky RPC on such a probe delays /ready or kills a fully-indexed app with exit 75).
 +    // When EVERY chain is end-capped the whole round is a no-op — exit the cutover loop. Omnichain has NO
 +    // 30s freshness gate, so this is the only thing that stops a permanently-failing RPC blocking forever.
++    //
++    // Take the all-capped break ONLY when `pendingEvents` is empty. Parked events (checkpoint above the
++    // omnichain finalized checkpoint, held for cross-chain ordering) drain via the probe/catchup path: an
++    // unconditional break would `yield { type: "pending" }` them to realtime, which skips every end-capped
++    // chain — silently DROPPING them. With pending non-empty, fall through unchanged; it converges (finalized
++    // rises → `omnichainTo` rises → pending drains → a later empty-pending round breaks).
 +    if (
-+      shouldSkipCutoverRound(params.indexingBuild.chains, params.perChainSync)
++      shouldSkipOmnichainCutoverRound(
++        params.indexingBuild.chains,
++        params.perChainSync,
++        pendingEvents.length,
++      )
 +    ) {
 +      break;
 +    }
@@ -119,7 +130,7 @@ index 01b6288..e6ab6f0 100644
      const context = {
        logger: params.common.logger.child({ action: "refetch_finalized_block" }),
        retryNullBlockRequest: true,
-@@ -327,6 +350,14 @@ export async function* getHistoricalEventsOmnichain(params: {
+@@ -327,6 +361,14 @@ export async function* getHistoricalEventsOmnichain(params: {
        params.indexingBuild.chains.map((chain, i) => {
          const rpc = params.indexingBuild.rpcs[i]!;
  
@@ -134,13 +145,18 @@ index 01b6288..e6ab6f0 100644
          return eth_getBlockByNumber(rpc, ["latest", false], context)
            .then((latest) =>
              eth_getBlockByNumber(
-@@ -358,6 +389,23 @@ export async function* getHistoricalEventsOmnichain(params: {
+@@ -358,6 +400,28 @@ export async function* getHistoricalEventsOmnichain(params: {
        }),
      );
  
 +    // Portal stream-realtime: clamp each refetched finalized block to the Portal head (pass-through in the
 +    // A-path) so the backfill cutover never targets past the Portal head — realtime keeps serving the tip.
++    // Excluded (end-capped) chains bypass the clamp entirely: their finalized was passed through untouched
++    // above, so the clamp is a no-op by construction — and in stream mode it probes the Portal head and
++    // THROWS on an unknown head, which would drag an excluded chain back onto the cutover critical path.
 +    for (let i = 0; i < finalizedBlocks.length; i++) {
++      if (cutoverProbe.includes(i) === false) continue;
++
 +      finalizedBlocks[i] = await clampFinalizedToPortalHead({
 +        chain: params.indexingBuild.chains[i]!,
 +        rpc: params.indexingBuild.rpcs[i]!,
@@ -158,7 +174,7 @@ index 01b6288..e6ab6f0 100644
      let shouldCatchup = false;
  
      for (let i = 0; i < params.indexingBuild.chains.length; i++) {
-@@ -577,6 +625,21 @@ export async function* getHistoricalEventsMultichain(params: {
+@@ -577,6 +641,21 @@ export async function* getHistoricalEventsMultichain(params: {
      }
      lastUnfinalizedRefetch = Date.now();
  
@@ -180,7 +196,7 @@ index 01b6288..e6ab6f0 100644
      const context = {
        logger: params.common.logger.child({ action: "refetch_finalized_block" }),
        retryNullBlockRequest: true,
-@@ -588,6 +651,14 @@ export async function* getHistoricalEventsMultichain(params: {
+@@ -588,6 +667,14 @@ export async function* getHistoricalEventsMultichain(params: {
        params.indexingBuild.chains.map((chain, i) => {
          const rpc = params.indexingBuild.rpcs[i]!;
  
@@ -195,13 +211,18 @@ index 01b6288..e6ab6f0 100644
          return eth_getBlockByNumber(rpc, ["latest", false], context)
            .then((latest) =>
              eth_getBlockByNumber(
-@@ -619,6 +690,23 @@ export async function* getHistoricalEventsMultichain(params: {
+@@ -619,6 +706,28 @@ export async function* getHistoricalEventsMultichain(params: {
        }),
      );
  
 +    // Portal stream-realtime: clamp each refetched finalized block to the Portal head (pass-through in the
 +    // A-path) so the backfill cutover never targets past the Portal head — realtime keeps serving the tip.
++    // Excluded (end-capped) chains bypass the clamp entirely: their finalized was passed through untouched
++    // above, so the clamp is a no-op by construction — and in stream mode it probes the Portal head and
++    // THROWS on an unknown head, which would drag an excluded chain back onto the cutover critical path.
 +    for (let i = 0; i < finalizedBlocks.length; i++) {
++      if (cutoverProbe.includes(i) === false) continue;
++
 +      finalizedBlocks[i] = await clampFinalizedToPortalHead({
 +        chain: params.indexingBuild.chains[i]!,
 +        rpc: params.indexingBuild.rpcs[i]!,
@@ -219,7 +240,7 @@ index 01b6288..e6ab6f0 100644
      let shouldCatchup = false;
  
      for (let i = 0; i < params.indexingBuild.chains.length; i++) {
-@@ -797,6 +885,11 @@ export async function* getHistoricalEventsIsolated(params: {
+@@ -797,6 +906,11 @@ export async function* getHistoricalEventsIsolated(params: {
  
      cursor = to;
  
@@ -231,7 +252,7 @@ index 01b6288..e6ab6f0 100644
      if (Date.now() - lastUnfinalizedRefetch < 30_000) {
        break;
      }
-@@ -826,6 +919,14 @@ export async function* getHistoricalEventsIsolated(params: {
+@@ -826,6 +940,14 @@ export async function* getHistoricalEventsIsolated(params: {
          ],
          context,
        ),
@@ -246,7 +267,7 @@ index 01b6288..e6ab6f0 100644
      );
  
      const finalizedBlockNumber = hexToNumber(finalizedBlock.number);
-@@ -1234,7 +1335,9 @@ export async function* getLocalSyncGenerator(params: {
+@@ -1234,7 +1356,9 @@ export async function* getLocalSyncGenerator(params: {
      });
    }
  
