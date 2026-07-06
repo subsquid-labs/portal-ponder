@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict';
 import { execFileSync, spawnSync } from 'node:child_process';
 import { existsSync, mkdtempSync, readFileSync, rmSync } from 'node:fs';
+import net from 'node:net';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { test } from 'node:test';
@@ -116,7 +117,31 @@ function resolvePgBin() {
   return null;
 }
 
-test('CHAOS_PGPORT override brings a throwaway cluster up on the overridden port (end-to-end)', (t) => {
+// Probe a free loopback TCP port by binding to port 0 and reading the OS-assigned port, then RELEASING
+// it before returning. Hardcoding a port (this test used to pin 54987) collides when two `node --test`
+// invocations run concurrently — a hermeticity/flake risk (issue #60). The bind-then-release pattern
+// has an inherent (tiny) TOCTOU window, but it makes an accidental fixed-port collision essentially
+// impossible, which is the flake we are removing. Returns a numeric port as a string.
+function freePort() {
+  return new Promise((resolve, reject) => {
+    const srv = net.createServer();
+    srv.once('error', reject);
+    srv.listen(0, '127.0.0.1', () => {
+      const { port } = srv.address();
+      srv.close((err) => {
+        if (err) {
+          reject(err);
+
+          return;
+        }
+
+        resolve(String(port));
+      });
+    });
+  });
+}
+
+test('CHAOS_PGPORT override brings a throwaway cluster up on the overridden port (end-to-end)', async (t) => {
   const pgbin = resolvePgBin();
   if (!pgbin) {
     t.skip('no local Postgres 16 toolchain — end-to-end port check skipped');
@@ -125,7 +150,9 @@ test('CHAOS_PGPORT override brings a throwaway cluster up on the overridden port
   }
 
   const work = mkdtempSync(join(tmpdir(), 'chaos-pgport-'));
-  const port = '54987';
+  // Probe a free port (bind-then-release) rather than hardcoding — two concurrent `node --test` runs
+  // would otherwise collide on a fixed port (issue #60).
+  const port = await freePort();
   const env = {
     ...process.env,
     CHAOS_WORK: work,

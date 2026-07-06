@@ -118,6 +118,102 @@ psql_ours () {
   PGHOST="$PGSOCK" PGPORT="$PGPORT" "$PSQL" -U postgres -Atqc "$1" "${2:-postgres}"
 }
 
+# ── backend label derivation (issue #60) ──────────────────────────────────────────────────────────
+# The Postgres binaries are resolved UNPINNED (CHAOS_PGBIN / pg_config / PATH), so the aggregate
+# metadata's `backend` string must be composed from the ACTUAL server, not a literal — otherwise a run
+# against, say, PG 17 would be silently mislabeled `postgres16-fsync-on` (attribution drift, exactly
+# what tarballSha256 pinning otherwise prevents). We derive it from OBSERVED state at campaign start:
+#   - version: the LIVE cluster's server_version_num (`show server_version_num`) → major, preferred
+#     because it names the server actually under test; fall back to the resolved binary's
+#     `pg_config --version` when the cluster is not yet up at label-time;
+#   - fsync: the LIVE cluster's effective `show fsync` (on|off) when up, else the durability contract
+#     of the managed config (fsync-on — see pg-chaos.conf), so the component reflects the real value.
+# Composed as postgres<major>-fsync-<on|off>. An explicit CHAOS_BACKEND_LABEL override is honoured ONLY
+# if its postgres<major> agrees with the observed major; a mismatch is a loud, fail-closed abort (we
+# never silently mislabel). Prints the label on stdout; returns nonzero on a rejected override.
+#
+# pg_config resolution mirrors pg-ctl-chaos.sh: an explicit CHAOS_PGBIN wins, else `pg_config` on PATH.
+pg_config_bin () {
+  if [ -n "${CHAOS_PGBIN:-}" ]; then
+    echo "$CHAOS_PGBIN/pg_config"
+  else
+    echo "pg_config"
+  fi
+}
+
+# observed major version: prefer the live cluster; fall back to the resolved binary. Prints an integer,
+# or empty when neither source could be read (caller treats empty as "could not observe").
+observed_pg_major () {
+  local vnum
+  vnum="$(psql_ours 'show server_version_num' 2>/dev/null)"
+  case "$vnum" in
+    ''|*[!0-9]*) ;;                                  # not a live/parseable server_version_num
+    *)
+      # server_version_num is MMmmpp (e.g. 160009 → 16); major = value / 10000, floored.
+      echo $(( vnum / 10000 ))
+      return 0
+      ;;
+  esac
+
+  # fall back to the resolved binary: `pg_config --version` → "PostgreSQL 16.9" → 16.
+  local vline major
+  vline="$("$(pg_config_bin)" --version 2>/dev/null)"
+  major="$(printf '%s' "$vline" | grep -oE '[0-9]+' | head -1)"
+  case "$major" in
+    ''|*[!0-9]*) return 0 ;;                         # unreadable → empty (fail-closed at the caller)
+  esac
+
+  echo "$major"
+}
+
+# observed fsync component (on|off): the live cluster's effective setting when up, else the managed
+# config's durability contract (fsync-on). Prints `on` or `off`.
+observed_fsync () {
+  local f
+  f="$(psql_ours 'show fsync' 2>/dev/null)"
+  case "$f" in
+    on|off) echo "$f"; return 0 ;;
+  esac
+
+  echo on   # cluster not up at label-time; pg-chaos.conf pins fsync=on (the tier's durability contract)
+}
+
+# compose + validate the backend label from observed state, honouring an optional CHAOS_BACKEND_LABEL
+# override that MUST agree with the observed major. Prints ONLY the final label on stdout (so a caller's
+# `label="$(derive_backend_label)"` captures the label and nothing else); all diagnostics go to stderr;
+# aborts nonzero on mismatch.
+derive_backend_label () {
+  local major
+  major="$(observed_pg_major)"
+  if [ -z "$major" ]; then
+    log "✗ could not observe the Postgres major version (no live cluster and pg_config --version unreadable) — refusing to compose a backend label" >&2
+    return 2
+  fi
+
+  local fsync
+  fsync="$(observed_fsync)"
+  local observed="postgres${major}-fsync-${fsync}"
+
+  if [ -n "${CHAOS_BACKEND_LABEL:-}" ]; then
+    # the override's major must match what we observed; anything else is a mislabel we refuse to write.
+    local ov_major
+    ov_major="$(printf '%s' "$CHAOS_BACKEND_LABEL" | grep -oE '^postgres[0-9]+' | grep -oE '[0-9]+' | head -1)"
+    if [ -z "$ov_major" ]; then
+      log "✗ CHAOS_BACKEND_LABEL='$CHAOS_BACKEND_LABEL' has no postgres<major> component to validate against the observed major ($major) — ABORT" >&2
+      return 2
+    fi
+    if [ "$ov_major" != "$major" ]; then
+      log "✗ CHAOS_BACKEND_LABEL='$CHAOS_BACKEND_LABEL' (major $ov_major) does NOT match the observed Postgres major ($major) — refusing to mislabel the campaign; ABORT" >&2
+      return 2
+    fi
+
+    echo "$CHAOS_BACKEND_LABEL"
+    return 0
+  fi
+
+  echo "$observed"
+}
+
 # ── crash-safe aggregate.json writer (temp file + rename) — IDENTICAL accounting to v3 ────────────
 agg_update () {
   local patch="$1"
@@ -1486,8 +1582,15 @@ NODE
   local baseline_digest
   baseline_digest="$(node -e "try{const m=require('$BASELINE_META');process.stdout.write(String(m.digest&&m.digest.store||''))}catch{process.stdout.write('')}")"
 
+  # Derive the backend label from OBSERVED state (issue #60): the cluster is up (preflight ensured it),
+  # so this reads the live server. A rejected CHAOS_BACKEND_LABEL override aborts the campaign here,
+  # BEFORE any metadata is written — never a mislabeled record.
+  local backend_label
+  backend_label="$(derive_backend_label)" || { log "✗ backend label derivation failed — ABORT"; exit 2; }
+  log "✓ backend label (observed): $backend_label"
+
   local params_json
-  params_json="{\"from\":$FROM,\"to\":$TO,\"maxKills\":$MAX_KILLS,\"minKills\":$MIN_KILLS,\"trigger\":\"poisson\",\"targetKillsPerRun\":$TARGET_KILLS,\"meanFloorSec\":$MEAN_FLOOR,\"meanCeilSec\":$MEAN_CEIL,\"backend\":\"postgres16-fsync-on\",\"pgPort\":$PGPORT,\"storeIdentity\":\"logical-digest\",\"baselineDigest\":\"$baseline_digest\",\"tier1\":{\"chunkBlocks\":$T1_CHUNK_BLOCKS,\"chunkFixed\":$T1_CHUNK_FIXED,\"readahead\":$T1_READAHEAD}}"
+  params_json="{\"from\":$FROM,\"to\":$TO,\"maxKills\":$MAX_KILLS,\"minKills\":$MIN_KILLS,\"trigger\":\"poisson\",\"targetKillsPerRun\":$TARGET_KILLS,\"meanFloorSec\":$MEAN_FLOOR,\"meanCeilSec\":$MEAN_CEIL,\"backend\":\"$backend_label\",\"pgPort\":$PGPORT,\"storeIdentity\":\"logical-digest\",\"baselineDigest\":\"$baseline_digest\",\"tier1\":{\"chunkBlocks\":$T1_CHUNK_BLOCKS,\"chunkFixed\":$T1_CHUNK_FIXED,\"readahead\":$T1_READAHEAD}}"
   local accept_json
   accept_json="{\"kills\":$ACCEPT_KILLS,\"runs\":$ACCEPT_RUNS,\"partialCoverageKills\":$ACCEPT_PARTIAL_KILLS,\"completionsFromPartial\":$ACCEPT_COMPLETIONS_FROM_PARTIAL,\"maxRuns\":$MAX_RUNS,\"maxWallSec\":$MAX_WALL_SEC}"
 
@@ -1558,8 +1661,19 @@ NODE
   done
 }
 
+# backend-label: derive + print the backend label from observed state (issue #60), applying the same
+# CHAOS_BACKEND_LABEL override validation the campaign uses. Prints the label on success (exit 0);
+# aborts nonzero on a rejected override or when the major cannot be observed. A real entrypoint for
+# debugging and for the mutation-verified label test — it exercises the PRODUCTION helper directly.
+backend_label_cmd () {
+  local label
+  label="$(derive_backend_label)" || exit 2
+  echo "$label"
+}
+
 case "${1:-campaign}" in
   selftest) selftest ;;
   campaign) campaign ;;
-  *) echo "usage: chaos3-driver-pg.sh [campaign|selftest]"; exit 2 ;;
+  backend-label) backend_label_cmd ;;
+  *) echo "usage: chaos-pg-driver.sh [campaign|selftest|backend-label]"; exit 2 ;;
 esac

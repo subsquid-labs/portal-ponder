@@ -59,6 +59,87 @@ mkdir -p "$ART"
 
 log () { echo "[$(date -u +%Y-%m-%dT%H:%M:%SZ)] $*"; }
 
+# ── backend label derivation (issue #60) ──────────────────────────────────────────────────────────
+# The baseline metadata's `backend` must describe the ACTUAL server this baseline was built on, not a
+# literal — the binaries are resolved unpinned so a PG-17 build would otherwise be mislabeled
+# `postgres16-fsync-on`. Derive it from OBSERVED state (live cluster preferred, resolved binary as a
+# fallback); honour an optional CHAOS_BACKEND_LABEL override only when its major agrees, else abort.
+# These mirror chaos-pg-driver.sh's helpers; kept local so this script stays standalone.
+pg_config_bin () {
+  if [ -n "${CHAOS_PGBIN:-}" ]; then
+    echo "$CHAOS_PGBIN/pg_config"
+  else
+    echo "pg_config"
+  fi
+}
+
+# observed major: prefer the live cluster (PGHOST/PGPORT are exported before this is called), else the
+# resolved binary. Prints an integer, or empty when neither source is readable.
+observed_pg_major () {
+  local vnum
+  vnum="$("$PSQL" -U postgres -Atqc 'show server_version_num' postgres 2>/dev/null)"
+  case "$vnum" in
+    ''|*[!0-9]*) ;;
+    *)
+      echo $(( vnum / 10000 ))
+      return 0
+      ;;
+  esac
+
+  local vline major
+  vline="$("$(pg_config_bin)" --version 2>/dev/null)"
+  major="$(printf '%s' "$vline" | grep -oE '[0-9]+' | head -1)"
+  case "$major" in
+    ''|*[!0-9]*) return 0 ;;
+  esac
+
+  echo "$major"
+}
+
+# observed fsync (on|off): live cluster's effective setting when up, else the managed config contract.
+observed_fsync () {
+  local f
+  f="$("$PSQL" -U postgres -Atqc 'show fsync' postgres 2>/dev/null)"
+  case "$f" in
+    on|off) echo "$f"; return 0 ;;
+  esac
+
+  echo on
+}
+
+# compose + validate → prints ONLY the label on stdout (diagnostics to stderr); aborts nonzero on a
+# mismatched override.
+derive_backend_label () {
+  local major
+  major="$(observed_pg_major)"
+  if [ -z "$major" ]; then
+    log "✗ could not observe the Postgres major version — refusing to compose a backend label" >&2
+    return 2
+  fi
+
+  local fsync
+  fsync="$(observed_fsync)"
+  local observed="postgres${major}-fsync-${fsync}"
+
+  if [ -n "${CHAOS_BACKEND_LABEL:-}" ]; then
+    local ov_major
+    ov_major="$(printf '%s' "$CHAOS_BACKEND_LABEL" | grep -oE '^postgres[0-9]+' | grep -oE '[0-9]+' | head -1)"
+    if [ -z "$ov_major" ]; then
+      log "✗ CHAOS_BACKEND_LABEL='$CHAOS_BACKEND_LABEL' has no postgres<major> to validate against the observed major ($major) — ABORT" >&2
+      return 2
+    fi
+    if [ "$ov_major" != "$major" ]; then
+      log "✗ CHAOS_BACKEND_LABEL='$CHAOS_BACKEND_LABEL' (major $ov_major) does NOT match the observed Postgres major ($major) — ABORT" >&2
+      return 2
+    fi
+
+    echo "$CHAOS_BACKEND_LABEL"
+    return 0
+  fi
+
+  echo "$observed"
+}
+
 log "▶ building fresh Postgres-tier baseline → db=$BASELINE_DBNAME (chunk=$T1_CHUNK_BLOCKS fixed=$T1_CHUNK_FIXED readahead=$T1_READAHEAD)"
 [ -f "$TARBALL" ] || { log "✗ tarball not found: $TARBALL"; exit 2; }
 [ -d "$APP" ] || { log "✗ app not found: $APP"; exit 2; }
@@ -68,6 +149,12 @@ log "▶ building fresh Postgres-tier baseline → db=$BASELINE_DBNAME (chunk=$T
 bash "$CDIR/pg-ctl-chaos.sh" ensure || { log "✗ could not ensure pg cluster"; exit 1; }
 
 export PGHOST="$PGSOCK" PGPORT="$PGPORT"
+
+# derive the backend label from the now-live cluster (issue #60); a rejected CHAOS_BACKEND_LABEL
+# override aborts here, before any DB/metadata is written.
+BACKEND_LABEL="$(derive_backend_label)" || { log "✗ backend label derivation failed — ABORT"; exit 2; }
+log "✓ backend label (observed): $BACKEND_LABEL"
+
 # refuse to clobber an existing baseline (persistent evidence).
 if "$PSQL" -U postgres -Atqc "select 1 from pg_database where datname='$BASELINE_DBNAME'" postgres | grep -q 1; then
   log "✗ baseline DB $BASELINE_DBNAME already exists — refusing to overwrite (drop it first)"
@@ -154,11 +241,12 @@ TARBALL_SHA="$(sha256sum "$TARBALL" | awk '{print $1}')"
 BASELINE_META="$BASELINE_META" DIGEST="$D1" PERTABLE_JSON="$PERTABLE_JSON" \
 T1_CHUNK_BLOCKS="$T1_CHUNK_BLOCKS" T1_CHUNK_FIXED="$T1_CHUNK_FIXED" T1_READAHEAD="$T1_READAHEAD" \
 BASELINE_DBNAME="$BASELINE_DBNAME" TARBALL_SHA="$TARBALL_SHA" PGPORT="$PGPORT" \
+BACKEND_LABEL="$BACKEND_LABEL" \
 node -e '
 const fs = require("fs");
 const f = process.env.BASELINE_META;
 const m = JSON.parse(fs.readFileSync(f, "utf8"));
-m.backend = "postgres16-fsync-on";
+m.backend = process.env.BACKEND_LABEL;
 m.databaseName = process.env.BASELINE_DBNAME;
 m.pgPort = Number(process.env.PGPORT);
 m.driver = "pg";
