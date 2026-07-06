@@ -16,6 +16,9 @@
 #   BENCH_OUT_DIR        where result/manifest/metrics land (default: ./bench-out)
 #   BENCH_POLL_SECONDS   completion poll interval (default 15)  BENCH_TIMEOUT_SECONDS (default 9000)
 #   BENCH_LOAD           free-text load-conditions note recorded in the manifest
+#   BENCH_MAX_OLD_SPACE_MB  V8 --max-old-space-size for the ponder child (default 32768 — the value
+#                        every baseline run was measured with; node's ~4 GB default OOMs a 15-chain
+#                        full backfill)
 #
 #   bash harness/bench/run-flagship.sh            # full 15-chain run
 #   bash harness/bench/run-flagship.sh --smoke    # single tiny chain (polygon) — validates the shim
@@ -115,6 +118,11 @@ node -e '
 # ── launch ponder ─────────────────────────────────────────────────────────────────────────────────
 export PORTAL_METRICS_FILE="${PORTAL_METRICS_FILE:-$BENCH_OUT_DIR/portal}"
 export PONDER_LOG_LEVEL="${PONDER_LOG_LEVEL:-info}"
+# V8 heap for the ponder child. node's default (~4 GB) dies in ineffective mark-compacts partway
+# through a 15-chain full backfill; every baseline run (44m55s config-b, bench-2a) was measured
+# with --max-old-space-size=32768 inside a 16 GB cgroup, so that is the default here. The cgroup
+# (the caller's systemd-run scope) stays the real memory ceiling.
+export NODE_OPTIONS="--max-old-space-size=${BENCH_MAX_OLD_SPACE_MB:-32768}"
 if [ "$SMOKE" = "1" ]; then
   # smoke: the ONE allowed EULER_CHAINS set — a single tiny chain to validate the shim surface fast.
   export EULER_CHAINS="polygon"
