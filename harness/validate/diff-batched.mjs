@@ -261,7 +261,7 @@ export function resolveTableSpecs(strictBlocks) {
   return out;
 }
 
-// 5k, not 50k: PGlite 0.2.13's WASM allocator spins forever on a single `select *` page whose
+// 5k, not 50k (issue #63): PGlite 0.2.13's WASM allocator spins forever on a single `select *` page whose
 // toasted input runs to ~300MB (detoast volume), which a 50k-row page of the widest sync-store
 // tables hits over full-history windows; the same rows in 5k-row pages complete at ~1.5s each.
 const BATCH = 5_000;
