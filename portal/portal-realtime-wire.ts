@@ -125,19 +125,20 @@ export async function portalFinalizedHead(
   });
 }
 
-/** The block number carried by a ponder checkpoint string, or undefined when there is no checkpoint
- * OR the checkpoint belongs to ANOTHER chain. Wiring helper for `clampFinalizedToPortalHead`'s `floor`:
- * the callers hold ponder's persisted safe checkpoint (`crashRecoveryCheckpoint`) as an encoded string.
+/** The block number carried by a ponder checkpoint string when its encoded chainId is the LOCAL chain,
+ * or undefined when there is no checkpoint OR the checkpoint belongs to another chain. This is the
+ * same-chain FAST PATH of the finality floor: a same-chain checkpoint encodes THIS chain's own persisted
+ * safe block, usable verbatim. The foreign case is handled by `deriveFinalityFloor` (timestamp mapping),
+ * which calls this first and falls through when it returns undefined for a checkpoint that is present.
  *
- * The chainId guard mirrors upstream's own crash-recovery handling (`runtime/historical.ts`): in the
- * omnichain ordering `finalizeOmnichain` writes the OMNICHAIN checkpoint verbatim to every chain's row
- * (no per-chain where clause), so a row's checkpoint can encode another chain's block height — "It is
- * not an invariant that `chainId` and `checkpoint.chainId` are the same" (internal/types.ts). A foreign
- * block number is wrong as a floor in BOTH directions: above the local RPC finalized block it disables
- * the Portal-head clamp outright (the boundary lands above the Portal head — the wave-4 stream-mode
- * stale-head FATAL, a deterministic crash-loop), and below the local safe point it silently
- * under-protects. Foreign chain → NO floor (the pre-floor behavior — never worse than main; the
- * multichain/isolated orderings write per-chain checkpoints and keep full protection). */
+ * The chainId distinction mirrors upstream's own crash-recovery handling (`runtime/historical.ts`
+ * `getSafeCrashRecoveryBlock` seam): in the omnichain ordering `finalizeOmnichain` writes the OMNICHAIN
+ * checkpoint verbatim to every chain's row (no per-chain where clause), so a row's checkpoint can encode
+ * another chain's block height — "It is not an invariant that `chainId` and `checkpoint.chainId` are the
+ * same" (internal/types.ts). A foreign block NUMBER is wrong as a floor in both directions (above the
+ * local RPC finalized block it disables the Portal-head clamp — the wave-4 stream-mode stale-head FATAL;
+ * below the local safe point it under-protects), so this helper refuses it — `deriveFinalityFloor` then
+ * maps the foreign checkpoint's TIMESTAMP to a LOCAL block instead. */
 export function checkpointBlockNumber(
   checkpoint: string | undefined,
   chainId: number,
@@ -148,6 +149,62 @@ export function checkpointBlockNumber(
   if (Number(decoded.chainId) !== chainId) return undefined;
 
   return Number(decoded.blockNumber);
+}
+
+/** The sync-store lookup `deriveFinalityFloor` uses to map a FOREIGN checkpoint's timestamp to a local
+ * block — the exact seam upstream's crash recovery uses (`runtime/historical.ts` calls
+ * `createSyncStore(...).getSafeCrashRecoveryBlock({ chainId, timestamp })`). We depend on the method
+ * shape only (not the whole store) so the floor derivation stays unit-testable without a database. */
+export type SafeCrashRecoveryBlockLookup = (args: {
+  chainId: number;
+  timestamp: number;
+}) => Promise<{ number: bigint; timestamp: bigint } | undefined>;
+
+/** Derive the stream-mode finality floor from ponder's persisted safe checkpoint (`crashRecoveryCheckpoint`).
+ *
+ * SAME-CHAIN (fast path): the checkpoint encodes THIS chain's persisted safe block — use its block number
+ * verbatim (via `checkpointBlockNumber`), no store query.
+ *
+ * FOREIGN CHAIN (omnichain only): `finalizeOmnichain` wrote another chain's block height into this chain's
+ * row, so the encoded block NUMBER is meaningless locally. Instead — mirroring upstream's own
+ * `getSafeCrashRecoveryBlock` handling of a foreign crash-recovery checkpoint — map the checkpoint's
+ * TIMESTAMP to the local chain's highest block at/below it (`getSafeCrashRecoveryBlock`, which selects the
+ * greatest local block with `timestamp < checkpoint.blockTimestamp`) and floor at THAT block.
+ *
+ * DIRECTION-OF-ERROR SAFETY (the crash-loop concern #55's review raised): the mapped floor can never
+ * exceed the true local finalized height in a way that disables the Portal-head clamp. The foreign
+ * checkpoint's `blockTimestamp` is a foreign-chain FINALIZED point that was persisted alongside this
+ * chain's own finalized state (omnichain finalizes all chains to a common checkpoint), so a local block
+ * with an EARLIER timestamp was itself finalized by the time that checkpoint was written — hence at/below
+ * the local finalized height (finalized-block timestamps are monotonic per chain). The `<` (strict)
+ * comparison keeps the floor at or below, never above, the boundary the timestamp corresponds to; a floor
+ * mapped from a LATER-than-finality timestamp would risk landing above local RPC finality and tripping the
+ * stream-mode FATAL — which is exactly why we must not relax `<` to `<=`-past-finality or round UP.
+ *
+ * NO LOCAL BLOCK at/below the timestamp (empty table on a first-ever run, or a checkpoint timestamp older
+ * than every local block) → `getSafeCrashRecoveryBlock` returns undefined → NO floor (pre-#55 behavior,
+ * strictly safe: never worse than main). Ditto when no store lookup is supplied (the cutover-refetch
+ * sites derive their floor from same-run state, not a checkpoint, so they pass none). */
+export async function deriveFinalityFloor(params: {
+  checkpoint: string | undefined;
+  chainId: number;
+  getSafeCrashRecoveryBlock?: SafeCrashRecoveryBlockLookup;
+}): Promise<number | undefined> {
+  const { checkpoint, chainId } = params;
+  if (checkpoint === undefined) return undefined;
+
+  const sameChain = checkpointBlockNumber(checkpoint, chainId);
+  if (sameChain !== undefined) return sameChain;
+
+  // Foreign checkpoint: map its timestamp to a local block. Without a store lookup we cannot, so fall
+  // back to no floor (pre-#55 behavior — the same result the same-chain guard produced before #57).
+  if (params.getSafeCrashRecoveryBlock === undefined) return undefined;
+
+  const timestamp = Number(decodeCheckpoint(checkpoint).blockTimestamp);
+  const block = await params.getSafeCrashRecoveryBlock({ chainId, timestamp });
+  if (block === undefined) return undefined;
+
+  return Number(block.number);
 }
 
 /**
