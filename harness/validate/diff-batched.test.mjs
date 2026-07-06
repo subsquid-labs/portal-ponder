@@ -5,9 +5,13 @@ import {
   buildKeysetSql,
   cmpKey,
   hashRows,
+  keysetRows,
   mergeCompare,
+  nextBatchSize,
   normRow,
+  parseByteTarget,
   resolveTableSpecs,
+  rowBytes,
   SYNC_STORE_PKS,
   TABLES,
 } from './diff-batched.mjs';
@@ -338,26 +342,40 @@ test('#58 buildKeysetSql: ORDER BY + tuple-WHERE follow the chain_id-prefixed PK
   for (const [table, spec] of Object.entries(TABLES)) {
     const cols = expected[table];
 
+    // The per-page LIMIT is now byte-aware (issue #63): the caller passes it and it is the ONLY thing
+    // that varies between pages. Pin the emitted SQL against a caller-supplied limit; the cursor
+    // WHERE/ORDER BY must not depend on it.
+    const limit = 12_345;
+
     // first page: ORDER BY the PK columns, no WHERE.
-    const first = buildKeysetSql(table, spec.keys, false);
+    const first = buildKeysetSql(table, spec.keys, false, limit);
     assert.equal(
       first,
-      `select * from ponder_sync."${table}"  order by ${cols} limit 5000`,
+      `select * from ponder_sync."${table}"  order by ${cols} limit ${limit}`,
       `${table} first-page SQL must ORDER BY the chain_id-prefixed PK`,
     );
 
     // cursor page: row-wise tuple WHERE over the SAME PK columns + $-placeholders, then ORDER BY.
-    const cursor = buildKeysetSql(table, spec.keys, true);
+    const cursor = buildKeysetSql(table, spec.keys, true, limit);
     const rhs = spec.keys.map((_, i) => `$${i + 1}`).join(', ');
     assert.equal(
       cursor,
-      `select * from ponder_sync."${table}" where (${cols}) > (${rhs}) order by ${cols} limit 5000`,
+      `select * from ponder_sync."${table}" where (${cols}) > (${rhs}) order by ${cols} limit ${limit}`,
       `${table} cursor-page SQL must tuple-compare + ORDER BY the chain_id-prefixed PK`,
     );
     // the tuple LHS and the ORDER BY must lead with chain_id (the PK prefix that makes it an index scan).
     assert.ok(
       cursor.includes('("chain_id",') || cursor.includes('("chain_id")'),
       `${table} cursor tuple must lead with chain_id`,
+    );
+
+    // A DIFFERENT limit changes ONLY the trailing `limit N` — the cursor WHERE + ORDER BY are byte,
+    // for byte, identical (this is the invariant issue #63's varying page size must preserve).
+    const other = buildKeysetSql(table, spec.keys, true, 999);
+    assert.equal(
+      other.replace(/ limit \d+$/, ''),
+      cursor.replace(/ limit \d+$/, ''),
+      `${table} cursor SQL (minus the limit) must not depend on the page size`,
     );
   }
 });
@@ -432,4 +450,284 @@ test('#58 multi-chain: streamingDiff is well-defined per (chain_id, block_number
     1,
     'old key mislabels the cross-chain rows as a field mismatch',
   );
+});
+
+// ── #63 byte-aware page sizing ─────────────────────────────────────────────────────────────────
+
+// #63 — the sizing POLICY. nextBatchSize(avg, target, floor, ceiling) returns floor(target/avg)
+// clamped to [floor, ceiling]. This is the whole point of the fix: the limit ADAPTS to the observed
+// row width so the per-query payload stays near `target`, instead of a fixed row count that wedges
+// PGlite on fat tables (a 50k-row page of ~300MB detoast). MUTATION: stub nextBatchSize to a constant
+// (e.g. `return 50_000`) — the adaptation, floor, and ceiling assertions below all FAIL.
+test('#63 nextBatchSize: limit adapts to observed row width toward the byte target', () => {
+  const target = 32 * 1024 * 1024; // 32MB
+  const floor = 5_000;
+  const ceiling = 50_000;
+
+  // a slim ~200-byte row → target/avg ≈ 167k rows, clamped DOWN to the ceiling.
+  assert.equal(
+    nextBatchSize(200, target, floor, ceiling),
+    ceiling,
+    'slim rows page at the ceiling',
+  );
+
+  // a fat ~64KB row (fat calldata) → target/avg = 512 rows, clamped UP to the floor.
+  assert.equal(
+    nextBatchSize(64 * 1024, target, floor, ceiling),
+    floor,
+    'fat rows page at the floor',
+  );
+
+  // a mid-width row that lands strictly INSIDE the window must adapt, not clamp: avg=2048 →
+  // 32MB/2048 = 16384 rows, which is between floor(5000) and ceiling(50000).
+  assert.equal(
+    nextBatchSize(2048, target, floor, ceiling),
+    16_384,
+    'a mid-width row adapts to floor(target/avg), not a fixed count',
+  );
+
+  // strict monotonicity: a wider row ⇒ a smaller-or-equal limit (the adaptation direction the fix
+  // depends on — wider detoast ⇒ fewer rows per query).
+  const wide = nextBatchSize(8_000, target, floor, ceiling);
+  const wider = nextBatchSize(16_000, target, floor, ceiling);
+  assert.ok(
+    wider <= wide,
+    'a wider observed row must not produce a larger limit',
+  );
+});
+
+// #63 — the byte TARGET actually scales the limit. Doubling the target roughly doubles the row count
+// for the same observed width (while both stay inside the clamp window). MUTATION: ignore `targetBytes`
+// (e.g. hardcode the numerator) → this proportionality breaks.
+test('#63 nextBatchSize: the byte target scales the row limit', () => {
+  const avg = 4096;
+  const floor = 1;
+  const ceiling = 10_000_000;
+  const small = nextBatchSize(avg, 8 * 1024 * 1024, floor, ceiling);
+  const big = nextBatchSize(avg, 16 * 1024 * 1024, floor, ceiling);
+  assert.equal(
+    big,
+    small * 2,
+    'doubling the target doubles the adaptive limit',
+  );
+});
+
+// #63 — degenerate observations carry no width signal ⇒ fall back to the FLOOR, the conservative
+// limit that cannot wedge on an unknown-/zero-width table. This covers the first-page default (no
+// observation yet) and any pathological page (all-empty rows → avg 0; a NaN/∞ average). MUTATION:
+// return the ceiling (or `est`) on a bad input → these FAIL, and the tool would fetch a huge first
+// page on an unknown-width table (the exact wedge #63 fixes).
+test('#63 nextBatchSize: degenerate inputs (0 / NaN / -/∞) fall back to the floor', () => {
+  const target = 32 * 1024 * 1024;
+  const floor = 5_000;
+  const ceiling = 50_000;
+  for (const bad of [0, -1, Number.NaN, Number.POSITIVE_INFINITY, -1000]) {
+    assert.equal(
+      nextBatchSize(bad, target, floor, ceiling),
+      floor,
+      `degenerate avg ${bad} must fall back to the floor`,
+    );
+  }
+});
+
+// #63 — the FIRST page (no previous observation) must default to the floor. The stream starts before
+// any width is known, so the first `limit` cannot be an aggressive guess on an unknown-width table.
+// The default args make nextBatchSize() with a degenerate/absent observation return the floor.
+test('#63 nextBatchSize: first-page default (no observation) is the floor', () => {
+  // no observation is modelled as a degenerate avg; with the module defaults this is MIN_BATCH=5000.
+  assert.equal(nextBatchSize(Number.NaN), 5_000);
+  assert.equal(nextBatchSize(0), 5_000);
+});
+
+// #63 — rowBytes: a cheap, deterministic per-row width ≈ the detoast volume. Bytes columns count as
+// their RAW byte length (the fat `input` Uint8Array — its byteLength IS the detoast cost), so a fat
+// calldata row measures far wider than a slim one. Deterministic: identical rows measure identically.
+test('#63 rowBytes: bytes columns dominate the width and the measure is deterministic', () => {
+  const slim = { chain_id: 1, block_number: 100, input: new Uint8Array(4) };
+  const fat = {
+    chain_id: 1,
+    block_number: 100,
+    input: new Uint8Array(200_000),
+  };
+  assert.ok(
+    rowBytes(fat) > rowBytes(slim) + 190_000,
+    'a fat-calldata row must measure far wider than a slim one',
+  );
+  assert.equal(
+    rowBytes(fat),
+    rowBytes({ ...fat }),
+    'identical rows measure identically (deterministic)',
+  );
+  // strings count as UTF-8 byte length, bigints as decimal-digit length, null as a floor of 1.
+  const mixed = { a: 'abc', b: 123456789n, c: null };
+  assert.equal(rowBytes(mixed), 3 + 9 + 1);
+});
+
+// #63 — parseByteTarget: CLI flag beats env beats default; junk falls through to the next source
+// (never a silent 0 that would collapse every page to the floor).
+test('#63 parseByteTarget: --byte-target > DIFF_BYTE_TARGET > default, junk falls through', () => {
+  const dflt = 32 * 1024 * 1024;
+  assert.equal(parseByteTarget([], {}, dflt), dflt, 'default when nothing set');
+  assert.equal(
+    parseByteTarget([], { DIFF_BYTE_TARGET: '8388608' }, dflt),
+    8388608,
+    'env override',
+  );
+  assert.equal(
+    parseByteTarget(
+      ['A', 'B', '--byte-target', '16777216'],
+      { DIFF_BYTE_TARGET: '8388608' },
+      dflt,
+    ),
+    16777216,
+    'CLI flag beats env',
+  );
+  // junk flag value → fall through to env; junk env → fall through to default.
+  assert.equal(
+    parseByteTarget(
+      ['--byte-target', 'nope'],
+      { DIFF_BYTE_TARGET: '4096' },
+      dflt,
+    ),
+    4096,
+    'non-numeric flag falls through to env',
+  );
+  assert.equal(
+    parseByteTarget(['--byte-target', '0'], { DIFF_BYTE_TARGET: '-5' }, dflt),
+    dflt,
+    'non-positive flag and env both fall through to the default',
+  );
+});
+
+// A faithful in-memory keyset-paginated fake DB: it answers exactly the SQL keysetRows emits (parses
+// the trailing `limit N`, applies the row-wise tuple cursor from the params, orders by the key tuple)
+// so keysetRows drives it identically to real PGlite — but every page size the differ chooses is
+// honoured, letting us prove the row STREAM is independent of the page-size sequence. It also records
+// the exact limit sequence used, so we can assert two runs really did page differently.
+function makeFakeDb(rows, keys) {
+  const cmp = (a, b) => {
+    for (const k of keys) {
+      const x = BigInt(a[k]);
+      const y = BigInt(b[k]);
+      if (x < y) {
+        return -1;
+      }
+      if (x > y) {
+        return 1;
+      }
+    }
+
+    return 0;
+  };
+  const ordered = rows.slice().sort(cmp);
+  const limits = [];
+
+  const db = {
+    limits,
+    query(sql, params) {
+      const m = sql.match(/limit (\d+)$/);
+      const limit = Number(m[1]);
+      limits.push(limit);
+      let start = 0;
+      if (params.length > 0) {
+        const cursor = {};
+        keys.forEach((k, i) => {
+          cursor[k] = params[i];
+        });
+        while (start < ordered.length && cmp(ordered[start], cursor) <= 0) {
+          start += 1;
+        }
+      }
+
+      return Promise.resolve({ rows: ordered.slice(start, start + limit) });
+    },
+  };
+
+  return db;
+}
+
+async function drain(iter) {
+  const out = [];
+  for await (const r of iter) {
+    out.push(r);
+  }
+
+  return out;
+}
+
+// #63 — CURSOR INDEPENDENCE: keysetRows must yield the SAME ordered row stream regardless of the
+// page-size sequence the byte-aware sizing chooses. The keyset cursor (tuple-WHERE > previous tail) is
+// what guarantees this — only the `limit` varies. We drive one dataset through a range of byte targets
+// (which forces genuinely different limit sequences) and assert every run yields a byte-identical
+// stream. MUTATION: make the cursor depend on the page size (e.g. advance by the limit instead of the
+// tail row, or reset `last`) → the streams diverge and this FAILS.
+test('#63 keysetRows: the row stream is independent of the byte-aware page-size sequence', async () => {
+  const keys = ['chain_id', 'block_number'];
+  // Enough slim rows to span MANY pages (past both the floor=5000 and ceiling=50000 limits), so the
+  // byte-aware sizing genuinely pages this dataset differently under different targets. Rows are slim
+  // (the width signal comes from `input`), so 120k tiny rows cost little memory but force multi-page
+  // walks. A small periodic width swing keeps the average realistic without bloating the fixture.
+  const rows = [];
+  for (let bn = 0; bn < 120_000; bn++) {
+    const width = bn % 7 === 0 ? 64 : 8;
+    rows.push({
+      chain_id: 1,
+      block_number: bn,
+      input: new Uint8Array(width),
+    });
+  }
+
+  const reference = await drain(keysetRows(makeFakeDb(rows, keys), 't', keys));
+  // reference must be the full dataset in key order.
+  assert.equal(reference.length, rows.length, 'reference stream is complete');
+  for (let i = 1; i < reference.length; i++) {
+    assert.ok(
+      reference[i].block_number > reference[i - 1].block_number,
+      'reference stream is strictly key-ordered',
+    );
+  }
+
+  const seqs = new Set();
+  // targets from tiny (clamps to the floor → many 5k pages) to large (clamps to the ceiling → few 50k
+  // pages) → genuinely different limit sequences over the SAME rows.
+  for (const target of [200_000, 32 * 1024 * 1024]) {
+    const db = makeFakeDb(rows, keys);
+    const stream = await drain(keysetRows(db, 't', keys, target));
+    seqs.add(db.limits.join(','));
+    assert.equal(
+      stream.length,
+      reference.length,
+      `byte-target ${target}: same row count`,
+    );
+    for (let i = 0; i < stream.length; i++) {
+      assert.equal(
+        stream[i].block_number,
+        reference[i].block_number,
+        `byte-target ${target}: row ${i} identical regardless of page size`,
+      );
+      assert.equal(
+        stream[i].input.byteLength,
+        reference[i].input.byteLength,
+        `byte-target ${target}: row ${i} payload identical`,
+      );
+    }
+  }
+
+  // the runs really DID page differently — otherwise "independence" would be vacuous.
+  assert.ok(
+    seqs.size > 1,
+    'the byte targets must produce genuinely different page-size sequences',
+  );
+});
+
+// #63 — the FIRST page uses the floor limit (no observation yet). keysetRows must issue its very first
+// query with `limit 5000` on a fresh, unknown-width table — the conservative default that cannot wedge.
+// MUTATION: seed the first `limit` from a large constant (e.g. 50000) → the recorded first limit is no
+// longer the floor and this FAILS.
+test('#63 keysetRows: the FIRST query uses the floor limit on an unknown-width table', async () => {
+  const keys = ['chain_id', 'block_number'];
+  const rows = [{ chain_id: 1, block_number: 0, input: new Uint8Array(8) }];
+  const db = makeFakeDb(rows, keys);
+  await drain(keysetRows(db, 't', keys));
+  assert.equal(db.limits[0], 5_000, 'first page is fetched at the floor limit');
 });
