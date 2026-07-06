@@ -54,6 +54,33 @@ const logFilter: any = {
   include: [],
 };
 
+// a block-interval filter — drives `needBlocks`, so assembleRange range-walks `cd.blockHeaders`
+const blockFilter: any = {
+  type: 'block',
+  chainId: 1,
+  sourceId: 'blk',
+  interval: 1,
+  offset: 0,
+  fromBlock: undefined,
+  toBlock: undefined,
+  hasTransactionReceipt: false,
+  include: [],
+};
+
+// an account-transaction filter — drives `needTxFilter`, so assembleRange range-walks `cd.txBlocks`
+const txFilterAll: any = {
+  type: 'transaction',
+  chainId: 1,
+  sourceId: 'acctAll',
+  fromAddress: '0xfrom',
+  toAddress: undefined,
+  includeReverted: false,
+  fromBlock: undefined,
+  toBlock: undefined,
+  hasTransactionReceipt: false,
+  include: [],
+};
+
 // ── INV-2: interval exactness vs a brute-force model ────────────────────────────────────────────────
 
 test('INV-2: assembleRange returns exactly the in-range logs (vs brute-force filter)', () => {
@@ -127,6 +154,93 @@ test('wave 5 (perf): assembleRange returns exactly the in-range logs whether the
   expect(
     bns(assembleRange([sparse], [11, 5_000], spec, new Map()).logs),
   ).toEqual([5_000]);
+
+  // (b′) ENTRY-SCAN lo-INCLUSIVE bound: a block sitting EXACTLY at `lo` must be kept. The scan branch's
+  // guard is `entry[0] >= lo` — an off-by-one to `> lo` would silently DROP the boundary block, and no
+  // other sub-case here has an entry at `lo` (the [11,5000] case's `lo=11` holds no block). This is the
+  // scan-branch twin of the range-walk's inclusive `bn = lo` start. (PR #66 review, non-blocking finding 2.)
+  // Interval [10, 1_000_000] over the size-3 map → hi−lo+1 = 999_991 > 3, so the ENTRY-SCAN branch runs;
+  // block 10 lies exactly at lo and must survive.
+  expect(
+    bns(assembleRange([sparse], [10, 1_000_000], spec, new Map()).logs),
+  ).toEqual([10, 5_000, 999_999]);
+});
+
+// An operation-counting Map: tallies `get()` lookups and every FULL-map iteration (`for…of` / `.entries()`
+// / spread — all route through `[Symbol.iterator]`). It lets a test OBSERVE which walk `entriesInRange`
+// took, pinning the range-walk's PRESENCE — not merely its output.
+class CountingMap<K, V> extends Map<K, V> {
+  gets = 0;
+  iterations = 0;
+  get(key: K): V | undefined {
+    this.gets += 1;
+
+    return super.get(key);
+  }
+  [Symbol.iterator](): MapIterator<[K, V]> {
+    this.iterations += 1;
+
+    return super[Symbol.iterator]();
+  }
+  entries(): MapIterator<[K, V]> {
+    this.iterations += 1;
+
+    return super.entries();
+  }
+}
+
+test('wave 5 follow-up (perf presence): a narrow interval over a large chunk RANGE-WALKS all three call sites (bounded get()s, zero full-map iteration) — the pre-#66 full-scan shape is rejected', () => {
+  // Pins the PRESENCE of the range-walk, not just its equivalence: reverting the three `entriesInRange`
+  // call sites (log-branch headers, needBlocks blockHeaders, needTxFilter txBlocks) to the pre-#66
+  // `for (const [bn, …] of cd.<map>) { if (bn < lo || bn > hi) continue; … }` full-scan shape re-introduces
+  // O(intervalsPerChunk × chunkEntries) iteration. Under that revert each instrumented map is ITERATED (≥1
+  // Symbol.iterator hit) and get()ed zero times — both arms below then fail; on the #66 range-walk the
+  // maps are get()ed (≤ interval width) and never iterated. (PR #66 review, non-blocking finding 1.)
+  const SIZE = 10_000;
+  const headers = new CountingMap<number, ReturnType<typeof header>>();
+  const blockHeaders = new CountingMap<number, ReturnType<typeof header>>();
+  const txBlocks = new CountingMap<
+    number,
+    { header: ReturnType<typeof header>; txs: ReturnType<typeof rawTx>[] }
+  >();
+  const cd = createChunkData();
+  cd.headers = headers;
+  cd.blockHeaders = blockHeaders;
+  cd.txBlocks = txBlocks;
+  for (let bn = 0; bn < SIZE; bn++) {
+    headers.set(bn, header(bn));
+    cd.logs.set(bn, [rawLog('0xVault', '0xtx' + bn)]);
+    cd.txs.set(bn, [rawTx('0xtx' + bn)]);
+    blockHeaders.set(bn, header(bn));
+    txBlocks.set(bn, { header: header(bn), txs: [rawTx('0xtxb' + bn)] });
+  }
+
+  // a NARROW interval [5000,5004] (width 5 ≪ SIZE): the range-walk get()s only the 5 interval blocks per
+  // map and NEVER iterates it; a full-scan would iterate all 10_000 entries once per call-site map.
+  const lo = 5_000;
+  const hi = 5_004;
+  const width = hi - lo + 1; // 5
+  const spec = compileFetchSpec(
+    [{ filter: logFilter }, { filter: blockFilter }, { filter: txFilterAll }],
+    new Map(),
+  );
+  const out = assembleRange([cd], [lo, hi], spec, new Map());
+
+  // correctness still holds — exactly the 5 in-range log blocks
+  const got = out.logs
+    .map((l: any) => Number(BigInt(l.blockNumber)))
+    .sort((x, y) => x - y);
+  expect(got).toEqual([5_000, 5_001, 5_002, 5_003, 5_004]);
+
+  // PRESENCE: each of the three call-site maps was range-walked — get() count is bounded BY THE INTERVAL
+  // WIDTH (not the chunk size) and the map was NEVER full-iterated.
+  for (const m of [headers, blockHeaders, txBlocks]) {
+    expect(m.iterations).toBe(0); // never full-scanned
+    expect(m.gets).toBeGreaterThan(0); // it DID range-walk (a get() per in-range block)
+    expect(m.gets).toBeLessThanOrEqual(width); // ≤ interval width, INDEPENDENT of SIZE
+  }
+  // a full-scan would have touched ≥ SIZE entries; the range-walk touched ≤ width per map.
+  expect(headers.gets).toBeLessThan(SIZE);
 });
 
 test('seenTx dedupe: two logs sharing a tx insert the tx once', () => {
