@@ -334,6 +334,57 @@ test('a body cut mid-NDJSON-line retries from the same cursor (transient), not a
   expect(froms[1]).toBe(froms[0]);
 });
 
+test('a zero-block 200 (clean-EOF truncation at a line boundary) retries from the same cursor — never skips block `cursor` (wave 5)', async () => {
+  // A proxy that cuts the connection cleanly AT a line boundary (or before the first byte) delivers a 200
+  // whose body drains to `done` with NO partial line — so the mid-line PortalTruncatedBodyError guard can't
+  // fire. Pre-fix this returned `{ blocks: [], last: cursor }`, and `stream` advanced cursor→cursor+1,
+  // SILENTLY SKIPPING block `cursor` (the Portal signals a genuinely empty range with 204, not a 200). Now a
+  // zero-block 200 is treated as a truncated body → same-cursor retry.
+  let call = 0;
+  const froms: number[] = [];
+  const client = mk({
+    fetchImpl: (async (_u: string, init: any) => {
+      call += 1;
+      froms.push(JSON.parse(init.body).fromBlock);
+      // clean-close 200 with an empty body (zero complete NDJSON lines) — NOT a 204
+      if (call === 1)
+        return {
+          status: 200,
+          ok: true,
+          headers: { get: () => null },
+          body: streamOf(['']),
+        };
+      // the retry delivers blocks 5 and 6; last=6 advances the cursor to 7 > to, terminating the stream
+      return ndjsonRes([{ header: { number: 5 } }, { header: { number: 6 } }]);
+    }) as any,
+  });
+  const out = await collect(client.stream(QUERY, 5, 6));
+  expect(out).toHaveLength(2); // block 5 delivered by the retry, never skipped
+  expect((out[0] as any).header.number).toBe(5);
+  expect(froms).toEqual([5, 5]); // same-cursor retry (5→5); an impl that advanced cursor would show [5,6]
+});
+
+test('a persistent zero-block 200 fails loud after the retry budget — it does not silently hole (wave 5)', async () => {
+  // The same-cursor retry is bounded: an endpoint that keeps returning a zero-block 200 must not spin
+  // forever NOR silently skip — it exhausts the transient budget and throws, surfacing the real problem.
+  let fetches = 0;
+  const client = mk({
+    fetchImpl: (async () => {
+      fetches += 1;
+      return {
+        status: 200,
+        ok: true,
+        headers: { get: () => null },
+        body: streamOf(['']),
+      };
+    }) as any,
+  });
+  await expect(collect(client.stream(QUERY, 0, 3))).rejects.toThrow(
+    PortalTruncatedBodyError,
+  );
+  expect(fetches).toBe(11); // initial try + 10 retries, same as any transient failure
+});
+
 test('isTransientError: PortalTruncatedBodyError and gzip-truncation shapes are retryable', () => {
   expect(
     isTransientError(
