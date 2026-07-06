@@ -1947,20 +1947,38 @@ const storeFactoryKey = (factory: any): string => {
 
 // `persisted` models the store's factory_addresses rows keyed by STORE IDENTITY → child → block.
 // getChildAddresses returns the upstream min-merged view; the default is an empty store (fresh
-// backfill), so callers that don't pass it behave exactly as before the write-side dedupe (#53).
+// backfill). Like the real tx-scoped store, a successful insertChildAddresses is visible to
+// subsequent getChildAddresses reads (min-merged); a test simulating a transaction ROLLBACK clears
+// the map it passed in.
 const mkFactorySyncStore = (
   onInsertChildren: (p: any) => void,
   persisted?: Map<string, Map<string, number>>,
-): any => ({
-  insertLogs: () => {},
-  insertBlocks: () => {},
-  insertTransactions: () => {},
-  insertTransactionReceipts: () => {},
-  insertTraces: () => {},
-  insertChildAddresses: (p: any) => onInsertChildren(p),
-  getChildAddresses: async ({ factory }: any) =>
-    new Map(persisted?.get(storeFactoryKey(factory)) ?? []),
-});
+): any => {
+  const store = persisted ?? new Map<string, Map<string, number>>();
+  return {
+    insertLogs: () => {},
+    insertBlocks: () => {},
+    insertTransactions: () => {},
+    insertTransactionReceipts: () => {},
+    insertTraces: () => {},
+    // async: upstream's promiseAllSettledWithThrow calls .catch on the returned value directly
+    insertChildAddresses: async (p: any) => {
+      onInsertChildren(p);
+      const key = storeFactoryKey(p.factory);
+      let rows = store.get(key);
+      if (rows === undefined) {
+        rows = new Map();
+        store.set(key, rows);
+      }
+      for (const [address, block] of p.childAddresses) {
+        const prev = rows.get(address);
+        if (prev === undefined || prev > block) rows.set(address, block);
+      }
+    },
+    getChildAddresses: async ({ factory }: any) =>
+      new Map(store.get(storeFactoryKey(factory)) ?? []),
+  };
+};
 
 const mkFactorySync = (
   port: number,
@@ -2291,6 +2309,238 @@ test('regression: a post-flush insertLogs failure fails the interval LOUD (core 
     // core rolls back; the interval is NOT marked cached, so restart re-discovery re-persists it.
     expect(calls).toHaveLength(1);
     expect(calls[0].childAddresses.get(CHILD_ADDR)).toBe(CHILD_CREATED_AT);
+  } finally {
+    srv.close();
+  }
+});
+
+test('regression (INV-15 tx-retry, PIPELINED): a post-flush rollback where a SIBLING interval enters before the same interval retries still re-flushes the children — the keyed slot is not evicted by the sibling', async () => {
+  // Ponder's core runs the whole interval callback inside a RETRYING transaction: a transient failure
+  // AFTER the child flush (insertLogs, syncBlockData, insertIntervals, COMMIT) rolls the inserted
+  // children back and re-runs the callback. Core also PIPELINES intervals — the next interval is
+  // dispatched INSIDE the failing interval's still-open transaction — so a sibling interval B can enter
+  // syncBlockRangeData between A's flush and A's retry. A single remembered slot let B's entry evict A's,
+  // so A's retry found nothing to restore, flushed EMPTY, and committed the factory interval cached
+  // WITHOUT its children — a permanent silent loss on the next restart. The keyed map survives this:
+  // B consumes only its own (absent) entry, A's entry stays put for A's retry. The earlier same-interval
+  // (A→A) shape could not see the eviction; this drives the real A → B → A ordering.
+  const srv = factoryPortalServer();
+  const p: number = await new Promise((r) =>
+    srv.listen(0, () => r((srv.address() as AddressInfo).port)),
+  );
+  try {
+    const factory = mkFactory();
+    const filter = mkFactoryFilter(factory);
+    const calls: any[] = [];
+    const persisted = new Map<string, Map<string, number>>();
+    let failLogs = true;
+    const syncStore = {
+      ...mkFactorySyncStore((x) => calls.push(x), persisted),
+      insertLogs: () => {
+        if (failLogs) throw new Error('transient: connection reset');
+      },
+    };
+    const sync = mkFactorySync(
+      p,
+      factory,
+      filter,
+      new Map([[factory.id, new Map()]]),
+    );
+    const interval: [number, number] = [0, FACTORY_RANGE_END];
+    const params = {
+      interval,
+      requiredIntervals: [{ interval, filter }],
+      requiredFactoryIntervals: [{ interval, factory }],
+      syncStore,
+    };
+
+    // attempt 1 (interval A): the flush succeeds (child@100 ∈ A → inserted, pending-slot recorded under
+    // A's key), then insertLogs fails → the interval rejects loud
+    await expect(sync.syncBlockRangeData(params)).rejects.toThrow(
+      'transient: connection reset',
+    );
+    expect(calls).toHaveLength(1);
+
+    // core rolls A's transaction back — the inserted children are GONE from the store
+    persisted.clear();
+
+    // a SIBLING interval B (a pipelined lane sharing chunk 0) enters BEFORE A retries. B holds none of
+    // A's children (child@100 ∉ [0,50]) and records no slot of its own — its only job here is to prove
+    // it does NOT evict A's still-uncommitted slot (the single-slot bug cleared it on any new interval).
+    failLogs = false;
+    const sibling: [number, number] = [0, 50];
+    await sync.syncBlockRangeData({
+      interval: sibling,
+      requiredIntervals: [{ interval: sibling, filter }],
+      requiredFactoryIntervals: [{ interval: sibling, factory }],
+      syncStore,
+    });
+    expect(calls).toHaveLength(1); // the sibling inserted nothing
+
+    // attempt 2 (core's retry re-runs interval A): the flush must re-insert the child — A's keyed slot
+    // survived the sibling, so re-entry restores the rolled-back queue and re-flushes it
+    const logs = await sync.syncBlockRangeData(params);
+    expect(calls).toHaveLength(2);
+    expect(calls[1].childAddresses.get(CHILD_ADDR)).toBe(CHILD_CREATED_AT);
+    expect(persisted.size).toBeGreaterThan(0); // durably back in the store this time
+    // and the retried interval still delivers its data
+    expect(
+      logs.some((l: any) => (l.address as string).toLowerCase() === CHILD_ADDR),
+    ).toBe(true);
+  } finally {
+    srv.close();
+  }
+});
+
+test("regression (INV-15 tx-retry, KEYED): a re-entering interval restores its OWN pending flush, not a sibling's — a non-matching interval never consumes/restores another interval's entry", async () => {
+  // Companion to the pipelined tx-retry test, pinning the keyed map from the other side. Two children
+  // live in two disjoint intervals: CHILD_LO@50 ∈ A=[0,100], CHILD_HI@150 ∈ B=[101,200]. Both intervals
+  // flush then fail post-flush (rolled back), so BOTH keyed slots are live at once. When A retries it must
+  // restore CHILD_LO (its OWN slot), never CHILD_HI (B's) and never nothing. A single slot would hold only
+  // the last-recorded (B's) flush — A's key mismatch would restore nothing; an UNCONDITIONAL restore would
+  // pull B's CHILD_HI (out of A's range → dropped). The INV-17 store dedupe absorbs an over-restore on the
+  // app path, so this asserts the exact child A re-flushes rather than a mere count.
+  const srv = twoChildFactoryServer();
+  const p: number = await new Promise((r) =>
+    srv.listen(0, () => r((srv.address() as AddressInfo).port)),
+  );
+  try {
+    const factory = mkFactory();
+    const filter = mkFactoryFilter(factory);
+    const calls: any[] = [];
+    const persisted = new Map<string, Map<string, number>>();
+    let failLogs = true;
+    const syncStore = {
+      ...mkFactorySyncStore((x) => calls.push(x), persisted),
+      insertLogs: () => {
+        if (failLogs) throw new Error('transient: connection reset');
+      },
+    };
+    const sync = mkFactorySync(
+      p,
+      factory,
+      filter,
+      new Map([[factory.id, new Map()]]),
+    );
+    const mkParams = (interval: [number, number]) => ({
+      interval,
+      requiredIntervals: [{ interval, filter }],
+      requiredFactoryIntervals: [{ interval, factory }],
+      syncStore,
+    });
+    const a: [number, number] = [0, 100];
+    const b: [number, number] = [101, 200];
+
+    // interval A flushes CHILD_LO@50, then fails post-flush → rolled back (slot "0-100" = {CHILD_LO})
+    await expect(sync.syncBlockRangeData(mkParams(a))).rejects.toThrow(
+      'transient: connection reset',
+    );
+    expect(calls.at(-1).childAddresses.get(CHILD_LO)).toBe(LO_AT);
+    persisted.clear();
+
+    // interval B flushes CHILD_HI@150, then fails post-flush → rolled back (slot "101-200" = {CHILD_HI}).
+    // B did NOT consume A's slot — both are now live.
+    await expect(sync.syncBlockRangeData(mkParams(b))).rejects.toThrow(
+      'transient: connection reset',
+    );
+    expect(calls.at(-1).childAddresses.get(CHILD_HI)).toBe(HI_AT);
+    persisted.clear();
+
+    // A retries: it must restore CHILD_LO (its OWN slot), NOT B's CHILD_HI and not an empty queue
+    failLogs = false;
+    await sync.syncBlockRangeData(mkParams(a));
+    expect(calls).toHaveLength(3);
+    expect(calls[2].childAddresses.get(CHILD_LO)).toBe(LO_AT);
+    expect(calls[2].childAddresses.has(CHILD_HI)).toBe(false);
+
+    // A's re-entry consumed ONLY its own slot — B's slot is untouched, so B's own retry still re-flushes
+    // CHILD_HI. A mutant that let a re-entering interval consume/delete a SIBLING's entry would strand it.
+    await sync.syncBlockRangeData(mkParams(b));
+    expect(calls).toHaveLength(4);
+    expect(calls[3].childAddresses.get(CHILD_HI)).toBe(HI_AT);
+  } finally {
+    srv.close();
+  }
+});
+
+test('regression (INV-15 × INV-9): children pre-discovered by the wide Portal scan are persisted when their interval is DELEGATED to RPC — the fallback dedupe-skips them, so the portal-side flush must run', async () => {
+  // The wide discovery scan (endHint = dataEnd) records children far past the interval being served,
+  // into the childAddresses record the RPC fallback SHARES. Upstream's syncAddressFactory persists only
+  // children NOT already in that record — so when a straddling interval is delegated whole to RPC, the
+  // pre-discovered child is persisted by NEITHER path while core still marks the factory interval
+  // cached in the same transaction. Before the fix the delegation branch returned without flushing:
+  // the child's events were permanently lost on the next restart.
+  process.env.PORTAL_FINALIZED_HEAD = '150'; // pin the head BELOW the factory range end (300)
+  const srv = factoryPortalServer();
+  const p: number = await new Promise((r) =>
+    srv.listen(0, () => r((srv.address() as AddressInfo).port)),
+  );
+  try {
+    const factory = mkFactory();
+    const filter = mkFactoryFilter(factory);
+    const rpcCalls: string[] = [];
+    const rpc: any = {
+      request: async (req: any) => {
+        rpcCalls.push(req.method);
+        if (req.method === 'eth_getLogs') return [];
+        throw new Error(`unexpected rpc ${req.method}`);
+      },
+    };
+    const stub = () => ({
+      debug() {},
+      info() {},
+      warn() {},
+      error() {},
+      trace() {},
+      child: () => stub(), // the stock RPC sync forks a child logger
+    });
+    const sync = createPortalHistoricalSync({
+      common: {
+        logger: stub(),
+        // read by the stock RPC sync's factory path (address-list vs unfiltered eth_getLogs)
+        options: { factoryAddressCountThreshold: 10_000 },
+      } as any,
+      chain: {
+        id: 1,
+        name: 'mainnet',
+        portal: `http://localhost:${p}`,
+        finalityBlockCount: 10,
+      } as any,
+      rpc,
+      childAddresses: new Map([[factory.id, new Map()]]),
+      eventCallbacks: [{ filter }],
+    } as any);
+    const calls: any[] = [];
+    const syncStore = mkFactorySyncStore((x) => calls.push(x));
+
+    // interval A ≤ head: served by the Portal; its wide discovery scan runs through the head (150) and
+    // queues the child created at 100 — OUTSIDE A, so A's interval-scoped flush leaves it pending
+    const a: [number, number] = [0, 50];
+    await sync.syncBlockRangeData({
+      interval: a,
+      requiredIntervals: [{ interval: a, filter }],
+      requiredFactoryIntervals: [{ interval: a, factory }],
+      syncStore,
+    });
+    expect(calls).toHaveLength(0); // nothing created in [0,50]
+
+    // interval K straddles the head (150 < 300) → delegated WHOLE to RPC. The pending child@100 ∈ K
+    // must be flushed by the portal side of the delegation — the fallback will dedupe-skip it.
+    const k: [number, number] = [51, FACTORY_RANGE_END];
+    await sync.syncBlockRangeData({
+      interval: k,
+      requiredIntervals: [{ interval: k, filter }],
+      requiredFactoryIntervals: [{ interval: k, factory }],
+      syncStore,
+    });
+    expect(rpcCalls).toContain('eth_getLogs'); // K really went to the stock RPC sync
+
+    const withChild = calls.filter((c: any) =>
+      c.childAddresses.has(CHILD_ADDR),
+    );
+    expect(withChild).toHaveLength(1); // persisted exactly once — by the portal-side flush
+    expect(withChild[0].childAddresses.get(CHILD_ADDR)).toBe(CHILD_CREATED_AT);
+    expect(withChild[0].chainId).toBe(1);
   } finally {
     srv.close();
   }
