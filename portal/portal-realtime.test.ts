@@ -426,6 +426,93 @@ test('streamHotBlocks: caches the /stream body across same-cursor re-opens, rebu
   ac.abort();
 });
 
+test('streamHotBlocks: the body-cache key pins CURSOR independently — a cursor advance with an unchanged parentBlockHash still rebuilds (wave 5 follow-up)', async () => {
+  // Finding 3 (PR #66 review): `cursor` must be an INDEPENDENT component of the body-cache key. The wave-5
+  // cache test above can't catch a regression that drops `cursor` from the key, because there the cursor
+  // advance (100→101) ALSO changes parentBlockHash (undefined→'h100'), so parentBlockHash alone still keys
+  // the rebuild. Here we hold parentBlockHash CONSTANT across a cursor advance by delivering consecutive
+  // blocks that share a hash string (unarmed mode → parentBlockHash = ring.get(cursor−1) = that shared
+  // hash), leaving `cursor` as the SOLE differing key input. Dropping `cursor` from bodyKey makes the final
+  // reopen a false cache HIT → the body would be re-POSTed with a STALE `fromBlock`; the count below then
+  // reads `builds === 2` and fails. The existing test stays green under that same mutation.
+  const enc = new TextEncoder();
+  const SAME = 'hSAME'; // blocks 100/101/102 all carry this hash → parentBlockHash is constant across them
+  const emptyStream = () =>
+    new ReadableStream({
+      start(c) {
+        c.close(); // 200 with no data → reconnect at the SAME cursor (no block delivered)
+      },
+    });
+  const streamOf = (block: any) =>
+    new ReadableStream({
+      start(c) {
+        c.enqueue(enc.encode(`${JSON.stringify(block)}\n`));
+        c.close();
+      },
+    });
+  const hdr = (n: number, hash: string, parent: string) => ({
+    header: { number: n, hash, parentHash: parent, timestamp: n },
+    logs: [],
+  });
+
+  const logs: any[] = [{ address: ['0xfactory'], topic0: ['0xproxycreated'] }];
+  const realMap = Array.prototype.map;
+  let builds = 0;
+  // count body serializations: the body maps `args.logs` exactly once per (re)build when txFields is set
+  (logs as any).map = function (this: any[], ...a: any[]) {
+    builds += 1;
+    return (realMap as any).apply(this, a);
+  };
+
+  const bodies: string[] = [];
+  let conn = 0;
+  const fetchImpl = (async (_url: string, init: any) => {
+    bodies.push(init.body);
+    conn += 1;
+    if (conn === 1) return { status: 200, ok: true, body: emptyStream() }; // cursor 100, pbh undefined
+    if (conn === 2)
+      return { status: 200, ok: true, body: streamOf(hdr(100, SAME, 'h99')) }; // cursor 100 → deliver 100
+    if (conn === 3)
+      return { status: 200, ok: true, body: streamOf(hdr(101, SAME, SAME)) }; // cursor 101, pbh=SAME → deliver 101
+    if (conn === 4)
+      return { status: 200, ok: true, body: streamOf(hdr(102, SAME, SAME)) }; // cursor 102, pbh=SAME (unchanged) → deliver 102
+    return { status: 204, ok: false, body: null };
+  }) as any;
+
+  const ac = new AbortController();
+  const gen = streamHotBlocks({
+    portalUrl: 'http://portal',
+    headers: {},
+    fromBlock: 100,
+    logs,
+    txFields: { hash: true },
+    fetchImpl,
+    signal: ac.signal,
+  });
+
+  const first = await gen.next(); // conn1 (empty, cursor 100) then conn2 delivers 100
+  expect(first.value?.header.number).toBe(100);
+  expect(builds).toBe(1); // conn1 open built; conn2 reused (same cursor 100, same pbh)
+
+  const second = await gen.next(); // conn3: cursor 101, pbh=SAME → rebuilt (cursor advanced)
+  expect(second.value?.header.number).toBe(101);
+  expect(builds).toBe(2);
+  expect(JSON.parse(bodies[2]!).fromBlock).toBe(101);
+  expect(JSON.parse(bodies[2]!).parentBlockHash).toBe(SAME);
+
+  const third = await gen.next(); // conn4: cursor 102, pbh=SAME (UNCHANGED from conn3) → MUST rebuild on cursor alone
+  expect(third.value?.header.number).toBe(102);
+  // THE PIN: parentBlockHash is byte-identical between conn3 and conn4 (both 'hSAME'); only `cursor`
+  // advanced 101→102. With `cursor` in the key this is a fresh build (fromBlock 102); drop `cursor` and it
+  // is a false cache hit that re-POSTs the stale fromBlock-101 body → builds stays 2 and this fails.
+  expect(builds).toBe(3);
+  expect(JSON.parse(bodies[3]!).parentBlockHash).toBe(SAME); // pbh unchanged — the confound is removed
+  expect(JSON.parse(bodies[3]!).fromBlock).toBe(102); // the body advanced with the cursor (never stale)
+
+  await gen.return(undefined);
+  ac.abort();
+});
+
 // ─────────────────────────────── /stream parentBlockHash + 409 fork negotiation (issue #33) ───────────────────────────────
 
 // A scripted Portal /stream mock: one entry per connection, each either a 200 that streams blocks then
