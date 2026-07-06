@@ -31,8 +31,9 @@ This is a skeleton published while the validation campaign is in flight. As of t
 following are **pending** and must not be read as proven:
 
 - The full paid **byte-diff matrix** (all cells in `harness/validate/cells.json`) — the plumbing smoke
-  cell and the flagship full-range cell (`F-full`, §3.2) have completed byte-identical; the remaining
-  cells are still pending.
+  cell (§3.1), the flagship full-range cell (`F-full`, §3.2), the inertness control (`CTRL`, §3.3), and
+  the eth Layer-L cell (`L-eth`, §3.4 — PASS under the documented `block.size` tolerance, #76) have
+  completed; the remaining cells are still pending.
 - The **flagship benchmark gate** (backfill speed reproduced within a stated tolerance of the
   published baseline) — tracked separately in a separate benchmarks document (pending publication),
   not asserted here.
@@ -118,7 +119,9 @@ Fork-vs-stock byte diffs across stratified block windows and app shapes, defined
 `harness/validate/cells.json` and run by `harness/validate/run-cell.sh` (and `ctrl-cell.sh` for the
 inertness control). The stock RPC path is the oracle; a cell **PASSES** only on an exit-0 byte diff
 across all row families (with the documented, narrow tolerances — e.g. `total_difficulty` excluded,
-RPC-only inert event-less blocks reported-not-failed). Matrix status in §3.
+RPC-only inert event-less blocks reported-not-failed, and the upstream-dataset `block.size` off-by-one
+at the RLP 2^16 boundary tolerated per [#76](../../issues/76)/[#77](../../pull/77), §5.3/§5.6). Matrix
+status in §3.
 
 ### Layer F — Third-party spot confirmation
 
@@ -140,8 +143,8 @@ the operator (see `harness/validate/README.md`).
 | Cell | App | Chain(s) | Sources | Windows | Status | Repro |
 |------|-----|----------|---------|---------|--------|-------|
 | `SMOKE` | erc20 | eth | logs, receipts | 1 tiny (12 blocks) | **DONE (SMOKE)** | `RPC_URL_OVERRIDE=<free-rpc> bash harness/validate/run-cell.sh SMOKE` |
-| `CTRL` | erc20 | eth | logs, receipts | 10 × 1k (seeded) | PENDING | `UPSTREAM_PONDER_VERSION=0.16.6 bash harness/validate/ctrl-cell.sh CTRL` |
-| `L-eth` | erc20 | eth | logs, receipts | 4×2k + 4×5k (seeded) | PENDING | `bash harness/validate/run-cell.sh L-eth` |
+| `CTRL` | erc20 | eth | logs, receipts | 10 × 1k (seeded) | **DONE (2026-07-06)** | `UPSTREAM_PONDER_VERSION=0.16.6 bash harness/validate/ctrl-cell.sh CTRL` |
+| `L-eth` | erc20 | eth | logs, receipts | 4×2k + 4×5k (seeded) | **DONE (2026-07-06) — PASS under documented tolerance (#76)** | `bash harness/validate/run-cell.sh L-eth` |
 | `L-base` | erc20 | base | logs, receipts | 4×2k + 4×5k (seeded) | PENDING | `bash harness/validate/run-cell.sh L-base` |
 | `L-arbitrum` | erc20 | arbitrum | logs, receipts | 4×2k + 4×5k (seeded) | PENDING | `bash harness/validate/run-cell.sh L-arbitrum` |
 | `L-polygon` | erc20 | polygon | logs, receipts | 4×2k + 4×5k (seeded) | PENDING | `bash harness/validate/run-cell.sh L-polygon` |
@@ -162,9 +165,16 @@ the operator (see `harness/validate/README.md`).
 
 Notes:
 - **`SMOKE`** proved `run-cell.sh` end-to-end (§3.1). It is deliberately outside the paid matrix.
-- **`CTRL`** is the *inertness* control: genuine upstream `ponder@0.16.6` vs the fork with the Portal
-  path unset, same config → proves the Portal patch does not perturb the stock RPC path. It runs via
-  `ctrl-cell.sh`, not `run-cell.sh`.
+- **`CTRL`** is the *inertness* control (gate **G2**): genuine upstream `ponder@0.16.6` vs the fork
+  with the Portal path unset, same config → proves the Portal patch does not perturb the stock RPC
+  path. It runs via `ctrl-cell.sh`, not `run-cell.sh`. **DONE (2026-07-06): byte-identical across all
+  row families on 10 / 10 windows — verdict, numbers, and chain of custody in §3.3.**
+- **`L-eth`** is the eth Layer-L cell (erc20 on eth, `4×2k` + `4×5k` seeded windows). **DONE
+  (2026-07-06): PASS under the documented `block.size` tolerance ([#76](../../issues/76)/[#77](../../pull/77))**
+  — every preserved store byte-identical on `logs` / `transactions` / `transaction_receipts` /
+  `traces` (strict tables), with a bounded, self-retiring count of tolerated `block.size` rows per
+  window. The first run caught the upstream-dataset defect; the full record — first-run verdicts,
+  the #78 differ-perf wedge, and the re-verdict — is in §3.4.
 - **`F-full`** is the flagship byte diff — full Euler history on eth, `[20529207 → 25436954]`, head
   **pinned in `cells.json` for reproducibility**, every sync-store row diffed by the constant-memory
   `diff-batched.mjs` plus an app-table checkpoint hash. **DONE (2026-07-06): byte-identical across all
@@ -267,6 +277,131 @@ Repro (a fresh end-to-end run; the operator supplies the tarball and the metered
 ```bash
 SQD_PONDER_TARBALL=<tarball> SQD_RPC_KEY=<paid-rpc-key> \
   bash harness/validate/run-cell.sh F-full
+```
+
+### 3.3 Matrix cell — CTRL (DONE, 2026-07-06)
+
+The **inertness control** (gate **G2**). Unlike every other cell, it does **not** test the Portal
+path — it tests that leaving the Portal path **off** perturbs nothing: the fork with its Portal
+environment **unset** is diffed against **genuine upstream `ponder@0.16.6`** at the same config over
+the same live block windows, both legs reading the same **metered JSON-RPC endpoint**. A pass means
+the only variable — *is the fork's patch present in the binary* — makes **no observable difference** to
+the stock RPC path. This is the control that lets the paid cells attribute any Portal-vs-RPC
+divergence to the Portal *path* rather than to the fork merely being a different build.
+
+**Verdict — 10 / 10 windows byte-identical:**
+
+- **10 of 10** seeded-random eth windows passed (`pass:true`), each **byte-identical across
+  `logs` / `transactions` / `transaction_receipts` / `traces` and every event-bearing `block`** — the
+  fork-with-Portal-unset store equals the upstream-`0.16.6` store exactly, on every window.
+- **114,921 matched logs** across the 10 windows; **39,937 metered JSON-RPC requests** total.
+- **0 auto-shrinks, 0 retry attempts** — every window passed on its first diff; the cell never had to
+  shrink a window or re-run one.
+- Per-window wall time **152–165 s** — a tight band with no outliers, consistent with two builds doing
+  identical pure-RPC work.
+
+**Chain of custody — clean, and that is the point.** This cell completed **straight through
+`ctrl-cell.sh`** with no killed attempts, no wedged diffs, and no tolerated rows. The verdict is the
+cell's own results document: ten window records, each `pass:true`, each recording a byte-identity diff
+over all five row families. Because both legs are stock RPC and the *only* difference between them is
+whether the fork's (unset) Portal patch is compiled in, an all-identical result **is** the claim:
+**the Portal patch is inert when the Portal environment is unset, proven on live RPC across 10
+seeded-random eth windows.**
+
+Repro:
+
+```bash
+UPSTREAM_PONDER_VERSION=0.16.6 bash harness/validate/ctrl-cell.sh CTRL
+```
+
+### 3.4 Matrix cell — L-eth (DONE, 2026-07-06 — PASS under the documented #76 tolerance)
+
+The eth **Layer-L** cell: the erc20 app on eth mainnet (chain 1), backfilled two ways (Portal vs a
+**metered JSON-RPC** ground truth) and diffed at the sync-store row level across two seeded-random
+window specs — **4 × 2 000 blocks (seed 101)** and **4 × 5 000 blocks (seed 102)** — plus the
+harness's **auto-shrink** re-runs. **This is the cell where the gate earned its keep: it caught a real
+upstream-dataset defect ([#76](../../issues/76)) and a real harness perf defect ([#78](../../issues/78)).**
+The first run is recorded **as-is** below — failures and all — because a gate that reports only its
+clean runs is not a gate.
+
+*Reconstruction note ([#79](../../issues/79)).* The results document folds the four seed-101 2k
+windows into the `attempts` arrays of the same-tagged seed-102 5k windows (a **tag collision** across
+the two specs — both emit `rand#0…rand#3`), so the full run is recovered from **windows *and* attempts
+together**. It is a results-labelling defect only: the budget sums and per-window verdicts are
+unaffected (§5.5). Reconstructed that way, there are **11 recorded window records**.
+
+**First run — recorded as-is (the pre-#77 differ).** Of the 11 records, exactly **one passed
+byte-identical outright**; every other diff either **failed on `blocks` only** or **wedged** (#78). In
+**every** blocks-only failure the `logs` / `transactions` / `transaction_receipts` / `traces` tables
+were **byte-identical** and the sole differing column was **`block.size`**, always with
+`rpc = portal + 1`, always on blocks whose canonical size is **≥ 65 540** — the signature of the
+upstream-dataset off-by-one now tracked as [#76](../../issues/76).
+
+| Window (spec) | Matched logs | First-run verdict | Differing field |
+|---------------|-------------:|-------------------|-----------------|
+| `rand#0` 2k `[19203200, 19205200]` | 13,117 | **PASS — byte-identical outright** | — |
+| `rand#1` 2k `[20145674, 20147674]` | 16,911 | FAIL — blocks-only (9 rows) | `block.size` only |
+| `rand#2` 2k `[19809831, 19811831]` | 28,741 | FAIL — blocks-only (1 row) | `block.size` only |
+| `rand#3` 2k `[19963239, 19965239]` | 20,951 | FAIL — blocks-only (5 rows) | `block.size` only |
+| `rand#0` 5k `[20028730, 20033730]` | 45,668 | FAIL — blocks-only (20 rows) | `block.size` only |
+| `rand#1` 5k `[19813237, 19818237]` | 73,881 | **diff WEDGED, killed (#78)** | (not reached) |
+| `rand#1+shrunk` `[19813237, 19815737]` | 41,078 | FAIL — blocks-only (5 rows) | `block.size` only |
+| `rand#2` 5k `[20130205, 20135205]` | 53,799 | FAIL — blocks-only (11 rows) | `block.size` only |
+| `rand#2+shrunk` `[20130205, 20132705]` | 22,088 | FAIL — blocks-only (4 rows) | `block.size` only |
+| `rand#3` 5k `[20474824, 20479824]` | 77,468 | **diff WEDGED, killed (#78)** | (not reached) |
+| `rand#3+shrunk` `[20474824, 20477324]` | 37,012 | FAIL — blocks-only (3 rows) | `block.size` only |
+
+**The #78 wedge (a harness perf defect, not a data defect).** The two largest stores —
+`rand#1` 5k (73,881 matched logs) and `rand#3` 5k (77,468 matched logs) — **wedged in the differ**: it
+printed `logs … identical` and then made no forward progress. The `rand#1` live diff was **killed
+after ~47 min** and both stores were **preserved**. Offline, that store's `logs` table alone takes
+~2 min and the full diff exceeds 300 s, whereas the **entire** diff of the 53,799-log `rand#2` store
+finishes in **6.7 s** — a pathological cliff between ~54 k and ~74 k matched rows, filed as
+[#78](../../issues/78). The harness's **auto-shrink** bounded the cost of the largest windows by
+re-running each on a smaller (half-size) leading window that diffs to completion — which is why
+`rand#1+shrunk`, `rand#2+shrunk`, and `rand#3+shrunk` appear above.
+
+**Re-verdict under the merged #77 tolerance.** [#77](../../pull/77) merged the precisely-scoped,
+self-retiring `block.size` tolerance (§5.3, §5.6). The **byte-aware batched differ** from
+[#72](../../pull/72) — which also sidesteps the #78 cliff by paged reads — was re-run **over every
+preserved store with no re-backfill** (a diff-only re-run against the preserved `ponder_sync` stores).
+Result: **every store is byte-identical across `logs` / `transactions` / `transaction_receipts` /
+`traces`**, with a small bounded count of tolerated `block.size` rows per window and the **strict
+(non-block) tables byte-identical in every store**:
+
+| Preserved store (window) | Matched logs | Tolerated `block.size` rows |
+|--------------------------|-------------:|----------------------------:|
+| `rand#1` 2k `[20145674, 20147674]` | 16,911 | 9 |
+| `rand#2` 2k `[19809831, 19811831]` | 28,741 | 1 |
+| `rand#3` 2k `[19963239, 19965239]` | 20,951 | 5 |
+| `rand#0` 5k `[20028730, 20033730]` | 45,668 | 20 |
+| `rand#1` 5k `[19813237, 19818237]` (monster store) | 73,881 | 10 |
+| `rand#1+shrunk` `[19813237, 19815737]` | 41,078 | 5 |
+| `rand#2` 5k `[20130205, 20135205]` | 53,799 | 11 |
+| `rand#2+shrunk` `[20130205, 20132705]` | 22,088 | 4 |
+| `rand#3` 5k `[20474824, 20479824]` (monster store) | 77,468 | 10 |
+| `rand#3+shrunk` `[20474824, 20477324]` | 37,012 | 3 |
+
+The two **monster stores** that wedged the old differ (#78) re-verdicted with the byte-aware batched
+differ **byte-identical, 10 tolerated `block.size` rows each, in 8.3 s and 9.5 s** respectively
+(73,881 logs / 52,670 txs and 77,468 logs / 51,533 txs) — a **>200×** recovery on exactly the stores
+that provoked the wedge, which also validates the #78 fix direction (paged reads). The `rand#0` 2k
+store `[19203200, 19205200]` (13,117 logs) needed no re-verdict: it passed **byte-identical outright**,
+`block.size` included.
+
+**Verdict — PASS under the documented tolerance.** **10 / 10 preserved stores pass under the #77
+tolerance**, and with the one outright-clean window that accounts for **11 / 11 window records**. Every
+first-run failure is **fully explained by #76** — a `block.size`-only, `rpc = portal + 1`,
+size-≥-65 540 divergence in the *upstream dataset* — and the **strict tables are byte-identical in
+every store**. The `block.size` tolerance is declared, bounded, reported per-window, and
+**self-retiring** the moment the upstream dataset is fixed (§5.3, §5.6). Cell totals: **11 recorded
+window records, 70,546 metered JSON-RPC requests**.
+
+Repro (the operator supplies the tarball and the metered RPC key — see `harness/validate/README.md`):
+
+```bash
+SQD_PONDER_TARBALL=<tarball> SQD_RPC_KEY=<paid-rpc-key> \
+  bash harness/validate/run-cell.sh L-eth
 ```
 
 ---
@@ -510,9 +645,13 @@ self-consistent under kills.
 ## 5. Findings log
 
 Every divergence and anomaly surfaced by the layers above is recorded here with its public issue and
-current state. **In cross-validation so far, the divergences found have been RPC-leg (leg-A) defects;
-the Portal leg matched third-party evidence in each confirmed case.** This is a factual record of what
-has been observed, not a claim that the Portal path is defect-free.
+current state. **In the A/B soak cross-validation (Layer D) so far, the divergences found have been
+RPC-leg (leg-A) defects; the Portal leg matched third-party evidence in each confirmed case.** The one
+confirmed **Portal-side** divergence to date is not a fork defect but an *upstream SQD dataset* defect
+— a `block.size` off-by-one at the RLP 2^16 boundary — surfaced by the Layer-E paid matrix, publicly
+reproducible against any RPC, and tolerated under a precisely-scoped, self-retiring class pending the
+upstream fix ([#76](../../issues/76), §5.3 and §5.6). This is a factual record of what has been
+observed, not a claim that the Portal path is defect-free.
 
 ### 5.1 Cross-validation findings (A/B soak differ, Layer D)
 
@@ -540,10 +679,12 @@ population of parent transactions on the stream wire. The realtime path continue
 
 ### 5.3 Benign / tolerated diff classes (declared, bounded, removable)
 
-The A/B differ tolerates a small, **explicitly enumerated** set of already-understood divergences so
-that a *new* divergence is never masked. Each class is narrowly scoped, reported in the status JSON,
-and designed to be removed once its underlying issue is fixed. The exact semantics are documented in
-`harness/soak-ab/ab-diff.mjs`.
+Both differ paths — the **A/B soak differ** (Layer D) and the **paid-matrix byte-diff** (Layer E) —
+tolerate a small, **explicitly enumerated** set of already-understood divergences so that a *new*
+divergence is never masked. Each class is narrowly scoped, reported in the diff's status output, and
+designed to be removed once its underlying issue is fixed. The A/B classes (the first four rows) are
+documented in `harness/soak-ab/ab-diff.mjs`; the paid-matrix `block.size` class (the last row, #76) is
+the tolerance merged in [#77](../../pull/77) and lives in the batched byte-diff path.
 
 | Class | Scope | Why tolerated | Removal condition |
 |-------|-------|---------------|-------------------|
@@ -551,6 +692,7 @@ and designed to be removed once its underlying issue is fixed. The exact semanti
 | **access_list-null (#27)** | a single already-diverged **shared** tx whose *only* divergence is `access_list` (every other column byte-identical: ex-`access_list` md5s equal) | The RPC leg persisted NULL where the Portal leg has the real list (#27). Tolerated **only** while the divergence stays access_list-only. | If any *second* column ever diverges on that row, it stops being tolerated → hard FAIL. Removed when #27 is fixed. |
 | **pinned known-bad row (#32)** | exactly one transaction hash on chain 42161 with the fabricated-empty `[]` shape | Isolates the single anomalous #32 row so it does not mask new drift. | The pin protects **only** the measured `[]`-vs-concrete-list shape — it does **not** tolerate an A-NULL / B-non-null drift or a B-side rot on that hash. Removed with #32. |
 | **leg-A onlyB row-loss (#36)** | `onlyB` log/block rows (present in leg B, missing in leg A) at/above a per-chain realtime-era floor; **chain 1 only** (the only chain where the loss was observed) | Leg A silently lost on-chain rows leg B holds (#36); below the floor leg A's store came from the complete-by-construction historical backfill path. | A chain with `onlyB` rows but **no** configured floor is a hard FAIL (unknown chains are never default-tolerated). Removed when leg A is repaired or the leg is retired. |
+| **upstream-dataset block.size (#76)** *(paid matrix, Layer E)* | a shared `blocks` row whose **only** divergence is `block.size` with `rpc = portal + 1`, on blocks of canonical size **≥ 65 540** (the RLP 2^16 boundary) | The upstream SQD Portal dataset serves `block.size` one byte low at the boundary (§5.6); the fork persists it faithfully, and every other block column plus all `logs` / `transactions` / `transaction_receipts` / `traces` rows are byte-identical. | Any *second* differing column, the opposite delta direction, or a sub-threshold size is a hard FAIL. **Self-retiring**: it matches nothing once the upstream size is correct. Removed when [#76](../../issues/76) is fixed. |
 
 **Candor about the limit of cross-validation.** Within a tolerated span the A/B differ *by itself*
 cannot distinguish leg-A row loss (leg A dropped a real on-chain row) from a hypothetical leg-B
@@ -590,6 +732,31 @@ belong in the open too.
 |-------|-------|---------|---------------------|
 | [#58](../../issues/58) | RESOLVED (**merged [#59](../../pull/59)**) | **Differ keyset pagination did not follow the sync-store PK.** The batched byte-diff's keyset cursor ordered/compared by columns that were **not** the `chain_id`-prefixed sync-store primary key, so on a large table the planner could not resolve each page as a single forward index scan; on the F-full full-history diff (§3.2) the tool diffed `logs` byte-identical, then **wedged on `transactions`** (days of CPU, no progress). | A tool defect (Layer E), not a data defect — both stores were intact (the offline re-diff with the fixed tool proved them byte-identical). Root-caused and fixed in **[#59](../../pull/59)**: ORDER BY + tuple-WHERE now lead with the `chain_id`-prefixed PK. Pinned by a DB-free SQL-shape test (`diff-batched.test.mjs`). |
 | [#63](../../issues/63) | RESOLVED (**merged [#72](../../pull/72)**) | **PGlite 0.2.13 WASM-allocator detoast-volume hang.** A single `select *` page whose toasted input runs to ~300 MB (which a 50,000-row page of the widest sync-store tables reaches over full-history windows) spins forever in PGlite 0.2.13's WASM allocator (the *detoast* step, not the query). The **same rows in 5,000-row pages** complete at ~1.5 s each. Surfaced by the fixed-keyset differ's first offline re-diff of the F-full evidence stores (§3.2), which hung after `logs` proved identical. | A finding about the **harness's embedded store backend**, not the fork or the diff logic. The interim mitigation shrank the differ page size `BATCH` from 50,000 to a fixed 5,000 rows (the F-full re-diff completed in ~65 s at that size). The **durable fix merged in [#72](../../pull/72)** replaces the fixed row count — only ever a proxy for detoast volume — with **byte-aware page sizing**: after each page the differ measures its rows' average serialized width and sizes the **next** page's row `limit` from it (`nextBatchSize(observedAvgRowBytes, targetBytes, floor, ceiling)` = `floor(target / avg)` clamped to `[5000, 50000]`; degenerate observations fall back to the floor), targeting a bounded per-query payload (default 32 MB, ~10× under the ~300 MB wedge threshold; override via `--byte-target` / `DIFF_BYTE_TARGET`), so fat-calldata tables page narrow and slim tables page wide under one byte budget. The keyset **cursor is unchanged** — the tuple-WHERE resumes strictly past the previous page's tail row regardless of page size, so the yielded row stream is identical for any limit sequence; only the `limit` varies. Pinned by the DB-free SQL-shape / sizing tests (`diff-batched.test.mjs`). |
+| [#78](../../issues/78) | OPEN (fix pending) | **Cell differ pathologically slow between ~54 k and ~74 k matched rows.** On the L-eth cell (§3.4) the *entire* diff of a 53,799-log store completes in **6.7 s**, but a 73,881-log store's diff **wedged** — its `logs` table alone ~2 min offline and the full diff >300 s — a superlinear cliff, not a gradual slowdown. Two L-eth diffs (`rand#1` and `rand#3` 5k) wedged; the live `rand#1` diff was **killed after ~47 min**. | A tool defect (Layer E), not a data defect — **the preserved stores re-verdicted byte-identical** with the byte-aware batched differ ([#72](../../pull/72)) in **8.3 s / 9.5 s** (§3.4), so no verdict changed and no store was lost. Worked around at run time by the harness's auto-shrink (bounded half-window re-runs); the durable **fix is pending** on #78, with [#72](../../pull/72)'s paged reads already demonstrating the >200× recovery on the exact stores that wedged. |
+| [#79](../../issues/79) | OPEN (fix pending) | **Results-doc tag collision across specs.** When one cell runs two window specs that reuse the same window **tags** (L-eth's seed-101 2k and seed-102 5k both emit `rand#0…rand#3`), the results JSON **folds** one spec's window records into the same-tagged records' `attempts` arrays, so the two specs' verdicts read as retries of each other. Surfaced on L-eth (§3.4), where the four 2k windows appear as `attempts` of the four 5k windows. | A **results-labelling** defect in the harness (Layer E), not a data defect: **budget sums and per-window verdicts are unaffected** — the full run is recovered by reading windows **and** attempts together (as §3.4 does), and every recorded window keeps its own range / verdict / request count. The **fix is pending** on #79. |
+
+### 5.6 Validation-matrix data findings (Layer E) — the upstream-dataset `block.size` off-by-one
+
+The paid matrix (Layer E) surfaced its first confirmed **Portal-side** divergence — and, unlike the
+Layer-D cross-validation findings above, it is **not** a portal-ponder fork defect but a defect in the
+**upstream SQD Portal dataset** the fork reads. It is recorded here in full because catching it is
+exactly what the gate is for: the L-eth cell (§3.4) flagged it, held the stores, and re-verdicted
+clean once the divergence was understood and bounded.
+
+| Issue | State | Finding | Attribution / layer |
+|-------|-------|---------|---------------------|
+| [#76](../../issues/76) | OPEN (tolerance **merged [#77](../../pull/77)**; upstream dataset fix tracked in #76) | **Upstream Portal dataset `block.size` off-by-one at the RLP 2^16 boundary.** On blocks whose canonical RLP-encoded size is **≥ 65 540**, the Portal dataset reports `block.size` **one byte low** (`rpc = portal + 1`); every other `blocks` column, and every `logs` / `transactions` / `transaction_receipts` / `traces` row, is byte-identical. Surfaced by the **L-eth** cell (§3.4): 10 of 11 first-run stores failed on `blocks` **only**, all with this exact signature. **Publicly reproducible** against any public archive node — e.g. block **19963775** (in the `rand#3` 2k window) reports `size` **66755** from the Portal endpoint vs **66756** from a public RPC. | A defect in the **upstream dataset** (the SQD Portal), not the portal-ponder fork or the diff tool: the fork faithfully persists what the dataset serves, and the RPC ground truth breaks the tie. Tolerated by a precisely-scoped, self-retiring diff class (§5.3) **merged in [#77](../../pull/77)**, under which the L-eth strict tables re-verdict clean; the underlying dataset fix is tracked in [#76](../../issues/76). |
+
+**Why this is tolerated rather than failed.** The tolerance is not a blanket "ignore blocks" waiver:
+it accepts a `blocks` row as matching **only** when the *sole* divergence is `block.size`, the RPC
+value is exactly the Portal value **+ 1**, and the block's canonical size is at/above the 2^16 boundary
+where the bug lives — any second differing column, any other delta direction, or a sub-threshold size
+is still a hard FAIL. It is reported per-window (the L-eth re-verdict prints the tolerated count for
+every store, §3.4) and it **removes itself** the moment the upstream dataset serves the correct size.
+This is the same discipline as the A/B differ's tolerated classes (§5.3): declared, bounded, and
+designed to be deleted. The candor point is the headline: **the byte-diff gate caught a real
+upstream-dataset defect that a coarser check would have waved through** — that is evidence the gate
+works, not a blemish on it.
 
 ---
 
@@ -625,14 +792,24 @@ belong in the open too.
   and an offline re-diff of the archived stores with the fixed tool) is stated in full in §3.2, as is
   the **app-hash caveat** — the app-table determinism hash was vacuous (no user rows written), so the
   byte-identity is proven at the sync-store row level only.
+- Two further paid cells are now **DONE**. The **inertness control `CTRL`** (§3.3) is **10 / 10**
+  seeded-random eth windows byte-identical (114,921 matched logs, 39,937 metered requests, zero
+  shrinks/retries), proving the Portal patch is **inert when the Portal environment is unset**. The
+  **eth Layer-L cell `L-eth`** (§3.4) is **PASS under the documented `block.size` tolerance**: all
+  **10 / 10** preserved stores are byte-identical on `logs` / `transactions` / `transaction_receipts` /
+  `traces` (strict tables), with every first-run `blocks`-only failure fully explained by the
+  upstream-dataset off-by-one [#76](../../issues/76) — the first case where the **gate caught a real
+  upstream data defect** (and, separately, a real harness perf defect [#78](../../issues/78)), which is
+  the evidence the gate works.
 - The A/B dual-implementation soak is **actively cross-validating** the Portal path against the RPC
   path hourly, and every divergence it has found is a **public, tracked issue** (§5) — with the Portal
   leg matching third-party evidence in each confirmed case.
 
 **Pending / not yet claimed:**
 
-- The **full paid byte-diff matrix** (§3) — SMOKE and the flagship `F-full` are DONE (§3.1, §3.2); the
-  remaining cells are PENDING. **This document will update each row as its cell completes.**
+- The **full paid byte-diff matrix** (§3) — SMOKE, the flagship `F-full`, the inertness control `CTRL`,
+  and the eth Layer-L cell `L-eth` are DONE (§3.1–§3.4); the remaining cells are PENDING. **This
+  document will update each row as its cell completes.**
 - The **flagship benchmark gate** (speed reproduced within tolerance of the published baseline) —
   see a separate benchmarks document (pending publication); not asserted here.
 - A **multi-day green-soak** sign-off and **GA of the zero-RPC realtime (stream) path** — the stream
