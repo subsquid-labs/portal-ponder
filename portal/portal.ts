@@ -149,6 +149,29 @@ export const createPortalHistoricalSync = (
   };
   const stash = new Map<string, StashEntry>(); // interval → block-data, consumed by syncBlockData
   const delegated = new Set<string>(); //        interval keys routed to RPC (finality gap)
+  // Per-interval record of the last non-empty INV-15 flush, keyed by ikey(interval). Ponder's core runs
+  // the whole interval callback inside a RETRYING transaction (queryBuilder re-runs it on transient DB
+  // failures — connection drops, deadlocks, even a failed COMMIT). A failure anywhere AFTER the flush
+  // rolls the inserted children back while the pending queue stays drained — the retry would then flush
+  // EMPTY and commit the factory interval cached WITHOUT its children (a permanent INV-15 violation:
+  // restarts load children only from the store). syncBlockRangeData restores an entry into the queue when
+  // the SAME interval re-enters (core's retry); a spurious restore after a COMMITTED attempt is safe (the
+  // INV-17 store dedupe no-ops the re-flush).
+  //
+  // KEYED, not a single slot, because core PIPELINES intervals: in runtime/historical.ts (`syncInterval`)
+  // the NEXT interval is dispatched INSIDE the current interval's still-open transaction — right after its
+  // syncBlockRangeData resolves, BEFORE syncBlockData/insertIntervals/COMMIT. So a sibling interval B can
+  // enter syncBlockRangeData and record its OWN flush while A's transaction is still failable. A single
+  // slot let B's entry evict A's, so A's retry found nothing to restore and committed EMPTY — the very
+  // loss this guards. With a Map only a MATCHING re-entry consumes its own entry; a sibling never touches
+  // another's. (Same-interval CONCURRENT re-entry — a retry re-dispatching the next interval with the same
+  // promise — degenerates to the documented INV-17 two-transaction TOCTOU residual: both txs read absence,
+  // both insert; only a DB UNIQUE truly closes that, so no extra handling is needed here.) Core gives no
+  // "committed" signal, so committed entries are pruned by a bounded cap: the LIVE pipeline depth is small
+  // (the next interval is only queued after the current one's range-data resolves), so the cap sits far
+  // above any set of still-uncommitted entries and the pruned oldest is always long-committed.
+  const MAX_PENDING_FLUSHES = 32;
+  const pendingFlushes = new Map<string, PendingFlush>();
   let chunkBlocks = cfg.chunkBlocks;
   let chunkSizeP: Promise<void> | undefined;
   let portalHead: number | undefined = cfg.finalizedHead;
@@ -495,6 +518,123 @@ export const createPortalHistoricalSync = (
     }
   };
 
+  // INV-15: persist the children discovered within an interval's range — the caller's syncStore is the
+  // transaction ponder's core commits together with insertIntervals (which marks the interval's factory
+  // intervals cached). Interval-scoped on purpose (see Discovery.takePendingInRange); a failed flush
+  // restores the queue and fails the interval loud (core rolls back — nothing is silently dropped).
+  // Called on BOTH serving paths — the Portal path (after its chunks resolve) and the RPC finality-
+  // delegation path — because core caches the factory intervals either way, and the RPC fallback cannot
+  // be trusted to persist these children itself: it shares `args.childAddresses`, and upstream's
+  // syncAddressFactory persists only children NOT already in that record, while the wide Portal scan
+  // (endHint = dataEnd) has usually already recorded them far past the interval being served.
+  const persistPendingChildren = async (
+    interval: Interval,
+    syncStore: Parameters<HistoricalSync['syncBlockRangeData']>[0]['syncStore'],
+  ): Promise<void> => {
+    const flush = discovery.takePendingInRange(interval[0], interval[1]);
+    if (flush.length === 0) return;
+
+    // Survives a post-flush rollback: restored into the queue when THIS SAME interval re-enters (core's
+    // transaction retry — see `pendingFlushes`). Keyed, so a pipelined sibling interval cannot evict it.
+    const key = ikey(interval);
+    pendingFlushes.set(key, flush);
+    // No commit signal from core, so prune the oldest (long-committed) entry once the map outgrows the
+    // small live pipeline depth. Map iteration is insertion-ordered → the first key is the oldest.
+    if (pendingFlushes.size > MAX_PENDING_FLUSHES) {
+      const oldest = pendingFlushes.keys().next().value as string;
+      pendingFlushes.delete(oldest);
+    }
+    try {
+      // INV-17 (write-side idempotence, #53): dedupe each factory's flush against the store's
+      // already-persisted rows BEFORE inserting. Upstream's `insertChildAddresses` is a plain
+      // INSERT with no ON CONFLICT and `factory_addresses` has no UNIQUE on (factory, chain,
+      // address) — so a resumed/re-run writer that re-flushes an already-persisted child set would
+      // durably DUPLICATE those rows. This is the write-side analogue of the read side's min-merge
+      // in `getChildAddresses` (LEAST semantics): keep a child only if it is not yet persisted OR
+      // is re-discovered at a STRICTLY LOWER creation block (whose lower row wins the min-merge on
+      // read). Re-flushes at an equal/higher block become no-ops, so re-inserting the same set
+      // cannot grow the table. `getChildAddresses` returns the store's min-merged map, and the
+      // fork owns only this call site (the store method is upstream), so the guard lives here.
+      //
+      // The read→dedupe→insert→insertIntervals sequence all runs inside ONE store transaction (the
+      // syncStore is created from the tx handle in runtime/historical.ts), so for a SINGLE writer the
+      // guard is transactional — no interleaving read/insert can slip a duplicate past it. (Two
+      // concurrent writers are two transactions: both can read absence and INSERT — only a DB UNIQUE
+      // closes that; documented residual on INV-17.)
+      //
+      // Group by STORE IDENTITY first (storeFactoryKey — factory minus id/sourceId): the store keys
+      // `factory_addresses` by that value, so aliased factories (same fields, different id/sourceId)
+      // share ONE row-set. Reading per `factory.id` and inserting all would let two aliases each read
+      // absence and BOTH insert the same children — durable duplicates. Canonicalizing collapses each
+      // alias group to one read + one insert; the group min-merges its members' children (LEAST), and
+      // inserting once under any member's factory object suffices for the whole group because
+      // `insertChildAddresses` upserts the `factories` row by that same stripped value and resolves
+      // `factory_id` from it (identical for every alias).
+      const groups = new Map<
+        string,
+        { factory: Factory; children: Map<Address, number> }
+      >();
+      for (const [factory, children] of flush) {
+        const key = storeFactoryKey(factory);
+        let group = groups.get(key);
+        if (group === undefined) {
+          group = { factory, children: new Map() };
+          groups.set(key, group);
+        }
+        for (const [address, block] of children) {
+          const prev = group.children.get(address);
+          if (prev === undefined || prev > block) {
+            group.children.set(address, block);
+          }
+        }
+      }
+
+      const deduped: PendingFlush = [];
+      for (const { factory, children } of groups.values()) {
+        const persisted = await syncStore.getChildAddresses({ factory });
+        // getChildAddresses returns stored text verbatim and min-merges case-SENSITIVELY, so a
+        // checksummed pre-existing row would not match a discovered child. Discovery lowercases every
+        // child (portal-discovery.ts), and upstream runtime matching lowercases its lookups, so the
+        // canonical child key is lowercase — normalize the persisted map to that before comparing.
+        const persistedLower = new Map<Address, number>();
+        for (const [address, block] of persisted) {
+          const lower = address.toLowerCase() as Address;
+          const prev = persistedLower.get(lower);
+          if (prev === undefined || prev > block) {
+            persistedLower.set(lower, block);
+          }
+        }
+
+        let toInsert: Map<Address, number> | undefined;
+        for (const [address, block] of children) {
+          const prev = persistedLower.get(address);
+          if (prev !== undefined && prev <= block) continue;
+
+          if (toInsert === undefined) toInsert = new Map();
+          toInsert.set(address, block);
+        }
+        if (toInsert !== undefined) deduped.push([factory, toInsert]);
+      }
+
+      if (deduped.length > 0) {
+        await Promise.all(
+          deduped.map(([factory, children]) =>
+            syncStore.insertChildAddresses({
+              factory,
+              childAddresses: children,
+              chainId: chain.id,
+            }),
+          ),
+        );
+      }
+    } catch (err) {
+      discovery.restorePending(flush);
+      pendingFlushes.delete(key); // restored NOW — a same-interval retry must not restore it a second time
+
+      throw err;
+    }
+  };
+
   // FIX 2: pin the discovery floor from the spec NOW, before the first fetch (re-pinned per call once
   // chunkBlocks is finalized). A no-op when there are no factory sources.
   pinDiscoveryFloor();
@@ -503,6 +643,19 @@ export const createPortalHistoricalSync = (
     async syncBlockRangeData(params) {
       const { interval, requiredFactoryIntervals, syncStore } = params;
       if (!startTime) startTime = Date.now();
+      // A SAME-interval re-entry is ponder's transaction retry (the interval callback re-runs after a
+      // rollback): restore THIS interval's previous flush — those children were rolled back with the
+      // transaction, and leaving the queue drained would commit the retry cached WITHOUT them (see
+      // `pendingFlushes`). Keyed by ikey, so this consumes ONLY this interval's entry: a pipelined sibling
+      // that entered while this transaction was still open left its own entry untouched, and this
+      // interval's entry likewise survives that sibling for its own retry. (persistPendingChildren
+      // re-records the entry below if this attempt also flushes non-empty, so a repeated retry is covered.)
+      const rkey = ikey(interval);
+      const reentry = pendingFlushes.get(rkey);
+      if (reentry !== undefined) {
+        discovery.restorePending(reentry);
+        pendingFlushes.delete(rkey);
+      }
       // finality gap: an interval past Portal's finalized head (or an unknown head) is delegated whole to
       // the authoritative RPC (INV-9). Re-confirm first (the Portal advances). The head can only be
       // stale-LOW (monotonic upstream), which errs safe.
@@ -542,6 +695,14 @@ export const createPortalHistoricalSync = (
             service: 'portal',
             msg: `Portal ${chain.name} [${interval[0]},${interval[1]}] ${portalHead === undefined ? 'head unknown' : `past finalized head ${portalHead}`} → RPC fallback`,
           });
+          // INV-15 × INV-9: children already discovered by the wide Portal scan and pending in this
+          // range MUST be flushed by THIS path. The fallback shares `args.childAddresses`, so upstream's
+          // syncAddressFactory dedupe-skips exactly the pre-discovered children (it persists only ones
+          // NOT already in the record) — while core still marks the factory interval cached in this same
+          // transaction. Skipping the flush here stranded them: persisted by NEITHER path, permanently
+          // lost on the next restart.
+          await persistPendingChildren(interval, syncStore);
+
           return rpcFallback().syncBlockRangeData(params);
         }
       }
@@ -585,100 +746,8 @@ export const createPortalHistoricalSync = (
       const data = await Promise.all(idxs.map(dataChunk));
 
       // INV-15: persist the children discovered within THIS interval's range NOW — dataChunk awaited
-      // discovery through this interval, and this call's syncStore is the transaction ponder's core
-      // commits together with insertIntervals (which marks THIS interval's factory intervals cached).
-      // Interval-scoped on purpose (see Discovery.takePendingInRange); a failed flush restores the
-      // queue and fails the interval loud (core rolls back — nothing is silently dropped).
-      const flush = discovery.takePendingInRange(interval[0], interval[1]);
-      if (flush.length > 0) {
-        try {
-          // INV-17 (write-side idempotence, #53): dedupe each factory's flush against the store's
-          // already-persisted rows BEFORE inserting. Upstream's `insertChildAddresses` is a plain
-          // INSERT with no ON CONFLICT and `factory_addresses` has no UNIQUE on (factory, chain,
-          // address) — so a resumed/re-run writer that re-flushes an already-persisted child set would
-          // durably DUPLICATE those rows. This is the write-side analogue of the read side's min-merge
-          // in `getChildAddresses` (LEAST semantics): keep a child only if it is not yet persisted OR
-          // is re-discovered at a STRICTLY LOWER creation block (whose lower row wins the min-merge on
-          // read). Re-flushes at an equal/higher block become no-ops, so re-inserting the same set
-          // cannot grow the table. `getChildAddresses` returns the store's min-merged map, and the
-          // fork owns only this call site (the store method is upstream), so the guard lives here.
-          //
-          // The read→dedupe→insert→insertIntervals sequence all runs inside ONE store transaction (the
-          // syncStore is created from the tx handle in runtime/historical.ts), so for a SINGLE writer the
-          // guard is transactional — no interleaving read/insert can slip a duplicate past it. (Two
-          // concurrent writers are two transactions: both can read absence and INSERT — only a DB UNIQUE
-          // closes that; documented residual on INV-17.)
-          //
-          // Group by STORE IDENTITY first (storeFactoryKey — factory minus id/sourceId): the store keys
-          // `factory_addresses` by that value, so aliased factories (same fields, different id/sourceId)
-          // share ONE row-set. Reading per `factory.id` and inserting all would let two aliases each read
-          // absence and BOTH insert the same children — durable duplicates. Canonicalizing collapses each
-          // alias group to one read + one insert; the group min-merges its members' children (LEAST), and
-          // inserting once under any member's factory object suffices for the whole group because
-          // `insertChildAddresses` upserts the `factories` row by that same stripped value and resolves
-          // `factory_id` from it (identical for every alias).
-          const groups = new Map<
-            string,
-            { factory: Factory; children: Map<Address, number> }
-          >();
-          for (const [factory, children] of flush) {
-            const key = storeFactoryKey(factory);
-            let group = groups.get(key);
-            if (group === undefined) {
-              group = { factory, children: new Map() };
-              groups.set(key, group);
-            }
-            for (const [address, block] of children) {
-              const prev = group.children.get(address);
-              if (prev === undefined || prev > block) {
-                group.children.set(address, block);
-              }
-            }
-          }
-
-          const deduped: PendingFlush = [];
-          for (const { factory, children } of groups.values()) {
-            const persisted = await syncStore.getChildAddresses({ factory });
-            // getChildAddresses returns stored text verbatim and min-merges case-SENSITIVELY, so a
-            // checksummed pre-existing row would not match a discovered child. Discovery lowercases every
-            // child (portal-discovery.ts), and upstream runtime matching lowercases its lookups, so the
-            // canonical child key is lowercase — normalize the persisted map to that before comparing.
-            const persistedLower = new Map<Address, number>();
-            for (const [address, block] of persisted) {
-              const lower = address.toLowerCase() as Address;
-              const prev = persistedLower.get(lower);
-              if (prev === undefined || prev > block) {
-                persistedLower.set(lower, block);
-              }
-            }
-
-            let toInsert: Map<Address, number> | undefined;
-            for (const [address, block] of children) {
-              const prev = persistedLower.get(address);
-              if (prev !== undefined && prev <= block) continue;
-
-              if (toInsert === undefined) toInsert = new Map();
-              toInsert.set(address, block);
-            }
-            if (toInsert !== undefined) deduped.push([factory, toInsert]);
-          }
-
-          if (deduped.length > 0) {
-            await Promise.all(
-              deduped.map(([factory, children]) =>
-                syncStore.insertChildAddresses({
-                  factory,
-                  childAddresses: children,
-                  chainId: chain.id,
-                }),
-              ),
-            );
-          }
-        } catch (err) {
-          discovery.restorePending(flush);
-          throw err;
-        }
-      }
+      // discovery through this interval (shared with the RPC-delegation path, see persistPendingChildren).
+      await persistPendingChildren(interval, syncStore);
 
       // PARALLEL read-ahead: prefetch ahead (never past the backfill end) — depth bounded by the shared
       // memory budget, not a fixed count (always lead-1; deeper only while unsaturated).
