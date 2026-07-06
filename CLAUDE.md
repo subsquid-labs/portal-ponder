@@ -14,8 +14,7 @@ These are enforced expectations for all TypeScript in this repo. Some are checke
      `if (!x) continue;` / `if (!x) break;` / `if (!x) return;`.
 
 2. **One variable per declaration.** Never `const a = 1, b = 2;` — one `const`/`let` each.
-   *(Biome flags this — `style/useSingleVarDeclarator`, currently `warn` while pre-existing
-   violations get cleaned up; bump to `error` once the repo is swept.)*
+   *(Biome-enforced at `error`: `style/useSingleVarDeclarator`.)*
 
 3. **Let guards and returns breathe.** Blank line *after* a guard clause
    (`if (...) continue;` / `break;`) when code follows, and a blank line *before* a `return`.

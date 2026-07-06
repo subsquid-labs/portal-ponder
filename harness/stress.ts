@@ -226,10 +226,10 @@ function sample() {
   const now = Date.now();
   const dt = (now - prev.t) / 1000 || 1;
   const snap = metrics.snapshot(now);
-  let req = 0,
-    bytes = 0,
-    err = 0,
-    ok = 0;
+  let req = 0;
+  let bytes = 0;
+  let err = 0;
+  let ok = 0;
   const statusAgg: Record<string, number> = {};
   for (const d of snap.perDataset) {
     req += d.httpRequests;

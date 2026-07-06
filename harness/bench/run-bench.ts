@@ -54,8 +54,8 @@ async function rssTreeMB(pid: number): Promise<number> {
     let out = '';
     ps.stdout.on('data', (d) => (out += d));
     ps.on('close', () => {
-      const rss = new Map<number, number>(),
-        kids = new Map<number, number[]>();
+      const rss = new Map<number, number>();
+      const kids = new Map<number, number[]>();
       for (const l of out.trim().split('\n')) {
         const [p, pp, r] = l.trim().split(/\s+/).map(Number);
         if (!p) continue;
@@ -112,10 +112,10 @@ export async function runBench(spec: BenchSpec): Promise<BenchResult> {
   );
 
   const t0 = Date.now();
-  let events = 0,
-    peakRssMB = 0,
-    done = false,
-    failed = '';
+  let events = 0;
+  let peakRssMB = 0;
+  let done = false;
+  let failed = '';
   let buf = '';
   const onLine = (line: string) => {
     const m = line.match(/event_count=(\d+)/);
