@@ -19,24 +19,42 @@ import { fileURLToPath } from 'node:url';
 const HERE = dirname(fileURLToPath(import.meta.url));
 const RESULTS = resolve(HERE, 'results');
 
-// Merge `record` (a fresh attempt for its tag) into the existing `windows` list. The prior window
-// for that tag (and its own attempts history) is folded into the new record's `attempts` array, so
-// no spent-requests row is ever lost — the returned windows carry the full attempt history.
+// Merge `record` (a fresh attempt for its tag) into the existing `windows` list. A prior window for
+// that tag is folded into the new record's `attempts` array — but ONLY when it covers the SAME
+// (from, to) range, i.e. it is a genuine RERUN of the same window. No spent-requests row is ever lost
+// (the returned windows carry the full attempt history), so budget-sum stays exact.
+//
+// A prior record that shares the tag but covers a DIFFERENT range is NOT a rerun — it is a different
+// window that happens to collide on tag. Folding it would bury its verdict under an unrelated window
+// (#79). Such a record is kept as its own top-level window instead, and the collision is warned
+// loudly: after the per-spec tag fix in windows.mjs, tags should never collide across windows, so
+// this branch firing means a stale/hand-edited results doc or a new collidable strategy.
 export function mergeWindows(windows, record) {
-  const prior = (windows ?? []).filter(
-    (w) => w.window?.tag === record.window.tag,
-  );
-  const kept = (windows ?? []).filter(
-    (w) => w.window?.tag !== record.window.tag,
-  );
+  const { from, to, tag } = record.window;
+  const kept = [];
   const history = [];
-  for (const p of prior) {
-    for (const a of p.attempts ?? []) {
+  for (const w of windows ?? []) {
+    if (w.window?.tag !== tag) {
+      kept.push(w);
+
+      continue;
+    }
+
+    if (w.window?.from !== from || w.window?.to !== to) {
+      console.warn(
+        `mergeWindows: tag '${tag}' reused across ranges [${w.window?.from},${w.window?.to}] and [${from},${to}] — keeping both as separate windows (a tag must identify one window)`,
+      );
+      kept.push(w);
+
+      continue;
+    }
+
+    for (const a of w.attempts ?? []) {
       history.push(a);
     }
 
     // the prior verdict-bearing record itself becomes an attempt (strip its nested attempts)
-    const { attempts: _drop, ...bare } = p;
+    const { attempts: _drop, ...bare } = w;
     history.push(bare);
   }
 

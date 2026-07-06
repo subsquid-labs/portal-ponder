@@ -46,6 +46,64 @@ test('mergeWindows: a rerun folds the prior attempt into `attempts` (spend is ne
   assert.equal(other.length, 2);
 });
 
+// ── #79 record-result: fold a prior record ONLY when its range matches (else it is a different
+// window that collided on tag, and its verdict must not be buried as an "attempt") ───────────────
+
+// A window carrying an explicit range, so same-tag records can differ by (from, to).
+const rangeWin = (tag, from, to, requests) => ({
+  window: { from, to, tag },
+  pass: true,
+  requests,
+});
+
+test('mergeWindows: a same-tag DIFFERENT-range record is kept as its own window, not folded (#79)', () => {
+  const warnings = [];
+  const realWarn = console.warn;
+  console.warn = (msg) => warnings.push(msg);
+  try {
+    const start = mergeWindows([], rangeWin('rand#0', 0, 2_000, 100));
+    // a colliding tag over an UNRELATED range (different seed/spec) — must NOT demote the first
+    // window's verdict into the second window's attempts.
+    const merged = mergeWindows(start, rangeWin('rand#0', 500_000, 502_000, 200));
+
+    assert.equal(merged.length, 2, 'both windows survive as top-level entries');
+    const ranges = merged
+      .map((w) => `${w.window.from}-${w.window.to}`)
+      .sort();
+    assert.deepEqual(ranges, ['0-2000', '500000-502000']);
+    for (const w of merged) {
+      assert.deepEqual(w.attempts ?? [], [], 'neither window was folded away');
+    }
+  } finally {
+    console.warn = realWarn;
+  }
+
+  assert.equal(warnings.length, 1, 'the tag collision is warned loudly');
+});
+
+test('mergeWindows: a same-tag SAME-range record still folds (rerun + `+shrunk` semantics intact)', () => {
+  // A genuine rerun of the same window (identical range) still folds — the prior spend is retained
+  // in `attempts`, exactly the behavior budget-sum relies on. This is the un-mutated rerun path.
+  const first = mergeWindows([], rangeWin('rand#0', 0, 2_000, 100));
+  const rerun = mergeWindows(first, rangeWin('rand#0', 0, 2_000, 150));
+
+  assert.equal(rerun.length, 1, 'a same-range rerun stays one window');
+  assert.equal(rerun[0].requests, 150, 'latest attempt is the verdict-bearing record');
+  assert.equal(rerun[0].attempts.length, 1);
+  assert.equal(rerun[0].attempts[0].requests, 100, 'prior spend retained');
+
+  // run-cell.sh tags an auto-shrunk re-run `<tag>+shrunk` over a HALVED range — a distinct tag, so it
+  // is a separate top-level window (never folded into its parent), and it also reruns cleanly.
+  const withShrunk = mergeWindows(rerun, rangeWin('rand#0+shrunk', 0, 1_000, 40));
+  assert.equal(withShrunk.length, 2, 'the +shrunk window is its own entry');
+
+  const shrunkRerun = mergeWindows(withShrunk, rangeWin('rand#0+shrunk', 0, 1_000, 55));
+  const shrunk = shrunkRerun.find((w) => w.window.tag === 'rand#0+shrunk');
+  assert.equal(shrunkRerun.length, 2, 'still two windows after the +shrunk rerun');
+  assert.equal(shrunk.requests, 55, 'latest +shrunk attempt is the verdict');
+  assert.equal(shrunk.attempts[0].requests, 40, 'prior +shrunk spend retained');
+});
+
 test('sumDoc: counts the verdict-bearing window AND every attempt', () => {
   const doc = {
     windows: [

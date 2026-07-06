@@ -54,7 +54,11 @@ export function seededRandomWindows({ seed, from, to, count, size }) {
   const out = [];
   for (let i = 0; i < count; i++) {
     const start = from + Math.floor(rand() * (span - size + 1));
-    out.push({ from: start, to: start + size, tag: `rand#${i}` });
+    // Tag is qualified by (seed, size) as well as index so that a cell expanding TWO seeded-random
+    // specs cannot emit colliding tags (#79): a bare `rand#${i}` repeated across specs let one spec's
+    // window get folded into an unrelated spec's `attempts` history in record-result.mjs. `+shrunk`
+    // suffixing (run-cell.sh) composes on top of this unchanged.
+    out.push({ from: start, to: start + size, tag: `rand#${seed}.${i}@${size}` });
   }
 
   return out;
