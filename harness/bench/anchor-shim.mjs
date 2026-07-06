@@ -301,8 +301,16 @@ async function selftest() {
       'deploy-parent 0x09 (deploy − 1) → header',
     );
 
-    const head = await call('/137', 'eth_getBlockByNumber', ['0x1e', true]);
-    expect(head.result?.number === '0x1e', 'head 0x1e (fullTx=true) → header');
+    const head = await call('/137', 'eth_getBlockByNumber', ['0x1e', false]);
+    expect(head.result?.number === '0x1e', 'head 0x1e (fullTx=false) → header');
+
+    // fullTransactions=true is off the startup surface: even a pinned block is rejected fail-loud,
+    // because a light header would be a wrong-shaped response for a fullTx request.
+    const fullTx = await call('/137', 'eth_getBlockByNumber', ['0x1e', true]);
+    expect(
+      fullTx.error?.code === -32602,
+      'fullTransactions=true → -32602 invalid params (off surface)',
+    );
 
     // via ?chain= query too
     const viaQuery = await call('/?chain=137', 'eth_chainId', []);
@@ -337,10 +345,11 @@ async function selftest() {
     const health = await healthRes.json();
     expect(health.ok === true, '/health → { ok:true }');
 
-    // every out-of-surface call must have been FLAGGED (un-pinned block, unknown method, unknown chain)
+    // every out-of-surface call must have been FLAGGED (fullTx=true, un-pinned block, unknown method,
+    // unknown chain)
     expect(
-      unexpected.length === 3,
-      `3 unexpected calls flagged (got ${unexpected.length}: ${unexpected
+      unexpected.length === 4,
+      `4 unexpected calls flagged (got ${unexpected.length}: ${unexpected
         .map((u) => u.reason)
         .join('; ')})`,
     );
@@ -356,7 +365,7 @@ async function selftest() {
     process.exit(1);
   }
 
-  console.log('anchor-shim selftest PASSED (12 checks)');
+  console.log('anchor-shim selftest PASSED (13 checks)');
   process.exit(0);
 }
 

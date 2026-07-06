@@ -139,15 +139,37 @@ test('serveRpc: "finalized" and "safe" tags both serve the finalized-target head
   }
 });
 
-test('serveRpc: a pinned block number is served regardless of hex form or fullTx flag', () => {
+test('serveRpc: a pinned block number is served regardless of hex form (fullTx=false)', () => {
   const a = buildChainAnchors(SNAP);
-  // deploy 0x0a requested with a padded/upcased form and fullTransactions=true
+  // deploy 0x0a requested with a padded/upcased form and the startup-surface fullTransactions=false
   const res = serveRpc(
-    { id: 2, method: 'eth_getBlockByNumber', params: ['0x00A', true] },
+    { id: 2, method: 'eth_getBlockByNumber', params: ['0x00A', false] },
     a,
   );
   assert.equal(res.body.result.hash, '0xdeploy');
   assert.equal(res.unexpected, undefined);
+});
+
+test('serveRpc: fullTransactions=true is off the surface → error AND flagged (fail-loud)', () => {
+  const a = buildChainAnchors(SNAP);
+  // even for a PINNED block, fullTransactions=true is an unforeseen caller: ponder 0.16.6's startup
+  // surface only ever sends false, and a light header would be a wrong-shaped response. Reject + flag.
+  const res = serveRpc(
+    { id: 2, method: 'eth_getBlockByNumber', params: ['0x0a', true] },
+    a,
+  );
+  assert.equal(
+    res.body.result,
+    undefined,
+    'no header is served for fullTx=true',
+  );
+  assert.equal(res.body.error.code, ERR_INVALID_PARAMS);
+  assert.match(
+    res.body.error.message,
+    /fullTransactions=true is off the pinned surface/,
+  );
+  assert.ok(res.unexpected, 'fullTx=true is flagged for stderr');
+  assert.match(res.unexpected, /fullTransactions=true/);
 });
 
 test('serveRpc: an UN-pinned block number → invalid-params error AND flagged unexpected', () => {

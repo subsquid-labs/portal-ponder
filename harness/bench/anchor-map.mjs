@@ -24,8 +24,10 @@
 // The deploy-parent (deploy−1) fetch is getLocalSyncProgress's "cached" diagnostic: getCachedBlock
 // returns `firstMissingBlock − 1` (the last-completed block) even on a FRESH store, so on every run
 // ponder fetches the block BEFORE the start of the backfill. It must be pinned or the run wedges.
-// The `fullTransactions` boolean is always false at startup; we serve the SAME light header for either
-// value (the snapshot carries only header fields), so a `true` request is honoured, not rejected.
+// The `fullTransactions` boolean is ALWAYS false on ponder 0.16.6's startup surface. A `true` request
+// would mean an unforeseen caller, and the snapshot only carries header fields — a light header is the
+// WRONG-shaped response for fullTransactions=true — so we reject it fail-loud (error + unexpected flag)
+// rather than silently serve a header that omits the requested transaction bodies.
 
 // JSON-RPC error codes we return. -32601 method-not-found for unknown methods; -32602 invalid-params for
 // a block the snapshot does not pin (the same code Polygon's public RPC returned for the wedging call,
@@ -151,6 +153,21 @@ export function serveRpc(req, anchors) {
 
 function serveBlockByNumber(id, params, anchors) {
   const tag = Array.isArray(params) ? params[0] : undefined;
+  const fullTx = Array.isArray(params) ? params[1] : undefined;
+
+  // fullTransactions=true is off the startup surface (ponder 0.16.6 only ever sends false). The snapshot
+  // carries header fields only, so a light header would be a wrong-shaped response — reject AND flag.
+  if (fullTx === true) {
+    return {
+      status: 200,
+      body: rpcError(
+        id,
+        ERR_INVALID_PARAMS,
+        `anchor-shim: fullTransactions=true is off the pinned surface for chain ${anchors.id} (only light headers are pinned)`,
+      ),
+      unexpected: `fullTransactions=true (block ${String(tag)})`,
+    };
+  }
 
   // tag requests: latest / finalized / safe map to their pinned header.
   if (typeof tag === 'string') {
