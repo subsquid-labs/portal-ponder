@@ -9,10 +9,11 @@
 //                        --ready-ms <epoch-ms /ready first went 200> \
 //                        --out bench.result.json
 //
-// The result carries: allComplete, historical start/end (unix s) + derived wallSeconds, the separate
-// unit-start→ready duration, per-chain completed/total blocks + complete flag, and rpc {requests,errors}
-// (errors MUST be 0 for a clean run). Exit 0 always writes the file; exit code reflects whether the run
-// looks CLEAN (complete + zero errors) so the driver can gate on it.
+// The result carries: allComplete, allBlocksComplete, historical start/end (unix s) + derived
+// wallSeconds, the separate unit-start→ready duration, per-chain completed/total blocks + complete flag,
+// and rpc {requests,errors} (errors MUST be 0 for a clean run). Exit 0 always writes the file; exit code
+// reflects whether the run looks CLEAN (is_complete for every chain + every chain's block counters fully
+// drained + zero rpc errors) so the driver can gate on it.
 
 import { writeFileSync } from 'node:fs';
 import { parseArgs } from './anchor-shim.mjs';
@@ -53,11 +54,18 @@ async function main() {
       ? Math.round((readyMs - unitStartMs) / 100) / 10
       : null;
 
-  const clean = summary.allComplete && summary.rpc.errors === 0;
+  // CLEAN requires all three: the is_complete gauge for every chain, zero rpc errors, AND every chain's
+  // block counters fully drained (completedBlocks === totalBlocks, both present) — the block gate catches
+  // a chain that flipped is_complete but did not actually finish its backfill.
+  const clean =
+    summary.allComplete &&
+    summary.allBlocksComplete &&
+    summary.rpc.errors === 0;
   const result = {
     generatedAt: new Date().toISOString(),
     clean,
     allComplete: summary.allComplete,
+    allBlocksComplete: summary.allBlocksComplete,
     historicalStartTs: summary.historicalStart,
     historicalEndTs: summary.historicalEnd,
     wallSeconds: summary.wallSeconds,

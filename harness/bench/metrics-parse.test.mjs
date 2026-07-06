@@ -55,6 +55,11 @@ test('summarizeMetrics: a clean end-capped run — all complete, wall time, zero
   const sum = summarizeMetrics(samples, ['polygon', 'ethereum']);
 
   assert.equal(sum.allComplete, true);
+  assert.equal(
+    sum.allBlocksComplete,
+    true,
+    'both chains have completedBlocks === totalBlocks (both gauges present)',
+  );
   assert.equal(sum.historicalStart, 1000, 'min start across chains');
   assert.equal(sum.historicalEnd, 1500, 'max end across chains');
   assert.equal(sum.wallSeconds, 500, 'wall = maxEnd − minStart');
@@ -84,6 +89,40 @@ test('summarizeMetrics: an incomplete chain makes allComplete false', () => {
     'a chain with no is_complete sample is not complete',
   );
   assert.equal(arb.completedBlocks, 0);
+});
+
+test('summarizeMetrics: is_complete=1 but completedBlocks < totalBlocks → allBlocksComplete false', () => {
+  // ethereum's is_complete gauge flipped to 1, but the block counters did NOT fully drain
+  // (700 < 800). The is_complete gauge alone says done; the stricter block gate must catch it.
+  const partial = `
+ponder_sync_is_complete{chain="ethereum"} 1
+ponder_historical_start_timestamp_seconds{chain="ethereum"} 1010
+ponder_historical_end_timestamp_seconds{chain="ethereum"} 1500
+ponder_historical_completed_blocks{chain="ethereum"} 700
+ponder_historical_total_blocks{chain="ethereum"} 800
+`;
+  const sum = summarizeMetrics(parsePrometheus(partial), ['ethereum']);
+  assert.equal(sum.allComplete, true, 'the is_complete gauge is still 1');
+  assert.equal(
+    sum.allBlocksComplete,
+    false,
+    'completedBlocks < totalBlocks → not block-complete (the clean gate must fail on this)',
+  );
+});
+
+test('summarizeMetrics: a missing block gauge → allBlocksComplete false (both must be present)', () => {
+  // is_complete=1 and completedBlocks reported, but total_blocks is ABSENT: cannot prove drained.
+  const missingTotal = `
+ponder_sync_is_complete{chain="ethereum"} 1
+ponder_historical_completed_blocks{chain="ethereum"} 800
+`;
+  const sum = summarizeMetrics(parsePrometheus(missingTotal), ['ethereum']);
+  assert.equal(sum.allComplete, true);
+  assert.equal(
+    sum.allBlocksComplete,
+    false,
+    'an absent total_blocks gauge cannot prove the backfill drained',
+  );
 });
 
 test('summarizeMetrics: a non-zero rpc error total surfaces (a bench red flag)', () => {

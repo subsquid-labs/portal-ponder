@@ -149,6 +149,9 @@ function lastByChain(samples, name) {
 
 // Build the bench result from parsed samples + the list of chain names we expect to complete.
 //   allComplete       — every expected chain has ponder_sync_is_complete == 1
+//   allBlocksComplete — every expected chain has completedBlocks === totalBlocks with BOTH gauges present
+//                       (a STRONGER completion signal than the is_complete gauge alone: it catches a chain
+//                       that flipped is_complete but whose block counters never fully drained)
 //   historicalStart/End — min start, max end across chains (unix seconds); wallSeconds = end − start
 //   perChain          — [{ chain, complete, completedBlocks, totalBlocks, startTs, endTs }]
 //   rpc               — { requests, errors } totalled across chains (errors MUST be 0 for a clean run)
@@ -167,17 +170,28 @@ export function summarizeMetrics(samples, expectedChains) {
   const chains = expectedChains ?? [...isComplete.keys()];
   const perChain = [];
   let allComplete = chains.length > 0;
+  let allBlocksComplete = chains.length > 0;
   for (const chain of chains) {
     const complete = (isComplete.get(chain) ?? 0) === 1;
     if (!complete) {
       allComplete = false;
     }
 
+    // stronger completion: both block gauges must be PRESENT (non-null) and equal. An absent gauge or
+    // completedBlocks < totalBlocks means the backfill did not fully drain, even if is_complete flipped.
+    const rawCompleted = completed.has(chain) ? completed.get(chain) : null;
+    const rawTotal = total.has(chain) ? total.get(chain) : null;
+    const blocksComplete =
+      rawCompleted !== null && rawTotal !== null && rawCompleted === rawTotal;
+    if (!blocksComplete) {
+      allBlocksComplete = false;
+    }
+
     perChain.push({
       chain,
       complete,
-      completedBlocks: completed.get(chain) ?? 0,
-      totalBlocks: total.get(chain) ?? 0,
+      completedBlocks: rawCompleted ?? 0,
+      totalBlocks: rawTotal ?? 0,
       startTs: startTs.get(chain) ?? null,
       endTs: endTs.get(chain) ?? null,
     });
@@ -197,6 +211,7 @@ export function summarizeMetrics(samples, expectedChains) {
 
   return {
     allComplete,
+    allBlocksComplete,
     historicalStart,
     historicalEnd,
     wallSeconds,
