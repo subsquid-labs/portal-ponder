@@ -1,8 +1,11 @@
 // Streaming / constant-memory byte-identity diff of two ponder_sync stores — the F-full variant of
 // harness/diff/diff.mjs. Where diff.mjs loads whole tables into memory, this walks each table in
-// ORDER BY key batches of 5k rows (keyset pagination) and merge-compares the two ordered streams,
-// so peak memory is one batch per side regardless of table size (the Euler-eth full history is
-// millions of rows). Tolerances match diff.mjs exactly:
+// ORDER BY key pages (keyset pagination) and merge-compares the two ordered streams, so peak memory
+// is one page per side regardless of table size (the Euler-eth full history is millions of rows). The
+// page size is BYTE-AWARE (issue #63): each page's row limit adapts from the previous page's observed
+// row width to keep the per-query detoast payload bounded (default ≤32MB, override --byte-target),
+// because PGlite's WASM allocator wedges on a too-large single-query detoast volume. Tolerances match
+// diff.mjs exactly:
 //   - logs / transactions / transaction_receipts / traces : strict set + field identity
 //   - blocks : total_difficulty excluded; ASYMMETRIC by default — a portal-only block (A) FAILS (the
 //     Portal path invented a block RPC never saw); only an rpc-only block (B) is tolerated (the stock
@@ -17,6 +20,7 @@
 //   node diff-batched.mjs <pgliteDirA> <pgliteDirB> [--app-hash]   diff sync stores (exit 0/1)
 //   node diff-batched.mjs --app-hash <pgliteDir> [--schema NAME]   ordered md5 over app tables
 //   STRICT_BLOCKS=1 node diff-batched.mjs A B                       blocks table strict (portal-vs-portal)
+//   --byte-target <bytes> (or DIFF_BYTE_TARGET env)                 per-query payload target (default 32MB)
 //
 // The pure comparison + hashing core is exported for unit tests (fixture rows, no database).
 
@@ -261,20 +265,130 @@ export function resolveTableSpecs(strictBlocks) {
   return out;
 }
 
-// 5k, not 50k (issue #63): PGlite 0.2.13's WASM allocator spins forever on a single `select *` page whose
-// toasted input runs to ~300MB (detoast volume), which a 50k-row page of the widest sync-store
-// tables hits over full-history windows; the same rows in 5k-row pages complete at ~1.5s each.
-const BATCH = 5_000;
+// ── byte-aware page sizing (issue #63) ─────────────────────────────────────────────────────────
+//
+// Why a FIXED row limit is unsafe. PGlite 0.2.13's WASM allocator spins forever (100% CPU, flat RSS,
+// no error) on a single `select *` page whose detoasted volume is too large — the F-full transactions
+// table carries ~982MB of TOASTed calldata, so one 50k-row page hauls ~300MB of `input` through the
+// WASM heap and wedges the tool. The same rows read in bounded-volume pages (memory reclaimed between
+// queries) complete in seconds. #64 mitigated this by hard-pinning the limit to 5,000, which is safe
+// for fat tables but leaves ~10× throughput on the table for slim ones (blocks, receipts).
+//
+// The durable fix: keep the per-query PAYLOAD bounded (not the row count). After each page we hold its
+// rows, so we measure their average serialized byte width and size the NEXT page to hit a target
+// payload (default 32MB), clamped to a [floor, ceiling] row window. Bounded payload ⇒ bounded detoast
+// volume ⇒ no wedge; the adaptive limit lets slim tables run wide and fat tables run narrow, all under
+// the same byte budget.
+//
+// The keyset CURSOR is entirely unchanged — the tuple-WHERE resumes strictly after the previous page's
+// tail row regardless of how many rows a page held, so the yielded row STREAM is identical for any
+// limit sequence. Only the `limit` value varies between pages.
+
+// Per-query payload target: keep one page's detoast volume comfortably under the ~300MB that wedges
+// the WASM heap. 32MB leaves ~10× headroom and still lets slim tables page wide.
+const DEFAULT_BYTE_TARGET = 32 * 1024 * 1024;
+
+// Row-limit clamp. FLOOR guarantees forward progress even if a single row is pathologically wide (a
+// page is never smaller than this, so the cursor always advances). CEILING caps the limit so a
+// degenerate tiny-average estimate can't ask for a multi-million-row page (and matches the historically
+// safe 50k upper bound for slim tables). The FIRST page has no observation yet, so it starts at the
+// FLOOR — the conservative choice that cannot wedge on an unknown-width table.
+const MIN_BATCH = 5_000;
+const MAX_BATCH = 50_000;
+
+// Cheap, deterministic per-row byte width ≈ the row's detoast volume. We size against the RAW payload
+// PGlite must materialize, so bytes columns count as their raw byte length (the fat `input` calldata is
+// a Uint8Array — its byteLength IS the detoast cost). Strings count as their UTF-8 byte length; bigints
+// and numbers as their decimal-digit length; everything else via a JSON fallback. No hashing, no full
+// normRow — one linear pass over the row's own values, so measuring a page is O(page bytes) and adds no
+// query. Deterministic: identical rows always measure identically.
+export function rowBytes(row) {
+  let n = 0;
+  for (const k of Object.keys(row)) {
+    const v = row[k];
+    if (v instanceof Uint8Array) {
+      n += v.byteLength;
+    } else if (typeof v === 'string') {
+      n += Buffer.byteLength(v);
+    } else if (typeof v === 'bigint' || typeof v === 'number') {
+      n += String(v).length;
+    } else if (v === null || v === undefined) {
+      n += 1;
+    } else {
+      n += Buffer.byteLength(JSON.stringify(v, bigintSafe));
+    }
+  }
+
+  return n;
+}
+
+// Pure sizing policy: given the average serialized byte width observed on the PREVIOUS page, return the
+// row limit for the NEXT page so its payload targets `targetBytes`, clamped to [floor, ceiling]. Kept
+// pure + exported so the whole adaptation (target, clamp, degenerate-input handling) is unit-testable
+// without a database — the WASM hang itself is not reproducible at test scale.
+//
+// Degenerate observations (0 / negative / NaN / non-finite avg — e.g. a page of all-empty rows, or a
+// first page with no observation) carry no width signal, so we fall back to the FLOOR: the conservative
+// limit that cannot wedge on an unknown- or zero-width table. A finite positive average yields
+// floor(targetBytes / avg), clamped into [floor, ceiling].
+export function nextBatchSize(
+  observedAvgRowBytes,
+  targetBytes = DEFAULT_BYTE_TARGET,
+  floor = MIN_BATCH,
+  ceiling = MAX_BATCH,
+) {
+  if (!Number.isFinite(observedAvgRowBytes) || observedAvgRowBytes <= 0) {
+    return floor;
+  }
+
+  const est = Math.floor(targetBytes / observedAvgRowBytes);
+  if (est < floor) {
+    return floor;
+  }
+  if (est > ceiling) {
+    return ceiling;
+  }
+
+  return est;
+}
+
+// Resolve the per-query byte target from CLI flag (`--byte-target <bytes>`) then env
+// (`DIFF_BYTE_TARGET`), falling back to the default. A missing, non-numeric, or non-positive value
+// falls through to the next source (never a silent 0 that would collapse every page to the floor).
+// Pure + exported so the override precedence is unit-testable without a process. Returns the resolved
+// positive integer byte target.
+export function parseByteTarget(
+  argv,
+  env = {},
+  fallback = DEFAULT_BYTE_TARGET,
+) {
+  const flag = argv.indexOf('--byte-target');
+  if (flag >= 0) {
+    const n = Number(argv[flag + 1]);
+    if (Number.isFinite(n) && n > 0) {
+      return Math.floor(n);
+    }
+  }
+
+  const fromEnv = Number(env.DIFF_BYTE_TARGET);
+  if (Number.isFinite(fromEnv) && fromEnv > 0) {
+    return Math.floor(fromEnv);
+  }
+
+  return fallback;
+}
 
 const toBig = (v) => (typeof v === 'bigint' ? v : BigInt(v));
 
-// Build one keyset page's SQL for `table` ordered by `keys`. When `hasCursor`, adds a row-wise
-// tuple WHERE so the page resumes strictly after the previous tail: (k0,k1,…) > ($1,$2,…). The
-// ORDER BY and the tuple LHS list the columns in `keys` order — which is the sync-store PK column
-// order (chain_id-first) — so the planner satisfies both the ordering and the range with a single
-// forward index scan on the PK, no per-page sort (issue #58). Pure + exported so a test can pin the
-// generated ORDER BY / tuple-WHERE shape per table WITHOUT a database.
-export function buildKeysetSql(table, keys, hasCursor) {
+// Build one keyset page's SQL for `table` ordered by `keys` with a per-page `limit`. When `hasCursor`,
+// adds a row-wise tuple WHERE so the page resumes strictly after the previous tail: (k0,k1,…) >
+// ($1,$2,…). The ORDER BY and the tuple LHS list the columns in `keys` order — which is the sync-store
+// PK column order (chain_id-first) — so the planner satisfies both the ordering and the range with a
+// single forward index scan on the PK, no per-page sort (issue #58). The `limit` varies between pages
+// (byte-aware sizing, issue #63) but is the ONLY thing that varies — the cursor WHERE/ORDER BY are
+// fixed. Pure + exported so a test can pin the generated ORDER BY / tuple-WHERE shape per table WITHOUT
+// a database.
+export function buildKeysetSql(table, keys, hasCursor, limit) {
   const cols = keys.map((k) => `"${k}"`).join(', ');
   const order = `order by ${cols}`;
   let where = '';
@@ -285,15 +399,26 @@ export function buildKeysetSql(table, keys, hasCursor) {
     where = `where ${lhs} > ${rhs}`;
   }
 
-  return `select * from ponder_sync."${table}" ${where} ${order} limit ${BATCH}`;
+  return `select * from ponder_sync."${table}" ${where} ${order} limit ${limit}`;
 }
 
-// Keyset-paginated async row stream: pulls BATCH rows at a time ordered by `keys`, holding at most
-// one batch in memory. `keys` are the sync-store PK columns (chain_id + block/index) → BigInt-comparable.
-async function* keysetRows(db, table, keys) {
+// Keyset-paginated async row stream: pulls a byte-aware page at a time ordered by `keys`, holding at
+// most one page in memory. The FIRST page uses the floor limit (no width observation yet); each
+// subsequent page's limit is sized from the PREVIOUS page's observed average row width so its payload
+// targets `byteTarget` (issue #63) — this is the ONLY thing that varies between pages. `keys` are the
+// sync-store PK columns (chain_id + block/index) → BigInt-comparable. The keyset cursor advances by the
+// previous page's tail row and is INDEPENDENT of the page size, so the yielded stream is identical for
+// any limit sequence.
+export async function* keysetRows(
+  db,
+  table,
+  keys,
+  byteTarget = DEFAULT_BYTE_TARGET,
+) {
   let last = null;
+  let limit = MIN_BATCH;
   for (;;) {
-    const sql = buildKeysetSql(table, keys, last !== null);
+    const sql = buildKeysetSql(table, keys, last !== null, limit);
     const params = [];
     if (last) {
       for (const k of keys) {
@@ -306,13 +431,28 @@ async function* keysetRows(db, table, keys) {
       return;
     }
 
+    // Measure THIS page's average serialized width before yielding, then size the NEXT page's limit
+    // from it. The cursor (below) is unaffected — only `limit` changes.
+    let pageBytes = 0;
+    for (const r of rows) {
+      pageBytes += rowBytes(r);
+    }
+
+    const avg = pageBytes / rows.length;
+    const wasFull = rows.length >= limit;
+
     for (const r of rows) {
       yield r;
     }
 
-    if (rows.length < BATCH) {
+    // A short page (fewer rows than we asked for) means the table is exhausted — stop. Tested against
+    // the limit THIS page was fetched with, exactly as before; only the value of `limit` is now
+    // adaptive, never how the end-of-table test works.
+    if (!wasFull) {
       return;
     }
+
+    limit = nextBatchSize(avg, byteTarget);
 
     const tail = rows[rows.length - 1];
     last = {};
@@ -326,19 +466,23 @@ function keyFnFor(keys) {
   return (row) => keys.map((k) => toBig(row[k]));
 }
 
-async function diffStores(dirA, dirB, { PGlite, strictBlocks = false }) {
+async function diffStores(
+  dirA,
+  dirB,
+  { PGlite, strictBlocks = false, byteTarget = DEFAULT_BYTE_TARGET },
+) {
   const dbA = await PGlite.create(dirA);
   const dbB = await PGlite.create(dirB);
   let fail = 0;
   const specs = resolveTableSpecs(strictBlocks);
   console.log(
-    `\nbatched byte-identity diff  (A=${dirA}  vs  B=${dirB})${strictBlocks ? '  [STRICT_BLOCKS: portal-vs-portal]' : ''}\n`,
+    `\nbatched byte-identity diff  (A=${dirA}  vs  B=${dirB})${strictBlocks ? '  [STRICT_BLOCKS: portal-vs-portal]' : ''}  [byte-target=${byteTarget}]\n`,
   );
 
   for (const [table, spec] of Object.entries(specs)) {
     const keyFn = keyFnFor(spec.keys);
-    const streamA = keysetRows(dbA, table, spec.keys);
-    const streamB = keysetRows(dbB, table, spec.keys);
+    const streamA = keysetRows(dbA, table, spec.keys, byteTarget);
+    const streamB = keysetRows(dbB, table, spec.keys, byteTarget);
     const r = await streamingDiff(streamA, streamB, {
       keyFn,
       drop: spec.drop,
@@ -493,10 +637,27 @@ async function main() {
     return;
   }
 
-  const [dirA, dirB] = argv;
+  // Positional dirs are every arg that is not a flag or a flag's value. Only --byte-target takes a
+  // value; drop it and the token after it so the dirs resolve wherever the flag sits on the line.
+  const positionals = [];
+  for (let i = 0; i < argv.length; i++) {
+    const arg = argv[i];
+    if (arg === '--byte-target') {
+      i += 1;
+
+      continue;
+    }
+    if (arg.startsWith('--')) {
+      continue;
+    }
+
+    positionals.push(arg);
+  }
+
+  const [dirA, dirB] = positionals;
   if (!dirA || !dirB) {
     console.error(
-      'usage: diff-batched.mjs <pgliteDirA> <pgliteDirB> [--app-hash] [--strict-blocks]',
+      'usage: diff-batched.mjs <pgliteDirA> <pgliteDirB> [--app-hash] [--strict-blocks] [--byte-target <bytes>]',
     );
     process.exit(2);
   }
@@ -505,7 +666,13 @@ async function main() {
   // diff (e.g. chaos resume vs baseline) where a one-sided block on EITHER side is a real gap.
   const strictBlocks =
     process.env.STRICT_BLOCKS === '1' || argv.includes('--strict-blocks');
-  const fail = await diffStores(dirA, dirB, { PGlite, strictBlocks });
+  // --byte-target <bytes> (or DIFF_BYTE_TARGET) overrides the per-query payload target (issue #63).
+  const byteTarget = parseByteTarget(argv, process.env);
+  const fail = await diffStores(dirA, dirB, {
+    PGlite,
+    strictBlocks,
+    byteTarget,
+  });
 
   if (argv.includes('--app-hash')) {
     const [ha, hb] = await Promise.all([
