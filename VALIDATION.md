@@ -272,9 +272,10 @@ adversarial-network scenarios and is unit-tested (`proxy.test.mjs`).
 
 Tier 0 proves atomicity, idempotence, and byte-identical completion, but — because its 50k range fits
 inside one 500k chunk — it cannot witness a resume from a *persisted partial* store ([#50](../../issues/50)).
-Tier 1 was built to close exactly that gap on a **crash-durable native Postgres backend** (`fsync=on`,
-`synchronous_commit=on`, `full_page_writes=on`), re-parameterized so the durable store advances in a
-**staircase** that kills can reliably land inside.
+Tier 1 was built to close exactly that gap on a **crash-durable native Postgres 16 backend** (`fsync=on`,
+`synchronous_commit=on`, `full_page_writes=on`; recorded as `postgres16-fsync-on` in the campaign
+metadata), re-parameterized so the durable store advances in a **staircase** that kills can reliably
+land inside.
 
 **Why Postgres, and why a logical digest.** The earlier attempt to prove partial-resume ran on PGlite,
 which runs single-user Postgres with `fsync` **off** and is **not crash-durable** under repeated
