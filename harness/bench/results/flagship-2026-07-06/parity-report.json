@@ -1,0 +1,442 @@
+{
+  "generatedAt": "2026-07-06T16:51:53.181Z",
+  "schema": "ponder_sync",
+  "pass": true,
+  "diffs": [],
+  "cells": [
+    {
+      "scope": "logs[chain 1]",
+      "field": "logCount",
+      "bench": "1351179",
+      "reference": "1351179",
+      "match": true
+    },
+    {
+      "scope": "logs[chain 1]",
+      "field": "minBlock",
+      "bench": "20558231",
+      "reference": "20558231",
+      "match": true
+    },
+    {
+      "scope": "logs[chain 1]",
+      "field": "maxBlock",
+      "bench": "25436861",
+      "reference": "25436861",
+      "match": true
+    },
+    {
+      "scope": "logs[chain 1]",
+      "field": "distinctTx",
+      "bench": "278763",
+      "reference": "278763",
+      "match": true
+    },
+    {
+      "scope": "logs[chain 56]",
+      "field": "logCount",
+      "bench": "260605",
+      "reference": "260605",
+      "match": true
+    },
+    {
+      "scope": "logs[chain 56]",
+      "field": "minBlock",
+      "bench": "47954461",
+      "reference": "47954461",
+      "match": true
+    },
+    {
+      "scope": "logs[chain 56]",
+      "field": "maxBlock",
+      "bench": "107424612",
+      "reference": "107424612",
+      "match": true
+    },
+    {
+      "scope": "logs[chain 56]",
+      "field": "distinctTx",
+      "bench": "64585",
+      "reference": "64585",
+      "match": true
+    },
+    {
+      "scope": "logs[chain 130]",
+      "field": "logCount",
+      "bench": "2134319",
+      "reference": "2134319",
+      "match": true
+    },
+    {
+      "scope": "logs[chain 130]",
+      "field": "minBlock",
+      "bench": "8805920",
+      "reference": "8805920",
+      "match": true
+    },
+    {
+      "scope": "logs[chain 130]",
+      "field": "maxBlock",
+      "bench": "52151560",
+      "reference": "52151560",
+      "match": true
+    },
+    {
+      "scope": "logs[chain 130]",
+      "field": "distinctTx",
+      "bench": "359002",
+      "reference": "359002",
+      "match": true
+    },
+    {
+      "scope": "logs[chain 137]",
+      "field": "logCount",
+      "bench": "803",
+      "reference": "803",
+      "match": true
+    },
+    {
+      "scope": "logs[chain 137]",
+      "field": "minBlock",
+      "bench": "88186880",
+      "reference": "88186880",
+      "match": true
+    },
+    {
+      "scope": "logs[chain 137]",
+      "field": "maxBlock",
+      "bench": "89375322",
+      "reference": "89375322",
+      "match": true
+    },
+    {
+      "scope": "logs[chain 137]",
+      "field": "distinctTx",
+      "bench": "219",
+      "reference": "219",
+      "match": true
+    },
+    {
+      "scope": "logs[chain 143]",
+      "field": "logCount",
+      "bench": "285415",
+      "reference": "285415",
+      "match": true
+    },
+    {
+      "scope": "logs[chain 143]",
+      "field": "minBlock",
+      "bench": "35528785",
+      "reference": "35528785",
+      "match": true
+    },
+    {
+      "scope": "logs[chain 143]",
+      "field": "maxBlock",
+      "bench": "84877761",
+      "reference": "84877761",
+      "match": true
+    },
+    {
+      "scope": "logs[chain 143]",
+      "field": "distinctTx",
+      "bench": "45315",
+      "reference": "45315",
+      "match": true
+    },
+    {
+      "scope": "logs[chain 146]",
+      "field": "logCount",
+      "bench": "663464",
+      "reference": "663464",
+      "match": true
+    },
+    {
+      "scope": "logs[chain 146]",
+      "field": "minBlock",
+      "bench": "6012293",
+      "reference": "6012293",
+      "match": true
+    },
+    {
+      "scope": "logs[chain 146]",
+      "field": "maxBlock",
+      "bench": "74831544",
+      "reference": "74831544",
+      "match": true
+    },
+    {
+      "scope": "logs[chain 146]",
+      "field": "distinctTx",
+      "bench": "145089",
+      "reference": "145089",
+      "match": true
+    },
+    {
+      "scope": "logs[chain 239]",
+      "field": "logCount",
+      "bench": "49324",
+      "reference": "49324",
+      "match": true
+    },
+    {
+      "scope": "logs[chain 239]",
+      "field": "minBlock",
+      "bench": "1838812",
+      "reference": "1838812",
+      "match": true
+    },
+    {
+      "scope": "logs[chain 239]",
+      "field": "maxBlock",
+      "bench": "21728682",
+      "reference": "21728682",
+      "match": true
+    },
+    {
+      "scope": "logs[chain 239]",
+      "field": "distinctTx",
+      "bench": "10723",
+      "reference": "10723",
+      "match": true
+    },
+    {
+      "scope": "logs[chain 999]",
+      "field": "logCount",
+      "bench": "67314",
+      "reference": "67314",
+      "match": true
+    },
+    {
+      "scope": "logs[chain 999]",
+      "field": "minBlock",
+      "bench": "13475680",
+      "reference": "13475680",
+      "match": true
+    },
+    {
+      "scope": "logs[chain 999]",
+      "field": "maxBlock",
+      "bench": "39287073",
+      "reference": "39287073",
+      "match": true
+    },
+    {
+      "scope": "logs[chain 999]",
+      "field": "distinctTx",
+      "bench": "19844",
+      "reference": "19844",
+      "match": true
+    },
+    {
+      "scope": "logs[chain 8453]",
+      "field": "logCount",
+      "bench": "1282875",
+      "reference": "1282875",
+      "match": true
+    },
+    {
+      "scope": "logs[chain 8453]",
+      "field": "minBlock",
+      "bench": "22952393",
+      "reference": "22952393",
+      "match": true
+    },
+    {
+      "scope": "logs[chain 8453]",
+      "field": "maxBlock",
+      "bench": "48055240",
+      "reference": "48055240",
+      "match": true
+    },
+    {
+      "scope": "logs[chain 8453]",
+      "field": "distinctTx",
+      "bench": "299559",
+      "reference": "299559",
+      "match": true
+    },
+    {
+      "scope": "logs[chain 9745]",
+      "field": "logCount",
+      "bench": "481982",
+      "reference": "481982",
+      "match": true
+    },
+    {
+      "scope": "logs[chain 9745]",
+      "field": "minBlock",
+      "bench": "1273481",
+      "reference": "1273481",
+      "match": true
+    },
+    {
+      "scope": "logs[chain 9745]",
+      "field": "maxBlock",
+      "bench": "25927203",
+      "reference": "25927203",
+      "match": true
+    },
+    {
+      "scope": "logs[chain 9745]",
+      "field": "distinctTx",
+      "bench": "78544",
+      "reference": "78544",
+      "match": true
+    },
+    {
+      "scope": "logs[chain 42161]",
+      "field": "logCount",
+      "bench": "729050",
+      "reference": "729050",
+      "match": true
+    },
+    {
+      "scope": "logs[chain 42161]",
+      "field": "minBlock",
+      "bench": "317852641",
+      "reference": "317852641",
+      "match": true
+    },
+    {
+      "scope": "logs[chain 42161]",
+      "field": "maxBlock",
+      "bench": "479227141",
+      "reference": "479227141",
+      "match": true
+    },
+    {
+      "scope": "logs[chain 42161]",
+      "field": "distinctTx",
+      "bench": "170141",
+      "reference": "170141",
+      "match": true
+    },
+    {
+      "scope": "logs[chain 43114]",
+      "field": "logCount",
+      "bench": "555877",
+      "reference": "555877",
+      "match": true
+    },
+    {
+      "scope": "logs[chain 43114]",
+      "field": "minBlock",
+      "bench": "57318158",
+      "reference": "57318158",
+      "match": true
+    },
+    {
+      "scope": "logs[chain 43114]",
+      "field": "maxBlock",
+      "bench": "89158239",
+      "reference": "89158239",
+      "match": true
+    },
+    {
+      "scope": "logs[chain 43114]",
+      "field": "distinctTx",
+      "bench": "128326",
+      "reference": "128326",
+      "match": true
+    },
+    {
+      "scope": "logs[chain 59144]",
+      "field": "logCount",
+      "bench": "257099",
+      "reference": "257099",
+      "match": true
+    },
+    {
+      "scope": "logs[chain 59144]",
+      "field": "minBlock",
+      "bench": "21905600",
+      "reference": "21905600",
+      "match": true
+    },
+    {
+      "scope": "logs[chain 59144]",
+      "field": "maxBlock",
+      "bench": "31216579",
+      "reference": "31216579",
+      "match": true
+    },
+    {
+      "scope": "logs[chain 59144]",
+      "field": "distinctTx",
+      "bench": "63725",
+      "reference": "63725",
+      "match": true
+    },
+    {
+      "scope": "logs[chain 60808]",
+      "field": "logCount",
+      "bench": "100634",
+      "reference": "100634",
+      "match": true
+    },
+    {
+      "scope": "logs[chain 60808]",
+      "field": "minBlock",
+      "bench": "13346054",
+      "reference": "13346054",
+      "match": true
+    },
+    {
+      "scope": "logs[chain 60808]",
+      "field": "maxBlock",
+      "bench": "23571049",
+      "reference": "23571049",
+      "match": true
+    },
+    {
+      "scope": "logs[chain 60808]",
+      "field": "distinctTx",
+      "bench": "28904",
+      "reference": "28904",
+      "match": true
+    },
+    {
+      "scope": "logs[chain 80094]",
+      "field": "logCount",
+      "bench": "20185992",
+      "reference": "20185992",
+      "match": true
+    },
+    {
+      "scope": "logs[chain 80094]",
+      "field": "minBlock",
+      "bench": "1134742",
+      "reference": "1134742",
+      "match": true
+    },
+    {
+      "scope": "logs[chain 80094]",
+      "field": "maxBlock",
+      "bench": "22943280",
+      "reference": "22943280",
+      "match": true
+    },
+    {
+      "scope": "logs[chain 80094]",
+      "field": "distinctTx",
+      "bench": "3314317",
+      "reference": "3314317",
+      "match": true
+    },
+    {
+      "scope": "blocks total",
+      "field": "count",
+      "bench": "4646445",
+      "reference": "4646445",
+      "match": true
+    },
+    {
+      "scope": "transactions total",
+      "field": "count",
+      "bench": "5007056",
+      "reference": "5007056",
+      "match": true
+    }
+  ]
+}

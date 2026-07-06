@@ -1,5 +1,5 @@
-# Deterministic-bench RUN OUTPUT (never committed). The anchors-<date>.json snapshot IS committed —
-# it is the reproducibility anchor — so it is deliberately NOT ignored here.
+# Deterministic-bench RUN OUTPUT (never committed by default). The anchors-<date>.json snapshot IS
+# committed — it is the reproducibility anchor — so it is deliberately NOT ignored here.
 bench-out/
 bench.result.json
 bench.manifest.json
@@ -7,3 +7,9 @@ parity-report.json
 metrics.txt
 shim.log
 ponder.log
+
+# Curated, published run artifacts under results/<run>/ ARE committed — they are the evidence
+# backing harness/euler-multichain/REPORT.md. Re-include exactly those (large logs/metrics stay out).
+!results/**/bench.result.json
+!results/**/bench.manifest.json
+!results/**/parity-report.json
