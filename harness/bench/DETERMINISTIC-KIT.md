@@ -16,7 +16,7 @@ anchor-map.mjs        PURE request→pinned-header mapping (fail-loud on anythin
 anchor-shim.mjs       local JSON-RPC server around anchor-map (one port, chain via /<id> or ?chain=); --selftest
 metrics-parse.mjs     PURE /metrics Prometheus parse + run summary (completion, wall time, rpc counts)  [unit-tested]
 emit-result.mjs       scrape /metrics → bench.result.json (wall time, per-chain blocks, rpc requests/errors)
-emit-manifest.mjs     bench.manifest.json (tarball+sha, repo sha, chains/anchors sha, env-by-name, cgroup, pg_settings)
+emit-manifest.mjs     bench.manifest.json (tarball+sha, repo sha, chains/anchors sha, env-by-name — secrets AND the Portal URL recorded as "<from-env>", cgroup, pg_settings)
 db-fresh.mjs          read-only preflight: is DATABASE_URL a fresh ponder store?
 run-flagship.sh       the run driver: preflight → shim → ponder start → poll completion → emit result + manifest
 parity-check.mjs      READ-ONLY equivalence of a bench DB vs a reference DB over ponder_sync (per-chain + totals)  [unit-tested]
@@ -102,6 +102,6 @@ pinned numbers / un-pinned number / unknown method / unknown chain / health) —
 real service and no committed file.
 
 ```bash
-node --test harness/bench/*.test.mjs          # 24 unit tests (anchor-map, metrics-parse, parity-check)
-node harness/bench/anchor-shim.mjs --selftest  # 12 in-process HTTP checks
+node --test harness/bench/*.test.mjs          # 27 unit tests (anchor-map, metrics-parse, parity-check)
+node harness/bench/anchor-shim.mjs --selftest  # 13 in-process HTTP checks
 ```

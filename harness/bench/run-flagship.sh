@@ -208,11 +208,20 @@ node "$BDIR/emit-manifest.mjs" \
   ${ANCHORS_FILE:+--anchors "$ANCHORS_FILE"} \
   --load "$BENCH_LOAD" \
   --repro "BENCH_RPC_BASE=$BENCH_RPC_BASE ANCHORS_FILE=<anchors.json> SQD_PONDER_TARBALL=<tgz> DATABASE_URL=<fresh> PORTAL_URL=<portal> PORTAL_API_KEY=<from-env> BENCH_SCHEMA=$BENCH_SCHEMA BENCH_PORT=$BENCH_PORT bash harness/bench/run-flagship.sh$([ "$SMOKE" = 1 ] && echo ' --smoke')"
+MANIFEST_RC=$?
 
 echo "▶ done. artifacts in $BENCH_OUT_DIR:"
 echo "    bench.result.json   (wall time, per-chain blocks, rpc counts)"
 echo "    bench.manifest.json (reproducibility)"
 echo "    metrics.txt         (full /metrics snapshot)"
+
+# A clean run WITHOUT its reproducibility manifest is not a valid, defensible bench — the manifest is
+# the WHAT-ran record. So a manifest-emit failure fails the run even when the result was clean: exit
+# nonzero if EITHER the result is not clean (RESULT_RC) OR manifest emission failed (MANIFEST_RC).
+if [ "$MANIFEST_RC" -ne 0 ]; then
+  echo "✗ emit-manifest failed (rc=$MANIFEST_RC) — the run has no reproducibility manifest; failing the run."
+  exit "$MANIFEST_RC"
+fi
 
 # exit reflects a CLEAN run (complete + zero rpc errors). emit-result exits 0 clean, 1 not-clean.
 exit "$RESULT_RC"

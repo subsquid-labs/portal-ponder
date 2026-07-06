@@ -8,8 +8,9 @@
 //
 //   node emit-manifest.mjs --out bench.manifest.json [--repro "<command>"] [--load "<free text>"]
 //
-// NEVER writes a secret. Key env vars (PORTAL_API_KEY, DATABASE_URL creds, SQD_RPC_KEY, …) are recorded
-// by NAME with the sentinel "<from-env>"; DATABASE_URL is decomposed to host/db WITHOUT credentials.
+// NEVER writes a secret. Key env vars (PORTAL_API_KEY, PORTAL_URL, DATABASE_URL creds, SQD_RPC_KEY, …)
+// are recorded by NAME with the sentinel "<from-env>"; DATABASE_URL is decomposed to host/db WITHOUT
+// credentials. PORTAL_URL is treated like a secret because it can embed a private/tenant-specific host.
 
 import { execFileSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
@@ -21,9 +22,12 @@ import { parseArgs } from './anchor-shim.mjs';
 const DIR = path.dirname(fileURLToPath(import.meta.url));
 const REPO_ROOT = path.resolve(DIR, '..', '..');
 
-// Env vars that carry SECRETS — recorded by name with "<from-env>", value NEVER read into the manifest.
+// Env vars recorded BY NAME with the "<from-env>" sentinel, value NEVER read into the manifest. This
+// covers credentials AND the Portal endpoint URL: PORTAL_URL can embed a private/tenant-specific Portal
+// host, so a raw manifest must never leak a user's endpoint — it is recorded by name like a secret.
 const SECRET_ENV = new Set([
   'PORTAL_API_KEY',
+  'PORTAL_URL',
   'SQD_RPC_KEY',
   'REALTIME_RPC_KEY',
   'DATABASE_URL', // handled specially (host/db decomposed, creds stripped)
@@ -31,7 +35,6 @@ const SECRET_ENV = new Set([
 
 // Non-secret run knobs recorded VERBATIM (value is meaningful and carries no credential).
 const KNOB_ENV = [
-  'PORTAL_URL',
   'PORTAL_CHECKS',
   'PORTAL_CHUNK_BLOCKS',
   'PORTAL_CHUNK_FIXED',
