@@ -84,3 +84,26 @@ echo "▶ diffing ponder_sync stores"
 DIFF_SCRIPT="${DIFF_SCRIPT:-$ROOT/harness/diff/diff.mjs}"
 cp "$DIFF_SCRIPT" "$WORK/diff.mjs"   # run from $WORK so @electric-sql/pglite resolves
 node "$WORK/diff.mjs" "$WORK/dbPortal" "$WORK/dbRpc" ${DIFF_ARGS:-}
+DIFF_RC=$?
+
+# On a NON-ZERO diff exit, rescue the backfilled stores before the EXIT trap removes $WORK. The
+# stores are the EXPENSIVE artifact (they may have cost paid RPC on the stock side); the diff itself
+# is free and re-runnable. Move dbPortal/dbRpc into a sibling preserved dir (outside $WORK) and echo
+# its path LOUDLY so a re-run can point the differ straight at them. KEEP_WORKSPACES=1 keeps the whole
+# $WORK regardless, so skip the move then — its stores are already retained in place.
+if [ "$DIFF_RC" -ne 0 ] && [ -z "${KEEP_WORKSPACES:-}" ]; then
+  PRESERVED="$(dirname "$WORK")/diff-preserved-stores-$$"
+  echo ""
+  # Only claim PRESERVED if the mkdir AND the move both succeed. A failed/partial move (e.g.
+  # read-only parent, ENOSPC) would otherwise print a success message while the EXIT trap still
+  # wipes $WORK — losing the expensive stores. On failure, warn LOUDLY and keep the trap's cleanup
+  # semantics unchanged (the operator can re-run with KEEP_WORKSPACES=1 to retain them next time).
+  if mkdir -p "$PRESERVED" && mv "$WORK/dbPortal" "$WORK/dbRpc" "$PRESERVED/"; then
+    echo "‼ DIFF FAILED (rc=$DIFF_RC) — backfilled stores PRESERVED at: $PRESERVED"
+    echo "  re-run the diff without re-backfilling:  node $DIFF_SCRIPT $PRESERVED/dbPortal $PRESERVED/dbRpc"
+  else
+    echo "‼ DIFF FAILED (rc=$DIFF_RC) — PRESERVE FAILED — stores will be removed with the workspace (set KEEP_WORKSPACES=1 to retain next time)"
+  fi
+fi
+
+exit "$DIFF_RC"

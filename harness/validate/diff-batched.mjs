@@ -200,24 +200,47 @@ export function hashRows(rows, keyFn, drop) {
 // ── DB adapters + CLI (only run when invoked directly; pglite is imported lazily so the pure
 //    exports above load with zero dependencies in the repo test runner) ─────────────────────────
 
-// Key columns + comparison drop-set per sync-store table. A single-chain diff is uniquely ordered by
-// these; the campaign always diffs one chain at a time.
-const TABLES = {
-  logs: { keys: ['block_number', 'log_index'], mode: 'strict' },
-  transactions: { keys: ['block_number', 'transaction_index'], mode: 'strict' },
+// Key columns + comparison drop-set per sync-store table. Each `keys` array is EXACTLY the sync-store
+// primary-key column order — every PK leads with `chain_id` (logs_pkey (chain_id, block_number,
+// log_index); transactions_pkey / transaction_receipts_pkey (chain_id, block_number,
+// transaction_index); traces_pkey (chain_id, block_number, transaction_index, trace_index);
+// blocks_pkey (chain_id, number)). The keyset ORDER BY + tuple-WHERE MUST match the PK column order
+// so every page is a streaming index scan on the PK, not a full-table sort (issue #58). With the
+// chain_id prefix the ordering is the PK order: comparison is unchanged for a single-chain store
+// (chain_id is a constant column) and well-defined per (chain_id, …) tuple for a multi-chain store.
+// `chain_id` is a COMPARE key, never a drop key — identical stores share identical chain_id values,
+// and an A/B pair of the same chain has it equal by construction.
+export const TABLES = {
+  logs: { keys: ['chain_id', 'block_number', 'log_index'], mode: 'strict' },
+  transactions: {
+    keys: ['chain_id', 'block_number', 'transaction_index'],
+    mode: 'strict',
+  },
   transaction_receipts: {
-    keys: ['block_number', 'transaction_index'],
+    keys: ['chain_id', 'block_number', 'transaction_index'],
     mode: 'strict',
   },
   traces: {
-    keys: ['block_number', 'transaction_index', 'trace_index'],
+    keys: ['chain_id', 'block_number', 'transaction_index', 'trace_index'],
     mode: 'strict',
   },
   blocks: {
-    keys: ['number'],
+    keys: ['chain_id', 'number'],
     mode: 'blocks',
     drop: new Set(['total_difficulty']),
   },
+};
+
+// The sync-store primary-key column order per table (source of truth: ponder's sync-store schema —
+// every *_pkey leads with chain_id). Exported so a test can pin each TABLES spec's keyset to the PK
+// column order without a database: dropping chain_id from any spec, or reordering the tuple, breaks
+// the streaming-index-scan guarantee this differ depends on (issue #58).
+export const SYNC_STORE_PKS = {
+  logs: ['chain_id', 'block_number', 'log_index'],
+  transactions: ['chain_id', 'block_number', 'transaction_index'],
+  transaction_receipts: ['chain_id', 'block_number', 'transaction_index'],
+  traces: ['chain_id', 'block_number', 'transaction_index', 'trace_index'],
+  blocks: ['chain_id', 'number'],
 };
 
 // Resolve the per-table comparison specs for a run. `strictBlocks` promotes the `blocks` table from
@@ -242,26 +265,39 @@ const BATCH = 50_000;
 
 const toBig = (v) => (typeof v === 'bigint' ? v : BigInt(v));
 
-// Keyset-paginated async row stream: pulls BATCH rows at a time ordered by `keys`, holding at most
-// one batch in memory. `keys` are numeric sync-store columns (block/index) → BigInt-comparable.
-async function* keysetRows(db, table, keys) {
+// Build one keyset page's SQL for `table` ordered by `keys`. When `hasCursor`, adds a row-wise
+// tuple WHERE so the page resumes strictly after the previous tail: (k0,k1,…) > ($1,$2,…). The
+// ORDER BY and the tuple LHS list the columns in `keys` order — which is the sync-store PK column
+// order (chain_id-first) — so the planner satisfies both the ordering and the range with a single
+// forward index scan on the PK, no per-page sort (issue #58). Pure + exported so a test can pin the
+// generated ORDER BY / tuple-WHERE shape per table WITHOUT a database.
+export function buildKeysetSql(table, keys, hasCursor) {
   const cols = keys.map((k) => `"${k}"`).join(', ');
   const order = `order by ${cols}`;
+  let where = '';
+  if (hasCursor) {
+    // (k0,k1,…) > (last0,last1,…) — row-wise tuple comparison for a stable keyset cursor.
+    const lhs = `(${cols})`;
+    const rhs = `(${keys.map((_, i) => `$${i + 1}`).join(', ')})`;
+    where = `where ${lhs} > ${rhs}`;
+  }
+
+  return `select * from ponder_sync."${table}" ${where} ${order} limit ${BATCH}`;
+}
+
+// Keyset-paginated async row stream: pulls BATCH rows at a time ordered by `keys`, holding at most
+// one batch in memory. `keys` are the sync-store PK columns (chain_id + block/index) → BigInt-comparable.
+async function* keysetRows(db, table, keys) {
   let last = null;
   for (;;) {
-    let where = '';
+    const sql = buildKeysetSql(table, keys, last !== null);
     const params = [];
     if (last) {
-      // (k0,k1,…) > (last0,last1,…) — row-wise tuple comparison for a stable keyset cursor.
-      const lhs = `(${cols})`;
-      const rhs = `(${keys.map((_, i) => `$${i + 1}`).join(', ')})`;
-      where = `where ${lhs} > ${rhs}`;
       for (const k of keys) {
         params.push(last[k]);
       }
     }
 
-    const sql = `select * from ponder_sync."${table}" ${where} ${order} limit ${BATCH}`;
     const { rows } = await db.query(sql, params);
     if (rows.length === 0) {
       return;

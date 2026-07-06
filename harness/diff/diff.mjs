@@ -41,19 +41,29 @@ export function setDiff(a, b) {
   return { ok, onlyA, onlyB };
 }
 
-// Block-identity keyed by NUMBER (parsed from each normalized row-string). Rules:
-//   • a number PRESENT on both sides whose full-row string differs → MISMATCH → FAIL
+// Block-identity keyed by (CHAIN_ID, NUMBER) — parsed from each normalized row-string. Rules:
+//   • a (chain,number) PRESENT on both sides whose full-row string differs → MISMATCH → FAIL
 //     (keying by hash would hide a same-number/different-hash reorg divergence as two one-sided
 //      extras that the old `ok` never checked)
-//   • a portal-only number (in A, not B) → FAIL — the Portal path invented a block RPC never saw
-//   • an rpc-only number (in B, not A) → tolerated: the stock RPC path stores inert event-less
+//   • a portal-only (chain,number) (in A, not B) → FAIL — the Portal path invented a block RPC never saw
+//   • an rpc-only (chain,number) (in B, not A) → tolerated: the stock RPC path stores inert event-less
 //     blocks it traced (never referenced)
-// A same-number pair is counted ONCE as shared (match or mismatch) — never double-counted as two
-// one-sided extras.
+// A same-(chain,number) pair is counted ONCE as shared (match or mismatch) — never double-counted as
+// two one-sided extras.
+//
+// The key MUST include chain_id: blocks_pkey is (chain_id, number), so in a multi-chain store two
+// different chains legitimately hold the same block number. Keying by number alone would collapse
+// same-height blocks from different chains into one Map slot — the last-inserted row wins and silently
+// overwrites the others, so a real per-chain divergence can hide behind a matching sibling chain
+// (proven false-pass). chain_id is a COMPARE key, never a drop key; for a single-chain store it is a
+// constant column, so the verdict is unchanged.
 export function blocksVerdict(
   aRows,
   bRows,
-  keyOf = (r) => JSON.parse(r).number,
+  keyOf = (r) => {
+    const o = JSON.parse(r);
+    return `${o.chain_id}:${o.number}`;
+  },
 ) {
   const a = new Map(aRows.map((r) => [keyOf(r), r]));
   const b = new Map(bRows.map((r) => [keyOf(r), r]));
@@ -122,8 +132,8 @@ async function main() {
     }
   }
 
-  // blocks: key by NUMBER (see blocksVerdict). Same-number field mismatch and portal-only blocks
-  // FAIL; only rpc-only inert event-less blocks are tolerated.
+  // blocks: key by (CHAIN_ID, NUMBER) (see blocksVerdict). Same-key field mismatch and portal-only
+  // blocks FAIL; only rpc-only inert event-less blocks are tolerated.
   {
     const [a, b] = await Promise.all([
       dump(dirA, 'blocks', BLOCK_DROP),
