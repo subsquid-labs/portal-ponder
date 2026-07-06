@@ -114,6 +114,116 @@ test('blocks mode: a PORTAL-only (A-only) block FAILS (asymmetric — #19)', asy
   assert.equal(r.shared, 2);
 });
 
+// ── issue #76: tolerated upstream block.size off-by-one (blocks mode only) ───────────────────────
+// Mirrors harness/diff/diff.mjs blocksVerdict. A=portal, B=rpc. A shared block whose ONLY differing
+// field is `size` with rpc==portal+1 and rpc>=65540 is counted in res.sizeTolerated (not res.mismatch)
+// and does NOT fail. Everything else about size, a second differing field, and strict mode all FAIL.
+const szBlock = (number, size, extra = {}) => ({
+  number,
+  hash: 'h',
+  size,
+  ...extra,
+});
+
+// MUTATION: run this against origin/main's diff-batched.mjs (no sizeTolerated branch) → na!==nb sets
+// res.mismatch and res.fail, so r.fail is true and r.sizeTolerated is undefined → this test FAILS.
+test('blocks mode #76: a lone size off-by-one at/above 65540 is tolerated, not a mismatch', async () => {
+  const r = await mergeCompare(
+    [szBlock(19963775, 66755)],
+    [szBlock(19963775, 66756)],
+    {
+      keyFn: blockKey,
+      mode: 'blocks',
+    },
+  );
+  assert.equal(r.fail, false, 'a lone size off-by-one at scale does not fail');
+  assert.equal(r.sizeTolerated, 1);
+  assert.equal(r.mismatch, 0, 'the tolerated row is not counted as a mismatch');
+  assert.equal(r.shared, 1);
+});
+
+test('blocks mode #76: a sub-threshold size delta (< 65540) still FAILS', async () => {
+  const r = await mergeCompare([szBlock(100, 30000)], [szBlock(100, 30001)], {
+    keyFn: blockKey,
+    mode: 'blocks',
+  });
+  assert.equal(
+    r.fail,
+    true,
+    'below the 65540 boundary the off-by-one is a real mismatch',
+  );
+  assert.equal(r.mismatch, 1);
+  assert.equal(r.sizeTolerated, 0);
+});
+
+test('blocks mode #76: a size delta of 2 (not exactly +1) still FAILS', async () => {
+  const r = await mergeCompare([szBlock(100, 66754)], [szBlock(100, 66756)], {
+    keyFn: blockKey,
+    mode: 'blocks',
+  });
+  assert.equal(r.fail, true, 'only an exact +1 delta is tolerated');
+  assert.equal(r.mismatch, 1);
+  assert.equal(r.sizeTolerated, 0);
+});
+
+test('blocks mode #76: portal LARGER than rpc (opposite sign) still FAILS', async () => {
+  const r = await mergeCompare([szBlock(100, 66757)], [szBlock(100, 66756)], {
+    keyFn: blockKey,
+    mode: 'blocks',
+  });
+  assert.equal(
+    r.fail,
+    true,
+    'only rpc == portal+1 is tolerated, never portal > rpc',
+  );
+  assert.equal(r.mismatch, 1);
+  assert.equal(r.sizeTolerated, 0);
+});
+
+test('blocks mode #76: size within tolerance but a SECOND field also differs still FAILS', async () => {
+  const portal = [szBlock(100, 66755, { gas_used: 100n })];
+  const rpc = [szBlock(100, 66756, { gas_used: 200n })];
+  const r = await mergeCompare(portal, rpc, {
+    keyFn: blockKey,
+    mode: 'blocks',
+  });
+  assert.equal(
+    r.fail,
+    true,
+    'a second differing field defeats the size tolerance',
+  );
+  assert.equal(r.mismatch, 1);
+  assert.equal(r.sizeTolerated, 0);
+});
+
+test('blocks mode #76: a consensus-field (hash) divergence at large size is NEVER masked', async () => {
+  const portal = [szBlock(100, 66755, { hash: '0xAAA' })];
+  const rpc = [szBlock(100, 66756, { hash: '0xZZZ' })];
+  const r = await mergeCompare(portal, rpc, {
+    keyFn: blockKey,
+    mode: 'blocks',
+  });
+  assert.equal(
+    r.fail,
+    true,
+    'a differing hash is a real mismatch even alongside a size off-by-one',
+  );
+  assert.equal(r.mismatch, 1);
+  assert.equal(r.sizeTolerated, 0);
+});
+
+test('strict mode #76: the size off-by-one is NOT tolerated under strict (scoped to blocks mode)', async () => {
+  // The tolerance is calibrated for the asymmetric portal-vs-rpc blocks comparison only. Under strict
+  // (logs/txs/receipts/traces, and portal-vs-portal STRICT_BLOCKS) a size difference is a real mismatch.
+  const r = await mergeCompare([szBlock(100, 66755)], [szBlock(100, 66756)], {
+    keyFn: blockKey,
+    mode: 'strict',
+  });
+  assert.equal(r.fail, true, 'strict mode tolerates nothing');
+  assert.equal(r.mismatch, 1);
+  assert.equal(r.sizeTolerated, 0);
+});
+
 test('blocks mode: total_difficulty is excluded, real field mismatch still fails', async () => {
   const drop = new Set(['total_difficulty']);
   const portal = [{ number: 100, hash: 'h', total_difficulty: null }];

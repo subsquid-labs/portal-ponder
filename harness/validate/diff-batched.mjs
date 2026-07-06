@@ -9,7 +9,10 @@
 //   - logs / transactions / transaction_receipts / traces : strict set + field identity
 //   - blocks : total_difficulty excluded; ASYMMETRIC by default — a portal-only block (A) FAILS (the
 //     Portal path invented a block RPC never saw); only an rpc-only block (B) is tolerated (the stock
-//     RPC path stores inert event-less blocks it traced); a shared-key field mismatch always FAILS.
+//     RPC path stores inert event-less blocks it traced); a shared-key field mismatch always FAILS,
+//     EXCEPT the known upstream block.size off-by-one (issue #76): a shared block whose ONLY differing
+//     field is `size` with rpc === portal + 1 and rpc ≥ 65540 is tolerated, not failed (self-retiring
+//     once the dataset is fixed). Mirrors harness/diff/diff.mjs `blocksVerdict` exactly.
 //     This asymmetry is CALIBRATED FOR portal-vs-RPC (A=portal, B=rpc). For a portal-vs-PORTAL diff
 //     (e.g. the chaos verify: a resumed store vs a clean baseline, both Portal-built) there is no
 //     inert-block asymmetry — a B-only (baseline-only) block means the resumed store is MISSING a
@@ -79,15 +82,60 @@ async function* fromArray(rows) {
   }
 }
 
+// ── known upstream defect: block.size off-by-one (issue #76) ─────────────────────────────────────
+// Mirrors harness/diff/diff.mjs exactly. The SQD Portal eth-mainnet dataset computes a block's `size`
+// with a fixed 2-byte RLP length-of-length prefix, so every block whose RLP payload crosses 2^16
+// (canonical size ≥ 65540, which needs a 3-byte length prefix) is reported one byte short:
+// portal.size === rpc.size − 1. The block hash and every consensus field are identical, and
+// logs/transactions/receipts/traces are byte-identical; only this one derived header field differs,
+// on ~0.3% of mainnet blocks (the large ones). The fork's transform is a pass-through, so the value
+// is upstream data, not our code (issue #76 tracks the dataset fix). We tolerate a shared block row
+// whose ONLY differing field is `size` with EXACTLY that signature — delta precisely +1, only at/above
+// the 65540 boundary. Anything else about size (a different delta, the opposite sign, a sub-threshold
+// delta) OR any second differing field still FAILS. Self-retiring: once the dataset is fixed the rows
+// compare equal and this never fires.
+const SIZE_TOLERANCE_MIN = 65540;
+
+// portalRow / rpcRow are normalized block row-strings (normRow output: sorted keys, bigint→decimal,
+// bytes→hex, total_difficulty dropped). Returns true iff `size` is the SOLE differing field and the
+// pair matches the issue-#76 off-by-one signature (rpc === portal + 1, rpc ≥ 65540).
+function sizeOffByOneTolerated(portalRow, rpcRow) {
+  const p = JSON.parse(portalRow);
+  const r = JSON.parse(rpcRow);
+
+  let diffField = null;
+  for (const k of new Set([...Object.keys(p), ...Object.keys(r)])) {
+    if (p[k] === r[k]) continue;
+
+    if (diffField !== null) return false;
+
+    diffField = k;
+  }
+
+  if (diffField !== 'size') return false;
+
+  const portalSize = Number(p.size);
+  const rpcSize = Number(r.size);
+
+  return (
+    Number.isFinite(portalSize) &&
+    Number.isFinite(rpcSize) &&
+    rpcSize === portalSize + 1 &&
+    rpcSize >= SIZE_TOLERANCE_MIN
+  );
+}
+
 // Streaming merge-compare of two key-ordered async row streams. Modes:
 //   • 'strict' : ANY only-one-side row fails, plus any shared-key field mismatch.
 //   • 'blocks' : ASYMMETRIC, mirroring harness/diff/diff.mjs `blocksVerdict`. A is the Portal store
 //     and B is the stock-RPC store (see diffStores / run.sh: dirA=portal, dirB=rpc). A portal-only
 //     block (onlyA) is a block the Portal path invented that RPC never saw → FAIL. An rpc-only block
 //     (onlyB) is a tolerated inert event-less block the stock RPC path traced but never referenced →
-//     reported, not failed. A shared-key field mismatch is always a FAIL. Before this fix 'blocks'
-//     was vacuous — it failed only on a shared mismatch and let a portal-only block sail through the
-//     F-full differ.
+//     reported, not failed. A shared-key field mismatch is always a FAIL, EXCEPT the known upstream
+//     block.size off-by-one (issue #76) — a shared block whose ONLY differing field is `size` with
+//     rpc === portal + 1 and rpc ≥ 65540 is counted in res.sizeTolerated, not res.mismatch, and does
+//     NOT fail (self-retiring once the dataset is fixed). Before the #19 fix 'blocks' was vacuous — it
+//     failed only on a shared mismatch and let a portal-only block sail through the F-full differ.
 // Returns counters and small samples (never the whole diff) so memory stays bounded.
 //
 // `onOnlyB` (optional): a callback invoked with each B-only row's value AS the merge encounters it, in
@@ -114,6 +162,7 @@ export async function streamingDiff(
     onlyA: 0,
     onlyB: 0,
     mismatch: 0,
+    sizeTolerated: 0,
     shared: 0,
     samples: [],
   };
@@ -167,10 +216,16 @@ export async function streamingDiff(
       const na = normRow(a.value, drop);
       const nb = normRow(b.value, drop);
       if (na !== nb) {
-        res.mismatch++;
-        res.fail = true;
-        sample('A', na);
-        sample('B', nb);
+        // The tolerated upstream size off-by-one (issue #76) applies ONLY to the asymmetric blocks
+        // comparison (A=portal, B=rpc); strict mode tolerates nothing. Anything else FAILS.
+        if (mode === 'blocks' && sizeOffByOneTolerated(na, nb)) {
+          res.sizeTolerated++;
+        } else {
+          res.mismatch++;
+          res.fail = true;
+          sample('A', na);
+          sample('B', nb);
+        }
       }
       a = await itA.next();
       b = await itB.next();
@@ -496,6 +551,9 @@ async function diffStores(
     const extra =
       spec.mode === 'blocks'
         ? `  shared=${r.shared} match` +
+          (r.sizeTolerated
+            ? `, ${r.sizeTolerated} tolerated (upstream size off-by-one, issue #76)`
+            : '') +
           (r.onlyB ? `, +${r.onlyB} inert event-less (RPC-only)` : '') +
           (r.onlyA ? `, +${r.onlyA} portal-only` : '') +
           (r.mismatch ? `  | ${r.mismatch} shared MISMATCH` : '')
