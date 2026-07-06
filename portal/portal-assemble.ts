@@ -259,6 +259,35 @@ export type AssembledRange = {
 };
 
 /**
+ * Yield a chunk map's entries whose block-number key ∈ [lo, hi], picking the cheaper of two walks: a
+ * RANGE-WALK (`get()` per block, bounded by the interval width `hi−lo+1`) or a full ENTRY-SCAN (bounded by
+ * `map.size`). The maps are keyed by block number, so both find exactly the same entries.
+ *
+ * Why it matters (wave 5, perf): a density-scaled chunk holds up to ~25M block entries, an interval is
+ * ≤~100k blocks, and the SAME cached chunk is assembled once per interval it overlaps. Scanning ALL chunk
+ * entries per interval — the previous shape — is O(intervalsPerChunk × chunkEntries): ~250 re-reads of a
+ * 25M-entry map, billions of iterator steps, tens of minutes on a backfill. This bounds each assemble at
+ * O(min(intervalWidth, chunkEntries)). Values are never `undefined` in these maps, so `!== undefined`
+ * cleanly rejects a range-walk miss.
+ */
+function* entriesInRange<V>(
+  map: Map<number, V>,
+  lo: number,
+  hi: number,
+): Generator<[number, V]> {
+  if (hi - lo + 1 <= map.size) {
+    for (let bn = lo; bn <= hi; bn++) {
+      const v = map.get(bn);
+      if (v !== undefined) yield [bn, v];
+    }
+  } else {
+    for (const entry of map) {
+      if (entry[0] >= lo && entry[0] <= hi) yield entry;
+    }
+  }
+}
+
+/**
  * Assemble exactly the interval's rows from its chunks (INV-2). Pure given `childAddresses` (which
  * discovery has already grown through the interval).
  */
@@ -270,7 +299,6 @@ export function assembleRange(
 ): AssembledRange {
   const [lo, hi] = interval;
   const matchers = buildMatchers(spec, childAddresses);
-  const inRange = (bn: number): boolean => bn >= lo && bn <= hi;
 
   const syncLogs: SyncLog[] = [];
   const blocksByNumber = new Map<number, SyncBlockHeader>();
@@ -287,15 +315,13 @@ export function assembleRange(
     syncReceipts.push(toSyncReceipt(raw, hdr));
   };
 
-  // INV-2 is enforced BY CONSTRUCTION here: every emitting branch below sits behind the single
-  // `inRange` predicate (there is deliberately no redundant per-row assert — it could never fire),
-  // and the exactness property is proven against a brute-force model in portal-assemble.test.ts.
+  // INV-2 is enforced BY CONSTRUCTION here: every emitting branch below iterates only entries whose block
+  // number ∈ [lo, hi] via `entriesInRange` (there is deliberately no redundant per-row assert — it could
+  // never fire), and the exactness property is proven against a brute-force model in portal-assemble.test.ts.
   // Each log is re-matched against the ACTUAL log filters (see logMatched above); a dropped log's
   // parent tx/block must not ride in either, so txs are keyed to the KEPT logs' transactionHash.
   for (const cd of chunks)
-    for (const [bn, hdr] of cd.headers) {
-      if (!inRange(bn)) continue;
-
+    for (const [bn, hdr] of entriesInRange(cd.headers, lo, hi)) {
       const rawLogs = cd.logs.get(bn) ?? [];
       if (rawLogs.length === 0) continue;
 
@@ -325,16 +351,15 @@ export function assembleRange(
   // whole includeAllBlocks scan).
   if (spec.needBlocks)
     for (const cd of chunks)
-      for (const [bn, hdr] of cd.blockHeaders) {
-        if (inRange(bn) && !blocksByNumber.has(bn))
+      for (const [bn, hdr] of entriesInRange(cd.blockHeaders, lo, hi)) {
+        if (!blocksByNumber.has(bn))
           blocksByNumber.set(bn, toSyncBlockHeader(hdr));
       }
 
   // account transaction sources: re-match Portal's from/to-filtered txs (+ factory + range), insert tx/receipt/block
   if (spec.needTxFilter)
     for (const cd of chunks)
-      for (const [bn, tb] of cd.txBlocks) {
-        if (!inRange(bn)) continue;
+      for (const [bn, tb] of entriesInRange(cd.txBlocks, lo, hi)) {
         for (const raw of tb.txs) {
           const tx = toSyncTransaction(raw, tb.header);
           if (!matchers.txFilterMatched(tx, bn)) continue;

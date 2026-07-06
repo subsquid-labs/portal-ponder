@@ -95,6 +95,40 @@ test('INV-2: assembleRange returns exactly the in-range logs (vs brute-force fil
   );
 });
 
+test('wave 5 (perf): assembleRange returns exactly the in-range logs whether the interval is NARROWER than the chunk (range-walk) or WIDER (entry-scan)', () => {
+  // The fix walks min(intervalWidth, chunkEntries) instead of every chunk entry per interval. Both
+  // branches must yield the identical in-range set — this pins that equivalence at the two extremes.
+  const spec = compileFetchSpec([{ filter: logFilter }], new Map());
+  const bns = (logs: any[]) =>
+    logs.map((l) => Number(BigInt(l.blockNumber))).sort((x, y) => x - y);
+
+  // (a) RANGE-WALK branch: a WIDE chunk (1000 block entries) with a NARROW interval [500,502]
+  // (hi−lo+1 = 3 ≤ 1000). Pre-fix scanned all 1000 entries; now it get()s only the 3 in-range blocks.
+  const wide = createChunkData();
+  for (let bn = 0; bn < 1000; bn++) {
+    wide.headers.set(bn, header(bn));
+    wide.logs.set(bn, [rawLog('0xVault', '0xtx' + bn)]);
+  }
+  expect(bns(assembleRange([wide], [500, 502], spec, new Map()).logs)).toEqual([
+    500, 501, 502,
+  ]);
+
+  // (b) ENTRY-SCAN branch: a SPARSE chunk (3 far-apart entries) with a huge interval (hi−lo+1 ≫ size) —
+  // range-walking a million blocks would be absurd, so the scan branch iterates the 3 entries instead.
+  const sparse = createChunkData();
+  for (const bn of [10, 5_000, 999_999]) {
+    sparse.headers.set(bn, header(bn));
+    sparse.logs.set(bn, [rawLog('0xVault', '0xtx' + bn)]);
+  }
+  expect(
+    bns(assembleRange([sparse], [0, 1_000_000], spec, new Map()).logs),
+  ).toEqual([10, 5_000, 999_999]);
+  // a block just OUTSIDE the interval is excluded by both branches (10 < 11; 999_999 > 5_000)
+  expect(
+    bns(assembleRange([sparse], [11, 5_000], spec, new Map()).logs),
+  ).toEqual([5_000]);
+});
+
 test('seenTx dedupe: two logs sharing a tx insert the tx once', () => {
   const cd = createChunkData();
   cd.headers.set(5, header(5));

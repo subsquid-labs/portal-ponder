@@ -329,16 +329,16 @@ export async function* streamHotBlocks(
   // Consecutive 409 fork-negotiations. Reset on any successful delivery; a runaway (>MAX) is a bug (the
   // server keeps rejecting a chain the ring believes canonical) → fail loud rather than spin. (issue #33)
   let consecutive409 = 0;
+  // Cache the serialized /stream request body. Its `logs` is O(total children) — up to ~100k filter rows on
+  // a busy factory chain (~4.6MB serialized) — and the loop re-enters body construction on EVERY iteration:
+  // each 204 re-poll (~500ms), each 409 round, each reopen on a new child. Re-`JSON.stringify`ing + re-
+  // uploading that on every poll is ~110MB of upload per block on a caught-up 12s chain. The body is a pure
+  // function of (cursor, parentBlockHash, logs-filter revision, dropped-field set), so rebuild only when one
+  // of those changes and re-POST the identical bytes otherwise. (wave 5)
+  let cachedBody: string | undefined;
+  let cachedKey: string | undefined;
   for (;;) {
     if (args.signal?.aborted) return;
-    const txFields = projectFields(args.txFields, 'transaction');
-    // Defaults are the SHARED portal-filters projections — the wire passes the same constants, so a
-    // caller omitting them can no longer drift from the single source (wave 4; the old inline literals
-    // were a second copy of exactly what the module header disclaims).
-    const blockFields = projectFields(
-      args.blockFields ?? BLOCK_FIELDS,
-      'block',
-    );
 
     // The parentBlockHash for this request: the ring's hash at cursor−1. When ARMED, a MISSING entry is an
     // invariant violation — the ring is seeded with the anchor and updated on every delivery, and the cursor
@@ -355,21 +355,40 @@ export async function* streamHotBlocks(
         `Portal realtime: no delivered-hash ring entry for the resume parent at ${cursor - 1} (cursor ${cursor}, floor ${floor()}) — cannot send parentBlockHash, which would re-open the /stream fork-negotiation hole. ${diagDump(args.diag)} Restart to re-sync from the finalized head.`,
       );
     }
-    const body = JSON.stringify({
-      type: 'evm',
-      fromBlock: cursor,
-      // omit the key entirely when we have no hash, so an unarmed legacy request is byte-identical to pre-#33
-      ...(parentBlockHash !== undefined ? { parentBlockHash } : {}),
-      includeAllBlocks: true,
-      fields: {
-        block: blockFields,
-        log: args.logFields ?? LOG_FIELDS,
-        ...(txFields ? { transaction: txFields } : {}),
-      },
-      logs: args.txFields
-        ? args.logs.map((r) => ({ ...r, transaction: true }))
-        : args.logs,
-    });
+    // Rebuild the body only when an input changed; otherwise reuse the last serialization (see above). The
+    // key is O(1) to compute — a change in the logs filter bumps `getLogsRevision`, a schema-degrade grows
+    // `droppedFields`, and a resume/reorg moves `cursor`/`parentBlockHash`.
+    const bodyKey = `${cursor}|${args.getLogsRevision?.() ?? 0}|${droppedFields.size}|${parentBlockHash ?? ''}`;
+    let body: string;
+    if (bodyKey === cachedKey && cachedBody !== undefined) {
+      body = cachedBody; // inputs unchanged — reuse the last serialization
+    } else {
+      const txFields = projectFields(args.txFields, 'transaction');
+      // Defaults are the SHARED portal-filters projections — the wire passes the same constants, so a
+      // caller omitting them can no longer drift from the single source (wave 4; the old inline literals
+      // were a second copy of exactly what the module header disclaims).
+      const blockFields = projectFields(
+        args.blockFields ?? BLOCK_FIELDS,
+        'block',
+      );
+      body = JSON.stringify({
+        type: 'evm',
+        fromBlock: cursor,
+        // omit the key entirely when we have no hash, so an unarmed legacy request is byte-identical to pre-#33
+        ...(parentBlockHash !== undefined ? { parentBlockHash } : {}),
+        includeAllBlocks: true,
+        fields: {
+          block: blockFields,
+          log: args.logFields ?? LOG_FIELDS,
+          ...(txFields ? { transaction: txFields } : {}),
+        },
+        logs: args.txFields
+          ? args.logs.map((r) => ({ ...r, transaction: true }))
+          : args.logs,
+      });
+      cachedBody = body;
+      cachedKey = bodyKey;
+    }
     let res: Response;
     try {
       res = await fetchImpl(`${args.portalUrl}/stream`, {

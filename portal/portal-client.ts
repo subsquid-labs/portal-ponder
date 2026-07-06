@@ -577,6 +577,21 @@ export function createPortalClient(deps: PortalClientDeps): PortalClient {
         if (typeof b.header?.number === 'number' && b.header.number > last)
           last = b.header.number;
       }
+      // A 200 (NOT 204) that drained to a CLEAN EOF with ZERO parsed blocks is a truncated/anomalous body:
+      // an intermediary that cut the connection AT a line boundary — or before the first byte — yields a
+      // clean `done` with no partial line, so the mid-line PortalTruncatedBodyError guard above never fires.
+      // The Portal signals a genuinely empty range with 204 (→ 'done', handled earlier); a data 200 always
+      // carries ≥1 block. Returning `{ blocks: [], last: cursor }` here would let `stream` advance the cursor
+      // to cursor+1 and SILENTLY SKIP block `cursor` — one one-block hole per such cut. Treat it exactly like
+      // a mid-line truncation: a transient same-cursor retry (lossless, duplicate-free — nothing was
+      // yielded), bounded by the retry budget so a PERSISTENT zero-line 200 fails loud rather than holing. (wave 5)
+      if (blocks.length === 0)
+        throw new PortalTruncatedBodyError(
+          cursor,
+          new Error(
+            '200 response drained to a clean EOF with zero NDJSON blocks',
+          ),
+        );
       gate.onOk(); // clean full response → a generation of these ramps concurrency up
       return { blocks, last };
     } catch (err) {
@@ -676,7 +691,9 @@ export function createPortalClient(deps: PortalClientDeps): PortalClient {
       yield batch.blocks;
       // Progress by construction (INV-13): fetchBatch initialises `last = cursor` and only ever raises
       // it, so `cursor = last + 1 ≥ cursor + 1` — the cursor strictly advances on every yielded batch,
-      // and a 204 terminates. No runtime guard is needed (and none could ever fire).
+      // and a 204 terminates. A zero-block 200 (a clean-EOF truncation) is now rejected as a
+      // PortalTruncatedBodyError in fetchBatch — never yielded — so a yielded batch is never empty and never
+      // steps the cursor over unfetched data (wave 5). No runtime guard is needed here (none could fire).
       cursor = batch.last + 1;
     }
   }

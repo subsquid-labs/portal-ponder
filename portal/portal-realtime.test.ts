@@ -347,6 +347,85 @@ test('streamHotBlocks: re-opens the /stream with the widened filter the moment t
   ac.abort();
 });
 
+test('streamHotBlocks: caches the /stream body across same-cursor re-opens, rebuilds it only when the cursor advances (wave 5 perf)', async () => {
+  // The /stream body is O(total children) — up to ~100k filter rows / multi-MB — and the loop re-enters
+  // body construction on every re-poll/reopen. It is now cached and only rebuilt when (cursor,
+  // parentBlockHash, logs-revision, dropped-field set) changes. We OBSERVE the rebuild directly: with
+  // `txFields` set, the body path calls `args.logs.map(...)`, so an instrumented `map` counts serializations.
+  const enc = new TextEncoder();
+  const emptyStream = () =>
+    new ReadableStream({
+      start(c) {
+        c.close(); // 200 with no data → reconnect at the SAME cursor (no block delivered)
+      },
+    });
+  const streamOf = (block: any) =>
+    new ReadableStream({
+      start(c) {
+        c.enqueue(enc.encode(`${JSON.stringify(block)}\n`));
+        c.close();
+      },
+    });
+  const hdr = (n: number, hash: string, parent: string) => ({
+    header: { number: n, hash, parentHash: parent, timestamp: n },
+    logs: [],
+  });
+
+  const logs: any[] = [{ address: ['0xfactory'], topic0: ['0xproxycreated'] }];
+  const realMap = Array.prototype.map;
+  let builds = 0;
+  // count body serializations: the body maps `args.logs` exactly once per (re)build when txFields is set
+  (logs as any).map = function (this: any[], ...a: any[]) {
+    builds += 1;
+    return (realMap as any).apply(this, a);
+  };
+
+  const bodies: string[] = [];
+  let conn = 0;
+  const fetchImpl = (async (_url: string, init: any) => {
+    bodies.push(init.body);
+    conn += 1;
+    if (conn === 1) return { status: 200, ok: true, body: emptyStream() }; // cursor 100, no data
+    if (conn === 2)
+      return { status: 200, ok: true, body: streamOf(hdr(100, 'h100', 'h99')) }; // cursor 100 → deliver 100
+    if (conn === 3)
+      return {
+        status: 200,
+        ok: true,
+        body: streamOf(hdr(101, 'h101', 'h100')),
+      }; // cursor 101 → deliver 101
+    return { status: 204, ok: false, body: null };
+  }) as any;
+
+  const ac = new AbortController();
+  const gen = streamHotBlocks({
+    portalUrl: 'http://portal',
+    headers: {},
+    fromBlock: 100,
+    logs,
+    txFields: { hash: true },
+    fetchImpl,
+    signal: ac.signal,
+  });
+
+  const first = await gen.next(); // conn1 (empty, cursor 100) then conn2 delivers block 100
+  expect(first.value?.header.number).toBe(100);
+  expect(bodies).toHaveLength(2);
+  expect(builds).toBe(1); // ONE serialization for TWO same-cursor requests — the body was REUSED
+  expect(bodies[0]).toBe(bodies[1]); // byte-identical
+  expect(JSON.parse(bodies[0]!).fromBlock).toBe(100);
+
+  const second = await gen.next(); // conn3 at cursor 101
+  expect(second.value?.header.number).toBe(101);
+  expect(bodies).toHaveLength(3);
+  expect(builds).toBe(2); // the cursor advanced → rebuilt exactly once more (never stale)
+  expect(bodies[2]).not.toBe(bodies[0]);
+  expect(JSON.parse(bodies[2]!).fromBlock).toBe(101);
+
+  await gen.return(undefined);
+  ac.abort();
+});
+
 // ─────────────────────────────── /stream parentBlockHash + 409 fork negotiation (issue #33) ───────────────────────────────
 
 // A scripted Portal /stream mock: one entry per connection, each either a 200 that streams blocks then
