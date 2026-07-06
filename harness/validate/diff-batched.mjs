@@ -1,6 +1,6 @@
 // Streaming / constant-memory byte-identity diff of two ponder_sync stores — the F-full variant of
 // harness/diff/diff.mjs. Where diff.mjs loads whole tables into memory, this walks each table in
-// ORDER BY key batches of 50k rows (keyset pagination) and merge-compares the two ordered streams,
+// ORDER BY key batches of 5k rows (keyset pagination) and merge-compares the two ordered streams,
 // so peak memory is one batch per side regardless of table size (the Euler-eth full history is
 // millions of rows). Tolerances match diff.mjs exactly:
 //   - logs / transactions / transaction_receipts / traces : strict set + field identity
@@ -261,7 +261,10 @@ export function resolveTableSpecs(strictBlocks) {
   return out;
 }
 
-const BATCH = 50_000;
+// 5k, not 50k (issue #63): PGlite 0.2.13's WASM allocator spins forever on a single `select *` page whose
+// toasted input runs to ~300MB (detoast volume), which a 50k-row page of the widest sync-store
+// tables hits over full-history windows; the same rows in 5k-row pages complete at ~1.5s each.
+const BATCH = 5_000;
 
 const toBig = (v) => (typeof v === 'bigint' ? v : BigInt(v));
 

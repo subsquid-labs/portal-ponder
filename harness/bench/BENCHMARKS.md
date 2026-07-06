@@ -68,6 +68,33 @@ indexing + chunk amortization), staying stable at **1.6 GB RSS / 0 errors** on 1
 amortize too (7.7 → 6 KB/event). `feature-blocks` is the outlier — 85 s for 2,001 ticks — the block-source
 `includeAllBlocks` scan (optimization #1 below).
 
+## Full-history backfill — F-full flagship cell
+
+The paid validation cell **F-full** (VALIDATION.md §3.2) also yields the first end-to-end
+**full-history** backfill timing: the entire recorded Euler v2 history on eth mainnet,
+`[20529207, 25436954]` — **4,907,748 blocks** — backfilled two ways on the same host, serially:
+
+| Leg | What it is | Wall-clock |
+|---|---|---|
+| Portal | the fork backfilling from the SQD Portal | **1819 s** |
+| Stock RPC | genuine `ponder@0.16.6` over a metered JSON-RPC endpoint | **6543 s** |
+
+→ **3.6× faster** on the Portal leg, same range, same host, same store backend.
+
+**Caveats (read before quoting the number):**
+
+- **Single run**, not an averaged benchmark — a datapoint, not a gate.
+- **Serial, same host**: the two legs ran one after the other on the same machine, so neither
+  contended with the other, but host-level variance is uncontrolled across a single pair.
+- **Network / endpoint-bound**: both legs are dominated by fetch, so the ratio reflects the specific
+  Portal dataset and the specific metered RPC endpoint used, not a pure engine comparison.
+- **PGlite store backend** (embedded), production chunking `PORTAL_CHUNK_BLOCKS=500000` (unlike the
+  bench base above, which sets the chunk to the bounded range — here it is the real production value).
+- The stock leg made **576,207 metered JSON-RPC requests** to reach ground truth.
+
+The correctness verdict for this same run (byte-identical sync-store rows across all families) and its
+full chain of custody are in **VALIDATION.md §3.2**.
+
 ## Findings (stability + speed)
 
 - **Stability is solid:** 0 errors / 0 retries across every bench; the dense-source chunk cap keeps

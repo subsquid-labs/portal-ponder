@@ -30,8 +30,9 @@ third-party sources (public archive nodes) are used to break ties when the two p
 This is a skeleton published while the validation campaign is in flight. As of this writing the
 following are **pending** and must not be read as proven:
 
-- The full paid **byte-diff matrix** (all cells in `harness/validate/cells.json`) — only the plumbing
-  smoke cell has completed; the flagship full-range cell (`F-full`) is in progress.
+- The full paid **byte-diff matrix** (all cells in `harness/validate/cells.json`) — the plumbing smoke
+  cell and the flagship full-range cell (`F-full`, §3.2) have completed byte-identical; the remaining
+  cells are still pending.
 - The **flagship benchmark gate** (backfill speed reproduced within a stated tolerance of the
   published baseline) — tracked separately in a separate benchmarks document (pending publication),
   not asserted here.
@@ -138,7 +139,7 @@ the operator (see `harness/validate/README.md`).
 | `L-polygon` | erc20 | polygon | logs, receipts | 4×2k + 4×5k (seeded) | PENDING | `bash harness/validate/run-cell.sh L-polygon` |
 | `L-bsc` | erc20 | bsc | logs, receipts | 4×2k + 4×5k (seeded) | PENDING | `bash harness/validate/run-cell.sh L-bsc` |
 | `L-avalanche` | erc20 | avalanche | logs, receipts | 4×2k + 4×5k (seeded) | PENDING | `bash harness/validate/run-cell.sh L-avalanche` |
-| `F-full` | euler | eth | factory, logs, transactions, receipts | full range [deploy → pinned head] | **IN PROGRESS** | `bash harness/validate/run-cell.sh F-full` |
+| `F-full` | euler | eth | factory, logs, transactions, receipts | full range [deploy → pinned head] | **DONE (2026-07-06)** | `bash harness/validate/run-cell.sh F-full` |
 | `F-base` | euler | base | factory, logs, transactions, receipts | 4×50k (seeded) | PENDING | `bash harness/validate/run-cell.sh F-base` |
 | `F-arbitrum` | euler | arbitrum | factory, logs, transactions, receipts | 4×50k (seeded) | PENDING | `bash harness/validate/run-cell.sh F-arbitrum` |
 | `F-bsc` | euler | bsc | factory, logs, transactions, receipts | 4×50k (seeded) | PENDING | `bash harness/validate/run-cell.sh F-bsc` |
@@ -158,7 +159,8 @@ Notes:
   `ctrl-cell.sh`, not `run-cell.sh`.
 - **`F-full`** is the flagship byte diff — full Euler history on eth, `[20529207 → 25436954]`, head
   **pinned in `cells.json` for reproducibility**, every sync-store row diffed by the constant-memory
-  `diff-batched.mjs` plus an app-table checkpoint hash. **In progress; no result claimed here yet.**
+  `diff-batched.mjs` plus an app-table checkpoint hash. **DONE (2026-07-06): byte-identical across all
+  row families — verdict, numbers, chain of custody, and the app-hash caveat in §3.2.**
 - **`A-eth` / `A-base`** († ): the traces app covers logs + receipts + traces but does **not** yet
   cover the *accounts* (tx from/to) or *block-interval* source types — a known, documented deviation
   (`sourceTypesNotCovered` in `cells.json`; `harness/diff/README.md`). `A-base` additionally requires
@@ -181,6 +183,81 @@ Repro:
 ```bash
 SQD_PONDER_TARBALL=<tarball> RPC_URL_OVERRIDE=<free-eth-rpc> \
   bash harness/validate/run-cell.sh SMOKE
+```
+
+### 3.2 Matrix cell — F-full (DONE, 2026-07-06)
+
+The flagship paid cell: the **full recorded history of the Euler v2 app on eth mainnet** (chain 1),
+range `[20529207, 25436954]` — **4,907,748 blocks**, head **pinned in `cells.json`** — backfilled two
+ways and diffed at the sync-store row level. The Portal leg reads the SQD Portal; the stock leg is
+genuine `ponder@0.16.6` over a **metered JSON-RPC endpoint**, treated as ground truth. Both legs ran
+serially on the same host with production chunking (`PORTAL_CHUNK_BLOCKS=500000`) into PGlite stores.
+
+**Verdict — byte-identical across every row family diffed:**
+
+| Row family | Portal | Stock RPC | Result |
+|------------|--------|-----------|--------|
+| `logs` | 885,893 | 885,893 | identical |
+| `transactions` | 276,674 | 276,674 | identical |
+| `transaction_receipts` | 276,674 | 276,674 | identical |
+| `traces` | 0 | 0 | identical (this app configures no trace source) |
+| `blocks` | 252,396 | 252,396 | 252,396 shared, all match (event-bearing blocks) |
+
+`RESULT_JSON {"fail":false}`.
+
+**Speed.** The Portal backfill leg completed in **1819 s** vs the stock-RPC leg's **6543 s** — a
+**3.6× speed-up** on the same host, same range, same store backend. This is a single serial run, so it
+is a datapoint, not a benchmark gate; see `harness/bench/BENCHMARKS.md` for the run's caveats.
+
+**Spend.** The stock-RPC leg made **576,207 metered JSON-RPC requests** (the `cells.json` advisory
+estimate was 1,030,000; the real count was well under it), roughly $5–6 of metered spend. The Portal
+leg is not RPC-metered.
+
+**Chain of custody — stated plainly, because the honesty is the evidence.** This cell did **not**
+complete via `run-cell.sh` end-to-end in one clean pass; it reached its byte-identical verdict through
+a documented recovery. The full custody chain:
+
+1. **First window attempt was killed at 60.5%.** An operator restart delivered a `SIGTERM` to the
+   Portal backfill 60.5% through the range (1223 s in, 6 metered requests). The partial attempt is
+   preserved in the cell's local attempt history (the per-cell `results/*.json` are gitignored operator
+   artifacts, not committed).
+2. **Second attempt — both backfills completed, then the in-cell differ wedged.** Both the Portal and
+   the stock-RPC legs backfilled to completion. The **then-committed** `diff-batched.mjs` — whose keyset
+   pagination did **not** follow the `chain_id`-prefixed sync-store primary keys — diffed `logs`
+   byte-identical, then **wedged on `transactions`** (days of CPU with no forward progress). The run was
+   frozen and both stores were copied to the operator's evidence archive before anything could be lost.
+3. **The differ bug was root-caused and fixed on `main`.** The keyset-pagination defect is
+   [#58](../../issues/58); the fix (make the ORDER BY and tuple-WHERE lead with the `chain_id`-prefixed
+   PK so each page is a single forward index scan) merged as **[#59](../../pull/59)**.
+4. **The verdict is the offline re-diff of the evidence copies with the fixed tool.** Re-running the
+   fixed-keyset differ over the two archived stores produced the byte-identical result above. That
+   fixed tool's **first** offline run itself **hung** — not on the keyset logic, but in PGlite 0.2.13's
+   WASM allocator, which spins forever when a 50,000-row `select *` page carries ~300 MB of toasted
+   input (detoast volume; [#63](../../issues/63)). The **same rows in 5,000-row pages** complete at ~1.5 s/page; re-paginated,
+   the full re-diff of all tables finished in ~65 s (output-file create→last-write timestamps in the evidence archive). Both tool variants' `sha256` digests were recorded
+   in the operator's evidence archive at run time (the fixed-keyset differ before the page-size change:
+   `9d1756d5df7f0ee484dbd34ed2ba3ff55de21944dad872789b26c225a5bcccea`; after:
+   `bbc93163b82cd63deb52761b35bd57361b5529834d9f4c277203c8897574b719`).
+5. **Net.** The repro command in the matrix stays valid **going forward**: [#59](../../pull/59) removed
+   the `transactions` wedge, and **this document's PR** removes the detoast hang by shrinking the
+   differ's page size to 5,000 rows (`diff-batched.mjs`, §5.5). A *fresh* end-to-end run is therefore
+   now unobstructed — but it costs ~$6 of metered RPC and ~2.5 h of backfill, so the verdict above
+   stands on the archived-store re-diff rather than on a re-run.
+
+**App-hash caveat (a real limitation, not a pass).** `cells.json` sets `appHash: true` for F-full, but
+the app-table determinism hash for this run was **vacuous**: the diff harness apps write **no
+user-table rows** (only `ponder_sync`), so the hash was equal on both legs
+(`d3cd7d216da429ef006bdeb611f0ffad`) purely because **zero** nonempty user tables existed on either
+side. The app-table sub-claim is **not** satisfied by this run — the byte-identity above is proven at
+the sync-store row level only. Follow-up: give the euler diff app a deterministic user table so a
+real, nonempty checkpoint hash can be compared.
+
+Repro (a fresh end-to-end run; the operator supplies the tarball and the metered RPC key — see
+`harness/validate/README.md`):
+
+```bash
+SQD_PONDER_TARBALL=<tarball> SQD_RPC_KEY=<paid-rpc-key> \
+  bash harness/validate/run-cell.sh F-full
 ```
 
 ---
@@ -445,6 +522,19 @@ per-kill coverage snapshots, and an acceptance criterion requiring kills observe
 persisted state, logically-identical final stores. Issue #50 itself remains open and unaffected; Tier 1
 works around it with small chunks rather than fixing it.
 
+### 5.5 Validation-tool findings (Layer E harness)
+
+These are findings about the **byte-diff tooling itself**, surfaced while running the paid matrix
+(Layer E). They are separate from the data findings above: neither the fork nor the ground-truth store
+is at fault — the tool was — and none of them changed a verdict. They are recorded here for the same
+reason as the chaos methodology findings (§5.4): the harness is part of the evidence, and its bugs
+belong in the open too.
+
+| Issue | State | Finding | Attribution / layer |
+|-------|-------|---------|---------------------|
+| [#58](../../issues/58) | RESOLVED (**merged [#59](../../pull/59)**) | **Differ keyset pagination did not follow the sync-store PK.** The batched byte-diff's keyset cursor ordered/compared by columns that were **not** the `chain_id`-prefixed sync-store primary key, so on a large table the planner could not resolve each page as a single forward index scan; on the F-full full-history diff (§3.2) the tool diffed `logs` byte-identical, then **wedged on `transactions`** (days of CPU, no progress). | A tool defect (Layer E), not a data defect — both stores were intact (the offline re-diff with the fixed tool proved them byte-identical). Root-caused and fixed in **[#59](../../pull/59)**: ORDER BY + tuple-WHERE now lead with the `chain_id`-prefixed PK. Pinned by a DB-free SQL-shape test (`diff-batched.test.mjs`). |
+| [#63](../../issues/63) | MITIGATED in this PR; open for byte-aware page sizing | **PGlite 0.2.13 WASM-allocator detoast-volume hang.** A single `select *` page whose toasted input runs to ~300 MB (which a 50,000-row page of the widest sync-store tables reaches over full-history windows) spins forever in PGlite 0.2.13's WASM allocator (the *detoast* step, not the query). The **same rows in 5,000-row pages** complete at ~1.5 s each. Surfaced by the fixed-keyset differ's first offline re-diff of the F-full evidence stores (§3.2), which hung after `logs` proved identical. | A finding about the **harness's embedded store backend**, not the fork or the diff logic. Mitigated in-harness by shrinking the differ page size `BATCH` from 50,000 to 5,000 rows (`diff-batched.mjs`; the pinned SQL-shape assertions were updated to `limit 5000`); [#63](../../issues/63) tracks the durable fix — a byte-aware page size, since a fixed row count is only a proxy for detoast volume. With the smaller page, the full F-full re-diff completed in ~65 s. |
+
 ---
 
 ## 6. Current status — what a reader can rely on today
@@ -465,15 +555,22 @@ works around it with small chunks rather than fixing it.
   alone could not witness (the [#50](../../issues/50) granularity shape, which remains open and is
   worked around by Tier 1's small chunks, not fixed).
 - The fork-vs-stock **byte-diff plumbing** is proven end-to-end by the SMOKE cell (byte-identical
-  across all five row families on public endpoints, §3.1).
+  across all five row families on public endpoints, §3.1), and the **flagship `F-full` cell is DONE**
+  (§3.2): the full recorded Euler v2 history on eth mainnet (`[20529207, 25436954]`, 4.9M blocks) is
+  **byte-identical** to a stock `ponder@0.16.6` JSON-RPC backfill across `logs` / `transactions` /
+  `transaction_receipts` / `traces` and every event-bearing `block` (885,893 / 276,674 / 276,674 / 0 /
+  252,396 rows). The chain of custody (a killed first attempt, a differ that wedged pre-[#59](../../pull/59),
+  and an offline re-diff of the archived stores with the fixed tool) is stated in full in §3.2, as is
+  the **app-hash caveat** — the app-table determinism hash was vacuous (no user rows written), so the
+  byte-identity is proven at the sync-store row level only.
 - The A/B dual-implementation soak is **actively cross-validating** the Portal path against the RPC
   path hourly, and every divergence it has found is a **public, tracked issue** (§5) — with the Portal
   leg matching third-party evidence in each confirmed case.
 
 **Pending / not yet claimed:**
 
-- The **full paid byte-diff matrix** (§3) — only SMOKE is DONE; `F-full` is in progress; the rest are
-  PENDING. **This document will update the `F-full` row (and the others) as each cell completes.**
+- The **full paid byte-diff matrix** (§3) — SMOKE and the flagship `F-full` are DONE (§3.1, §3.2); the
+  remaining cells are PENDING. **This document will update each row as its cell completes.**
 - The **flagship benchmark gate** (speed reproduced within tolerance of the published baseline) —
   see a separate benchmarks document (pending publication); not asserted here.
 - A **multi-day green-soak** sign-off and **GA of the zero-RPC realtime (stream) path** — the stream
