@@ -34,6 +34,7 @@ import { eth_getBlockByNumber } from '@/rpc/actions.js';
 import type { Rpc } from '@/rpc/index.js';
 import { getChildAddress, isLogFactoryMatched } from '@/runtime/filter.js';
 import type { RealtimeSyncEvent } from '@/sync-realtime/index.js';
+import { decodeCheckpoint } from '@/utils/checkpoint.js';
 import { probeFinalizedHead } from './portal-client.js';
 // Log-request construction + field projections are the SINGLE source in portal-filters — shared with the
 // historical sync so realtime and backfill fetch-specs can never drift. Re-exported for callers/tests.
@@ -124,16 +125,54 @@ export async function portalFinalizedHead(
   });
 }
 
+/** The block number carried by a ponder checkpoint string, or undefined when there is no checkpoint
+ * OR the checkpoint belongs to ANOTHER chain. Wiring helper for `clampFinalizedToPortalHead`'s `floor`:
+ * the callers hold ponder's persisted safe checkpoint (`crashRecoveryCheckpoint`) as an encoded string.
+ *
+ * The chainId guard mirrors upstream's own crash-recovery handling (`runtime/historical.ts`): in the
+ * omnichain ordering `finalizeOmnichain` writes the OMNICHAIN checkpoint verbatim to every chain's row
+ * (no per-chain where clause), so a row's checkpoint can encode another chain's block height — "It is
+ * not an invariant that `chainId` and `checkpoint.chainId` are the same" (internal/types.ts). A foreign
+ * block number is wrong as a floor in BOTH directions: above the local RPC finalized block it disables
+ * the Portal-head clamp outright (the boundary lands above the Portal head — the wave-4 stream-mode
+ * stale-head FATAL, a deterministic crash-loop), and below the local safe point it silently
+ * under-protects. Foreign chain → NO floor (the pre-floor behavior — never worse than main; the
+ * multichain/isolated orderings write per-chain checkpoints and keep full protection). */
+export function checkpointBlockNumber(
+  checkpoint: string | undefined,
+  chainId: number,
+): number | undefined {
+  if (checkpoint === undefined) return undefined;
+
+  const decoded = decodeCheckpoint(checkpoint);
+  if (Number(decoded.chainId) !== chainId) return undefined;
+
+  return Number(decoded.blockNumber);
+}
+
 /**
  * In stream mode, lower `finalizedBlock` to the Portal's finalized head (when the Portal lags ponder's
  * RPC-derived finalized block). Pass-through for the A-path (no portal / flag off) and when the Portal is
  * already at/ahead of the RPC finalized block — so it never RAISES the boundary. Called at every site that
  * sets `syncProgress.finalized`: the initial `getLocalSyncProgress` and the backfill-cutover refetch.
+ *
+ * `floor` is a finality floor the boundary must never go BELOW (a persisted monotonic high-watermark).
+ * Load-balanced Portal replicas answer `/finalized-head` independently, so across a RESTART (or at the
+ * backfill-cutover refetch) the probe can return a head below finality ponder has already PERSISTED.
+ * Adopting it would make realtime re-stream `(head, floor]` — blocks whose indexed rows crash recovery
+ * can NOT revert (their reorg-table rows were deleted at finalize) — double-indexing every event in the
+ * range; and the first finalize after it would write the regressed checkpoint over the persisted one
+ * verbatim (`finalizeOmnichain` has no monotonic guard). Callers pass ponder's persisted safe checkpoint
+ * (startup) or the previously adopted boundary (cutover); a head below it is clamped UP to the floor.
+ * Clamping up is safe: `(head, floor]` is finalized history, identical across replicas — a lagging
+ * replica just hasn't re-marked it final yet. The floor also overrides a PORTAL_FINALIZED_HEAD pin below
+ * it: a pin below persisted finality would corrupt data, so correctness wins over the pin.
  */
 export async function clampFinalizedToPortalHead(params: {
   chain: Chain;
   rpc: Rpc;
   finalizedBlock: LightBlock;
+  floor?: number;
   common?: Common;
   fetchImpl?: typeof fetch;
 }): Promise<LightBlock> {
@@ -178,15 +217,29 @@ export async function clampFinalizedToPortalHead(params: {
     throw new Error(
       `Portal ${chain.name}: /finalized-head probe failed in stream mode (PORTAL_REALTIME=stream) — cannot establish the finality boundary. Check Portal connectivity for ${portalUrl}.`,
     );
+  // Persisted-finality floor: never adopt a boundary below finality ponder has already persisted (or
+  // below the previously adopted boundary, at the cutover sites). Ponder's own migrate-time guard
+  // ("Finalized block cannot move backwards") checks only the RPC finalized block, which is fetched
+  // BEFORE this clamp — without the floor, a lagging replica's stale-LOW head bypasses it entirely.
+  let boundary = head;
+  if (params.floor !== undefined && boundary < params.floor) {
+    params.common?.logger.warn({
+      service: 'portal',
+      msg: `Portal ${chain.name}: /finalized-head ${head} is BELOW the persisted finality floor ${params.floor} (a lagging replica, or a PORTAL_FINALIZED_HEAD pin below persisted finality) — clamping UP to the floor. (head, floor] is finalized history; adopting the lower head would re-index it.`,
+    });
+    boundary = params.floor;
+  }
   // Portal at/ahead of RPC finalized → nothing to clamp (never RAISE the boundary).
-  if (head >= hexToNumber(finalizedBlock.number)) return finalizedBlock;
+  if (boundary >= hexToNumber(finalizedBlock.number)) return finalizedBlock;
 
-  const clamped = (await eth_getBlockByNumber(rpc, [numberToHex(head), false], {
-    retryNullBlockRequest: true,
-  })) as unknown as LightBlock;
+  const clamped = (await eth_getBlockByNumber(
+    rpc,
+    [numberToHex(boundary), false],
+    { retryNullBlockRequest: true },
+  )) as unknown as LightBlock;
   params.common?.logger.debug({
     service: 'portal',
-    msg: `Portal ${chain.name}: clamped realtime finalized ${hexToNumber(finalizedBlock.number)} → Portal head ${head} (stream mode)`,
+    msg: `Portal ${chain.name}: clamped realtime finalized ${hexToNumber(finalizedBlock.number)} → ${boundary} (stream mode)`,
   });
   return clamped;
 }
