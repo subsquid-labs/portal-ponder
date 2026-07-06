@@ -58,7 +58,11 @@ export function seededRandomWindows({ seed, from, to, count, size }) {
     // specs cannot emit colliding tags (#79): a bare `rand#${i}` repeated across specs let one spec's
     // window get folded into an unrelated spec's `attempts` history in record-result.mjs. `+shrunk`
     // suffixing (run-cell.sh) composes on top of this unchanged.
-    out.push({ from: start, to: start + size, tag: `rand#${seed}.${i}@${size}` });
+    out.push({
+      from: start,
+      to: start + size,
+      tag: `rand#${seed}.${i}@${size}`,
+    });
   }
 
   return out;
