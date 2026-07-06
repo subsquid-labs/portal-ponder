@@ -814,12 +814,21 @@ preflight () {
 
   local got
   got="$(sha256sum "$TARBALL" | awk '{print $1}')"
-  # Only enforce a pin when the operator explicitly set one; otherwise record the observed hash.
-  if [ -n "${CHAOS_TARBALL_SHA:-}" ] && [ "$got" != "$CHAOS_TARBALL_SHA" ]; then
-    log "✗ tarball sha256 MISMATCH: got=$got want=$CHAOS_TARBALL_SHA — ABORT"
-    exit 2
+  # Tarball pinning is fail-closed by intent: the campaign that produced the recorded acceptance
+  # numbers verified the tarball sha256 against a pin on every launch. When CHAOS_TARBALL_SHA is set
+  # we ENFORCE it (mismatch = loud abort). When it is UNSET the run is UNPINNED — we cannot enforce
+  # what we were not told, so we WARN loudly (a self-comparison would be a no-op that only looks like
+  # a pass). Pin it (CHAOS_TARBALL_SHA=<sha256>) for a reproducible, tamper-evident run.
+  if [ -n "${CHAOS_TARBALL_SHA:-}" ]; then
+    if [ "$got" != "$CHAOS_TARBALL_SHA" ]; then
+      log "✗ tarball sha256 MISMATCH: got=$got want=$CHAOS_TARBALL_SHA — ABORT"
+      exit 2
+    fi
+
+    log "✓ tarball sha256 pinned+verified ($got)"
+  else
+    log "⚠ tarball sha256 UNPINNED (CHAOS_TARBALL_SHA unset) — observed $got, NOT verified against a pin; set CHAOS_TARBALL_SHA to enforce"
   fi
-  log "✓ tarball sha256 = $got"
   log "✓ harness commit @ $(git -C "$CDIR" rev-parse --short HEAD 2>/dev/null || echo '?')"
 
   # ensure the crash-durable cluster is up (idempotent) — the substrate is NEVER killed hereafter.

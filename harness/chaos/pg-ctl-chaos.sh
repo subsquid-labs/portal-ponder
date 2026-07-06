@@ -58,11 +58,13 @@ is_up () {
 }
 
 wire_config () {
-  # Render the managed config: substitute the @CHAOS_PGSOCK@ placeholder in the template with our
-  # actual (absolute) socket dir, into a rendered file next to the datadir; then ensure
-  # postgresql.conf includes it exactly once.
+  # Render the managed config: substitute the @CHAOS_PGPORT@ and @CHAOS_PGSOCK@ placeholders in the
+  # template with our actual port + (absolute) socket dir, into a rendered file next to the datadir;
+  # then ensure postgresql.conf includes it exactly once. Substituting the PORT is what keeps the
+  # server's listen port in lockstep with the port the driver/tools connect on — an unsubstituted
+  # port would let CHAOS_PGPORT diverge from the server and silently break every connection.
   local rendered="$PGDATA/pg-chaos.rendered.conf"
-  sed "s#@CHAOS_PGSOCK@#$PGSOCK#g" "$PGCONF" > "$rendered"
+  sed -e "s#@CHAOS_PGPORT@#$PGPORT#g" -e "s#@CHAOS_PGSOCK@#$PGSOCK#g" "$PGCONF" > "$rendered"
   local inc="include = '$rendered'"
   if ! grep -qF "$inc" "$PGDATA/postgresql.conf" 2>/dev/null; then
     printf '\n# ── chaos-pg managed config (issue #52) ──\n%s\n' "$inc" >> "$PGDATA/postgresql.conf"
