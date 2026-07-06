@@ -362,9 +362,11 @@ re-running each on a smaller (half-size) leading window that diffs to completion
 `rand#1+shrunk`, `rand#2+shrunk`, and `rand#3+shrunk` appear above.
 
 **Re-verdict under the merged #77 tolerance.** [#77](../../pull/77) merged the precisely-scoped,
-self-retiring `block.size` tolerance (§5.3, §5.6). The **byte-aware batched differ** from
-[#72](../../pull/72) — which also sidesteps the #78 cliff by paged reads — was re-run **over every
-preserved store with no re-backfill** (a diff-only re-run against the preserved `ponder_sync` stores).
+self-retiring `block.size` tolerance (§5.3, §5.6). The tolerant differ was re-run **over every
+preserved store with no re-backfill** (a diff-only re-run against the preserved `ponder_sync`
+stores): the eight stores whose first-run diff had completed re-verdicted with the **fixed cell
+differ**, and the two monster stores that wedged it (#78) re-verdicted with the **byte-aware batched
+differ** from [#72](../../pull/72), which sidesteps the #78 cliff by paged reads.
 Result: **every store is byte-identical across `logs` / `transactions` / `transaction_receipts` /
 `traces`**, with a small bounded count of tolerated `block.size` rows per window and the **strict
 (non-block) tables byte-identical in every store**:
@@ -745,7 +747,7 @@ clean once the divergence was understood and bounded.
 
 | Issue | State | Finding | Attribution / layer |
 |-------|-------|---------|---------------------|
-| [#76](../../issues/76) | OPEN (tolerance **merged [#77](../../pull/77)**; upstream dataset fix tracked in #76) | **Upstream Portal dataset `block.size` off-by-one at the RLP 2^16 boundary.** On blocks whose canonical RLP-encoded size is **≥ 65 540**, the Portal dataset reports `block.size` **one byte low** (`rpc = portal + 1`); every other `blocks` column, and every `logs` / `transactions` / `transaction_receipts` / `traces` row, is byte-identical. Surfaced by the **L-eth** cell (§3.4): 10 of 11 first-run stores failed on `blocks` **only**, all with this exact signature. **Publicly reproducible** against any public archive node — e.g. block **19963775** (in the `rand#3` 2k window) reports `size` **66755** from the Portal endpoint vs **66756** from a public RPC. | A defect in the **upstream dataset** (the SQD Portal), not the portal-ponder fork or the diff tool: the fork faithfully persists what the dataset serves, and the RPC ground truth breaks the tie. Tolerated by a precisely-scoped, self-retiring diff class (§5.3) **merged in [#77](../../pull/77)**, under which the L-eth strict tables re-verdict clean; the underlying dataset fix is tracked in [#76](../../issues/76). |
+| [#76](../../issues/76) | OPEN (tolerance **merged [#77](../../pull/77)**; upstream dataset fix tracked in #76) | **Upstream Portal dataset `block.size` off-by-one at the RLP 2^16 boundary.** On blocks whose canonical RLP-encoded size is **≥ 65 540**, the Portal dataset reports `block.size` **one byte low** (`rpc = portal + 1`); every other `blocks` column, and every `logs` / `transactions` / `transaction_receipts` / `traces` row, is byte-identical. Surfaced by the **L-eth** cell (§3.4): of the 11 first-run records, 8 failed on `blocks` **only** and the 2 whose diffs wedged (#78) re-verdicted with the same signature — all 10 preserved stores carry it, and the one remaining window passed outright. **Publicly reproducible** against any public archive node — e.g. block **19963775** (in the `rand#3` 2k window) reports `size` **66755** from the Portal endpoint vs **66756** from a public RPC. | A defect in the **upstream dataset** (the SQD Portal), not the portal-ponder fork or the diff tool: the fork faithfully persists what the dataset serves, and the RPC ground truth breaks the tie. Tolerated by a precisely-scoped, self-retiring diff class (§5.3) **merged in [#77](../../pull/77)**, under which the L-eth strict tables re-verdict clean; the underlying dataset fix is tracked in [#76](../../issues/76). |
 
 **Why this is tolerated rather than failed.** The tolerance is not a blanket "ignore blocks" waiver:
 it accepts a `blocks` row as matching **only** when the *sole* divergence is `block.size`, the RPC
