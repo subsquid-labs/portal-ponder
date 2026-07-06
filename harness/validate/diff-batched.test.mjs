@@ -342,7 +342,7 @@ test('#58 buildKeysetSql: ORDER BY + tuple-WHERE follow the chain_id-prefixed PK
     const first = buildKeysetSql(table, spec.keys, false);
     assert.equal(
       first,
-      `select * from ponder_sync."${table}"  order by ${cols} limit 50000`,
+      `select * from ponder_sync."${table}"  order by ${cols} limit 5000`,
       `${table} first-page SQL must ORDER BY the chain_id-prefixed PK`,
     );
 
@@ -351,7 +351,7 @@ test('#58 buildKeysetSql: ORDER BY + tuple-WHERE follow the chain_id-prefixed PK
     const rhs = spec.keys.map((_, i) => `$${i + 1}`).join(', ');
     assert.equal(
       cursor,
-      `select * from ponder_sync."${table}" where (${cols}) > (${rhs}) order by ${cols} limit 50000`,
+      `select * from ponder_sync."${table}" where (${cols}) > (${rhs}) order by ${cols} limit 5000`,
       `${table} cursor-page SQL must tuple-compare + ORDER BY the chain_id-prefixed PK`,
     );
     // the tuple LHS and the ORDER BY must lead with chain_id (the PK prefix that makes it an index scan).
