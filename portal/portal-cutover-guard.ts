@@ -27,6 +27,25 @@
  * cutover iterations, so an end-capped chain stays end-capped — the guard never flips a chain back into
  * the probe set mid-loop.
  *
+ * OMNICHAIN CORRECTNESS — TWO-PHASE PROBE (INV-18). Excluding end-capped chains is only safe per-round in
+ * isolation; across a catchup round it can DROP events vs upstream main. The omnichain generator parks
+ * events whose checkpoint exceeds the shared `omnichainTo = min(min-over-chains finalized, max-over-chains
+ * end)`, and drains them on a later round once `omnichainTo` rises. An excluded end-capped chain keeps its
+ * STALE finalized, and when that stale value is the min-over-chains floor sitting BELOW an active chain's
+ * end, it caps `omnichainTo` so the active chain's events park and can never drain — the loop breaks and
+ * realtime (which skips every end-capped chain) drops them. Main never drops because it probes AND ADOPTS
+ * every chain on the catchup round, lifting the floor. (A pending-only "probe all when pending>0" gate
+ * does not fix it: on the round that first parks the event, pending is still 0.)
+ *
+ * So the omnichain loop runs TWO phases. PHASE 1 (`omnichainCutoverProbeIndices`) probes the necessity-
+ * gated reduced set (exclude end-capped unless events are parked). It computes `shouldCatchup` from those
+ * results; if — and only if — catchup fires while chains were excluded, PHASE 2
+ * (`cutoverExcludedIndices`) re-probes + clamps exactly the excluded complement and the loop adopts EVERY
+ * chain, so the catchup-round adoption is byte-equivalent to main. When no chain advances (the steady-
+ * state fully-bounded case) `shouldCatchup` is false, phase 2 never runs, and end-capped chains are probed
+ * ZERO times — issue #70's availability win is preserved. Multichain has no pending/parking mechanism and
+ * keeps the single-phase reduced probe unchanged.
+ *
  * Pure w.r.t. I/O and env: it reads only block numbers, so it is unit-testable without any RPC/network.
  */
 
@@ -130,3 +149,76 @@ export const shouldSkipOmnichainCutoverRound = <TChain>(
   pendingCount: number,
 ): boolean =>
   pendingCount === 0 && shouldSkipCutoverRound(chains, perChainSync);
+
+/**
+ * PHASE 1 of the omnichain two-phase cutover probe (INV-18) — the necessity-gated REDUCED probe set.
+ *
+ * `cutoverProbeIndices` excludes end-capped chains: with an EMPTY probe set every chain passes its own
+ * finalized through untouched, so no `finalized` rises, `shouldCatchup` stays false, and the omnichain
+ * loop exits via its `if (shouldCatchup === false) break`. That is exactly what we want when nothing is
+ * parked and no chain advances — the steady-state fully-bounded app issues ZERO cutover refetches, which
+ * is the whole availability win of issue #70.
+ *
+ * But the reduced set alone is NOT a whole-loop correctness proof. When a probed chain advances enough
+ * to trigger catchup while an EXCLUDED end-capped chain still carries a STALE finalized that is the
+ * min-over-chains floor capping `omnichainTo` below the active chains' end frontier, the excluded chain's
+ * stale finalized parks the active chain's events above `omnichainTo` forever: a later round finds the
+ * excluded chain advances by ≤ `finalityBlockCount` (not enough to re-trigger catchup on its own), the
+ * loop breaks, and the parked events are handed to realtime — which skips every end-capped chain and
+ * DROPS them. Upstream main never hits this because it probes + ADOPTS every chain on the catchup round,
+ * so the stale floor rises too. (A pending-only "probe all when pending>0" gate does NOT close it either:
+ * on the round that first PARKS the event, pending is still 0, so the excluded chain is never probed —
+ * verified by whole-loop simulation.)
+ *
+ * The two-phase probe closes it WITHOUT giving up #70: this helper returns the reduced PHASE-1 set; the
+ * caller computes `shouldCatchup` from phase-1 results, and IF catchup fires AND chains were excluded, it
+ * re-probes the excluded set (PHASE 2, see `cutoverExcludedIndices`) and adopts every chain — so a
+ * catchup round adopts main-equivalent finality and the stale floor can never cap a draining round. When
+ * no chain advances (the steady-state bounded case) `shouldCatchup` is false, phase 2 never runs, and
+ * excluded end-capped chains are probed 0 times.
+ *
+ * `pendingCount` keeps the `pending>0 → probe all` gate: when events are already parked, the round is on
+ * the drain path, so probe (and phase-2-adopt) every chain immediately rather than waiting a round. When
+ * `pendingCount === 0` (the common case) this is exactly `cutoverProbeIndices` — end-capped chains
+ * excluded. `pendingCount` is passed in (not read here) to keep the helper pure and unit-testable.
+ */
+export const omnichainCutoverProbeIndices = <TChain>(
+  chains: readonly TChain[],
+  perChainSync: Map<TChain, { syncProgress: CutoverSyncProgress }>,
+  pendingCount: number,
+): number[] => {
+  if (pendingCount > 0) {
+    return chains.map((_, i) => i);
+  }
+
+  return cutoverProbeIndices(chains, perChainSync);
+};
+
+/**
+ * PHASE 2 of the omnichain two-phase cutover probe (INV-18) — the chains EXCLUDED from a given phase-1
+ * probe set, in `chains` order.
+ *
+ * The omnichain caller runs this only when phase 1 already decided to catch up (some probed chain
+ * advanced by more than its `finalityBlockCount`). On such a round upstream main probes AND adopts every
+ * chain; the reduced phase-1 set left the end-capped chains carrying stale finalized blocks. Re-probing
+ * exactly this complement — then clamping and adopting it alongside the phase-1 blocks — makes the
+ * catchup-round adoption byte-equivalent to main, so no excluded chain's stale finalized can remain the
+ * floor that caps `omnichainTo` and parks another chain's events into a drop.
+ *
+ * `probeIndices` is the phase-1 set (from `omnichainCutoverProbeIndices`); the result is its complement
+ * over `[0, chains.length)`. Pure and unit-testable: it reads nothing but the two index views.
+ */
+export const cutoverExcludedIndices = <TChain>(
+  chains: readonly TChain[],
+  probeIndices: readonly number[],
+): number[] => {
+  const probed = new Set(probeIndices);
+  const excluded: number[] = [];
+  for (let i = 0; i < chains.length; i++) {
+    if (probed.has(i)) continue;
+
+    excluded.push(i);
+  }
+
+  return excluded;
+};
