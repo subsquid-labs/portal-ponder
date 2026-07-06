@@ -2,11 +2,14 @@ import assert from 'node:assert/strict';
 import { test } from 'node:test';
 import {
   appHashVerdict,
+  buildKeysetSql,
   cmpKey,
   hashRows,
   mergeCompare,
   normRow,
   resolveTableSpecs,
+  SYNC_STORE_PKS,
+  TABLES,
 } from './diff-batched.mjs';
 
 // key by (block_number, log_index) as the real logs table would be ordered
@@ -289,5 +292,144 @@ test('STRICT_BLOCKS: a baseline-only (B-only) block FAILS (chaos resume vs basel
     tolerant.fail,
     false,
     'the default asymmetric blocks mode tolerates the B-only block — the bug the override fixes',
+  );
+});
+
+// #58 — keyset pagination must ORDER BY the sync-store PK column order (chain_id-first) so every
+// 50k-row page is a forward index scan on the PK, not a full-table sort. This pins every TABLES
+// spec's keyset to the PK column order (SYNC_STORE_PKS, taken verbatim from ponder's sync-store
+// schema). MUTATION: drop 'chain_id' from any spec's keys (or reorder the tuple) → this test FAILS.
+test('#58 keyset↔PK: every TABLES keyset is exactly the chain_id-prefixed sync-store PK order', () => {
+  // same table set on both sides — no spec silently added/removed.
+  assert.deepEqual(
+    Object.keys(TABLES).sort(),
+    Object.keys(SYNC_STORE_PKS).sort(),
+  );
+
+  for (const [table, pk] of Object.entries(SYNC_STORE_PKS)) {
+    const spec = TABLES[table];
+    assert.ok(spec, `TABLES has a spec for ${table}`);
+    assert.equal(
+      spec.keys[0],
+      'chain_id',
+      `${table} keyset must LEAD with chain_id (the PK prefix) — else every page full-sorts`,
+    );
+    assert.deepEqual(
+      spec.keys,
+      pk,
+      `${table} keyset must match the PK column order exactly (${pk.join(', ')})`,
+    );
+  }
+});
+
+// #58 — pin the SQL the keyset builder emits for each table: ORDER BY and the tuple-cursor WHERE must
+// list the PK columns in PK order, so the planner uses a single forward PK index scan (no per-page
+// sort). MUTATION: drop chain_id from a spec → the asserted ORDER BY / tuple LHS no longer starts
+// with "chain_id" → this test FAILS.
+test('#58 buildKeysetSql: ORDER BY + tuple-WHERE follow the chain_id-prefixed PK per table', () => {
+  const expected = {
+    logs: '"chain_id", "block_number", "log_index"',
+    transactions: '"chain_id", "block_number", "transaction_index"',
+    transaction_receipts: '"chain_id", "block_number", "transaction_index"',
+    traces: '"chain_id", "block_number", "transaction_index", "trace_index"',
+    blocks: '"chain_id", "number"',
+  };
+
+  for (const [table, spec] of Object.entries(TABLES)) {
+    const cols = expected[table];
+
+    // first page: ORDER BY the PK columns, no WHERE.
+    const first = buildKeysetSql(table, spec.keys, false);
+    assert.equal(
+      first,
+      `select * from ponder_sync."${table}"  order by ${cols} limit 50000`,
+      `${table} first-page SQL must ORDER BY the chain_id-prefixed PK`,
+    );
+
+    // cursor page: row-wise tuple WHERE over the SAME PK columns + $-placeholders, then ORDER BY.
+    const cursor = buildKeysetSql(table, spec.keys, true);
+    const rhs = spec.keys.map((_, i) => `$${i + 1}`).join(', ');
+    assert.equal(
+      cursor,
+      `select * from ponder_sync."${table}" where (${cols}) > (${rhs}) order by ${cols} limit 50000`,
+      `${table} cursor-page SQL must tuple-compare + ORDER BY the chain_id-prefixed PK`,
+    );
+    // the tuple LHS and the ORDER BY must lead with chain_id (the PK prefix that makes it an index scan).
+    assert.ok(
+      cursor.includes('("chain_id",') || cursor.includes('("chain_id")'),
+      `${table} cursor tuple must lead with chain_id`,
+    );
+  }
+});
+
+// #58 — functional multi-chain regression. Two chains' rows interleave by block_number: chain 1 has
+// blocks 100,102; chain 2 has block 101. Keyed per-(chain_id, block_number) (the fixed keyset) the two
+// stores are IDENTICAL and every row is shared. Keyed by (block_number) ALONE (the OLD keyset) the
+// merge mis-orders across chains — chain 2's block 101 sorts BETWEEN chain 1's 100 and 102 — and any
+// cross-chain block-number collision would be silently conflated. This proves the fix makes the diff
+// well-defined per (chain_id, …) tuple; the OLD keyset would mis-order these rows.
+test('#58 multi-chain: streamingDiff is well-defined per (chain_id, block_number) tuple', async () => {
+  const row = (chain, bn, extra = {}) => ({
+    chain_id: chain,
+    block_number: bn,
+    hash: `h${chain}-${bn}`,
+    ...extra,
+  });
+
+  // interleave the two chains so their block numbers are NOT globally monotone in row order — the
+  // stream is only monotone under the (chain_id, block_number) key, exactly like a real two-chain store.
+  const store = [row(1n, 100n), row(1n, 102n), row(2n, 101n)];
+
+  const chainKey = (r) => [r.chain_id, r.block_number];
+  const same = await mergeCompare(store, store.slice(), {
+    keyFn: chainKey,
+    mode: 'strict',
+  });
+  assert.equal(
+    same.fail,
+    false,
+    'identical multi-chain stores must be shared, not divergent',
+  );
+  assert.equal(same.shared, 3);
+  assert.equal(same.onlyA, 0);
+  assert.equal(same.onlyB, 0);
+
+  // a cross-chain collision the OLD (block_number-only) key would CONFLATE: chain 1 block 101 and
+  // chain 2 block 101 are DISTINCT rows. Under the fixed (chain_id, block_number) key A has (1,101)
+  // and B has (2,101) — a real one-sided divergence on EACH side that strict must FAIL.
+  const a = [row(1n, 100n), row(1n, 101n, { hash: 'A-only' })];
+  const b = [row(1n, 100n), row(2n, 101n, { hash: 'B-only' })];
+  const withChain = await mergeCompare(a, b, {
+    keyFn: chainKey,
+    mode: 'strict',
+  });
+  assert.equal(
+    withChain.fail,
+    true,
+    'distinct-chain rows sharing a block number must NOT be conflated — strict fails on the one-sided rows',
+  );
+  assert.equal(withChain.onlyA, 1, 'chain-1 block 101 is A-only');
+  assert.equal(withChain.onlyB, 1, 'chain-2 block 101 is B-only');
+  assert.equal(withChain.shared, 1, 'only chain-1 block 100 is shared');
+
+  // the OLD block_number-only key would WRONGLY treat (1,101) and (2,101) as the SAME row and report a
+  // field MISMATCH instead of two distinct one-sided rows — conflating two chains. This locks the
+  // semantic improvement: the chain_id prefix keeps per-chain identity distinct.
+  const oldKey = (r) => [r.block_number];
+  const conflated = await mergeCompare(a, b, { keyFn: oldKey, mode: 'strict' });
+  assert.equal(
+    conflated.shared,
+    2,
+    'the OLD block_number-only key CONFLATES the two chains block-101 rows as one shared key',
+  );
+  assert.equal(
+    conflated.onlyA,
+    0,
+    'proof the old key hides the cross-chain divergence as a shared mismatch, not a one-sided row',
+  );
+  assert.equal(
+    conflated.mismatch,
+    1,
+    'old key mislabels the cross-chain rows as a field mismatch',
   );
 });
