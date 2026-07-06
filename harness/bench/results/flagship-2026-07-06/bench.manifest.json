@@ -1,0 +1,70 @@
+{
+  "generatedAt": "2026-07-06T16:45:24.008Z",
+  "kind": "portal-ponder deterministic 15-chain flagship bench manifest",
+  "tarball": {
+    "path": "subsquid-ponder-0.16.6-flagship-eef69b6.tgz",
+    "sha256": "25bfbabeca1cf90a827556719b48d2c5b9c6452c7650746f231475178c336b6e",
+    "sizeBytes": 914672
+  },
+  "repo": {
+    "mainSha": "4318c83f036f1e77d0198b71a75f809352b4ac2f",
+    "branch": "flagship-integration",
+    "dirty": true
+  },
+  "chainsJson": {
+    "path": "harness/euler-multichain/chains.json",
+    "sha256": "198994f497f18beea16380872a3a6515700bb3b6be905d657bba258ad669320a"
+  },
+  "anchorsFile": {
+    "path": "anchors-2026-07-06.json",
+    "sha256": "fc0cb082585f9e188577c56f806f140ba06f212508dcd305ec2b2f1a0fc48be6"
+  },
+  "env": {
+    "knobs": {
+      "PORTAL_URL": "<from-env>",
+      "PORTAL_CHECKS": "off",
+      "PONDER_LOG_LEVEL": "info",
+      "BENCH_RPC_BASE": "http://127.0.0.1:8645",
+      "NODE_OPTIONS": "--max-old-space-size=32768"
+    },
+    "secretsByName": {
+      "PORTAL_API_KEY": "<from-env>"
+    },
+    "database": {
+      "host": "127.0.0.1",
+      "port": "54329",
+      "database": "euler_bench_flagship",
+      "credentials": "<from-env, withheld>"
+    },
+    "eulerChainsState": "unset (all 15 chains)"
+  },
+  "host": {
+    "nodeVersion": "v22.22.2",
+    "platform": "linux",
+    "arch": "x64",
+    "cpuCount": 96,
+    "cgroup": {
+      "memoryMaxV2": null,
+      "memoryHighV2": null,
+      "cpuMaxV2": null,
+      "memoryLimitV1": null
+    }
+  },
+  "postgres": {
+    "checkpoint_timeout": "300 s",
+    "effective_cache_size": "524288 8kB",
+    "full_page_writes": "on",
+    "maintenance_work_mem": "131072 kB",
+    "max_connections": "40",
+    "max_wal_size": "1024 MB",
+    "min_wal_size": "80 MB",
+    "server_version": "16.14 (Ubuntu 16.14-0ubuntu0.24.04.1)",
+    "shared_buffers": "65536 8kB",
+    "synchronous_commit": "on",
+    "wal_compression": "off",
+    "wal_level": "replica",
+    "work_mem": "32768 kB"
+  },
+  "loadConditions": "co-resident background services on the host were stopped for the measurement window; host otherwise idle",
+  "repro": "BENCH_RPC_BASE=http://127.0.0.1:8645 ANCHORS_FILE=<anchors.json> SQD_PONDER_TARBALL=<tgz> DATABASE_URL=<fresh> PORTAL_URL=<portal> PORTAL_API_KEY=<from-env> BENCH_SCHEMA=euler_bench BENCH_PORT=42169 bash harness/bench/run-flagship.sh"
+}

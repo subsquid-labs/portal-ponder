@@ -40,6 +40,15 @@ const REALTIME_RPC_KEY = process.env.REALTIME_RPC_KEY;
 const REALTIME_RPC_URL = process.env.REALTIME_RPC_URL; // realtime RPC base (from env; provisioned per client)
 const REALTIME = process.env.EULER_REALTIME === 'true';
 
+// Deterministic bench: when BENCH_RPC_BASE is set, EVERY chain's ONLY RPC transport is the local
+// pinned-anchor shim (harness/bench/anchor-shim.mjs) at `${BENCH_RPC_BASE}/${chainId}` — no freeRpcs
+// fallback. The shim serves the startup anchors of an end-capped [deploy, head] backfill from a
+// committed real-header snapshot, so the run has zero external RPC dependence and is reproducible.
+// FAIL LOUD, not fall back: if the shim is missing an anchor the run must error, never silently reach
+// a flaky public RPC. When the env is UNSET this whole path is inert and behaviour is unchanged.
+const BENCH_RPC_BASE = process.env.BENCH_RPC_BASE;
+const benchRpc = (chainId: number) => http(`${BENCH_RPC_BASE}/${chainId}`);
+
 // Chains served by the realtime RPC. Realtime uses it (alone) on these.
 const REALTIME_CHAINS = new Set([1, 42161, 8453, 43114, 137, 56, 9745, 143]);
 const realtimeRpc = (chainId: number) =>
@@ -47,12 +56,25 @@ const realtimeRpc = (chainId: number) =>
     fetchOptions: { headers: { 'x-api-key': REALTIME_RPC_KEY ?? '' } },
   });
 
-// realtime → the realtime RPC ALONE (the endpoint under evaluation): no generic proxy, no flaky
-// keyless public fallback (their 403/timeout cascades stall the single-thread). bench → public RPCs only.
-const rpcFor = (c: ChainRow) =>
-  REALTIME && REALTIME_RPC_KEY && REALTIME_RPC_URL && REALTIME_CHAINS.has(c.id)
-    ? realtimeRpc(c.id)
-    : c.freeRpcs;
+// bench → the pinned-anchor shim ALONE (no public fallback — fail loud). realtime → the realtime RPC
+// ALONE (the endpoint under evaluation): no generic proxy, no flaky keyless public fallback (their
+// 403/timeout cascades stall the single-thread). otherwise → public RPCs only.
+const rpcFor = (c: ChainRow) => {
+  if (BENCH_RPC_BASE) {
+    return benchRpc(c.id);
+  }
+
+  if (
+    REALTIME &&
+    REALTIME_RPC_KEY &&
+    REALTIME_RPC_URL &&
+    REALTIME_CHAINS.has(c.id)
+  ) {
+    return realtimeRpc(c.id);
+  }
+
+  return c.freeRpcs;
+};
 
 // optional subset: EULER_CHAINS=ethereum,base limits the run. In realtime mode with no explicit subset,
 // default to the realtime-RPC chains (the 8 that have a realtime source).

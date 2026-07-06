@@ -70,15 +70,11 @@
     "head": 89464275,
     "sqdSlug": "polygon",
     "freeRpcs": [
-      "https://rpc.ankr.com/polygon",
-      "https://polygon-rpc.com",
       "https://rpc-mainnet.matic.quiknode.pro",
       "https://polygon-public.nodies.app",
-      "https://polygon-mainnet.public.blastapi.io",
       "https://1rpc.io/matic",
       "https://polygon-bor-rpc.publicnode.com",
       "https://polygon.api.onfinality.io/public",
-      "https://polygon.rpc.blxrbdn.com",
       "https://polygon.drpc.org",
       "https://polygon.gateway.tenderly.co"
     ],
@@ -117,7 +113,6 @@
     "freeRpcs": [
       "https://rpc.soniclabs.com",
       "https://sonic.drpc.org",
-      "https://rpc.ankr.com/sonic_mainnet",
       "https://sonic.api.onfinality.io/public",
       "https://sonic.therpc.io",
       "https://sonic-json-rpc.stakely.io",

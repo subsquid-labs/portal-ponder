@@ -1,0 +1,136 @@
+{
+  "generatedAt": "2026-07-06T16:45:23.955Z",
+  "clean": true,
+  "allComplete": true,
+  "historicalStartTs": 1783353207,
+  "historicalEndTs": 1783356314,
+  "wallSeconds": 3107,
+  "startToReadySeconds": 3118.6,
+  "rpc": {
+    "requests": 90,
+    "errors": 0
+  },
+  "chainCount": 15,
+  "perChain": [
+    {
+      "chain": "ethereum",
+      "complete": true,
+      "completedBlocks": 4907748,
+      "totalBlocks": 4907748,
+      "startTs": 1783353207,
+      "endTs": 1783356314
+    },
+    {
+      "chain": "binance",
+      "complete": true,
+      "completedBlocks": 61058244,
+      "totalBlocks": 61058244,
+      "startTs": 1783353207,
+      "endTs": 1783356314
+    },
+    {
+      "chain": "unichain",
+      "complete": true,
+      "completedBlocks": 43610101,
+      "totalBlocks": 43610101,
+      "startTs": 1783353207,
+      "endTs": 1783356314
+    },
+    {
+      "chain": "polygon",
+      "complete": true,
+      "completedBlocks": 2531291,
+      "totalBlocks": 2531291,
+      "startTs": 1783353207,
+      "endTs": 1783356314
+    },
+    {
+      "chain": "monad",
+      "complete": true,
+      "completedBlocks": 54019877,
+      "totalBlocks": 54019877,
+      "startTs": 1783353207,
+      "endTs": 1783356314
+    },
+    {
+      "chain": "sonic",
+      "complete": true,
+      "completedBlocks": 69791284,
+      "totalBlocks": 69791284,
+      "startTs": 1783353207,
+      "endTs": 1783356314
+    },
+    {
+      "chain": "tac",
+      "complete": true,
+      "completedBlocks": 20968490,
+      "totalBlocks": 20968490,
+      "startTs": 1783353207,
+      "endTs": 1783356314
+    },
+    {
+      "chain": "hyperliquid",
+      "complete": true,
+      "completedBlocks": 37309348,
+      "totalBlocks": 37309348,
+      "startTs": 1783353207,
+      "endTs": 1783356314
+    },
+    {
+      "chain": "base",
+      "complete": true,
+      "completedBlocks": 25773030,
+      "totalBlocks": 25773030,
+      "startTs": 1783353207,
+      "endTs": 1783356314
+    },
+    {
+      "chain": "plasma",
+      "complete": true,
+      "completedBlocks": 25451074,
+      "totalBlocks": 25451074,
+      "startTs": 1783353207,
+      "endTs": 1783356314
+    },
+    {
+      "chain": "arbitrum",
+      "complete": true,
+      "completedBlocks": 240586948,
+      "totalBlocks": 240586948,
+      "startTs": 1783353207,
+      "endTs": 1783356314
+    },
+    {
+      "chain": "avalanche",
+      "complete": true,
+      "completedBlocks": 32396006,
+      "totalBlocks": 32396006,
+      "startTs": 1783353207,
+      "endTs": 1783356314
+    },
+    {
+      "chain": "linea",
+      "complete": true,
+      "completedBlocks": 13322777,
+      "totalBlocks": 13322777,
+      "startTs": 1783353207,
+      "endTs": 1783356314
+    },
+    {
+      "chain": "bob",
+      "complete": true,
+      "completedBlocks": 10423864,
+      "totalBlocks": 10423864,
+      "startTs": 1783353207,
+      "endTs": 1783356314
+    },
+    {
+      "chain": "berachain",
+      "complete": true,
+      "completedBlocks": 21847735,
+      "totalBlocks": 21847735,
+      "startTs": 1783353207,
+      "endTs": 1783356314
+    }
+  ]
+}

@@ -8,9 +8,10 @@ Captured on a single OVH box (Ubuntu 24.04). The run is deliberately bounded to 
 
 ## TL;DR
 
-- **28,405,932 events across 15 chains, 2,484 vaults**, full history, in **44m 55s**.
-- **Byte-complete and correct** — verified independently against the Portal ground truth: **60/60 sampled windows across all 15 chains match exactly**, and two independent runs produced the **identical** 28,405,932 total.
-- **Modest footprint** — the indexer ran capped at **16 GB / 2 cores** (peak 9.2 GB, ~1 core of real work); Postgres is a separate, throughput-tuned production DB. No 96-core/125 GB machine required — the box was just what we had; its cores and RAM sat idle.
+- **28,405,932 events across 15 chains, 2,484 vaults**, full history — reproduced from scratch on the Portal in **51m 47s** by the deterministic zero-RPC bench kit (2026-07-06), and previously in **44m 55s** on the config-b run (2026-07-01).
+- **Complete and correct** — verified two independent ways: (1) a fresh Portal-only backfill matched the **frozen reference store on all 62 compared aggregate cells** — per-chain `logs` count / min-block / max-block / distinct-tx over the complete range of every chain, plus whole-store `blocks` and `transactions` totals; **28,405,932 log rows** identical on both sides (whole-store aggregate equality, not sampling); (2) **byte-level** correctness comes from the Portal ground truth — Portal-derived logs are byte-identical to JSON-RPC `eth_getLogs` (the differential test in the repo), and **60/60 sampled windows** across all 15 chains matched that ground truth exactly. This is now the **second** independent run to reproduce the same 28,405,932 total.
+- **Zero external RPC** in the deterministic run — all **90 RPC requests** (exactly 6/chain × 15) were served from a committed anchor snapshot by the kit's local shim, **0 errors**; the ponder process's only remote endpoint was the SQD Portal.
+- **Modest footprint** — the indexer ran capped at **16 GB / 2 cores** (config-b peak 9.2 GB, ~1 core of real work) on a 96-core host; Postgres is a separate, throughput-tuned production DB. No 96-core/125 GB machine required — its cores and RAM sat idle.
 - **The Portal is not the bottleneck.** It feeds data faster than a single Ponder event-loop can consume it; wall-time is set by Ponder's single-threaded indexing, not by fetch, RAM, or cores.
 
 ---
@@ -50,7 +51,9 @@ Captured on a single OVH box (Ubuntu 24.04). The run is deliberately bounded to 
 
 ## Correctness (the part that matters)
 
-Data correctness was treated as the gate: **the report does not ship unless the data is provably complete and correct.** Three independent lines of evidence, all against the **SQD Portal ground truth** (Portal-derived logs are byte-identical to JSON-RPC `eth_getLogs` — see the differential test in the repo):
+Data correctness was treated as the gate: **the report does not ship unless the data is provably complete and correct.** Four independent lines of evidence — three against the **SQD Portal ground truth** (Portal-derived logs are byte-identical to JSON-RPC `eth_getLogs` — see the differential test in the repo), plus a whole-store parity gate against the frozen reference DB:
+
+0. **Whole-store parity vs the frozen reference — exact on all 62 compared aggregate cells (2026-07-06).** A fresh Portal-only backfill was compared against the frozen reference store over `ponder_sync`: per-chain `logs` count / min-block / max-block / distinct-tx for all 15 chains, plus whole-store `blocks` (**4,646,445**) and `transactions` (**5,007,056**) totals. **All 62 cells identical, 0 diffs** — total log rows **28,405,932** equal on both sides. This is not sampling: it compares the complete stored range of every chain (the gate is whole-store aggregate equality, not a raw row-byte comparison). Raw report: [`../bench/results/flagship-2026-07-06/parity-report.json`](../bench/results/flagship-2026-07-06/parity-report.json).
 
 1. **Windowed completeness — 60/60 exact.** For each chain we sampled four 100k-block windows (early / 40% / 75% / head) and compared the indexed event count to the Portal's, both filtered to the discovered children + the 24 event topics. **Every window matched exactly** — e.g. ethereum `[24.21M–24.31M]` 28,825 = 28,825; berachain `[17.48M–17.58M]` **282,320 = 282,320**.
 2. **Cross-run reproducibility — identical.** Two independent runs with *different* chunking, heap, and Postgres configs produced the **identical** 28,405,932-event total. A data-loss bug would diverge; it doesn't.
@@ -60,9 +63,47 @@ Data correctness was treated as the gate: **the report does not ship unless the 
 
 ---
 
+## Deterministic reproduction (2026-07-06)
+
+The original A/B numbers below were measured against live public RPC lists for the startup anchors — flaky, and not reproducible on demand (a bad public endpoint could wedge a run). The **deterministic bench kit** (`harness/bench/`, see [`DETERMINISTIC-KIT.md`](../bench/DETERMINISTIC-KIT.md)) closes that gap: it serves every startup anchor from a **committed snapshot of real chain headers** via a local shim, so a full 15-chain run now has **zero external RPC dependence** and is reproducible from the snapshot alone. On 2026-07-06 the definitive run completed clean and passed the whole-store parity gate.
+
+Every number in the table below traces to a committed artifact in [`../bench/results/flagship-2026-07-06/`](../bench/results/flagship-2026-07-06/). A few **launch-environment** facts in this section are *not* captured by the artifacts — the cgroup memory/CPU limits, the shim's `UNEXPECTED` count, and the `dirty: true` flag's explanation — those are **operator-recorded** and are explicitly called out as such where they appear:
+
+| what | value | artifact |
+|---|---|---|
+| result emitted at (UTC) | 2026-07-06 16:45:23.955 | `bench.result.json` (`generatedAt`) |
+| clean / all-complete | **true / true** | `bench.result.json` |
+| wall time | **3107 s (51m 47s)** | `bench.result.json` (`wallSeconds`) |
+| start→ready | 3118.6 s | `bench.result.json` |
+| chains complete | **15 / 15** (each `completedBlocks == totalBlocks`) | `bench.result.json` (`perChain`) |
+| RPC requests / errors | **90 / 0** (exactly 6 per chain × 15) | `bench.result.json` (`rpc`) |
+| store parity vs reference | **pass — 62/62 cells, 0 diffs** | `parity-report.json` |
+| total log rows (both sides) | **28,405,932** | `parity-report.json` (Σ per-chain `logCount`) |
+| store totals (both sides) | blocks **4,646,445** / transactions **5,007,056** | `parity-report.json` |
+
+**Zero external RPC.** All 90 RPC requests were served by the kit's local anchor shim from the pre-captured snapshot `anchors-2026-07-06.json` (`sha256 fc0cb0…48be6`, committed on this branch and recorded in the manifest); `rpc.errors = 0`. The 6 requests per chain are `1× eth_chainId` + `5× eth_getBlockByNumber` (latest, finalized-target, deploy, deploy−1, head). **The ponder process's only remote endpoint was the SQD Portal** — the entire dataset came from the Portal, RPC only served the local startup anchors. (Two supervision probes hit the shim during the run — one non-RPC health check and one `eth_getBlockByNumber` issued outside the ponder process; ponder's RPC counters are unaffected.) The shim ran fail-loud with `UNEXPECTED = 0` for the RPC surface — no off-surface call was served (the single `UNEXPECTED` line it logged was the rejected non-RPC supervision probe). *(The `UNEXPECTED` count is read from the shim's run log, which is not a committed artifact — this is an operator-recorded fact, not one the committed `bench.result.json` / manifest captures.)*
+
+**Resource envelope** (the cgroup limits the run was launched under): `MemoryMax=16G`, `CPUQuota=200%` (2 cores) on a **96-core host**; node **v22.22.2** with `NODE_OPTIONS=--max-old-space-size=32768`; `PORTAL_CHECKS=off`; Postgres **16.14** local. (The manifest's `host.cgroup.*` fields read `null` — a known kit gap where the cgroup introspection returns nothing in this launch mode; the limits above are the values the run was constrained to, not read back from the manifest. Follow-up: teach `emit-manifest.mjs` to resolve the effective cgroup limits.)
+
+**Wall time vs the config-b baseline — honest delta.** 51m 47s (3107 s) is **+15.3 %** over the previously published **44m 55s** (2695 s) config-b baseline. Same 16 GB / 2-core envelope. The two runs are on **different dates against a live Portal service**, and the code under test also differs (the 2026-07-01 baseline predates several fixes merged since, plus the PR #71 branch included in this build) — so the delta is **flagged but unattributed**: two data points cannot split it between Portal throughput variance and code changes, and no claim is made either way. What is new is that the deterministic kit makes future comparisons **apples-to-apples**: fixed anchor snapshot, zero public-RPC noise, controlled attribution of any future delta. An earlier ad-hoc 2026-07-06 15-chain attempt clocked 65m 55s but was **polluted** (a public-RPC finality-probe wedge blocked `/ready` for ~17 min, `PORTAL_CHECKS=on`, and co-resident load) — it is **not** a valid headline and is recorded here only for candor.
+
+**Second exact-parity reproduction.** This deterministic run is the *second* independent run to reproduce the frozen reference store exactly (the first was 2026-07-06 morning's ad-hoc run). A fresh Portal-only backfill produced the same 28,405,932 log rows with identical per-chain count, min/max block, and distinct-tx aggregates as the reference (the parity gate compares complete-range aggregates over every chain, not raw row bytes) — see the Correctness section's whole-store parity gate.
+
+**Provenance (all publicly resolvable).** The fork under test is tarball `subsquid-ponder-0.16.6-flagship-eef69b6.tgz` (`sha256 25bfba…36b6e`), built from **main @ `248f41e`** + PR #71 branch `fix/bounded-cutover-skip` @ `874cbab` + this PR's kit commits — all public refs, all core-identical at `eef69b6`. The manifest's `repo.mainSha` (`4318c83`) is a *local integration ref* of exactly those public commits (harness-only commits after the tarball build do not touch the core packages, so the tarball is core-identical to `eef69b6`); the manifest's `dirty: true` reflects untracked run outputs in the working tree, **not** source edits. The committed `bench.manifest.json` is a redaction of the raw run manifest with exactly two edits — `PORTAL_URL` → `<from-env>` and a generalized `loadConditions` line — everything else verbatim.
+
+**Findings from this run (candor):**
+
+- **First flagship attempt today OOM'd** at node's default ~4 GB old-space, because the kit didn't set `NODE_OPTIONS` for the ponder child. Fixed on this branch: `run-flagship.sh` now exports `BENCH_MAX_OLD_SPACE_MB` (default **32768**) into `NODE_OPTIONS`.
+- **The anchor capture originally omitted `logsBloom` and the deploy-parent (`deploy−1`) header** — caught by the shim's fail-loud design during smoke (an un-pinned block would have been served as junk otherwise). Fixed on this branch (commit `88ebf2d`), and the snapshot re-captured with the complete startup surface.
+- **Manifest cgroup introspection gap** (`host.cgroup.*` read `null` in this launch mode) — noted above; follow-up to resolve the effective limits into the manifest.
+
+The run used the full committed kit end-to-end: `db-fresh.mjs` preflight → `anchor-shim.mjs` → `ponder start` → completion poll → `emit-result.mjs` / `emit-manifest.mjs`, then `parity-check.mjs` against the frozen reference DB.
+
+---
+
 ## Performance, footprint, and the A/B
 
-We ran two configurations to find the right operating point. **Both indexed the identical 28.4M events; only the config differed.**
+We ran two configurations (2026-07-01) to find the right operating point. **Both indexed the identical 28.4M events; only the config differed.** (These are the earlier live-RPC-anchor runs; the deterministic 2026-07-06 run above is the reproducible headline — same 16 GB / 2-core envelope, 51m 47s, and is the one whose full artifacts are committed.)
 
 | | (a) over-provisioned | (b) modest — recommended |
 |---|---|---|
