@@ -1,0 +1,9 @@
+# Deterministic-bench RUN OUTPUT (never committed). The anchors-<date>.json snapshot IS committed —
+# it is the reproducibility anchor — so it is deliberately NOT ignored here.
+bench-out/
+bench.result.json
+bench.manifest.json
+parity-report.json
+metrics.txt
+shim.log
+ponder.log
