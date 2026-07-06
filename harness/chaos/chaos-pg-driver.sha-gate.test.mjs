@@ -54,6 +54,9 @@ function runPreflight(extraEnv, tarballBytes = 'not empty') {
     // the .mjs tools + verify script default to the committed files next to the driver
     ...extraEnv,
   };
+  // Hermetic: a CHAOS_TARBALL_SHA exported in the runner's own environment must not leak through
+  // the process.env spread — the unset-pin case below has to actually exercise the UNPINNED branch.
+  if (!('CHAOS_TARBALL_SHA' in extraEnv)) delete env.CHAOS_TARBALL_SHA;
 
   // create the app dir (preflight checks `-d "$APP"`)
   spawnSync('mkdir', ['-p', app]);

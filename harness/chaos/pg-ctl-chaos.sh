@@ -41,6 +41,14 @@ pgbin () { if [ -n "$PGBIN" ]; then echo "$PGBIN/$1"; else echo "$1"; fi; }
 WORK="${CHAOS_WORK:-$CDIR/.chaos-pg}"
 PGDATA="${CHAOS_PGDATA:-$WORK/pgdata}"
 PGPORT="${CHAOS_PGPORT:-54329}"
+# Fail-closed: the port is sed-substituted into the rendered config (wire_config) and exported into
+# psql env — anything but a plain port number would be interpreted by sed/postgres instead of rejected.
+case "$PGPORT" in
+  ''|*[!0-9]*)
+    echo "[pg-ctl] CHAOS_PGPORT must be a plain TCP port number, got: $PGPORT" >&2
+    exit 2
+    ;;
+esac
 PGSOCK="${CHAOS_PGSOCK:-$WORK/pgsock}"
 PGLOG="${CHAOS_PGLOG:-$WORK/pg.log}"
 PGCONF="${CHAOS_PGCONF:-$CDIR/pg-chaos.conf}"

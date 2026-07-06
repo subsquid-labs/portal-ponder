@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { execFileSync } from 'node:child_process';
+import { execFileSync, spawnSync } from 'node:child_process';
 import { existsSync, mkdtempSync, readFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
@@ -171,6 +171,39 @@ test('CHAOS_PGPORT override brings a throwaway cluster up on the overridden port
     } catch {
       // best-effort teardown
     }
+    rmSync(work, { recursive: true, force: true });
+  }
+});
+
+test('a non-numeric CHAOS_PGPORT is rejected fail-closed before any pg or sed use', () => {
+  // The port is sed-substituted into the rendered config; an exotic value ('54&987' would render
+  // 'port = 54@CHAOS_PGPORT@987', a newline would inject a second config line) must be rejected
+  // up front, not interpreted.
+  const work = mkdtempSync(join(tmpdir(), 'chaos-pgport-bad-'));
+  const ctl = join(HERE, 'pg-ctl-chaos.sh');
+
+  try {
+    // NOTE: an EMPTY CHAOS_PGPORT falls back to the script's default via ${CHAOS_PGPORT:-54329},
+    // which is correct behavior, not a rejection case.
+    for (const bad of ['54&987', '54987\nmax_connections = 1', 'abc']) {
+      const res = spawnSync('bash', [ctl, 'status'], {
+        env: { ...process.env, CHAOS_WORK: work, CHAOS_PGPORT: bad },
+        encoding: 'utf8',
+        timeout: 30000,
+      });
+
+      assert.notEqual(
+        res.status,
+        0,
+        `CHAOS_PGPORT=${JSON.stringify(bad)} must be rejected`,
+      );
+      assert.match(
+        `${res.stdout}${res.stderr}`,
+        /plain TCP port number/,
+        'rejection must name the constraint loudly',
+      );
+    }
+  } finally {
     rmSync(work, { recursive: true, force: true });
   }
 });
