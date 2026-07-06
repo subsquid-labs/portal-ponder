@@ -79,19 +79,62 @@ index 32ba7a8..ca44266 100644
        const error = new RpcProviderError(
          `Invalid RPC response: 'transaction.blockNumber' (${hexToBigInt(transaction.blockNumber)}) is larger than the maximum allowed value (${PG_BIGINT_MAX}).`,
 diff --git a/packages/core/src/runtime/historical.ts b/packages/core/src/runtime/historical.ts
-index 01b6288..00dde99 100644
+index 01b6288..e6ab6f0 100644
 --- a/packages/core/src/runtime/historical.ts
 +++ b/packages/core/src/runtime/historical.ts
-@@ -14,6 +14,8 @@ import { eth_getBlockByNumber } from "@/rpc/actions.js";
+@@ -14,6 +14,13 @@ import { eth_getBlockByNumber } from "@/rpc/actions.js";
  import type { Rpc } from "@/rpc/index.js";
  import { buildEvents, decodeEvents } from "@/runtime/events.js";
  import { createHistoricalSync } from "@/sync-historical/index.js";
 +import { createPortalHistoricalSync } from "@/sync-historical/portal.js";
++import {
++  cutoverProbeIndices,
++  isEndCappedAtCutover,
++  shouldSkipCutoverRound,
++} from "@/sync-historical/portal-cutover-guard.js";
 +import { clampFinalizedToPortalHead } from "@/sync-historical/portal-realtime-wire.js";
  import { type SyncStore, createSyncStore } from "@/sync-store/index.js";
  import {
    MAX_CHECKPOINT,
-@@ -358,6 +360,23 @@ export async function* getHistoricalEventsOmnichain(params: {
+@@ -316,6 +323,22 @@ export async function* getHistoricalEventsOmnichain(params: {
+       yield { type: "events", result: mergeResults };
+     }
+ 
++    // Portal cutover guard (INV-18): an end-capped chain (configured end ≤ finalized) is provably
++    // range-neutral at cutover — its `to = min(finalized, end) = end` cannot move — so it must never be
++    // probed here (a flaky RPC on such a probe delays /ready or kills a fully-indexed app with exit 75).
++    // When EVERY chain is end-capped the whole round is a no-op — exit the cutover loop. Omnichain has NO
++    // 30s freshness gate, so this is the only thing that stops a permanently-failing RPC blocking forever.
++    if (
++      shouldSkipCutoverRound(params.indexingBuild.chains, params.perChainSync)
++    ) {
++      break;
++    }
++
++    const cutoverProbe = cutoverProbeIndices(
++      params.indexingBuild.chains,
++      params.perChainSync,
++    );
++
+     const context = {
+       logger: params.common.logger.child({ action: "refetch_finalized_block" }),
+       retryNullBlockRequest: true,
+@@ -327,6 +350,14 @@ export async function* getHistoricalEventsOmnichain(params: {
+       params.indexingBuild.chains.map((chain, i) => {
+         const rpc = params.indexingBuild.rpcs[i]!;
+ 
++        // End-capped chains are excluded from the probe: pass their current finalized block through
++        // untouched (a refetch could only raise it, never changing `to = min(finalized, end) = end`).
++        if (cutoverProbe.includes(i) === false) {
++          return Promise.resolve(
++            params.perChainSync.get(chain)!.syncProgress.finalized,
++          );
++        }
++
+         return eth_getBlockByNumber(rpc, ["latest", false], context)
+           .then((latest) =>
+             eth_getBlockByNumber(
+@@ -358,6 +389,23 @@ export async function* getHistoricalEventsOmnichain(params: {
        }),
      );
  
@@ -115,7 +158,44 @@ index 01b6288..00dde99 100644
      let shouldCatchup = false;
  
      for (let i = 0; i < params.indexingBuild.chains.length; i++) {
-@@ -619,6 +638,23 @@ export async function* getHistoricalEventsMultichain(params: {
+@@ -577,6 +625,21 @@ export async function* getHistoricalEventsMultichain(params: {
+     }
+     lastUnfinalizedRefetch = Date.now();
+ 
++    // Portal cutover guard (INV-18): an end-capped chain (configured end ≤ finalized) is provably
++    // range-neutral at cutover — its `to = min(finalized, end) = end` cannot move — so it must never be
++    // probed here (a flaky RPC on such a probe delays /ready or kills a fully-indexed app with exit 75).
++    // When EVERY chain is end-capped the whole round is a no-op — exit the cutover loop.
++    if (
++      shouldSkipCutoverRound(params.indexingBuild.chains, params.perChainSync)
++    ) {
++      break;
++    }
++
++    const cutoverProbe = cutoverProbeIndices(
++      params.indexingBuild.chains,
++      params.perChainSync,
++    );
++
+     const context = {
+       logger: params.common.logger.child({ action: "refetch_finalized_block" }),
+       retryNullBlockRequest: true,
+@@ -588,6 +651,14 @@ export async function* getHistoricalEventsMultichain(params: {
+       params.indexingBuild.chains.map((chain, i) => {
+         const rpc = params.indexingBuild.rpcs[i]!;
+ 
++        // End-capped chains are excluded from the probe: pass their current finalized block through
++        // untouched (a refetch could only raise it, never changing `to = min(finalized, end) = end`).
++        if (cutoverProbe.includes(i) === false) {
++          return Promise.resolve(
++            params.perChainSync.get(chain)!.syncProgress.finalized,
++          );
++        }
++
+         return eth_getBlockByNumber(rpc, ["latest", false], context)
+           .then((latest) =>
+             eth_getBlockByNumber(
+@@ -619,6 +690,23 @@ export async function* getHistoricalEventsMultichain(params: {
        }),
      );
  
@@ -139,7 +219,19 @@ index 01b6288..00dde99 100644
      let shouldCatchup = false;
  
      for (let i = 0; i < params.indexingBuild.chains.length; i++) {
-@@ -826,6 +862,14 @@ export async function* getHistoricalEventsIsolated(params: {
+@@ -797,6 +885,11 @@ export async function* getHistoricalEventsIsolated(params: {
+ 
+     cursor = to;
+ 
++    // Portal cutover guard (INV-18): an end-capped chain (configured end ≤ finalized) is provably
++    // range-neutral at cutover — its `to = min(finalized, end) = end` cannot move — so never probe it
++    // here. This isolated chain is the whole app: end-capped ⇒ exit the cutover loop (zero refetches).
++    if (isEndCappedAtCutover(params.syncProgress)) break;
++
+     if (Date.now() - lastUnfinalizedRefetch < 30_000) {
+       break;
+     }
+@@ -826,6 +919,14 @@ export async function* getHistoricalEventsIsolated(params: {
          ],
          context,
        ),
@@ -154,7 +246,7 @@ index 01b6288..00dde99 100644
      );
  
      const finalizedBlockNumber = hexToNumber(finalizedBlock.number);
-@@ -1234,7 +1278,9 @@ export async function* getLocalSyncGenerator(params: {
+@@ -1234,7 +1335,9 @@ export async function* getLocalSyncGenerator(params: {
      });
    }
  
