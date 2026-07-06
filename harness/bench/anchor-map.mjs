@@ -18,8 +18,12 @@
 // Anchor requests observed in @subsquid/ponder 0.16.6 (runtime/index.ts, runtime/historical.ts):
 //   eth_getBlockByNumber(["latest",   false])                                  → latest header
 //   eth_getBlockByNumber([hex(latest.number − finalityBlockCount), false])     → finalized-target header
-//   eth_getBlockByNumber([hex(start=deploy), false])                           → deploy header
-//   eth_getBlockByNumber([hex(end=head),     false])                           → head header (end ≤ finalized)
+//   eth_getBlockByNumber([hex(start=deploy),   false])                         → deploy header
+//   eth_getBlockByNumber([hex(cached=deploy−1), false])                        → deploy-parent header
+//   eth_getBlockByNumber([hex(end=head),       false])                         → head header (end ≤ finalized)
+// The deploy-parent (deploy−1) fetch is getLocalSyncProgress's "cached" diagnostic: getCachedBlock
+// returns `firstMissingBlock − 1` (the last-completed block) even on a FRESH store, so on every run
+// ponder fetches the block BEFORE the start of the backfill. It must be pinned or the run wedges.
 // The `fullTransactions` boolean is always false at startup; we serve the SAME light header for either
 // value (the snapshot carries only header fields), so a `true` request is honoured, not rejected.
 
@@ -63,10 +67,10 @@ export function canonicalizeBlockNumber(raw) {
 
 // Build the immutable lookup an anchor snapshot presents to the shim, for ONE chain. `snapshotChain`
 // is a chains[] entry from an anchors-<date>.json file: { id, headers: { latest, finalizedTarget,
-// deploy, head } } where each header carries at least { number (0x hex), hash, ... }. We index every
-// pinned header by its canonical hex number, and remember which header answers the latest/finalized
-// tags. Throws if the snapshot is malformed — a shim that cannot build its map must fail at startup,
-// never serve a partial surface.
+// deploy, deployParent, head } } where each header carries at least { number (0x hex), hash, ... }. We
+// index every pinned header by its canonical hex number, and remember which header answers the
+// latest/finalized tags. Throws if the snapshot is malformed — a shim that cannot build its map must
+// fail at startup, never serve a partial surface.
 export function buildChainAnchors(snapshotChain) {
   if (!snapshotChain || typeof snapshotChain !== 'object') {
     throw new Error('buildChainAnchors: snapshot chain entry is missing');
@@ -81,7 +85,13 @@ export function buildChainAnchors(snapshotChain) {
   }
 
   const byNumber = new Map();
-  for (const role of ['latest', 'finalizedTarget', 'deploy', 'head']) {
+  for (const role of [
+    'latest',
+    'finalizedTarget',
+    'deploy',
+    'deployParent',
+    'head',
+  ]) {
     const header = headers[role];
     if (!header || typeof header.number !== 'string') {
       throw new Error(

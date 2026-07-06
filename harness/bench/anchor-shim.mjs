@@ -225,6 +225,7 @@ async function selftest() {
           latest: { number: '0x64', hash: '0xaa' },
           finalizedTarget: { number: '0x32', hash: '0xbb' },
           deploy: { number: '0x0a', hash: '0xcc' },
+          deployParent: { number: '0x09', hash: '0xce' },
           head: { number: '0x1e', hash: '0xdd' },
         },
       },
@@ -290,6 +291,16 @@ async function selftest() {
       'deploy 0x00A (normalized) → header',
     );
 
+    // deploy-parent (deploy − 1): ponder fetches it at startup, so it MUST be on the surface
+    const deployParent = await call('/137', 'eth_getBlockByNumber', [
+      '0x9',
+      false,
+    ]);
+    expect(
+      deployParent.result?.number === '0x09',
+      'deploy-parent 0x09 (deploy − 1) → header',
+    );
+
     const head = await call('/137', 'eth_getBlockByNumber', ['0x1e', true]);
     expect(head.result?.number === '0x1e', 'head 0x1e (fullTx=true) → header');
 
@@ -345,7 +356,7 @@ async function selftest() {
     process.exit(1);
   }
 
-  console.log('anchor-shim selftest PASSED (11 checks)');
+  console.log('anchor-shim selftest PASSED (12 checks)');
   process.exit(0);
 }
 

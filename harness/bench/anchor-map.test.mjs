@@ -8,13 +8,15 @@ import {
   serveRpc,
 } from './anchor-map.mjs';
 
-// A synthetic one-chain snapshot entry (polygon shape: id 137, four real-shaped headers).
+// A synthetic one-chain snapshot entry (polygon shape: id 137, five real-shaped headers). deployParent
+// is deploy − 1 (0x0a → 0x09): ponder ALWAYS fetches the block before the backfill start at startup.
 const SNAP = {
   id: 137,
   headers: {
     latest: { number: '0x5555', hash: '0xlatest' },
     finalizedTarget: { number: '0x548d', hash: '0xfinal' },
     deploy: { number: '0x0a', hash: '0xdeploy' },
+    deployParent: { number: '0x09', hash: '0xdeployparent' },
     head: { number: '0x1e', hash: '0xhead' },
   },
 };
@@ -51,8 +53,43 @@ test('buildChainAnchors: indexes every pinned header by canonical number + tag a
   assert.equal(a.chainIdHex, '0x89', 'chain id 137 → 0x89 hex');
   assert.equal(a.byNumber.get('0x1e').hash, '0xhead');
   assert.equal(a.byNumber.get('0xa').hash, '0xdeploy', 'deploy 0x0a → key 0xa');
+  assert.equal(
+    a.byNumber.get('0x9').hash,
+    '0xdeployparent',
+    'deploy-parent (deploy−1) is indexed too — ponder fetches it at startup',
+  );
   assert.equal(a.latest.number, '0x5555');
   assert.equal(a.finalizedTarget.number, '0x548d');
+});
+
+test('serveRpc: the deploy-parent (deploy−1) block is a pinned anchor, served not rejected', () => {
+  const a = buildChainAnchors(SNAP);
+  const res = serveRpc(
+    { id: 8, method: 'eth_getBlockByNumber', params: ['0x9', false] },
+    a,
+  );
+  assert.equal(
+    res.body.result.hash,
+    '0xdeployparent',
+    'ponder getCachedBlock fetches firstMissingBlock−1 even on a fresh store',
+  );
+  assert.equal(res.unexpected, undefined, 'deploy-parent is on the surface');
+});
+
+test('buildChainAnchors: a missing deploy-parent header fails closed (never a partial surface)', () => {
+  const noParent = {
+    id: 137,
+    headers: {
+      latest: { number: '0x5555' },
+      finalizedTarget: { number: '0x548d' },
+      deploy: { number: '0x0a' },
+      head: { number: '0x1e' },
+    },
+  };
+  assert.throws(
+    () => buildChainAnchors(noParent),
+    /missing the "deployParent"/,
+  );
 });
 
 test('buildChainAnchors: a missing header role fails closed (never a partial surface)', () => {

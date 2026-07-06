@@ -3,14 +3,14 @@
 Reproducible, zero-external-RPC tooling for the 15-chain flagship benchmark of
 `harness/euler-multichain`. The flagship app runs a bounded `[deploy, pinnedHead]` backfill where the
 **SQD Portal carries all data**; the only RPC traffic in a clean run is, per chain, `1× eth_chainId` +
-a handful of `eth_getBlockByNumber` for the startup anchors (latest, finalized-target, deploy, head).
+a handful of `eth_getBlockByNumber` for the startup anchors (latest, finalized-target, deploy, deploy−1, head).
 This kit serves those anchors from a **committed snapshot of real chain headers** via a local shim, so
 a bench run has no external RPC dependence and is reproducible from the snapshot alone. Everything is
 **bash + node only** (the `pg`-touching tools use `import('pg')`, resolved from the app's
 `node_modules` after `npm install`, exactly like `harness/chaos/pg-digest.mjs`).
 
 ```
-capture-anchors.mjs   one-time capture of REAL headers (latest / finalized-target / deploy / head) → anchors-<date>.json
+capture-anchors.mjs   one-time capture of REAL headers (latest / finalized-target / deploy / deploy−1 / head) → anchors-<date>.json
 anchors-<date>.json   the COMMITTED reproducibility anchor (headers + host-only provenance + sha256 manifest line)
 anchor-map.mjs        PURE request→pinned-header mapping (fail-loud on anything off the surface)  [unit-tested]
 anchor-shim.mjs       local JSON-RPC server around anchor-map (one port, chain via /<id> or ?chain=); --selftest
@@ -28,13 +28,15 @@ parity-check.mjs      READ-ONLY equivalence of a bench DB vs a reference DB over
 
 - `eth_chainId` → the chain id from `chains.json`.
 - `eth_getBlockByNumber` for the `latest` tag, the `finalized`/`safe` tags (mapped to the
-  finalized-target header), and the **exact** block numbers pinned in the snapshot (deploy, head,
-  latest, finalized-target — matched by canonical hex, so `0x00A` / `0xa` / `10` all resolve).
+  finalized-target header), and the **exact** block numbers pinned in the snapshot (deploy, deploy−1,
+  head, latest, finalized-target — matched by canonical hex, so `0x00A` / `0xa` / `10` all resolve).
 
 Any other method, tag (`earliest`/`pending`), or un-pinned block number returns a JSON-RPC error **and**
 a loud `anchor-shim UNEXPECTED …` line on stderr — an unforeseen call is learned about, never served
 junk. Ponder 0.16.6 fetches the finalized target **by number** (`latest − finalityBlockCount`), not by
-the `finalized` tag; the tag is served defensively anyway. Finality counts: 65 eth / 200 polygon /
+the `finalized` tag; the tag is served defensively anyway. It also fetches **`deploy − 1`** at startup
+(`getLocalSyncProgress`'s cached-block diagnostic returns `firstMissingBlock − 1`, even on a fresh
+store), so the block before the backfill start is pinned too. Finality counts: 65 eth / 200 polygon /
 240 arbitrum / 30 default (`getFinalityBlockCount`).
 
 ## The end-capped invariant
@@ -100,6 +102,6 @@ pinned numbers / un-pinned number / unknown method / unknown chain / health) —
 real service and no committed file.
 
 ```bash
-node --test harness/bench/*.test.mjs          # 22 unit tests (anchor-map, metrics-parse, parity-check)
-node harness/bench/anchor-shim.mjs --selftest  # 11 in-process HTTP checks
+node --test harness/bench/*.test.mjs          # 24 unit tests (anchor-map, metrics-parse, parity-check)
+node harness/bench/anchor-shim.mjs --selftest  # 12 in-process HTTP checks
 ```

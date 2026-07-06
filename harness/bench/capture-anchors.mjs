@@ -97,6 +97,7 @@ const HEADER_FIELDS = [
   'hash',
   'parentHash',
   'timestamp',
+  'logsBloom',
   'stateRoot',
   'transactionsRoot',
   'receiptsRoot',
@@ -183,6 +184,14 @@ async function captureChain(chain, allowUncapped) {
     numberToHex(finalizedTargetNum),
   );
   const deploy = await fetchHeader(chain.freeRpcs, numberToHex(chain.deploy));
+
+  // deploy-parent (deploy − 1): ponder's getLocalSyncProgress ALWAYS fetches the block before the
+  // backfill start (getCachedBlock returns firstMissingBlock − 1, even on a fresh store), so the shim
+  // must pin it or a run wedges. deploy is never block 0 for these chains, so deploy − 1 >= 0.
+  const deployParent = await fetchHeader(
+    chain.freeRpcs,
+    numberToHex(chain.deploy - 1),
+  );
   const head = await fetchHeader(chain.freeRpcs, numberToHex(chain.head));
 
   // cross-check each captured header's hash against a distinct second source.
@@ -191,6 +200,7 @@ async function captureChain(chain, allowUncapped) {
     latest,
     finalizedTarget,
     deploy,
+    deployParent,
     head,
   })) {
     const cc = await crossCheck(chain.freeRpcs, cap.header, cap.source);
@@ -232,6 +242,7 @@ async function captureChain(chain, allowUncapped) {
         latest: latest.header,
         finalizedTarget: finalizedTarget.header,
         deploy: deploy.header,
+        deployParent: deployParent.header,
         head: head.header,
       },
       provenance: checks,
