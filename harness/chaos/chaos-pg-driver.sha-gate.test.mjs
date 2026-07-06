@@ -3,8 +3,8 @@ import { spawnSync } from 'node:child_process';
 import { chmodSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
-import { fileURLToPath } from 'node:url';
 import { test } from 'node:test';
+import { fileURLToPath } from 'node:url';
 
 // These tests pin the tarball-sha256 gate in chaos-pg-driver.sh's preflight (issue #52). The bug they
 // lock out: the sanitized driver defaulted the pin to the sha of the tarball ITSELF and only enforced
@@ -23,7 +23,8 @@ const HERE = dirname(fileURLToPath(import.meta.url));
 const DRIVER = join(HERE, 'chaos-pg-driver.sh');
 
 // sha256 of the empty string — a stable, known-wrong pin for the mismatch case.
-const SHA_OF_EMPTY = 'e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855';
+const SHA_OF_EMPTY =
+  'e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855';
 
 function runPreflight(extraEnv, tarballBytes = 'not empty') {
   const work = mkdtempSync(join(tmpdir(), 'chaos-sha-'));
@@ -37,7 +38,10 @@ function runPreflight(extraEnv, tarballBytes = 'not empty') {
 
   // stub pg-ctl: any pg operation halts preflight loudly AFTER the sha gate.
   const pgctlStub = join(work, 'pgctl-stub.sh');
-  writeFileSync(pgctlStub, '#!/usr/bin/env bash\necho "STUB-PGCTL-REACHED"\nexit 1\n');
+  writeFileSync(
+    pgctlStub,
+    '#!/usr/bin/env bash\necho "STUB-PGCTL-REACHED"\nexit 1\n',
+  );
   chmodSync(pgctlStub, 0o755);
 
   const env = {
@@ -66,9 +70,16 @@ function runPreflight(extraEnv, tarballBytes = 'not empty') {
 }
 
 test('sha gate: CHAOS_TARBALL_SHA set + MISMATCH → loud abort, never reaches pg-ctl', () => {
-  const { out, status } = runPreflight({ CHAOS_TARBALL_SHA: SHA_OF_EMPTY }, 'definitely not empty');
+  const { out, status } = runPreflight(
+    { CHAOS_TARBALL_SHA: SHA_OF_EMPTY },
+    'definitely not empty',
+  );
 
-  assert.match(out, /tarball sha256 MISMATCH/i, 'a set-but-wrong pin must log MISMATCH');
+  assert.match(
+    out,
+    /tarball sha256 MISMATCH/i,
+    'a set-but-wrong pin must log MISMATCH',
+  );
   assert.doesNotMatch(
     out,
     /STUB-PGCTL-REACHED/,
@@ -81,16 +92,32 @@ test('sha gate: CHAOS_TARBALL_SHA set + MATCH → verified, proceeds past the ga
   // pin to the empty-string sha and feed an empty tarball so they match.
   const { out } = runPreflight({ CHAOS_TARBALL_SHA: SHA_OF_EMPTY }, '');
 
-  assert.match(out, /pinned\+verified/i, 'a matching pin must be reported as pinned+verified');
-  assert.doesNotMatch(out, /MISMATCH/i, 'a matching pin must not log a mismatch');
+  assert.match(
+    out,
+    /pinned\+verified/i,
+    'a matching pin must be reported as pinned+verified',
+  );
+  assert.doesNotMatch(
+    out,
+    /MISMATCH/i,
+    'a matching pin must not log a mismatch',
+  );
   // with a good pin the gate passes and preflight advances to the pg-ctl stub.
-  assert.match(out, /STUB-PGCTL-REACHED/, 'a verified sha must let preflight continue');
+  assert.match(
+    out,
+    /STUB-PGCTL-REACHED/,
+    'a verified sha must let preflight continue',
+  );
 });
 
 test('sha gate: CHAOS_TARBALL_SHA UNSET → loud UNPINNED warning, never a bare pass', () => {
   const { out } = runPreflight({}, 'some tarball bytes');
 
-  assert.match(out, /UNPINNED/i, 'an unset pin must warn loudly that the run is unpinned');
+  assert.match(
+    out,
+    /UNPINNED/i,
+    'an unset pin must warn loudly that the run is unpinned',
+  );
   assert.doesNotMatch(
     out,
     /sha256 (pinned\+verified|verified)\b/i,

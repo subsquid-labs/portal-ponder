@@ -3,8 +3,8 @@ import { execFileSync } from 'node:child_process';
 import { existsSync, mkdtempSync, readFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
-import { fileURLToPath } from 'node:url';
 import { test } from 'node:test';
+import { fileURLToPath } from 'node:url';
 
 // These tests pin the CHAOS_PGPORT plumbing between pg-chaos.conf and pg-ctl-chaos.sh (issue #52).
 // The bug they lock out: pg-chaos.conf used to hardcode `port = 54329`, so overriding CHAOS_PGPORT
@@ -29,11 +29,14 @@ function renderConf(port, sock) {
 
 // The effective `port = ...` directive (a real config line, not a comment).
 function effectivePort(rendered) {
-  const line = rendered
-    .split('\n')
-    .find((l) => /^\s*port\s*=/.test(l));
+  const line = rendered.split('\n').find((l) => /^\s*port\s*=/.test(l));
 
-  return line ? line.replace(/^\s*port\s*=\s*/, '').split('#')[0].trim() : null;
+  return line
+    ? line
+        .replace(/^\s*port\s*=\s*/, '')
+        .split('#')[0]
+        .trim()
+    : null;
 }
 
 function effectiveSocketDir(rendered) {
@@ -42,15 +45,16 @@ function effectiveSocketDir(rendered) {
     .find((l) => /^\s*unix_socket_directories\s*=/.test(l));
 
   return line
-    ? line.replace(/^\s*unix_socket_directories\s*=\s*/, '').split('#')[0].trim()
+    ? line
+        .replace(/^\s*unix_socket_directories\s*=\s*/, '')
+        .split('#')[0]
+        .trim()
     : null;
 }
 
 test('pg-chaos.conf carries a substitutable port placeholder (not a hardcoded port)', () => {
   const raw = readFileSync(CONF, 'utf8');
-  const portLine = raw
-    .split('\n')
-    .find((l) => /^\s*port\s*=/.test(l));
+  const portLine = raw.split('\n').find((l) => /^\s*port\s*=/.test(l));
 
   assert.ok(portLine, 'conf must have a `port = ...` directive');
   assert.match(
@@ -73,15 +77,21 @@ test('wire_config substitution renders the effective port from the override (not
 
 test('wire_config substitution leaves no @CHAOS_*@ residue on the effective directives', () => {
   const rendered = renderConf(54321, '/some/sock');
-  const portLine = rendered
-    .split('\n')
-    .find((l) => /^\s*port\s*=/.test(l));
+  const portLine = rendered.split('\n').find((l) => /^\s*port\s*=/.test(l));
   const sockLine = rendered
     .split('\n')
     .find((l) => /^\s*unix_socket_directories\s*=/.test(l));
 
-  assert.doesNotMatch(portLine, /@CHAOS_/, 'port directive still has an unsubstituted token');
-  assert.doesNotMatch(sockLine, /@CHAOS_/, 'socket directive still has an unsubstituted token');
+  assert.doesNotMatch(
+    portLine,
+    /@CHAOS_/,
+    'port directive still has an unsubstituted token',
+  );
+  assert.doesNotMatch(
+    sockLine,
+    /@CHAOS_/,
+    'socket directive still has an unsubstituted token',
+  );
 });
 
 test('the default port still resolves to 54329 when CHAOS_PGPORT is not overridden', () => {
@@ -125,24 +135,39 @@ test('CHAOS_PGPORT override brings a throwaway cluster up on the overridden port
   const ctl = join(HERE, 'pg-ctl-chaos.sh');
 
   try {
-    execFileSync('bash', [ctl, 'ensure'], { env, stdio: 'pipe', timeout: 120000 });
+    execFileSync('bash', [ctl, 'ensure'], {
+      env,
+      stdio: 'pipe',
+      timeout: 120000,
+    });
 
-    const rendered = readFileSync(join(work, 'pgdata', 'pg-chaos.rendered.conf'), 'utf8');
+    const rendered = readFileSync(
+      join(work, 'pgdata', 'pg-chaos.rendered.conf'),
+      'utf8',
+    );
     assert.equal(
       effectivePort(rendered),
       port,
       'rendered conf must carry the overridden port',
     );
 
-    const ready = execFileSync(join(pgbin, 'pg_isready'), ['-U', 'postgres', '-q'], {
-      env: { ...env, PGHOST: join(work, 'pgsock'), PGPORT: port },
-      stdio: 'pipe',
-    });
+    const ready = execFileSync(
+      join(pgbin, 'pg_isready'),
+      ['-U', 'postgres', '-q'],
+      {
+        env: { ...env, PGHOST: join(work, 'pgsock'), PGPORT: port },
+        stdio: 'pipe',
+      },
+    );
     // pg_isready exits 0 (empty output) when accepting connections on the given port.
     assert.equal(ready.toString(), '');
   } finally {
     try {
-      execFileSync('bash', [ctl, 'stop'], { env, stdio: 'pipe', timeout: 60000 });
+      execFileSync('bash', [ctl, 'stop'], {
+        env,
+        stdio: 'pipe',
+        timeout: 60000,
+      });
     } catch {
       // best-effort teardown
     }
