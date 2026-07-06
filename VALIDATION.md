@@ -58,17 +58,25 @@ live in [`portal/INVARIANTS.md`](portal/INVARIANTS.md); the runtime asserts them
 whole-structure O(n) checks used in CI), and the suite proves them with property-based tests
 (`fast-check`, seed-pinned for deterministic runs).
 
-The suite runs **against both supported upstream Ponder versions** — `0.16.6` and `0.15.17` — by
-grafting the Portal layer onto a pinned Ponder checkout:
+The suite runs **against all three supported upstream Ponder versions** — `0.15.17`, `0.16.6`, and
+`0.16.7` — by grafting the Portal layer onto a pinned Ponder checkout:
 
 ```bash
-scripts/sync-upstream.sh 0.16.6  --test
 scripts/sync-upstream.sh 0.15.17 --test
+scripts/sync-upstream.sh 0.16.6  --test
+scripts/sync-upstream.sh 0.16.7  --test
 ```
 
 (config `portal/vite.portal.config.ts`, files `portal/*.test.ts`). The seam
 (`HistoricalSync.syncBlockRangeData` / `syncBlockData`) is verified identical in shape across that
-version range (`versions.json`).
+version range (`versions.json`), and CI's seam matrix (derived from `compat.tested`) runs all three on
+every push. The newest, `0.16.7`, was registered by **[#74](../../pull/74)** (2026-07-06) on a
+**seam-identity + full-suite** basis: the `0.16.6` wiring patch applies to the `0.16.7` tree
+byte-identically (zero rejects, all 10 files) and the full Portal suite (**272/272**) passes on the
+graft; the lone upstream delta `0.16.6 → 0.16.7` is a single DB-layer PR (`ponder-sh/ponder#2314`,
+live-query notification batching) with **zero Portal-graft-surface overlap**. As with `0.15.17`, that
+basis is **not** a fresh RPC byte-diff or cross-validation — the §3 / §5 byte-diff and A/B evidence
+remains on `0.16.6`.
 
 ### Layer B — Mutation-verified regression tests
 
@@ -239,10 +247,11 @@ a documented recovery. The full custody chain:
    `9d1756d5df7f0ee484dbd34ed2ba3ff55de21944dad872789b26c225a5bcccea`; after:
    `bbc93163b82cd63deb52761b35bd57361b5529834d9f4c277203c8897574b719`).
 5. **Net.** The repro command in the matrix stays valid **going forward**: [#59](../../pull/59) removed
-   the `transactions` wedge, and **this document's PR** removes the detoast hang by shrinking the
-   differ's page size to 5,000 rows (`diff-batched.mjs`, §5.5). A *fresh* end-to-end run is therefore
-   now unobstructed — but it costs ~$6 of metered RPC and ~2.5 h of backfill, so the verdict above
-   stands on the archived-store re-diff rather than on a re-run.
+   the `transactions` wedge, and the detoast hang is durably fixed by the **byte-aware page sizing
+   merged in [#72](../../pull/72)** (`diff-batched.mjs`, §5.5), which supersedes the interim fixed
+   5,000-row page. A *fresh* end-to-end run is therefore now unobstructed — but it costs ~$6 of metered
+   RPC and ~2.5 h of backfill, so the verdict above stands on the archived-store re-diff rather than on
+   a re-run.
 
 **App-hash caveat (a real limitation, not a pass).** `cells.json` sets `appHash: true` for F-full, but
 the app-table determinism hash for this run was **vacuous**: the diff harness apps write **no
@@ -449,6 +458,53 @@ CHAOS_PORTAL=<public-portal-dataset> CHAOS_RPC=<public-rpc> \
   bash harness/chaos/chaos-pg-driver.sh
 ```
 
+### 4.3 Tier 1 — re-acceptance on the current `main` build (ACCEPTED 2026-07-06)
+
+The §4.2 acceptance ran on 2026-07-05, before the wave of Portal fixes that followed it. To confirm
+those fixes did not regress crash/resume — and to test a stronger property — a **second full Tier-1
+campaign** was run **2026-07-06** against the build of `main` **@ `248f41e`** (the build *after* that
+fix wave), using the **same methodology, parameters, range, backend, and harness as §4.2**:
+`postgres16-fsync-on` (`fsync` / `synchronous_commit` / `full_page_writes` on); `PORTAL_CHUNK_BLOCKS=2000`,
+`PORTAL_CHUNK_FIXED=1`, `PORTAL_READAHEAD=1`; chain 1 (ethereum) range `[20529207, 20579207]`; Poisson
+kill schedule with the adaptive per-run mean clamped to **4–7 s**; store identity by the same logical
+digest (`harness/chaos/pg-digest.mjs`) plus the intervals-tile-exactly check. The repro is identical to
+§4.2's (`build-baseline-pg.sh` + `chaos-pg-driver.sh`), against the same private tarball and public
+Portal/RPC endpoints.
+
+**Aggregate result (status = pass):**
+
+- **236 `SIGKILL`s** delivered across **273 attempted / 31 completed-and-verified** backfill runs
+  (37 runs total: **31 pass / 6 neutral / 0 fail** — no failures, no freezes, no unreadable post-kill
+  stores).
+- **166 kills landed at partial durable coverage** (`0 < coverage < 100%`).
+- **17 completed backfills resumed from partial persisted state** and reached a **logically-identical**
+  final store (digest byte-equal to the baseline, intervals tiling `[20529207, 20579207]` exactly).
+- Zero `InvariantViolation` under `PORTAL_CHECKS=strict`; zero store-durability failures.
+
+Acceptance thresholds (all cleared): kills ≥ 200 (**236**), completed-verified ≥ 25 (**31**), kills at
+partial coverage ≥ 25 (**166**), completions-from-partial ≥ 1 (**17**).
+
+**Cross-build store equivalence — the strongest result here.** Every completed run's logical digest
+equalled the frozen baseline digest `360af5126a0efffc49b871594b8ac3ea`. That baseline was built by the
+**earlier** `main` build (`458dc8c`), while this campaign ran on `248f41e`; because every completed run
+on `248f41e` reproduced it exactly, the re-acceptance additionally proves that the `248f41e` build
+reproduces the `458dc8c` build's `ponder_sync` **row content byte-for-byte** over the campaign range —
+two different `main` builds producing byte-identical sync-store content, not merely one build being
+self-consistent under kills.
+
+**Candor.**
+
+- **6 of 37 runs are `neutral` — calibration misses**, exactly the §4.2 class: each **completed with
+  fewer than the required minimum kills** (here **zero** kills), so it is neither a pass nor a fail and
+  **contributes no kills to the totals**. Every run that cleared the kill floor ran to a verified
+  completion and **PASSed**; there were **zero** fails and **zero** freezes across the campaign.
+- **The campaign's aggregate metadata carries the label `chaos-3-pg`** — a hard-coded default in the
+  driver (`v3-pg`), which was **deliberately reused unchanged** from the §4.2 campaign. The label is
+  cosmetic, is disclosed here, and affects no count.
+- **The longest runs were Poisson tails, not stalls.** The two longest runs (**373 s** at 39 kills;
+  **350 s** at 33 kills) simply accrued the most kills and resume cycles under the Poisson schedule —
+  wall time scales with kill count — and both completed and verified PASS.
+
 ---
 
 ## 5. Findings log
@@ -533,7 +589,7 @@ belong in the open too.
 | Issue | State | Finding | Attribution / layer |
 |-------|-------|---------|---------------------|
 | [#58](../../issues/58) | RESOLVED (**merged [#59](../../pull/59)**) | **Differ keyset pagination did not follow the sync-store PK.** The batched byte-diff's keyset cursor ordered/compared by columns that were **not** the `chain_id`-prefixed sync-store primary key, so on a large table the planner could not resolve each page as a single forward index scan; on the F-full full-history diff (§3.2) the tool diffed `logs` byte-identical, then **wedged on `transactions`** (days of CPU, no progress). | A tool defect (Layer E), not a data defect — both stores were intact (the offline re-diff with the fixed tool proved them byte-identical). Root-caused and fixed in **[#59](../../pull/59)**: ORDER BY + tuple-WHERE now lead with the `chain_id`-prefixed PK. Pinned by a DB-free SQL-shape test (`diff-batched.test.mjs`). |
-| [#63](../../issues/63) | MITIGATED in this PR; open for byte-aware page sizing | **PGlite 0.2.13 WASM-allocator detoast-volume hang.** A single `select *` page whose toasted input runs to ~300 MB (which a 50,000-row page of the widest sync-store tables reaches over full-history windows) spins forever in PGlite 0.2.13's WASM allocator (the *detoast* step, not the query). The **same rows in 5,000-row pages** complete at ~1.5 s each. Surfaced by the fixed-keyset differ's first offline re-diff of the F-full evidence stores (§3.2), which hung after `logs` proved identical. | A finding about the **harness's embedded store backend**, not the fork or the diff logic. Mitigated in-harness by shrinking the differ page size `BATCH` from 50,000 to 5,000 rows (`diff-batched.mjs`; the pinned SQL-shape assertions were updated to `limit 5000`); [#63](../../issues/63) tracks the durable fix — a byte-aware page size, since a fixed row count is only a proxy for detoast volume. With the smaller page, the full F-full re-diff completed in ~65 s. |
+| [#63](../../issues/63) | RESOLVED (**merged [#72](../../pull/72)**) | **PGlite 0.2.13 WASM-allocator detoast-volume hang.** A single `select *` page whose toasted input runs to ~300 MB (which a 50,000-row page of the widest sync-store tables reaches over full-history windows) spins forever in PGlite 0.2.13's WASM allocator (the *detoast* step, not the query). The **same rows in 5,000-row pages** complete at ~1.5 s each. Surfaced by the fixed-keyset differ's first offline re-diff of the F-full evidence stores (§3.2), which hung after `logs` proved identical. | A finding about the **harness's embedded store backend**, not the fork or the diff logic. The interim mitigation shrank the differ page size `BATCH` from 50,000 to a fixed 5,000 rows (the F-full re-diff completed in ~65 s at that size). The **durable fix merged in [#72](../../pull/72)** replaces the fixed row count — only ever a proxy for detoast volume — with **byte-aware page sizing**: after each page the differ measures its rows' average serialized width and sizes the **next** page's row `limit` from it (`nextBatchSize(observedAvgRowBytes, targetBytes, floor, ceiling)` = `floor(target / avg)` clamped to `[5000, 50000]`; degenerate observations fall back to the floor), targeting a bounded per-query payload (default 32 MB, ~10× under the ~300 MB wedge threshold; override via `--byte-target` / `DIFF_BYTE_TARGET`), so fat-calldata tables page narrow and slim tables page wide under one byte budget. The keyset **cursor is unchanged** — the tuple-WHERE resumes strictly past the previous page's tail row regardless of page size, so the yielded row stream is identical for any limit sequence; only the `limit` varies. Pinned by the DB-free SQL-shape / sizing tests (`diff-batched.test.mjs`). |
 
 ---
 
@@ -541,9 +597,10 @@ belong in the open too.
 
 **Proven today (with reproducible evidence in this repo):**
 
-- The Portal layer's invariants (INV-1 … INV-16) hold under property-based tests **on both supported
-  upstream Ponder versions** (`0.16.6`, `0.15.17`), and every fix is backed by a mutation-verified
-  regression test.
+- The Portal layer's invariants (INV-1 … INV-16) hold under property-based tests **on all three
+  supported upstream Ponder versions** (`0.15.17`, `0.16.6`, `0.16.7` — the last registered by
+  [#74](../../pull/74) on a seam-identity + full-suite basis, §2), and every fix is backed by a
+  mutation-verified regression test.
 - **Crash/resume is safe, and resume-from-partial-persisted-state is now proven.** Tier 0 (PGlite,
   §4.1): 203 kills across 41/41 completed backfills, `SIGKILL`-atomic and restart-idempotent,
   byte-identical to an unkilled baseline across all five row families, intervals tiling exactly, zero
@@ -553,7 +610,12 @@ belong in the open too.
   persisted state** to a **logically-identical** final store (surrogate-id-excluding digest + exact
   interval tiling). So *attributable* resume-from-partial is evidenced today — the property Tier 0
   alone could not witness (the [#50](../../issues/50) granularity shape, which remains open and is
-  worked around by Tier 1's small chunks, not fixed).
+  worked around by Tier 1's small chunks, not fixed). This Tier-1 acceptance was **reproduced on the
+  current `main` build (`248f41e`) on 2026-07-06 (§4.3, ACCEPTED)** — same methodology, all thresholds
+  cleared again (**236 kills, 31 verified completions, 166 at partial coverage, 17 resumed from
+  partial**, zero failures) — and every completed run reproduced the earlier build's baseline digest
+  exactly, so the two `main` builds are **byte-identical at the sync-store row level** over the range
+  (cross-build store equivalence).
 - The fork-vs-stock **byte-diff plumbing** is proven end-to-end by the SMOKE cell (byte-identical
   across all five row families on public endpoints, §3.1), and the **flagship `F-full` cell is DONE**
   (§3.2): the full recorded Euler v2 history on eth mainnet (`[20529207, 25436954]`, 4.9M blocks) is
@@ -590,7 +652,7 @@ All tooling is `bash` + `node` only (no extra dependencies) and lives in this re
 
 | Evidence | Tool | Doc |
 |----------|------|-----|
-| Unit + invariant suite (both versions) | `scripts/sync-upstream.sh <ver> --test` | `CLAUDE.md`, `portal/INVARIANTS.md` |
+| Unit + invariant suite (all three versions) | `scripts/sync-upstream.sh <ver> --test` | `CLAUDE.md`, `portal/INVARIANTS.md` |
 | Chaos kill-loop + resume (Tier 0, PGlite byte-diff) | `harness/chaos/kill-loop.sh`, `verify-resume.sh`, `proxy.mjs` | `harness/validate/README.md` §Chaos |
 | Chaos resume-from-partial (Tier 1, Postgres logical-digest) | `harness/chaos/chaos-pg-driver.sh`, `build-baseline-pg.sh`, `pg-ctl-chaos.sh`, `verify-resume-pg.sh`, `pg-digest.mjs`, `snapshot-coverage-pg.mjs`, `check-intervals-pg.mjs` | §4.2 (this doc); tool headers |
 | Validation matrix (fork vs stock) | `harness/validate/run-cell.sh`, `ctrl-cell.sh`, `cells.json` | `harness/validate/README.md` |
