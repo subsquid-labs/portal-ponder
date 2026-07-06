@@ -123,7 +123,7 @@ derive_backend_label () {
 
   if [ -n "${CHAOS_BACKEND_LABEL:-}" ]; then
     local ov_major
-    ov_major="$(printf '%s' "$CHAOS_BACKEND_LABEL" | grep -oE 'postgres([0-9]+)' | grep -oE '[0-9]+' | head -1)"
+    ov_major="$(printf '%s' "$CHAOS_BACKEND_LABEL" | grep -oE '^postgres[0-9]+' | grep -oE '[0-9]+' | head -1)"
     if [ -z "$ov_major" ]; then
       log "✗ CHAOS_BACKEND_LABEL='$CHAOS_BACKEND_LABEL' has no postgres<major> to validate against the observed major ($major) — ABORT" >&2
       return 2
