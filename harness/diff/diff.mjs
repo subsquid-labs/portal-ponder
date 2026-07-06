@@ -41,10 +41,55 @@ export function setDiff(a, b) {
   return { ok, onlyA, onlyB };
 }
 
+// ── known upstream defect: block.size off-by-one (issue #76) ─────────────────────────────────────
+// The SQD Portal eth-mainnet dataset computes a block's `size` with a fixed 2-byte RLP
+// length-of-length prefix, so every block whose RLP payload crosses 2^16 (canonical size ≥ 65540,
+// which needs a 3-byte length prefix) is reported one byte short: portal.size === rpc.size − 1. The
+// block hash and every consensus field are identical, and logs/transactions/receipts/traces are
+// byte-identical; only this one derived header field differs, on ~0.3% of mainnet blocks (the large
+// ones). The fork's transform is a pass-through, so the value is upstream data, not our code (issue
+// #76 tracks the dataset fix). We tolerate a shared block row whose ONLY differing field is `size`
+// with EXACTLY that signature — delta precisely +1, only at/above the 65540 boundary. Anything else
+// about size (a different delta, the opposite sign, a sub-threshold delta) OR any second differing
+// field still FAILS. Self-retiring: once the dataset is fixed the rows compare equal and this never
+// fires.
+const SIZE_TOLERANCE_MIN = 65540;
+
+// portalRow / rpcRow are normalized block row-strings (norm output: sorted keys, bigint→decimal,
+// bytes→hex, total_difficulty dropped). Returns true iff `size` is the SOLE differing field and the
+// pair matches the issue-#76 off-by-one signature (rpc === portal + 1, rpc ≥ 65540).
+function sizeOffByOneTolerated(portalRow, rpcRow) {
+  const p = JSON.parse(portalRow);
+  const r = JSON.parse(rpcRow);
+
+  let diffField = null;
+  for (const k of new Set([...Object.keys(p), ...Object.keys(r)])) {
+    if (p[k] === r[k]) continue;
+
+    if (diffField !== null) return false;
+
+    diffField = k;
+  }
+
+  if (diffField !== 'size') return false;
+
+  const portalSize = Number(p.size);
+  const rpcSize = Number(r.size);
+
+  return (
+    Number.isFinite(portalSize) &&
+    Number.isFinite(rpcSize) &&
+    rpcSize === portalSize + 1 &&
+    rpcSize >= SIZE_TOLERANCE_MIN
+  );
+}
+
 // Block-identity keyed by (CHAIN_ID, NUMBER) — parsed from each normalized row-string. Rules:
 //   • a (chain,number) PRESENT on both sides whose full-row string differs → MISMATCH → FAIL
 //     (keying by hash would hide a same-number/different-hash reorg divergence as two one-sided
-//      extras that the old `ok` never checked)
+//      extras that the old `ok` never checked) — EXCEPT the known upstream block.size off-by-one
+//      (issue #76): a shared block whose ONLY differing field is `size` with rpc === portal + 1 and
+//      rpc ≥ 65540 is classified `sizeTolerated`, not `mismatch`, so it does not fail (self-retiring)
 //   • a portal-only (chain,number) (in A, not B) → FAIL — the Portal path invented a block RPC never saw
 //   • an rpc-only (chain,number) (in B, not A) → tolerated: the stock RPC path stores inert event-less
 //     blocks it traced (never referenced)
@@ -68,7 +113,21 @@ export function blocksVerdict(
   const a = new Map(aRows.map((r) => [keyOf(r), r]));
   const b = new Map(bRows.map((r) => [keyOf(r), r]));
   const shared = [...a.keys()].filter((n) => b.has(n));
-  const mismatch = shared.filter((n) => a.get(n) !== b.get(n));
+
+  // A shared key whose row-strings differ is a MISMATCH, EXCEPT the tolerated upstream size
+  // off-by-one (issue #76) — those are split into sizeTolerated and do NOT fail.
+  const mismatch = [];
+  const sizeTolerated = [];
+  for (const n of shared) {
+    if (a.get(n) === b.get(n)) continue;
+
+    if (sizeOffByOneTolerated(a.get(n), b.get(n))) {
+      sizeTolerated.push(n);
+    } else {
+      mismatch.push(n);
+    }
+  }
+
   const portalOnly = [...a.keys()].filter((n) => !b.has(n));
   const rpcExtra = [...b.keys()].filter((n) => !a.has(n));
   const ok = mismatch.length === 0 && portalOnly.length === 0;
@@ -79,6 +138,7 @@ export function blocksVerdict(
     bSize: b.size,
     shared,
     mismatch,
+    sizeTolerated,
     portalOnly,
     rpcExtra,
     sampleA: (n) => a.get(n),
@@ -142,6 +202,9 @@ async function main() {
     const v = blocksVerdict(a, b);
     console.log(
       `  ${v.ok ? '✅' : '❌'} ${'blocks'.padEnd(20)} portal=${String(v.aSize).padStart(6)}  rpc=${String(v.bSize).padStart(6)}  shared=${v.shared.length} match` +
+        (v.sizeTolerated.length
+          ? `, ${v.sizeTolerated.length} tolerated (upstream size off-by-one, issue #76)`
+          : '') +
         (v.rpcExtra.length
           ? `, +${v.rpcExtra.length} inert event-less (RPC-only)`
           : '') +

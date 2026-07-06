@@ -93,6 +93,106 @@ test('blocksVerdict: multi-chain — chain-1 differs at height 100 while chain-2
   );
 });
 
+// ── issue #76: tolerated upstream block.size off-by-one ─────────────────────────────────────────
+// The SQD Portal dataset reports eth-mainnet block.size one byte short whenever the RLP length crosses
+// 2^16 (canonical size ≥ 65540): portal.size === rpc.size − 1, with the hash and every consensus field
+// identical. blocksVerdict must classify EXACTLY that signature (size the sole differing field, delta
+// +1, rpc ≥ 65540) as sizeTolerated — not mismatch — so it does not fail; everything else about size
+// (sub-threshold delta, delta ≠ 1, opposite sign) and any second differing field still FAILS.
+// A `size`-bearing block row: same (chain_id, number, hash) on both sides so `size` is the SOLE diff.
+const sizeBlock = (number, size, hash = '0xdeadbeef', chain_id = 1) =>
+  JSON.stringify({ chain_id, hash, number, size });
+
+// MUTATION: run this test against origin/main's diff.mjs (no sizeTolerated split) → the off-by-one is
+// a MISMATCH so v.ok is false and v.sizeTolerated is undefined → this test FAILS on the pre-fix code.
+test('blocksVerdict #76: a lone size off-by-one at/above 65540 is tolerated, not a mismatch', () => {
+  const portal = [sizeBlock(19963775, 66755)];
+  const rpc = [sizeBlock(19963775, 66756)];
+  const v = blocksVerdict(portal, rpc);
+  assert.equal(v.ok, true, 'a lone size off-by-one at scale does not fail');
+  assert.deepEqual(v.sizeTolerated, ['1:19963775']);
+  assert.equal(
+    v.mismatch.length,
+    0,
+    'the tolerated row is not counted as a mismatch',
+  );
+  assert.equal(v.shared.length, 1);
+});
+
+test('blocksVerdict #76: a sub-threshold size delta (< 65540) still FAILS', () => {
+  const v = blocksVerdict([sizeBlock(100, 30000)], [sizeBlock(100, 30001)]);
+  assert.equal(
+    v.ok,
+    false,
+    'below the 65540 boundary the off-by-one is a real mismatch',
+  );
+  assert.deepEqual(v.mismatch, ['1:100']);
+  assert.equal(v.sizeTolerated.length, 0);
+});
+
+test('blocksVerdict #76: a size delta of 2 (not exactly +1) still FAILS', () => {
+  const v = blocksVerdict([sizeBlock(100, 66754)], [sizeBlock(100, 66756)]);
+  assert.equal(v.ok, false, 'only an exact +1 delta is tolerated');
+  assert.deepEqual(v.mismatch, ['1:100']);
+  assert.equal(v.sizeTolerated.length, 0);
+});
+
+test('blocksVerdict #76: portal LARGER than rpc (opposite sign) still FAILS', () => {
+  const v = blocksVerdict([sizeBlock(100, 66757)], [sizeBlock(100, 66756)]);
+  assert.equal(
+    v.ok,
+    false,
+    'only rpc == portal+1 is tolerated, never portal > rpc',
+  );
+  assert.deepEqual(v.mismatch, ['1:100']);
+  assert.equal(v.sizeTolerated.length, 0);
+});
+
+test('blocksVerdict #76: size within tolerance but a SECOND field also differs still FAILS', () => {
+  // size is a valid off-by-one, but gas_used also differs → not the isolated-size signature.
+  const portal = [
+    JSON.stringify({
+      chain_id: 1,
+      gas_used: 100,
+      hash: '0xa',
+      number: 100,
+      size: 66755,
+    }),
+  ];
+  const rpc = [
+    JSON.stringify({
+      chain_id: 1,
+      gas_used: 200,
+      hash: '0xa',
+      number: 100,
+      size: 66756,
+    }),
+  ];
+  const v = blocksVerdict(portal, rpc);
+  assert.equal(
+    v.ok,
+    false,
+    'a second differing field defeats the size tolerance',
+  );
+  assert.deepEqual(v.mismatch, ['1:100']);
+  assert.equal(v.sizeTolerated.length, 0);
+});
+
+test('blocksVerdict #76: a consensus-field (hash) divergence at large size is NEVER masked', () => {
+  // hash differs (a real reorg divergence) AND size is off-by-one — the tolerance must not swallow it.
+  const v = blocksVerdict(
+    [sizeBlock(100, 66755, '0xAAA')],
+    [sizeBlock(100, 66756, '0xZZZ')],
+  );
+  assert.equal(
+    v.ok,
+    false,
+    'a differing hash is a real mismatch even alongside a size off-by-one',
+  );
+  assert.deepEqual(v.mismatch, ['1:100']);
+  assert.equal(v.sizeTolerated.length, 0);
+});
+
 test('setDiff: multi-chain STRICT tables do not conflate — same-height rows differ per chain', () => {
   // STRICT tables (logs/transactions/receipts/traces) compare full normalized row-strings (which
   // include chain_id) as a set, so they never had the number-key conflation. This pins that: two
