@@ -104,6 +104,50 @@ test('planDiscovery: null when no floor or already covered; reaches endHint', ()
   expect(p!.to).toBe(500); // reaches the endHint in one pass
 });
 
+// ── #21 §1: the factory-range gate — scanWindow delegates matching to ponder's isLogFactoryMatched ──
+// INV-15's interval-scoped flush (`takePendingInRange`) is lossless ONLY because scanWindow rejects any
+// creation log below `factory.fromBlock`: a sub-floor child that leaked into `childAddresses` + the
+// pending queue would be suppressed at its in-range creation block by the min-merge guard
+// (`prev === undefined || prev > bn`), so it would sit in memory forever — never persisted while its
+// factory interval is marked cached — a silent restart loss. scanWindow gets that gate for free by
+// delegating to ponder-core's `isLogFactoryMatched` (runtime/filter.ts). This pins the delegation at the
+// UNIT level (independent of portal.ts's discovery-floor plumbing): the floor is set BELOW `fromBlock`,
+// so scanWindow DOES stream the sub-floor creation log to the matcher — and only the matcher discards it.
+// If the seam ever weakens (matcher bypassed, or the fromBlock check dropped), this fails loud.
+
+test('#21 §1: a creation log BELOW factory.fromBlock is neither recorded nor queued/flushed (isLogFactoryMatched gate)', async () => {
+  const gated = { ...factory(), fromBlock: 100 } as Factory; // floor gate at 100
+  const events = [
+    { child: '0xbe10', bn: 50 }, // BELOW fromBlock → the matcher must discard
+    { child: '0xab0e', bn: 150 }, // above fromBlock → recorded + queued
+  ];
+  const childAddresses: ChildAddresses = new Map([
+    ['f', new Map<Address, number>()],
+  ]);
+  const d = createDiscovery({
+    client: fakeClient(events),
+    childAddresses,
+    factories: [gated],
+    discoveryWindows: 4,
+    stats: createStats(),
+  });
+  d.setFloor(0); // BELOW fromBlock on purpose: scanWindow streams block 50 to the matcher
+  await d.ensure(500, { chunkBlocks: 100, endHint: 500 });
+
+  const rec = childAddresses.get('f')!;
+  // the sub-floor child is discarded by isLogFactoryMatched — never recorded, never queued.
+  expect(rec.has('0xbe10' as Address)).toBe(false);
+  expect(rec.get('0xab0e' as Address)).toBe(150); // the above-floor child is recorded at its creation block
+
+  // AND it is absent from the pending flush over the FULL range (would-be persistence) — pinning that a
+  // sub-floor child never reaches insertChildAddresses either. Only the above-floor child flushes.
+  const flush = d.takePendingInRange(0, 500);
+  const flushed = new Map(flush.flatMap(([, children]) => [...children]));
+  expect(flushed.has('0xbe10' as Address)).toBe(false);
+  expect(flushed.get('0xab0e' as Address)).toBe(150);
+  expect(flushed.size).toBe(1);
+});
+
 // ── INV-4: earliest-creation convergence under shuffled/overlapping windows ─────────────────────────
 
 test('INV-4: shuffled/overlapping discovery windows converge to the same earliest-creation map', async () => {

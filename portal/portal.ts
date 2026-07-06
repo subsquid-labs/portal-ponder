@@ -179,15 +179,24 @@ export const createPortalHistoricalSync = (
 
   // FIX 2 (INV-3/INV-15): the discovery floor is the earliest block ANY factory could create a child —
   // `min` over the compiled spec's factories of `fromBlock ?? 0` (undefined ⇒ genesis). It is a property
-  // of the SPEC, not of the intervals ponder happens to still need, so it is pinned at CONSTRUCTION (and
-  // re-pinned per call, since chunkBlocks can scale) — see `pinDiscoveryFloor`. `discFloorBlock` is the
-  // downward-clamped floor BLOCK (grid-independent, so it survives a rescale); requiredFactoryIntervals /
-  // the interval start only REFINE it downward (C4/INV-4).
-  const specFloorBlock =
+  // of the SPEC alone, not of the intervals ponder happens to still need, so it is pinned ONCE at
+  // CONSTRUCTION (grid-independent, so it survives a chunkBlocks rescale — see `pinDiscoveryFloor`).
+  //
+  // #21: no per-call downward refinement. Such a refinement is dead for correctness — the floor only has
+  // to sit AT OR BELOW every real matched child-creation block, and `isLogFactoryMatched` discards any
+  // creation log below `factory.fromBlock`, so every child that matters for factory `f` is created at
+  // block ≥ `f.fromBlock ≥ discFloorBlock`. Neither `interval[0]` nor a `requiredFactoryIntervals` start
+  // can ever lower a real child below `discFloorBlock` (each factory required-interval start is
+  // `intervalIntersection(params.interval, [factory.fromBlock, factory.toBlock])`-bounded, so ≥
+  // `factory.fromBlock ≥ discFloorBlock`). But `interval[0]` CAN drag the floor BELOW `discFloorBlock`:
+  // in a mixed config (plain log filter from 0 + factory from ~15M) the first data interval starts at 0,
+  // so the old `min(..., interval[0])` pulled the floor to 0 and the first `ensure()` streamed ~15M blocks
+  // of factory-query results the matcher then discarded — a one-time-per-process overscan. Dropping it
+  // keeps only the tight, sufficient construction-time floor.
+  const discFloorBlock =
     spec.factories.length > 0
       ? Math.min(...spec.factories.map((f) => f.fromBlock ?? 0))
       : undefined;
-  let discFloorBlock = specFloorBlock;
 
   const ikey = (i: Interval): string => `${i[0]}-${i[1]}`;
   // FIX 1 (INV-9/INV-13): the data ceiling is the LOWER of the configured backfill end and the live Portal
@@ -641,7 +650,7 @@ export const createPortalHistoricalSync = (
 
   return {
     async syncBlockRangeData(params) {
-      const { interval, requiredFactoryIntervals, syncStore } = params;
+      const { interval, syncStore } = params;
       if (!startTime) startTime = Date.now();
       // A SAME-interval re-entry is ponder's transaction retry (the interval callback re-runs after a
       // rollback): restore THIS interval's previous flush — those children were rolled back with the
@@ -726,17 +735,14 @@ export const createPortalHistoricalSync = (
         });
       }
 
-      // FIX 2: (re-)pin the discovery floor BEFORE any fetch. Base floor = the spec's earliest factory
-      // start (`discFloorBlock`, seeded at construction); requiredFactoryIntervals and the interval start
-      // only REFINE it downward (C4/INV-4). Applied on EVERY call (not just when ponder hands over
-      // requiredFactoryIntervals) so an early spanning-chunk fetch never runs without discovery.
-      if (discFloorBlock !== undefined) {
-        discFloorBlock = Math.min(
-          discFloorBlock,
-          interval[0],
-          ...requiredFactoryIntervals.map((r) => r.interval[0]),
-        );
-      }
+      // FIX 2 (#21): (re-)pin the discovery floor BEFORE any fetch. The floor is the spec's earliest
+      // factory start (`discFloorBlock`, fixed at construction). Re-pinned here — not refined — only
+      // because `chunkBlocks` may have scaled since construction, which moves the grid snap. No per-call
+      // downward refinement from `interval[0]` / `requiredFactoryIntervals`: those terms are dead for
+      // correctness (each is ≥ `discFloorBlock`, so they never lower a real matched child below the
+      // floor), and the `interval[0]` term caused a one-time sub-floor discovery overscan in mixed
+      // configs (see the construction-time note). Applied on EVERY call so an early spanning-chunk fetch
+      // never runs without discovery.
       pinDiscoveryFloor();
 
       const startIdx = idxOf(interval[0], chunkBlocks);

@@ -2889,18 +2889,132 @@ test('regression (#53, case-normalization): a CHECKSUMMED pre-existing store row
   }
 });
 
-test('regression (#21, INV-15 gate): a factory creation log BELOW factory.fromBlock is neither recorded in childAddresses nor queued/flushed (isLogFactoryMatched floor gate)', async () => {
+test('regression (#21 §2): in a mixed config the discovery scan starts at the factory floor, not interval[0] (no sub-floor overscan)', async () => {
+  // #21 §2: the discovery floor is the construction-time floor (min over spec.factories of fromBlock ?? 0)
+  // and NOTHING lowers it per call. The removed per-call refinement took min(discFloorBlock, interval[0],
+  // …requiredFactoryIntervals starts); its interval[0] term was dead for correctness but dragged the floor
+  // to 0 in a MIXED config — a plain log filter from block 0 makes the first data interval start at 0, so
+  // the old refinement pulled the scan origin to 0 and the first ensure() streamed ~15M blocks of factory-
+  // query results the matcher then discarded (a one-time-per-process overscan). This pins that the FIRST
+  // discovery request begins at the grid-snapped factory floor (15M here), never at interval[0]=0.
+  //
+  // Deterministic grid: PORTAL_CHUNK_FIXED disables density scaling and PORTAL_CHUNK_BLOCKS=1_000_000
+  // fixes the width, so the floor snaps to idxOf(15_000_000, 1_000_000)*1_000_000 = 15_000_000 exactly.
+  process.env.PORTAL_CHUNK_BLOCKS = '1000000';
+  process.env.PORTAL_CHUNK_FIXED = '1';
+  process.env.PORTAL_FINALIZED_HEAD = '20000000';
+  const FACTORY_FROM = 15_000_000; // on the 1M grid → floor snaps to itself
+  const factory = { ...mkFactory(), fromBlock: FACTORY_FROM };
+  // a plain (non-factory) log filter from block 0 — its interval[0]=0 is what the old refinement latched.
+  const plainFilter = {
+    type: 'log',
+    chainId: 1,
+    sourceId: 'plain',
+    address: '0x' + 'a1'.repeat(20),
+    topic0: DEPOSIT_TOPIC0,
+    topic1: null,
+    topic2: null,
+    topic3: null,
+    fromBlock: 0,
+    toBlock: undefined,
+    hasTransactionReceipt: false,
+    include: [],
+  };
+  const factoryFilter = {
+    ...mkFactoryFilter(factory),
+    fromBlock: FACTORY_FROM,
+  };
+
+  // record the fromBlock of every DISCOVERY request (topic0 = ProxyCreated selector). Serves nothing.
+  const discoveryFroms: number[] = [];
+  const srv = http.createServer((req, res) => {
+    let body = '';
+    req.on('data', (c) => {
+      body += c;
+    });
+    req.on('end', () => {
+      if (req.url?.includes('finalized-head')) {
+        res.writeHead(200, { 'content-type': 'application/json' });
+        res.end(JSON.stringify({ number: 20_000_000 }));
+        return;
+      }
+      const q = body ? JSON.parse(body) : {};
+      const isDiscovery = ((q.logs ?? []) as any[]).some((s) =>
+        (s.topic0 ?? [])
+          .map((x: string) => x.toLowerCase())
+          .includes(PROXY_CREATED_TOPIC0.toLowerCase()),
+      );
+      if (isDiscovery) discoveryFroms.push(q.fromBlock ?? 0);
+
+      res.writeHead(204).end();
+    });
+  });
+  const p: number = await new Promise((r) =>
+    srv.listen(0, () => r((srv.address() as AddressInfo).port)),
+  );
+  try {
+    const sync = createPortalHistoricalSync({
+      common: {
+        logger: { debug() {}, info() {}, warn() {}, error() {}, trace() {} },
+      },
+      chain: { id: 1, name: 'mainnet', portal: `http://localhost:${p}` },
+      childAddresses: new Map([[factory.id, new Map()]]),
+      eventCallbacks: [{ filter: plainFilter }, { filter: factoryFilter }],
+    } as any);
+    // ponder issues the FIRST interval from block 0 (the plain filter's start) — the exact mixed-config
+    // ordering the old interval[0] term latched. requiredFactoryIntervals is empty on this early fetch.
+    const interval: [number, number] = [0, 1_000_000];
+    await sync.syncBlockRangeData({
+      interval,
+      requiredIntervals: [{ interval, filter: plainFilter }],
+      requiredFactoryIntervals: [],
+      syncStore: mkFactorySyncStore(() => {}),
+    });
+
+    expect(discoveryFroms.length).toBeGreaterThan(0); // discovery DID run (the floor is pinned)
+    const firstWindowFrom = Math.min(...discoveryFroms);
+    // THE REGRESSION: the scan starts at the grid-snapped factory floor, NOT at interval[0]=0.
+    expect(firstWindowFrom).toBe(FACTORY_FROM);
+    expect(firstWindowFrom).not.toBe(0);
+    // and NO discovery request probes below the floor (the whole sub-floor [0, 15M) range is never scanned).
+    expect(discoveryFroms.every((f) => f >= FACTORY_FROM)).toBe(true);
+  } finally {
+    srv.close();
+    delete process.env.PORTAL_CHUNK_BLOCKS;
+    delete process.env.PORTAL_CHUNK_FIXED;
+    delete process.env.PORTAL_FINALIZED_HEAD;
+  }
+});
+
+test('regression (#21 §1, INV-15 gate): a factory creation log BELOW factory.fromBlock is neither recorded in childAddresses nor queued/flushed (isLogFactoryMatched floor gate)', async () => {
   // INV-15's interval-scoped flush is lossless only because scanWindow delegates creation-log matching
   // to ponder's isLogFactoryMatched, which rejects any creation log below factory.fromBlock. A child
   // "created" below the floor must never enter childAddresses or the pending queue — otherwise the
   // min-merge guard would also suppress re-queueing at its in-range creation block, and the child would
   // sit in memory forever, never persisted while its factory interval is marked cached (a restart loss).
-  // This pins the silent dependence: if the matcher seam is ever bypassed, the test fails loud. (#21 §1)
-  const factory = { ...mkFactory(), fromBlock: 100 }; // floor at 100 — a child "created" at 50 is sub-floor
-  const filter = { ...mkFactoryFilter(factory), fromBlock: 100 };
+  // This pins the silent dependence: if the matcher seam is ever bypassed, the test fails loud.
+  //
+  // #21 §2 removed the per-call discovery-floor refinement, so the scan floor is now the CONSTRUCTION-time
+  // floor (min over spec.factories of fromBlock ?? 0). To still deliver a sub-floor creation log to the
+  // matcher WITHOUT relying on that removed refinement, this uses a MIXED factory config: a genesis
+  // factory (gen, fromBlock 0) drags the construction floor to 0, so scanWindow legitimately issues a
+  // window covering block 50; the GATED factory (fromBlock 100) is the one whose child is "created" at 50
+  // (sub-floor) — and only isLogFactoryMatched (100 > 50) discards it. The gate, not the scan origin, is
+  // what's under test.
+  const gen = mkFactory(); // genesis factory (fromBlock 0) → construction floor = min(0,100) = 0
+  const gated = {
+    ...mkFactory(),
+    id: 'factory_gated',
+    sourceId: 'gated',
+    address: '0x' + 'da'.repeat(20),
+    fromBlock: 100, // floor gate at 100 — a child "created" at 50 is sub-floor for THIS factory
+  };
+  const genFilter = mkFactoryFilter(gen);
+  const gatedFilter = { ...mkFactoryFilter(gated), fromBlock: 100 };
   const BELOW_FLOOR_CHILD = '0x' + 'bf'.repeat(20);
 
-  // a Portal that emits a ProxyCreated log at block 50 (below the factory floor) for discovery requests.
+  // a Portal that emits the gated factory's ProxyCreated log at block 50 (below its floor) for discovery
+  // requests that target the gated factory's address. The gen factory has no children (empty backfill).
   const srv = http.createServer((req, res) => {
     let body = '';
     req.on('data', (c) => {
@@ -2915,20 +3029,24 @@ test('regression (#21, INV-15 gate): a factory creation log BELOW factory.fromBl
       const q = body ? JSON.parse(body) : {};
       const from = q.fromBlock ?? 0;
       const to = q.toBlock ?? 1e12;
-      const isDiscovery = ((q.logs ?? []) as any[]).some((s) =>
-        (s.topic0 ?? [])
-          .map((x: string) => x.toLowerCase())
-          .includes(PROXY_CREATED_TOPIC0.toLowerCase()),
+      const targetsGated = ((q.logs ?? []) as any[]).some(
+        (s) =>
+          (s.topic0 ?? [])
+            .map((x: string) => x.toLowerCase())
+            .includes(PROXY_CREATED_TOPIC0.toLowerCase()) &&
+          (s.address ?? [])
+            .map((x: string) => x.toLowerCase())
+            .includes(gated.address.toLowerCase()),
       );
       const out: any[] = [];
       // emit the sub-floor creation log at 50 whenever the window covers it (the Portal has no floor
       // knowledge — the matcher, not the source, must reject it).
-      if (isDiscovery && from <= 50 && to >= 50) {
+      if (targetsGated && from <= 50 && to >= 50) {
         out.push({
           header: mkFactoryHeader(50),
           logs: [
             {
-              address: FACTORY_ADDR,
+              address: gated.address,
               topics: [
                 PROXY_CREATED_TOPIC0,
                 '0x' + '00'.repeat(12) + BELOW_FLOOR_CHILD.slice(2),
@@ -2954,25 +3072,41 @@ test('regression (#21, INV-15 gate): a factory creation log BELOW factory.fromBl
   );
   try {
     const calls: any[] = [];
-    const childAddresses = new Map([[factory.id, new Map<string, number>()]]);
-    const sync = mkFactorySync(p, factory, filter, childAddresses as any);
-    // The interval STARTS AT 0 (below the factory floor 100) — the per-call floor refinement
-    // (min(discFloorBlock, interval[0], …)) drags the discovery scan origin down to 0, so scanWindow
-    // ISSUES a window covering block 50 and the source DELIVERS the sub-floor creation log to the
-    // matcher. isLogFactoryMatched (factory.fromBlock=100 > 50) is the ONLY thing that discards it —
-    // pinning that gate. (Not a FIX-2 overscan test; #21 §2's floor-refinement change is left open.)
+    const childAddresses = new Map([
+      [gen.id, new Map<string, number>()],
+      [gated.id, new Map<string, number>()],
+    ]);
+    const sync = createPortalHistoricalSync({
+      common: {
+        logger: { debug() {}, info() {}, warn() {}, error() {}, trace() {} },
+      },
+      chain: { id: 1, name: 'mainnet', portal: `http://localhost:${p}` },
+      childAddresses,
+      eventCallbacks: [{ filter: genFilter }, { filter: gatedFilter }],
+    } as any);
+    // The genesis factory pins the construction floor at 0, so scanWindow reaches block 50 and DELIVERS
+    // the gated factory's sub-floor creation log to the matcher. isLogFactoryMatched (gated.fromBlock=100
+    // > 50) is the ONLY thing that discards it — pinning the gate under the post-#21-§2 floor semantics.
     const interval: [number, number] = [0, FACTORY_RANGE_END];
     await sync.syncBlockRangeData({
       interval,
-      requiredIntervals: [{ interval, filter }],
-      requiredFactoryIntervals: [{ interval, factory }],
+      requiredIntervals: [
+        { interval, filter: genFilter },
+        { interval, filter: gatedFilter },
+      ],
+      requiredFactoryIntervals: [
+        { interval, factory: gen },
+        { interval, factory: gated },
+      ],
       syncStore: mkFactorySyncStore((x) => calls.push(x)),
     });
 
     // the sub-floor child is NEITHER recorded in the in-memory map NOR flushed to the store.
-    expect(childAddresses.get(factory.id)?.has(BELOW_FLOOR_CHILD)).toBe(false);
-    expect(childAddresses.get(factory.id)?.size).toBe(0);
-    expect(calls).toHaveLength(0);
+    expect(childAddresses.get(gated.id)?.has(BELOW_FLOOR_CHILD)).toBe(false);
+    expect(childAddresses.get(gated.id)?.size).toBe(0);
+    expect(
+      calls.some((c: any) => c.childAddresses.has(BELOW_FLOOR_CHILD)),
+    ).toBe(false);
   } finally {
     srv.close();
   }
