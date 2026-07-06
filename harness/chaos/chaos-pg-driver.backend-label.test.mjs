@@ -133,13 +133,19 @@ function pgConfigPresent() {
 test('backend label tracks the OBSERVED Postgres major (not a hardcoded 16)', (t) => {
   const major = observedMajorFromBinary();
   if (major == null) {
-    t.skip('no Postgres toolchain to observe a major — derivation cannot run here');
+    t.skip(
+      'no Postgres toolchain to observe a major — derivation cannot run here',
+    );
 
     return;
   }
 
   const { out, status } = runLabel();
-  assert.equal(status, 0, `derivation must succeed with a toolchain present (out: ${out})`);
+  assert.equal(
+    status,
+    0,
+    `derivation must succeed with a toolchain present (out: ${out})`,
+  );
   // The printed label's major must equal the INDEPENDENTLY observed major. A mutant that hardcodes
   // `postgres16-...` would fail this whenever the toolchain is not 16.
   const printed = out.trim().split('\n').pop().trim();
@@ -170,7 +176,11 @@ test('a CHAOS_BACKEND_LABEL override whose major MISMATCHES the observed major a
     CHAOS_BACKEND_LABEL: `postgres${wrongMajor}-fsync-on`,
   });
 
-  assert.notEqual(status, 0, 'a mismatched override major must exit nonzero (fail-closed)');
+  assert.notEqual(
+    status,
+    0,
+    'a mismatched override major must exit nonzero (fail-closed)',
+  );
   assert.match(
     out,
     /does NOT match the observed Postgres major/i,
@@ -195,9 +205,17 @@ test('a CHAOS_BACKEND_LABEL override whose major MATCHES the observed major is h
   const override = `postgres${major}-fsync-off`;
   const { out, status } = runLabel({ CHAOS_BACKEND_LABEL: override });
 
-  assert.equal(status, 0, `a matching-major override must be accepted (out: ${out})`);
+  assert.equal(
+    status,
+    0,
+    `a matching-major override must be accepted (out: ${out})`,
+  );
   const printed = out.trim().split('\n').pop().trim();
-  assert.equal(printed, override, 'a matching override must be recorded verbatim');
+  assert.equal(
+    printed,
+    override,
+    'a matching override must be recorded verbatim',
+  );
 });
 
 test('a CHAOS_BACKEND_LABEL override with no postgres<major> component aborts nonzero', (t) => {
@@ -209,7 +227,11 @@ test('a CHAOS_BACKEND_LABEL override with no postgres<major> component aborts no
 
   const { out, status } = runLabel({ CHAOS_BACKEND_LABEL: 'sqlite-fsync-on' });
 
-  assert.notEqual(status, 0, 'an override with no postgres<major> must be rejected');
+  assert.notEqual(
+    status,
+    0,
+    'an override with no postgres<major> must be rejected',
+  );
   assert.match(
     out,
     /no postgres<major>/i,
@@ -229,7 +251,9 @@ test('a CHAOS_BACKEND_LABEL whose postgres<major> is only a SUBSTRING (xpostgres
     return;
   }
 
-  const { out, status } = runLabel({ CHAOS_BACKEND_LABEL: 'xpostgres16-fsync-on' });
+  const { out, status } = runLabel({
+    CHAOS_BACKEND_LABEL: 'xpostgres16-fsync-on',
+  });
 
   assert.notEqual(
     status,
@@ -320,7 +344,11 @@ test('backend label is derived from the LIVE cluster (show server_version_num), 
     });
     const out = `${res.stdout || ''}${res.stderr || ''}`;
 
-    assert.equal(res.status, 0, `derivation must succeed against a live cluster (out: ${out})`);
+    assert.equal(
+      res.status,
+      0,
+      `derivation must succeed against a live cluster (out: ${out})`,
+    );
     const printed = out.trim().split('\n').pop().trim();
     // The label MUST equal the value computed from the LIVE server. A mutant that changes the live
     // branch's `vnum / 10000` to `vnum / 100000` mislabels PG16 as postgres1 and fails exactly here.
