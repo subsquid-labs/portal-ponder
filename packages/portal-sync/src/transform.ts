@@ -196,7 +196,9 @@ const parityToCallFrame = (
   const a = t.action ?? {};
   const r = t.result ?? {};
   let type: string;
-  let to: Hex | undefined, input: Hex, output: Hex | undefined;
+  let to: Hex | undefined;
+  let input: Hex;
+  let output: Hex | undefined;
   if (t.type === 'call') {
     type = CALL_TYPE[a.type as string] ?? 'CALL';
     to = a.to;

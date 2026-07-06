@@ -69,8 +69,8 @@ console.log(`Portal logs: ${portalLogs.length} | RPC logs: ${rpcLogs.length}`);
 let mismatches = 0;
 const allKeys = new Set([...portalMap.keys(), ...rpcMap.keys()]);
 for (const k of allKeys) {
-  const p = portalMap.get(k),
-    r = rpcMap.get(k);
+  const p = portalMap.get(k);
+  const r = rpcMap.get(k);
   if (!p) {
     console.log(`  MISSING in Portal: ${k}`);
     mismatches++;

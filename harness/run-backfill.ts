@@ -103,8 +103,8 @@ for (const s of chain.singletons) {
 const perEvent = new Map<string, number>();
 let sampleRow: unknown;
 const t2 = Date.now();
-let p2http = 0,
-  totalLogs = 0;
+let p2http = 0;
+let totalLogs = 0;
 for await (const batch of client.streamFinalized(
   buildPortalQuery([START, TO], dataFilters),
 )) {

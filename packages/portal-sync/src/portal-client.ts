@@ -223,10 +223,10 @@ export class PortalClient {
 
   private async drainNdjson(res: Response, fromBlock: number) {
     const blocks: PortalBlock[] = [];
-    let bytes = 0,
-      logs = 0,
-      transactions = 0,
-      traces = 0;
+    let bytes = 0;
+    let logs = 0;
+    let transactions = 0;
+    let traces = 0;
     let lastBlock: number | undefined;
 
     const reader = res.body!.getReader();
