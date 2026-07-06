@@ -175,6 +175,66 @@ test('resolveWindowEntry rejects an unknown strategy loudly', () => {
   );
 });
 
+// ── #79 seeded-random tags must be unique across two specs in one cell ───────────────────────────
+
+test('resolveWindows: a cell expanding TWO seeded-random specs yields all-distinct tags (#79)', () => {
+  // Shape of the real L-eth cell: two seeded specs over the same range, differing seed AND size.
+  // MUTATION: with the old `rand#${i}` tag both specs emit rand#0..rand#3, so the tags collide and
+  // this assertion fails on origin/main.
+  const cell = {
+    chainId: 1,
+    windows: [
+      {
+        strategy: 'seeded-random',
+        seed: 101,
+        from: 19_000_000,
+        to: 20_500_000,
+        count: 4,
+        size: 2_000,
+      },
+      {
+        strategy: 'seeded-random',
+        seed: 102,
+        from: 19_000_000,
+        to: 20_500_000,
+        count: 4,
+        size: 5_000,
+      },
+    ],
+  };
+  const windows = resolveWindows(cell);
+  const tags = windows.map((w) => w.tag);
+
+  assert.equal(tags.length, 8, '4 + 4 windows expanded');
+  assert.equal(
+    new Set(tags).size,
+    tags.length,
+    'every expanded window carries a distinct tag',
+  );
+});
+
+test('seededRandomWindows: tags encode seed and size so two specs never collide (#79)', () => {
+  const a = seededRandomWindows({
+    seed: 101,
+    from: 19_000_000,
+    to: 20_500_000,
+    count: 4,
+    size: 2_000,
+  });
+  const b = seededRandomWindows({
+    seed: 102,
+    from: 19_000_000,
+    to: 20_500_000,
+    count: 4,
+    size: 5_000,
+  });
+  const collisions = a
+    .map((w) => w.tag)
+    .filter((t) => b.some((w) => w.tag === t));
+
+  assert.deepEqual(collisions, [], 'no tag is shared between the two specs');
+});
+
 test('resolveWindows flattens a mixed cell deterministically', () => {
   const cell = {
     chainId: 1,
