@@ -166,27 +166,30 @@ index 01b6288..00dde99 100644
    const { callback: intervalCallback, generator: intervalGenerator } =
      createCallbackGenerator<{
 diff --git a/packages/core/src/runtime/index.ts b/packages/core/src/runtime/index.ts
-index c5dfe5d..9ff6562 100644
+index c5dfe5d..4394ad8 100644
 --- a/packages/core/src/runtime/index.ts
 +++ b/packages/core/src/runtime/index.ts
-@@ -10,6 +10,7 @@ import type {
+@@ -10,6 +10,8 @@ import type {
  import type { SyncBlock } from "@/internal/types.js";
  import { eth_getBlockByNumber } from "@/rpc/actions.js";
  import type { Rpc } from "@/rpc/index.js";
-+import { assertStreamModeSupported, checkpointBlockNumber, clampFinalizedToPortalHead, isPortalRealtime } from "@/sync-historical/portal-realtime-wire.js";
++import { assertStreamModeSupported, clampFinalizedToPortalHead, deriveFinalityFloor, isPortalRealtime } from "@/sync-historical/portal-realtime-wire.js";
++import type { SafeCrashRecoveryBlockLookup } from "@/sync-historical/portal-realtime-wire.js";
  import {
    getFilterFactories,
    getFilterFromBlock,
-@@ -74,6 +75,8 @@ export async function getLocalSyncProgress(params: {
+@@ -74,6 +76,10 @@ export async function getLocalSyncProgress(params: {
    filters: Filter[];
    finalizedBlock: LightBlock;
    cachedIntervals: CachedIntervals;
 +  /** Ponder's persisted safe checkpoint for this chain — the Portal finality floor across restarts. */
 +  crashRecoveryCheckpoint?: string | undefined;
++  /** Maps a FOREIGN checkpoint's timestamp to a local block (omnichain floor). See `deriveFinalityFloor`. */
++  getSafeCrashRecoveryBlock?: SafeCrashRecoveryBlockLookup;
  }): Promise<SyncProgress> {
    const syncProgress = {
      isEnd: () => {
-@@ -144,7 +147,21 @@ export async function getLocalSyncProgress(params: {
+@@ -144,7 +150,28 @@ export async function getLocalSyncProgress(params: {
          ],
    );
  
@@ -194,22 +197,29 @@ index c5dfe5d..9ff6562 100644
 +  // Fail loud at process start (not after a multi-day backfill) if stream mode can't serve a source. (finding 5)
 +  if (isPortalRealtime(params.chain))
 +    assertStreamModeSupported(params.filters, params.chain.name);
++  // Never let a lagging replica's stale-LOW head pull the boundary below finality ponder has already
++  // persisted — realtime would re-stream (head, floor] and double-index rows crash recovery cannot revert.
++  // A same-chain checkpoint floors at its own block; a FOREIGN one (omnichain writes the omnichain
++  // checkpoint to every chain's row) is timestamp-mapped to a local block via getSafeCrashRecoveryBlock.
++  const floor = await deriveFinalityFloor({
++    checkpoint: params.crashRecoveryCheckpoint,
++    chainId: params.chain.id,
++    getSafeCrashRecoveryBlock: params.getSafeCrashRecoveryBlock,
++  });
 +  // Portal stream-realtime: lower the finalized block to the Portal head so historical stops there and
 +  // realtime streams `[portal-head+1 → tip]`. Pass-through in the A-path (no portal / flag off).
 +  const finalizedBlock = await clampFinalizedToPortalHead({
 +    chain: params.chain,
 +    rpc: params.rpc,
 +    finalizedBlock: params.finalizedBlock,
-+    // Never let a lagging replica's stale-LOW head pull the boundary below finality ponder has already
-+    // persisted — realtime would re-stream (head, floor] and double-index rows crash recovery cannot revert.
-+    floor: checkpointBlockNumber(params.crashRecoveryCheckpoint, params.chain.id),
++    floor,
 +    common: params.common,
 +  });
 +  syncProgress.finalized = finalizedBlock;
    syncProgress.start = diagnostics[0];
    if (diagnostics.length === 2) {
      syncProgress.current = diagnostics[1];
-@@ -157,7 +174,7 @@ export async function getLocalSyncProgress(params: {
+@@ -157,7 +184,7 @@ export async function getLocalSyncProgress(params: {
    // Latest `toBlock` among all `filters`
    const end = Math.max(...params.filters.map((filter) => filter.toBlock!));
  
@@ -219,10 +229,10 @@ index c5dfe5d..9ff6562 100644
        number: toHex(end),
        hash: "0x",
 diff --git a/packages/core/src/runtime/isolated.ts b/packages/core/src/runtime/isolated.ts
-index 1e026c9..c67e5b8 100644
+index 1e026c9..dafaae8 100644
 --- a/packages/core/src/runtime/isolated.ts
 +++ b/packages/core/src/runtime/isolated.ts
-@@ -147,6 +147,10 @@ export async function runIsolated({
+@@ -147,6 +147,13 @@ export async function runIsolated({
      rpc: indexingBuild.rpcs[0]!,
      finalizedBlock: indexingBuild.finalizedBlocks[0]!,
      cachedIntervals,
@@ -230,14 +240,17 @@ index 1e026c9..c67e5b8 100644
 +    crashRecoveryCheckpoint: crashRecoveryCheckpoint?.find(
 +      ({ chainId }) => chainId === chain.id,
 +    )?.checkpoint,
++    // Isolated writes per-chain checkpoints (same-chain fast path), but pass the lookup for a uniform seam
++    // — deriveFinalityFloor only queries it when a checkpoint is foreign (never in this ordering).
++    getSafeCrashRecoveryBlock: syncStore.getSafeCrashRecoveryBlock,
    });
    const childAddresses = await getChildAddresses({
      filters: eventCallbacks.map(({ filter }) => filter),
 diff --git a/packages/core/src/runtime/multichain.ts b/packages/core/src/runtime/multichain.ts
-index 04579ac..bff2da8 100644
+index 04579ac..99d5e0a 100644
 --- a/packages/core/src/runtime/multichain.ts
 +++ b/packages/core/src/runtime/multichain.ts
-@@ -172,6 +172,10 @@ export async function runMultichain({
+@@ -172,6 +172,13 @@ export async function runMultichain({
          finalizedBlock:
            indexingBuild.finalizedBlocks[indexingBuild.chains.indexOf(chain)]!,
          cachedIntervals,
@@ -245,14 +258,17 @@ index 04579ac..bff2da8 100644
 +        crashRecoveryCheckpoint: crashRecoveryCheckpoint?.find(
 +          ({ chainId }) => chainId === chain.id,
 +        )?.checkpoint,
++        // Multichain writes per-chain checkpoints (same-chain fast path), but pass the lookup for a uniform
++        // seam — deriveFinalityFloor only queries it when a checkpoint is foreign (never in this ordering).
++        getSafeCrashRecoveryBlock: syncStore.getSafeCrashRecoveryBlock,
        });
        const childAddresses = await getChildAddresses({
          filters: eventCallbacks.map(({ filter }) => filter),
 diff --git a/packages/core/src/runtime/omnichain.ts b/packages/core/src/runtime/omnichain.ts
-index a7fd553..bd69655 100644
+index a7fd553..fbaa23e 100644
 --- a/packages/core/src/runtime/omnichain.ts
 +++ b/packages/core/src/runtime/omnichain.ts
-@@ -175,6 +175,10 @@ export async function runOmnichain({
+@@ -175,6 +175,13 @@ export async function runOmnichain({
          finalizedBlock:
            indexingBuild.finalizedBlocks[indexingBuild.chains.indexOf(chain)]!,
          cachedIntervals,
@@ -260,6 +276,9 @@ index a7fd553..bd69655 100644
 +        crashRecoveryCheckpoint: crashRecoveryCheckpoint?.find(
 +          ({ chainId }) => chainId === chain.id,
 +        )?.checkpoint,
++        // Omnichain writes the omnichain checkpoint to every chain's row, so this chain's row can encode a
++        // FOREIGN chain's block; the floor timestamp-maps it to a local block (see deriveFinalityFloor).
++        getSafeCrashRecoveryBlock: syncStore.getSafeCrashRecoveryBlock,
        });
        const childAddresses = await getChildAddresses({
          filters: eventCallbacks.map(({ filter }) => filter),

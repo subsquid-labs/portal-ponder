@@ -13,12 +13,14 @@ import {
   buildPortalLogRequests,
   checkpointBlockNumber,
   clampFinalizedToPortalHead,
+  deriveFinalityFloor,
   discoverChildAddresses,
   getPortalRealtimeEventGenerator,
   isPortalRealtime,
   lightToLightBlock,
   portalFinalizedHead,
   resolveRedeliveryTimeoutMs,
+  type SafeCrashRecoveryBlockLookup,
   toRealtimeSyncEvent,
   uniqueFactories,
 } from './portal-realtime-wire.js';
@@ -608,11 +610,11 @@ test('checkpointBlockNumber: decodes the block number out of a persisted checkpo
   expect(checkpointBlockNumber(undefined, 1)).toBeUndefined();
 });
 
-test("checkpointBlockNumber: a FOREIGN-chain checkpoint yields NO floor — omnichain finalize writes the omnichain checkpoint verbatim to every chain's row, so its block height is another chain's", () => {
+test("checkpointBlockNumber: refuses a FOREIGN-chain checkpoint's block number (the same-chain fast path only) — its height is another chain's, meaningless locally", () => {
   // finalizeOmnichain updates PONDER_CHECKPOINT with no per-chain where clause: chain 1's row can carry
-  // a checkpoint encoding chain 8453's block height. Used as chain 1's floor it either disables the
-  // Portal-head clamp (foreign height above the local RPC finalized → the stream-mode stale-head FATAL,
-  // a crash-loop) or silently under-protects (foreign height below the local safe point).
+  // a checkpoint encoding chain 8453's block height. As a floor its block NUMBER is wrong in both
+  // directions, so this helper (the same-chain fast path) refuses it; deriveFinalityFloor then maps the
+  // FOREIGN checkpoint's TIMESTAMP to a local block instead (see the deriveFinalityFloor tests below).
   const foreign = encodeCheckpoint({
     ...ZERO_CHECKPOINT,
     blockTimestamp: 1_700_000_000n,
@@ -620,7 +622,156 @@ test("checkpointBlockNumber: a FOREIGN-chain checkpoint yields NO floor — omni
     blockNumber: 99_999_999n, // a Base-scale height, nonsense on an Ethereum-scale chain
   });
   expect(checkpointBlockNumber(foreign, 1)).toBeUndefined();
-  expect(checkpointBlockNumber(foreign, 8_453)).toBe(99_999_999); // same chain → still a valid floor
+  expect(checkpointBlockNumber(foreign, 8_453)).toBe(99_999_999); // same chain → its own block, valid
+});
+
+// ─────────────────────────────── deriveFinalityFloor ───────────────────────────────
+
+// A getSafeCrashRecoveryBlock lookup that records its args and returns the block whose timestamp is the
+// GREATEST that is STRICTLY BELOW the requested timestamp — the exact `timestamp < :ts` semantics of
+// upstream's sync-store query (SELECT number,timestamp FROM blocks WHERE chainId=? AND timestamp<? ORDER
+// BY number DESC LIMIT 1). `blocks` is an ascending-by-number list of {number, timestamp} for the chain.
+const recordingLookup = (blocks: { number: bigint; timestamp: bigint }[]) => {
+  const calls: { chainId: number; timestamp: number }[] = [];
+  const lookup: SafeCrashRecoveryBlockLookup = async ({
+    chainId,
+    timestamp,
+  }) => {
+    calls.push({ chainId, timestamp });
+    let match: { number: bigint; timestamp: bigint } | undefined;
+    for (const block of blocks) {
+      if (block.timestamp < BigInt(timestamp)) {
+        match = block; // ascending list → last match is the highest block below the timestamp
+      }
+    }
+
+    return match;
+  };
+
+  return { lookup, calls };
+};
+
+test('deriveFinalityFloor: SAME-CHAIN checkpoint uses its own block number directly (fast path) — never queries the store', async () => {
+  const checkpoint = encodeCheckpoint({
+    ...ZERO_CHECKPOINT,
+    blockTimestamp: 1_700_000_000n,
+    chainId: 1n,
+    blockNumber: 12_345n,
+  });
+  const { lookup, calls } = recordingLookup([
+    { number: 999_999n, timestamp: 1_699_000_000n },
+  ]);
+  const floor = await deriveFinalityFloor({
+    checkpoint,
+    chainId: 1,
+    getSafeCrashRecoveryBlock: lookup,
+  });
+  expect(floor).toBe(12_345); // the checkpoint's own block, verbatim
+  expect(calls.length).toBe(0); // same-chain → no timestamp mapping, the store is never touched
+});
+
+test('deriveFinalityFloor: undefined checkpoint → undefined floor (no checkpoint persisted yet)', async () => {
+  const { lookup, calls } = recordingLookup([]);
+  const floor = await deriveFinalityFloor({
+    checkpoint: undefined,
+    chainId: 1,
+    getSafeCrashRecoveryBlock: lookup,
+  });
+  expect(floor).toBeUndefined();
+  expect(calls.length).toBe(0);
+});
+
+test('deriveFinalityFloor: a FOREIGN checkpoint is TIMESTAMP-MAPPED to the local chain’s highest block at/below that timestamp — the floor is a LOCAL block, not the foreign height (issue #57)', async () => {
+  // finalizeOmnichain wrote chain 8453's checkpoint (timestamp 1_700_000_500, block 99_999_999) into
+  // chain 1's row. The foreign block number is meaningless locally; the TIMESTAMP maps to chain 1's
+  // highest block finalized at/below it. This mirrors upstream getSafeCrashRecoveryBlock verbatim.
+  const foreign = encodeCheckpoint({
+    ...ZERO_CHECKPOINT,
+    blockTimestamp: 1_700_000_500n,
+    chainId: 8_453n,
+    blockNumber: 99_999_999n,
+  });
+  // chain 1 local blocks: 900@…000, 950@…400 (below the checkpoint ts), 1000@…600 (ABOVE it, must NOT map)
+  const { lookup, calls } = recordingLookup([
+    { number: 900n, timestamp: 1_700_000_000n },
+    { number: 950n, timestamp: 1_700_000_400n },
+    { number: 1_000n, timestamp: 1_700_000_600n },
+  ]);
+  const floor = await deriveFinalityFloor({
+    checkpoint: foreign,
+    chainId: 1,
+    getSafeCrashRecoveryBlock: lookup,
+  });
+  expect(floor).toBe(950); // highest LOCAL block with timestamp < 1_700_000_500 — NOT 99_999_999, NOT 1000
+  expect(calls).toEqual([{ chainId: 1, timestamp: 1_700_000_500 }]); // queried with the LOCAL chainId + foreign ts
+});
+
+test('deriveFinalityFloor: FOREIGN checkpoint but NO local block at/below the timestamp → undefined floor (pre-#55 behavior — first-ever run / older-than-every-block checkpoint; strictly safe)', async () => {
+  const foreign = encodeCheckpoint({
+    ...ZERO_CHECKPOINT,
+    blockTimestamp: 1_700_000_500n,
+    chainId: 8_453n,
+    blockNumber: 99_999_999n,
+  });
+  // every local block is ABOVE the checkpoint timestamp (or the table is empty) → the store returns none
+  const { lookup, calls } = recordingLookup([
+    { number: 1_000n, timestamp: 1_700_000_600n },
+  ]);
+  const floor = await deriveFinalityFloor({
+    checkpoint: foreign,
+    chainId: 1,
+    getSafeCrashRecoveryBlock: lookup,
+  });
+  expect(floor).toBeUndefined(); // no mappable local block → no floor → pre-#55 pass-through (never worse)
+  expect(calls).toEqual([{ chainId: 1, timestamp: 1_700_000_500 }]);
+});
+
+test('deriveFinalityFloor: FOREIGN checkpoint with NO store lookup supplied → undefined floor (the cutover sites derive their floor from same-run state, not a checkpoint)', async () => {
+  const foreign = encodeCheckpoint({
+    ...ZERO_CHECKPOINT,
+    blockTimestamp: 1_700_000_500n,
+    chainId: 8_453n,
+    blockNumber: 99_999_999n,
+  });
+  const floor = await deriveFinalityFloor({ checkpoint: foreign, chainId: 1 });
+  expect(floor).toBeUndefined(); // cannot map without a store → pre-#55 behavior (same as the old guard)
+});
+
+test('deriveFinalityFloor → clampFinalizedToPortalHead: the timestamp-mapped floor actually CLAMPS the stream-mode boundary UP — a lagging replica must not re-stream already-finalized blocks after an omnichain restart (issue #57)', async () => {
+  // End-to-end: an omnichain restart where chain 1's row carries chain 8453's checkpoint. The foreign
+  // checkpoint maps to chain 1's local block 950; a lagging replica reports head 900; the derived floor
+  // must clamp the boundary UP to 950, exactly as #55's same-chain floor does. RPC finalized is 1000.
+  process.env.PORTAL_REALTIME = 'stream';
+  const foreign = encodeCheckpoint({
+    ...ZERO_CHECKPOINT,
+    blockTimestamp: 1_700_000_500n,
+    chainId: 8_453n,
+    blockNumber: 99_999_999n,
+  });
+  const { lookup } = recordingLookup([
+    { number: 900n, timestamp: 1_700_000_000n },
+    { number: 950n, timestamp: 1_700_000_400n },
+  ]);
+  const floor = await deriveFinalityFloor({
+    checkpoint: foreign,
+    chainId: 1,
+    getSafeCrashRecoveryBlock: lookup,
+  });
+  expect(floor).toBe(950);
+
+  const fetchImpl = (async () => ({
+    json: async () => ({ number: 900 }), // lagging replica
+  })) as any;
+  const { rpc, calls } = recordingRpc('0x3b6'); // 950
+  const out = await clampFinalizedToPortalHead({
+    chain: { portal: 'http://p', name: 'c' } as any,
+    rpc,
+    finalizedBlock: rpcFinalized1000,
+    floor,
+    fetchImpl,
+  });
+  expect(calls[0]!.params[0]).toBe('0x3b6'); // boundary fetched at the MAPPED floor (950), not the lagging 900
+  expect(hexToNumber(out.number)).toBe(950);
 });
 
 // ─────────────────────────────── end-to-end generator ───────────────────────────────
