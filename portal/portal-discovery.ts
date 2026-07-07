@@ -85,6 +85,11 @@ export type PendingFlush = [Factory, Map<Address, number>][];
 export interface Discovery {
   /** Set the discovery floor (factory-start block). The shell clamps DOWNWARD (C4) before calling. */
   setFloor(floorBlock: number): void;
+  /**
+   * #50 / INV-3: adopt durable factory-interval coverage as the initial watermark. Virgin-state
+   * only; never below the floor.
+   */
+  seed(throughBlock: number): void;
   /** Grid reset: forget floor + watermark (dense-source chunk cap). Pending children stay queued. */
   reset(): void;
   /** Ensure discovery is complete through `needTo` (awaited before a data fetch). */
@@ -263,6 +268,14 @@ export function createDiscovery(deps: DiscoveryDeps): Discovery {
   return {
     setFloor: (floorBlock: number) => {
       floor = floorBlock;
+    },
+    seed: (throughBlock: number) => {
+      if (floor < 0) return;
+      if (through !== -1 || confirmed !== -1) return;
+      if (throughBlock < floor) return;
+
+      through = throughBlock;
+      confirmed = throughBlock;
     },
     // pendingChildren survives a grid reset: re-discovery re-finds known children at prev === bn (not
     // re-queued), and still-unflushed children flush with their owning interval.

@@ -8,6 +8,7 @@
  * executes them. Keeping it pure makes the tiling/coverage guarantees (INV-2 support, INV-13)
  * unit-testable in isolation.
  */
+import type { Interval } from '@/utils/interval.js';
 
 /** The chunk index a block falls in. */
 export const idxOf = (blockNumber: number, chunkBlocks: number): number =>
@@ -27,6 +28,25 @@ export const chunkRange = (
   Math.max(idx * chunkBlocks, backfillStart),
   Math.min(idx * chunkBlocks + chunkBlocks - 1, end),
 ];
+
+/**
+ * #50: the quantum-bounded fetch window. Always covers `need` when given; low edge trimmed to
+ * the requesting interval (the durable frontier); span is at least min(quantum, available).
+ */
+export const fetchBounds = (
+  gridFrom: number,
+  desiredTo: number,
+  need: Interval | undefined,
+  quantum: number,
+): [number, number] => {
+  const from = need === undefined ? gridFrom : Math.max(gridFrom, need[0]);
+  const to = Math.min(
+    desiredTo,
+    Math.max(need === undefined ? 0 : need[1], from + quantum - 1),
+  );
+
+  return [from, to];
+};
 
 /**
  * Scale the base chunk width by the chain's block density. High-block-rate chains (Arbitrum

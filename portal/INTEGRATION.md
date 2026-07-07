@@ -30,6 +30,8 @@ Within an interval the two methods split the work:
 
 Ponder feeds intervals that are small relative to a full history. A Portal request, on the other hand, is latency-bound per call but has very large parallel bandwidth, so serving one small interval per request would waste it. The fork instead fetches **large aligned chunks** and serves every interval from an in-memory cache keyed by chunk index. A chunk covers `PORTAL_CHUNK_BLOCKS` blocks (default 500,000), and the fork scales that up by the chain's block density: it multiplies the base width by a density factor of `head ÷ 25,000,000` (that divisor is a fixed mainnet-scale reference height, so a ~25M-block chain gets 1×), then caps the resulting chunk at 25M blocks. The two 25M figures are distinct — one is the density divisor, the other the maximum chunk width — and only coincidentally share a value. So a high-block-rate chain like Arbitrum takes proportionally fewer round-trips rather than 19× as many 500k chunks. The Portal charges by data touched, not by block width, so wider chunks cut round-trips at no extra cost. Set `PORTAL_CHUNK_FIXED` to disable density scaling. Trace and block-interval sources return much denser data and are capped to `PORTAL_TRACE_CHUNK_BLOCKS` (default 2,000) so a single chunk can't buffer a busy contract's entire trace set.
 
+On a fresh process the first fetches slow-start instead of immediately streaming an entire chunk. `PORTAL_WARMUP_BLOCKS` (default 25,000) is the initial fetch/discovery quantum; each successful stream doubles it until it reaches the effective chunk width, after which the request pattern is the same as the legacy full-chunk path. Interval-serving fetches also trim the low edge to the requested interval, so a resumed process does not re-stream the already-committed prefix of a large chunk before its first durable commit. Set `PORTAL_WARMUP_BLOCKS=0` to disable this warmup path and restore the legacy fetch shape.
+
 Chunks are also **prefetched**: as an interval finishes, the fork issues the next chunks concurrently (up to `PORTAL_READAHEAD` deep, default 6) so the Portal's per-request latency overlaps with indexing instead of serializing in front of it. How far read-ahead actually runs is bounded by the shared memory budget below, not by a fixed count. Chunks behind the current interval are evicted as it advances.
 
 ## The backfill → realtime handoff
@@ -66,6 +68,8 @@ A factory source (an EVault factory that emits thousands of child vaults, say) h
 
 - Discovery is a wide scan of the factory's creation event over `[deploy, head]`, pinned to the factory's real deploy block rather than block 0. The Portal serializes a single stream in block order, so the scan is split into `PORTAL_DISCOVERY_WINDOWS` (default 8) disjoint windows issued concurrently; each window additionally fans out across `PORTAL_BUFFER_SIZE` (default 100) chunk workers on the Portal side, at no extra cost.
 - A data chunk only fetches once discovery has completed *through its own block range*. Data chunks may be fetched out of order, but no child event is ever missed, because the child set is known to be complete up to each chunk's blocks before that chunk streams.
+
+During warmup, discovery advances in the same bounded quantum as the data fetch instead of scanning to the whole backfill end before the first interval can commit. On resume, the discovery watermark is seeded from the durable interval frontier (`interval[0] - 1`) after the factory floor is pinned; this is sound because Ponder only resumes past factory intervals whose children were persisted and preloaded. Virgin-state guards prevent the seed from overriding live or failed discovery state.
 
 Discovered child addresses are pushed into the Portal's server-side log filter (`address` + `topic0..3`), so a factory with thousands of children still resolves to a small number of streamed reads rather than per-address lookups.
 
@@ -119,6 +123,7 @@ The defaults run well without configuration. These environment variables overrid
 | `PORTAL_MAX_ROWS_IN_MEM` | `250000` | Shared buffered-row budget for read-ahead (~1.5–2.5 GB). Raise with a larger `--max-old-space-size`. |
 | `PORTAL_READAHEAD` | `6` | Max chunks prefetched ahead of the indexer, per chain. |
 | `PORTAL_CHUNK_BLOCKS` | `500000` | Base block range per request; scaled by block density unless fixed. |
+| `PORTAL_WARMUP_BLOCKS` | `25000` | Initial fetch/discovery quantum for process warmup; doubles after successful streams until it reaches the chunk width. Set `0` to disable warmup and use the legacy full-chunk fetch shape. |
 | `PORTAL_CHUNK_FIXED` | unset | Set to any value to disable density-based chunk scaling. |
 | `PORTAL_TRACE_CHUNK_BLOCKS` | `2000` | Chunk width when a chain has trace or block-interval sources (denser data). |
 | `PORTAL_REQUEST_TIMEOUT` | `30000` | Per-request connect/headers deadline (ms) for a Portal stream POST. A request that stalls before its headers arrive is aborted and retried, so a hung gateway can't leak its shared-controller slot. |
@@ -154,7 +159,7 @@ Both runs indexed the identical 28.4M events; only the configuration differed. T
 
 ## Where the code lives
 
-The `portal/` layer is a functional core behind an imperative shell, organised around explicit invariants (see [`INVARIANTS.md`](INVARIANTS.md), INV-1…INV-18):
+The `portal/` layer is a functional core behind an imperative shell, organised around explicit invariants (see [`INVARIANTS.md`](INVARIANTS.md), INV-1…INV-19):
 
 - `portal.ts` — orchestration shell (`createPortalHistoricalSync`): chunk cache, stash, delegation, seam methods.
 - `portal-config.ts` / `portal-errors.ts` / `portal-invariant.ts` — frozen config (INV-14), typed errors, runtime checks.

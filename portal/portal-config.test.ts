@@ -6,6 +6,7 @@ import { loadPortalConfig, PortalConfigError } from './portal-config.js';
 test('INV-14: empty env → documented defaults, frozen', () => {
   const c = loadPortalConfig({});
   expect(c.chunkBlocks).toBe(500_000);
+  expect(c.warmupBlocks).toBe(25_000);
   expect(c.readahead).toBe(6);
   expect(c.bufferSize).toBe(100);
   expect(c.discoveryWindows).toBe(8);
@@ -28,6 +29,7 @@ test('INV-14: empty env → documented defaults, frozen', () => {
 test('INV-14: valid overrides parse', () => {
   const c = loadPortalConfig({
     PORTAL_CHUNK_BLOCKS: '250000',
+    PORTAL_WARMUP_BLOCKS: '1000',
     PORTAL_READAHEAD: '3',
     PORTAL_API_KEY: 'k',
     PORTAL_FINALIZED_HEAD: '123',
@@ -40,6 +42,7 @@ test('INV-14: valid overrides parse', () => {
     PORTAL_IDLE_TIMEOUT: '45000',
   });
   expect(c.chunkBlocks).toBe(250_000);
+  expect(c.warmupBlocks).toBe(1_000);
   expect(c.readahead).toBe(3);
   expect(c.apiKey).toBe('k');
   expect(c.finalizedHead).toBe(123);
@@ -75,6 +78,10 @@ test('INV-14: garbage numeric → loud PortalConfigError (not silent NaN)', () =
 
 test('INV-14: out-of-range → loud', () => {
   expect(() => loadPortalConfig({ PORTAL_CHUNK_BLOCKS: '0' })).toThrow(/range/);
+  expect(() => loadPortalConfig({ PORTAL_WARMUP_BLOCKS: '-1' })).toThrow(
+    /range/,
+  );
+  expect(loadPortalConfig({ PORTAL_WARMUP_BLOCKS: '0' }).warmupBlocks).toBe(0);
   expect(() => loadPortalConfig({ PORTAL_MIN_CONCURRENCY: '0' })).toThrow(
     /range/,
   );

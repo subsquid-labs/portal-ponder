@@ -159,7 +159,11 @@ beforeEach(async () => {
 afterEach(() => {
   server.close();
   delete process.env.PORTAL_CHUNK_FIXED;
+  delete process.env.PORTAL_CHUNK_BLOCKS;
   delete process.env.PORTAL_FINALIZED_HEAD;
+  delete process.env.PORTAL_WARMUP_BLOCKS;
+  delete process.env.PORTAL_READAHEAD;
+  delete process.env.PORTAL_CHECKS;
 });
 
 test("regression: matched log's transaction is fetched, transformed, and inserted (event.transaction defined)", async () => {
@@ -2060,6 +2064,415 @@ const mkFactorySync = (
     childAddresses: childAddresses as any,
     eventCallbacks: [{ filter }],
   } as any);
+
+// ── issue #50: bounded time-to-first-durable-commit warmup ───────────────────────────────────────
+const cx50PlainFilter = (toBlock = 100_000): any => ({
+  type: 'log',
+  chainId: 1,
+  sourceId: 'cx50',
+  address: VAULT,
+  topic0: DEPOSIT_TOPIC0,
+  topic1: null,
+  topic2: null,
+  topic3: null,
+  fromBlock: 0,
+  toBlock,
+  hasTransactionReceipt: false,
+  include: [],
+});
+
+const cx50SyncStore = (insertedLogs?: any[]): any => ({
+  insertLogs: (x: any) => {
+    insertedLogs?.push(...x.logs);
+  },
+  insertBlocks: () => {},
+  insertTransactions: () => {},
+  insertTransactionReceipts: () => {},
+  insertTraces: () => {},
+  insertChildAddresses: async () => {},
+  getChildAddresses: async () => new Map(),
+});
+
+const cx50Sync = (
+  port: number,
+  filter: any,
+  childAddresses: Map<string, Map<string, number>> = new Map(),
+) =>
+  createPortalHistoricalSync({
+    common: {
+      logger: { debug() {}, info() {}, warn() {}, error() {}, trace() {} },
+    } as any,
+    chain: {
+      id: 1,
+      name: 'mainnet',
+      portal: `http://localhost:${port}`,
+    } as any,
+    childAddresses: childAddresses as any,
+    eventCallbacks: [{ filter }],
+  } as any);
+
+const cx50HasTopic = (q: any, topic0: string): boolean =>
+  ((q.logs ?? []) as any[]).some((s) =>
+    (s.topic0 ?? []).map((x: string) => x.toLowerCase()).includes(topic0),
+  );
+
+const cx50HasAddress = (q: any, address: string): boolean =>
+  ((q.logs ?? []) as any[]).some((s) =>
+    (s.address ?? [])
+      .map((x: string) => x.toLowerCase())
+      .includes(address.toLowerCase()),
+  );
+
+const cx50ChildEventBlock = (num: number, child: string) => ({
+  header: mkFactoryHeader(num),
+  logs: [
+    {
+      address: child,
+      topics: [DEPOSIT_TOPIC0],
+      data: '0x',
+      transactionHash: '0x' + '50'.repeat(32),
+      transactionIndex: 0,
+      logIndex: 0,
+    },
+  ],
+  transactions: [
+    {
+      transactionIndex: 0,
+      hash: '0x' + '50'.repeat(32),
+      from: '0x' + 'ee'.repeat(20),
+      to: child,
+      input: '0x',
+      value: '0x0',
+      nonce: 0,
+      gas: '0x1',
+      gasPrice: '0x1',
+      type: 0,
+    },
+  ],
+});
+
+test('#50 T1: first data fetch is warmup-bounded', async () => {
+  process.env.PORTAL_WARMUP_BLOCKS = '1000';
+  process.env.PORTAL_READAHEAD = '0';
+  const dataRequests: any[] = [];
+  const srv = http.createServer((req, res) => {
+    let body = '';
+    req.on('data', (c) => {
+      body += c;
+    });
+    req.on('end', () => {
+      if (req.url?.includes('finalized-head')) {
+        res.writeHead(200, { 'content-type': 'application/json' });
+        res.end(JSON.stringify({ number: 2_000_000_000 }));
+        return;
+      }
+      const q = body ? JSON.parse(body) : {};
+      dataRequests.push(q);
+      anchorRes(res, q.toBlock ?? 1e12);
+    });
+  });
+  const p: number = await new Promise((r) =>
+    srv.listen(0, () => r((srv.address() as AddressInfo).port)),
+  );
+  try {
+    const filter = cx50PlainFilter();
+    const sync = cx50Sync(p, filter);
+    const interval: [number, number] = [0, 25];
+    await sync.syncBlockRangeData({
+      interval,
+      requiredIntervals: [{ interval, filter }],
+      requiredFactoryIntervals: [],
+      syncStore: cx50SyncStore(),
+    });
+
+    expect(dataRequests.length).toBeGreaterThan(0);
+    expect(Math.max(...dataRequests.map((q) => q.toBlock))).toBeLessThanOrEqual(
+      1_025,
+    );
+  } finally {
+    srv.close();
+  }
+});
+
+test('#50 T2: first factory discovery scan is warmup-bounded', async () => {
+  process.env.PORTAL_WARMUP_BLOCKS = '1000';
+  process.env.PORTAL_READAHEAD = '0';
+  const discoveryRequests: any[] = [];
+  const srv = http.createServer((req, res) => {
+    let body = '';
+    req.on('data', (c) => {
+      body += c;
+    });
+    req.on('end', () => {
+      const q = body ? JSON.parse(body) : {};
+      if (cx50HasTopic(q, PROXY_CREATED_TOPIC0.toLowerCase())) {
+        discoveryRequests.push(q);
+      }
+      anchorRes(res, q.toBlock ?? 1e12);
+    });
+  });
+  const p: number = await new Promise((r) =>
+    srv.listen(0, () => r((srv.address() as AddressInfo).port)),
+  );
+  try {
+    const factory = mkFactory();
+    const filter = { ...mkFactoryFilter(factory), toBlock: 100_000 };
+    const sync = cx50Sync(p, filter, new Map([[factory.id, new Map()]]));
+    const interval: [number, number] = [0, 25];
+    await sync.syncBlockRangeData({
+      interval,
+      requiredIntervals: [{ interval, filter }],
+      requiredFactoryIntervals: [{ interval, factory }],
+      syncStore: cx50SyncStore(),
+    });
+
+    expect(discoveryRequests.length).toBeGreaterThan(0);
+    expect(
+      Math.max(...discoveryRequests.map((q) => q.toBlock)),
+    ).toBeLessThanOrEqual(1_000);
+  } finally {
+    srv.close();
+  }
+});
+
+test('#50 T3: resumed factory discovery is seeded at the durable frontier', async () => {
+  process.env.PORTAL_WARMUP_BLOCKS = '1000';
+  process.env.PORTAL_READAHEAD = '0';
+  const CHILD_PRELOADED = '0x' + '5c'.repeat(20);
+  const EVENT_AT = 50_010;
+  const discoveryRequests: any[] = [];
+  const inserted: any[] = [];
+  const srv = http.createServer((req, res) => {
+    let body = '';
+    req.on('data', (c) => {
+      body += c;
+    });
+    req.on('end', () => {
+      const q = body ? JSON.parse(body) : {};
+      const from = q.fromBlock ?? 0;
+      const to = q.toBlock ?? 1e12;
+      if (cx50HasTopic(q, PROXY_CREATED_TOPIC0.toLowerCase())) {
+        discoveryRequests.push(q);
+      }
+      const out =
+        from <= EVENT_AT &&
+        to >= EVENT_AT &&
+        cx50HasTopic(q, DEPOSIT_TOPIC0.toLowerCase()) &&
+        cx50HasAddress(q, CHILD_PRELOADED)
+          ? [cx50ChildEventBlock(EVENT_AT, CHILD_PRELOADED)]
+          : [];
+      anchorRes(res, to, out);
+    });
+  });
+  const p: number = await new Promise((r) =>
+    srv.listen(0, () => r((srv.address() as AddressInfo).port)),
+  );
+  try {
+    const factory = mkFactory();
+    const filter = { ...mkFactoryFilter(factory), toBlock: 100_000 };
+    const childAddresses = new Map([
+      [factory.id, new Map([[CHILD_PRELOADED, 100]])],
+    ]);
+    const sync = cx50Sync(p, filter, childAddresses as any);
+    const interval: [number, number] = [50_001, 50_025];
+    await sync.syncBlockRangeData({
+      interval,
+      requiredIntervals: [{ interval, filter }],
+      requiredFactoryIntervals: [{ interval, factory }],
+      syncStore: cx50SyncStore(inserted),
+    });
+
+    expect(discoveryRequests.length).toBeGreaterThan(0);
+    expect(discoveryRequests.some((q) => (q.fromBlock ?? 0) <= 50_000)).toBe(
+      false,
+    );
+    expect(
+      inserted.some(
+        (l) => (l.address as string).toLowerCase() === CHILD_PRELOADED,
+      ),
+    ).toBe(true);
+  } finally {
+    srv.close();
+  }
+});
+
+test('#50 T4: resumed data fetch trims the low edge to the interval', async () => {
+  process.env.PORTAL_WARMUP_BLOCKS = '1000';
+  process.env.PORTAL_READAHEAD = '0';
+  const CHILD_PRELOADED = '0x' + '6c'.repeat(20);
+  const dataRequests: any[] = [];
+  const srv = http.createServer((req, res) => {
+    let body = '';
+    req.on('data', (c) => {
+      body += c;
+    });
+    req.on('end', () => {
+      const q = body ? JSON.parse(body) : {};
+      const isData = cx50HasTopic(q, DEPOSIT_TOPIC0.toLowerCase());
+      if (isData) dataRequests.push(q);
+      anchorRes(res, q.toBlock ?? 1e12);
+    });
+  });
+  const p: number = await new Promise((r) =>
+    srv.listen(0, () => r((srv.address() as AddressInfo).port)),
+  );
+  try {
+    const factory = mkFactory();
+    const filter = { ...mkFactoryFilter(factory), toBlock: 100_000 };
+    const childAddresses = new Map([
+      [factory.id, new Map([[CHILD_PRELOADED, 100]])],
+    ]);
+    const sync = cx50Sync(p, filter, childAddresses as any);
+    const interval: [number, number] = [50_001, 50_025];
+    await sync.syncBlockRangeData({
+      interval,
+      requiredIntervals: [{ interval, filter }],
+      requiredFactoryIntervals: [{ interval, factory }],
+      syncStore: cx50SyncStore(),
+    });
+
+    expect(dataRequests.length).toBeGreaterThan(0);
+    expect(
+      Math.min(...dataRequests.map((q) => q.fromBlock)),
+    ).toBeGreaterThanOrEqual(50_001);
+  } finally {
+    srv.close();
+  }
+});
+
+test('#50 T5: an interval inside the warmed window is served as a need-based cache hit', async () => {
+  process.env.PORTAL_WARMUP_BLOCKS = '1000';
+  process.env.PORTAL_READAHEAD = '0';
+  const dataRequests: any[] = [];
+  const srv = http.createServer((req, res) => {
+    let body = '';
+    req.on('data', (c) => {
+      body += c;
+    });
+    req.on('end', () => {
+      const q = body ? JSON.parse(body) : {};
+      dataRequests.push(q);
+      anchorRes(res, q.toBlock ?? 1e12);
+    });
+  });
+  const p: number = await new Promise((r) =>
+    srv.listen(0, () => r((srv.address() as AddressInfo).port)),
+  );
+  try {
+    const filter = cx50PlainFilter();
+    const sync = cx50Sync(p, filter);
+    const first: [number, number] = [0, 25];
+    await sync.syncBlockRangeData({
+      interval: first,
+      requiredIntervals: [{ interval: first, filter }],
+      requiredFactoryIntervals: [],
+      syncStore: cx50SyncStore(),
+    });
+    expect(Math.max(...dataRequests.map((q) => q.toBlock))).toBeLessThanOrEqual(
+      1_025,
+    );
+    const afterFirst = dataRequests.length;
+
+    const second: [number, number] = [26, 50];
+    await sync.syncBlockRangeData({
+      interval: second,
+      requiredIntervals: [{ interval: second, filter }],
+      requiredFactoryIntervals: [],
+      syncStore: cx50SyncStore(),
+    });
+
+    expect(dataRequests).toHaveLength(afterFirst);
+  } finally {
+    srv.close();
+  }
+});
+
+test('#50 T6: INV-19 trips before serving below a trimmed cache low edge', async () => {
+  process.env.PORTAL_WARMUP_BLOCKS = '1000';
+  process.env.PORTAL_READAHEAD = '0';
+  process.env.PORTAL_CHECKS = 'strict';
+  const srv = http.createServer((req, res) => {
+    let body = '';
+    req.on('data', (c) => {
+      body += c;
+    });
+    req.on('end', () => {
+      const q = body ? JSON.parse(body) : {};
+      anchorRes(res, q.toBlock ?? 1e12);
+    });
+  });
+  const p: number = await new Promise((r) =>
+    srv.listen(0, () => r((srv.address() as AddressInfo).port)),
+  );
+  try {
+    const filter = cx50PlainFilter();
+    const sync = cx50Sync(p, filter);
+    const first: [number, number] = [1000, 1024];
+    await sync.syncBlockRangeData({
+      interval: first,
+      requiredIntervals: [{ interval: first, filter }],
+      requiredFactoryIntervals: [],
+      syncStore: cx50SyncStore(),
+    });
+
+    const second: [number, number] = [0, 24];
+    await expect(
+      sync.syncBlockRangeData({
+        interval: second,
+        requiredIntervals: [{ interval: second, filter }],
+        requiredFactoryIntervals: [],
+        syncStore: cx50SyncStore(),
+      }),
+    ).rejects.toThrow(/INV-19/);
+  } finally {
+    srv.close();
+  }
+});
+
+test('#50 convergence: fetch quantum doubles until the chunk is covered', async () => {
+  process.env.PORTAL_CHUNK_BLOCKS = '8000';
+  process.env.PORTAL_WARMUP_BLOCKS = '1000';
+  process.env.PORTAL_READAHEAD = '0';
+  const dataRequests: any[] = [];
+  const srv = http.createServer((req, res) => {
+    let body = '';
+    req.on('data', (c) => {
+      body += c;
+    });
+    req.on('end', () => {
+      const q = body ? JSON.parse(body) : {};
+      dataRequests.push(q);
+      anchorRes(res, q.toBlock ?? 1e12);
+    });
+  });
+  const p: number = await new Promise((r) =>
+    srv.listen(0, () => r((srv.address() as AddressInfo).port)),
+  );
+  try {
+    const filter = cx50PlainFilter(7_999);
+    const sync = cx50Sync(p, filter);
+    const intervals: [number, number][] = [
+      [0, 25],
+      [1000, 1025],
+      [3000, 3025],
+      [7000, 7025],
+    ];
+    for (const interval of intervals) {
+      await sync.syncBlockRangeData({
+        interval,
+        requiredIntervals: [{ interval, filter }],
+        requiredFactoryIntervals: [],
+        syncStore: cx50SyncStore(),
+      });
+    }
+
+    expect(dataRequests.map((q) => q.toBlock - q.fromBlock + 1)).toEqual([
+      1000, 2000, 4000, 1000,
+    ]);
+  } finally {
+    srv.close();
+  }
+});
 
 test('regression: discovered factory children are persisted via insertChildAddresses in the SAME syncBlockRangeData call', async () => {
   const srv = factoryPortalServer();
