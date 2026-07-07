@@ -149,6 +149,45 @@ test('#50 T9: discovery quantum doubles geometrically and converges without per-
   );
 });
 
+test('#50 T10: reset() restores the discovery slow-start — the first post-reset scan is warmup-bounded again', async () => {
+  const WARMUP = 1000;
+  const requests: [number, number][] = [];
+  const client: PortalClient = {
+    finalizedHead: async () => undefined,
+    finalizedHeadRetry: async () => undefined,
+    async *stream(_q, from, to) {
+      requests.push([from, to]);
+      yield [];
+    },
+  };
+  const d = createDiscovery({
+    client,
+    childAddresses: new Map([['f', new Map()]]),
+    factories: [factory()],
+    discoveryWindows: 1,
+    warmupBlocks: WARMUP,
+    stats: createStats(),
+  });
+  const opts = { chunkBlocks: 50_000, endHint: 10_000_000 };
+
+  // Grow the quantum well past its warmup seed across several successful scans.
+  d.setFloor(0);
+  for (let i = 0; i < 3; i++) {
+    await d.ensure(Math.max(0, d.through() + 1), opts);
+  }
+  expect(requests.at(-1)![1] - requests.at(-1)![0] + 1).toBeGreaterThan(WARMUP);
+
+  // A grid reset must forget the grown quantum, not just the watermark: the next scan slow-starts afresh.
+  d.reset();
+  const afterReset = requests.length;
+  d.setFloor(0);
+  await d.ensure(1, opts);
+
+  const first = requests[afterReset]!;
+  expect(first[0]).toBe(0);
+  expect(first[1] - first[0] + 1).toBe(WARMUP);
+});
+
 // ── #21 §1: the factory-range gate — scanWindow delegates matching to ponder's isLogFactoryMatched ──
 // INV-15's interval-scoped flush (`takePendingInRange`) is lossless ONLY because scanWindow rejects any
 // creation log below `factory.fromBlock`: a sub-floor child that leaked into `childAddresses` + the

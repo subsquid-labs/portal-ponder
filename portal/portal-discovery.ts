@@ -137,8 +137,10 @@ export function createDiscovery(deps: DiscoveryDeps): Discovery {
   let floor = -1;
   let through = -1; // optimistic watermark (dedup + `from`)
   let confirmed = -1; // last SUCCESSFUL watermark (rollback target)
-  let discoveryQuantum =
+  // The discovery slow-start seed: warmup-bounded, or unbounded (legacy full-range) when warmup is off.
+  const initialDiscoveryQuantum =
     warmupBlocks === 0 ? Number.POSITIVE_INFINITY : warmupBlocks;
+  let discoveryQuantum = initialDiscoveryQuantum;
   let inflight: Promise<void> = Promise.resolve();
   // Bumped by reset(). Each scan captures the generation at plan time; a scan that resolves OR rejects
   // after a reset changed the generation must NOT touch the watermark. Otherwise a stale success advances
@@ -299,6 +301,7 @@ export function createDiscovery(deps: DiscoveryDeps): Discovery {
       floor = -1;
       through = -1;
       confirmed = -1;
+      discoveryQuantum = initialDiscoveryQuantum; // forget the grown quantum too: a reset slow-starts afresh
       inflight = Promise.resolve();
       generation++; // invalidate any in-flight scan stamped with the previous generation (issue #9)
     },
