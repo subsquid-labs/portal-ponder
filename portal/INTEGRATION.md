@@ -19,7 +19,7 @@ const historicalSync = params.chain.portal
   : createHistoricalSync(params);        // stock RPC path, unchanged
 ```
 
-The Portal sync receives the **same** `params` as the stock sync — `chain`, `rpc`, `childAddresses`, and the chain's full `eventCallbacks` (its complete filter set). No handler or config shape is translated; the fork reads Ponder's own filters and factory map directly. Because it satisfies Ponder's existing interface rather than a public API, the integration is a small fork generated from upstream Ponder plus a short wiring patch (`portal/wiring/`), and it tracks Ponder closely — the seam is identical across the tested range (0.15.17–0.16.6, see [`versions.json`](../versions.json)).
+The Portal sync receives the **same** `params` as the stock sync — `chain`, `rpc`, `childAddresses`, and the chain's full `eventCallbacks` (its complete filter set). No handler or config shape is translated; the fork reads Ponder's own filters and factory map directly. Because it satisfies Ponder's existing interface rather than a public API, the integration is a small fork generated from upstream Ponder plus a short wiring patch (`portal/wiring/`), and it tracks Ponder closely — the seam is identical across the tested range (0.15.17–0.16.7, see [`versions.json`](../versions.json)).
 
 Within an interval the two methods split the work:
 
@@ -138,9 +138,9 @@ Raising concurrency does not help when indexing is the bottleneck, which for a f
 
 Once the Portal serves the backfill, a resync is bound by **indexing**, not fetching. Ponder indexes on a single thread, so the practical ceiling for a large multichain app is that one thread.
 
-The reference run — all 15 Portal-supported Euler V2 chains, full history, **28,405,932 events**, byte-verified complete against the Portal — finished in **44m 55s** on an indexer capped at 16 GB and 2 cores (peak 9.2 GB, about one core of real work). Postgres was a separate, throughput-tuned database, and the backfill ran against a **dedicated (provisioned) Portal** — the free public `portal.sqd.dev` is shared and rate-limited under load, so it backfills slower. Over the same run the Portal's fetch queue drained to idle with the buffer full while a single event loop worked through the tail: the Portal outruns the indexer, and more RAM or cores sit idle.
+The reference run — all 15 Portal-supported Euler V2 chains, full history, **28,405,932 events**, byte-verified complete against the Portal — finished in **51m 47s** on an indexer capped at 16 GB and 2 cores (the reproducible deterministic run, 2026-07-06; about one core of real work). Postgres was a separate, throughput-tuned database, and the backfill ran against a **dedicated (provisioned) Portal** — the free public `portal.sqd.dev` is shared and rate-limited under load, so it backfills slower. Over the same run the Portal's fetch queue drained to idle with the buffer full while a single event loop worked through the tail: the Portal outruns the indexer, and more RAM or cores sit idle.
 
-The A/B in that run is the useful lesson. A modest, well-tuned configuration beat an over-provisioned one:
+The 2026-07-01 A/B is the useful lesson. A modest, well-tuned configuration beat an over-provisioned one (both predate the reproducible 51m 47s run above):
 
 | | Over-provisioned | Modest — recommended |
 |---|---|---|
@@ -154,7 +154,7 @@ Both runs indexed the identical 28.4M events; only the configuration differed. T
 
 ## Where the code lives
 
-The `portal/` layer is a functional core behind an imperative shell, organised around explicit invariants (see [`INVARIANTS.md`](INVARIANTS.md), INV-1…INV-15):
+The `portal/` layer is a functional core behind an imperative shell, organised around explicit invariants (see [`INVARIANTS.md`](INVARIANTS.md), INV-1…INV-18):
 
 - `portal.ts` — orchestration shell (`createPortalHistoricalSync`): chunk cache, stash, delegation, seam methods.
 - `portal-config.ts` / `portal-errors.ts` / `portal-invariant.ts` — frozen config (INV-14), typed errors, runtime checks.

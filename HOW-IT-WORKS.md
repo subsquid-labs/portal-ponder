@@ -17,7 +17,7 @@ JSON-RPC was built to serve transactions and single-object reads, not to scan hi
 - One `eth_getBlockByNumber` **per matched block**, to attach the header and timestamp every event needs.
 - More per-item calls for transactions, receipts, and traces when a source needs them.
 
-Each call is a round-trip that re-establishes almost no context, and the total scales with the data. A single protocol's Ethereum history — 457,931 matched events, deploy to head — lands events across a large fraction of that many distinct blocks, so the header fetches _alone_ are hundreds of thousands of serial requests. A **factory** makes it worse in a way that matters: you can't query a child contract's logs until you've discovered the child, and children are created continuously across history, so you first scan for addresses and then fan out per-child log queries. This is the shape RPC forces — many small requests, in sequence, mostly waiting.
+Each call is a round-trip that re-establishes almost no context, and the total scales with the data. A single protocol's Ethereum history — 885,893 matched events across ~252,000 distinct blocks, deploy to head (the committed `F-full` cell, VALIDATION.md §3.2) — needs a header fetch for each of those blocks, so the header fetches _alone_ are hundreds of thousands of serial requests. A **factory** makes it worse in a way that matters: you can't query a child contract's logs until you've discovered the child, and children are created continuously across history, so you first scan for addresses and then fan out per-child log queries. This is the shape RPC forces — many small requests, in sequence, mostly waiting.
 
 ## The Portal model: a range as one streamed pass
 
@@ -49,7 +49,7 @@ const historicalSync = params.chain.portal
 
 The Portal sync receives the **same** `params` as the stock one — `chain`, `rpc`, `childAddresses`, and the chain's full `eventCallbacks` — and reads Ponder's own filters and factory maps directly. Nothing about handlers, schema, or config is translated.
 
-**Why a fork and not a plugin.** That seam is an internal interface, not part of Ponder's public API; there is no extension point to register an alternative historical sync. So the integration is a fork — but a deliberately thin one. The repository carries only the `portal/` layer plus a short wiring patch ([`portal/wiring/`](portal/wiring/)) that adds a `portal?` field to the chain config, threads it through `buildConfig` and the internal `Chain` type, and swaps the one constructor above. The published package is *generated* from upstream Ponder plus that patch, so it tracks Ponder closely — the seam has held identical across 0.15.17–0.16.6 ([`versions.json`](versions.json)).
+**Why a fork and not a plugin.** That seam is an internal interface, not part of Ponder's public API; there is no extension point to register an alternative historical sync. So the integration is a fork — but a deliberately thin one. The repository carries only the `portal/` layer plus a short wiring patch ([`portal/wiring/`](portal/wiring/)) that adds a `portal?` field to the chain config, threads it through `buildConfig` and the internal `Chain` type, and swaps the one constructor above. The published package is *generated* from upstream Ponder plus that patch, so it tracks Ponder closely — the seam has held identical across 0.15.17–0.16.7 ([`versions.json`](versions.json)).
 
 ## Making the network disappear: chunking and read-ahead
 
@@ -103,15 +103,15 @@ One honest caveat sets the ceiling: handlers that read on-chain state with `read
 
 ## Why it's fast — and where the ceiling honestly is
 
-Put the two layers together — a range as one streamed pass, fanned out in parallel and prefetched ahead of indexing — and a single-chain backfill of full Ethereum Euler history (deploy to head, ~5M blocks, 457,931 events) finishes in **4m 45s** on a dedicated Portal, against about **38 minutes** over stock RPC: roughly **8×**.
+Put the two layers together — a range as one streamed pass, fanned out in parallel and prefetched ahead of indexing — and a single-chain backfill of full Ethereum Euler history (`[20529207, 25436954]`, 4,907,748 blocks, 885,893 logs) finishes in **1819 s (~30 min)** on the Portal, against **6543 s (~109 min)** over stock RPC on the same host: **3.6×** (the committed `F-full` cell, VALIDATION.md §3.2). Both legs are fetch-bound, and the sync-store rows come out byte-identical.
 
-The more interesting result is what happens next, because it names the real ceiling. **Once fetch is fast, the bottleneck moves entirely into Ponder, which indexes on a single thread.** The reference run makes this concrete: one app indexing all 15 Portal-supported Euler V2 chains, full history, **28,405,932 events**, in **44m 55s**, on an indexer capped at 16 GB and 2 cores (peak 9.2 GB, about one core of real work). During that run:
+The more interesting result is what happens next, because it names the real ceiling. **Once fetch is fast, the bottleneck moves entirely into Ponder, which indexes on a single thread.** The reference run makes this concrete: one app indexing all 15 Portal-supported Euler V2 chains, full history, **28,405,932 events**, in **51m 47s** (the reproducible deterministic run, 2026-07-06), on an indexer capped at 16 GB and 2 cores (about one core of real work). During that run:
 
 - The node process pinned **one core at ~92%** while roughly **93 of the box's 96 cores sat idle**.
 - **Postgres was faster than the indexer** — its backends idled in `ClientRead`, waiting for data.
 - **The Portal outran both** — its fetch queue drained to idle with the buffer full, while a single event loop worked through the tail.
 
-So more RAM or cores don't buy wall-time here; they're already idle. A counter-intuitive A/B from the same run drives it home: a **modest, well-tuned** configuration (16 GB / 2 cores, fixed chunks, tuned Postgres) beat an **over-provisioned** one (32 GB heap, default Postgres) on the *identical* 28.4M events — 44m 55s vs 67m 10s, 9.2 GB vs 19.0 GB peak, 10,513 vs 7,024 events/s. The lesson: don't over-provision the indexer; right-size it and tune the database. The lever for going faster is **sharding chains across processes** — running the event-heaviest chain on its own to add an indexing thread — not a bigger machine. Full write-up: [`harness/euler-multichain/REPORT.md`](harness/euler-multichain/REPORT.md).
+So more RAM or cores don't buy wall-time here; they're already idle. A counter-intuitive A/B from the earlier 2026-07-01 runs drives it home: a **modest, well-tuned** configuration (16 GB / 2 cores, fixed chunks, tuned Postgres) beat an **over-provisioned** one (32 GB heap, default Postgres) on the *identical* 28.4M events — 44m 55s vs 67m 10s, 9.2 GB vs 19.0 GB peak, 10,513 vs 7,024 events/s. The lesson: don't over-provision the indexer; right-size it and tune the database. The lever for going faster is **sharding chains across processes** — running the event-heaviest chain on its own to add an indexing thread — not a bigger machine. Full write-up: [`harness/euler-multichain/REPORT.md`](harness/euler-multichain/REPORT.md).
 
 ## Correctness: byte-identical to `eth_getLogs`
 
@@ -121,7 +121,7 @@ This is proven, not asserted. The differential harness ([`harness/diff`](harness
 
 ## Where the code lives
 
-The layer is organised around explicit, provable **invariants** — a functional core (pure, property-tested) behind an imperative shell. See [`portal/INVARIANTS.md`](portal/INVARIANTS.md) for the catalog (INV-1…INV-15) that ties doc ⟷ code ⟷ test together.
+The layer is organised around explicit, provable **invariants** — a functional core (pure, property-tested) behind an imperative shell. See [`portal/INVARIANTS.md`](portal/INVARIANTS.md) for the catalog (INV-1…INV-18) that ties doc ⟷ code ⟷ test together.
 
 | File | What it holds |
 |---|---|
