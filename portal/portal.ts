@@ -38,6 +38,7 @@ import {
 import {
   chunkRange,
   evictionPlan,
+  fetchBounds,
   idxOf,
   readAheadPlan,
   scaleChunkBlocks,
@@ -124,6 +125,7 @@ export const createPortalHistoricalSync = (
     childAddresses: args.childAddresses,
     factories: spec.factories,
     discoveryWindows: cfg.discoveryWindows,
+    warmupBlocks: cfg.warmupBlocks,
     stats,
   });
 
@@ -137,6 +139,7 @@ export const createPortalHistoricalSync = (
   type CacheEntry = {
     promise: Promise<ChunkData>;
     specId: symbol;
+    coveredFrom: number;
     coveredTo: number;
     token: RowToken;
   };
@@ -173,6 +176,10 @@ export const createPortalHistoricalSync = (
   const MAX_PENDING_FLUSHES = 32;
   const pendingFlushes = new Map<string, PendingFlush>();
   let chunkBlocks = cfg.chunkBlocks;
+  // #50: per-process fetch quantum. Starts small for bounded time-to-first-commit, then converges
+  // to chunkBlocks; PORTAL_WARMUP_BLOCKS=0 disables the warmup and restores the legacy fetch shape.
+  let fetchQuantum =
+    cfg.warmupBlocks === 0 ? Number.POSITIVE_INFINITY : cfg.warmupBlocks;
   let chunkSizeP: Promise<void> | undefined;
   let portalHead: number | undefined = cfg.finalizedHead;
   let startTime = 0;
@@ -210,6 +217,12 @@ export const createPortalHistoricalSync = (
       spec.backfillEnd ?? Number.POSITIVE_INFINITY,
       portalHead ?? Number.POSITIVE_INFINITY,
     );
+
+  const growFetchQuantum = (): void => {
+    if (cfg.warmupBlocks === 0) return;
+
+    fetchQuantum = Math.min(fetchQuantum * 2, chunkBlocks);
+  };
 
   // FIX 2: snap `discFloorBlock` to the current grid and install it as the discovery floor. Idempotent —
   // called at construction and again on every syncBlockRangeData before any fetch (chunkBlocks may have
@@ -408,8 +421,8 @@ export const createPortalHistoricalSync = (
     }
   };
 
-  // ── one data chunk: gated on discovery-through-this-chunk, then the source streams ──────────────────
-  const dataChunk = (idx: number): Promise<ChunkData> => {
+  // ── one data chunk: gated on discovery-through-the-fetch-window, then the source streams ────────────
+  const dataChunk = (idx: number, need?: Interval): Promise<ChunkData> => {
     // Desired coverage RIGHT NOW: grid end clamped to the live backfill end / Portal head. For a fully
     // finalized (or bounded-backfill) chunk this equals the grid end and never grows; for the FRONTIER
     // chunk it grows as the Portal head advances — which drives the extend path below (INV-13).
@@ -429,11 +442,45 @@ export const createPortalHistoricalSync = (
       'data request targets past the Portal finalized head',
       () => ({ idx, desiredTo, portalHead }),
     );
-    // Discovery scans as far as the backfill will need in one pass; head-clamped (FIX 1) via dataEnd().
+
+    const activeNeed = cfg.warmupBlocks === 0 ? undefined : need;
+    const needTo = activeNeed === undefined ? desiredTo : activeNeed[1];
+    const quantum = Math.min(fetchQuantum, chunkBlocks);
     const de = dataEnd();
+    const legacyEndHint = Number.isFinite(de) ? de : desiredTo;
     const ensureOpts = {
       chunkBlocks,
-      endHint: Number.isFinite(de) ? de : desiredTo,
+      endHint: legacyEndHint,
+    };
+    const discoveryEnsureTarget = (target: number): number => {
+      if (spec.factories.length === 0) return target;
+
+      const { floor, through } = discovery.snapshot();
+      if (target < floor && through < floor) return floor;
+
+      return target;
+    };
+    const discoveryReady = (target: number): boolean => {
+      if (spec.factories.length === 0) return true;
+
+      const { floor, through } = discovery.snapshot();
+      return target < floor || through >= target;
+    };
+    const assertNeedCoveredFrom = (cached: CacheEntry): void => {
+      if (activeNeed === undefined) return;
+
+      invariant(
+        'INV-19',
+        activeNeed[0] >= cached.coveredFrom,
+        'cache entry starts after requested interval',
+        () => ({
+          idx,
+          needFrom: activeNeed[0],
+          needTo,
+          coveredFrom: cached.coveredFrom,
+          coveredTo: cached.coveredTo,
+        }),
+      );
     };
 
     const cached = dataCache.get(idx);
@@ -444,7 +491,39 @@ export const createPortalHistoricalSync = (
         'cached chunk built under a different fetch-spec',
         () => ({ idx }),
       );
-      if (desiredTo <= cached.coveredTo) {
+      if (
+        activeNeed !== undefined &&
+        activeNeed[0] < cached.coveredFrom &&
+        activeNeed[1] >= cached.coveredFrom
+      ) {
+        stats.extends++;
+        const prefixFrom = activeNeed[0];
+        const prefixTo = cached.coveredFrom - 1;
+        const prev = cached.promise;
+        cached.coveredFrom = prefixFrom; // optimistic low-water so concurrent callers dedup onto this repair
+        const repaired = (async (): Promise<ChunkData> => {
+          const cd = await prev;
+          const ensureTo = discoveryEnsureTarget(prefixTo);
+          await discovery.ensure(ensureTo, ensureOpts);
+          invariant(
+            'INV-3',
+            discoveryReady(prefixTo),
+            'chunk prefix repair under a stale discovery watermark',
+            () => ({ idx, ...discovery.snapshot(), desiredTo, prefixTo }),
+          );
+          await runStreams(cd, prefixFrom, prefixTo, cached.token);
+          growFetchQuantum();
+
+          return cd;
+        })();
+        cached.promise = repaired;
+        repaired.catch(() => {
+          if (dataCache.get(idx) === cached) dataCache.delete(idx);
+          freeToken(cached.token);
+        });
+      }
+      assertNeedCoveredFrom(cached);
+      if (needTo <= cached.coveredTo) {
         stats.cacheHits++;
         return cached.promise;
       }
@@ -454,21 +533,27 @@ export const createPortalHistoricalSync = (
       // gap — EXTEND instead: stream ONLY the newly finalized tail (coveredTo, desiredTo] and merge.
       stats.extends++;
       const extendFrom = cached.coveredTo + 1;
-      cached.coveredTo = desiredTo; // optimistic high-water so concurrent callers don't double-extend
+      const extendTo = Math.min(
+        desiredTo,
+        Math.max(needTo, cached.coveredTo + quantum),
+      );
+      cached.coveredTo = extendTo; // optimistic high-water so concurrent callers don't double-extend
       const prev = cached.promise;
       const extended = (async (): Promise<ChunkData> => {
         const cd = await prev;
-        await discovery.ensure(desiredTo, ensureOpts); // discovery must reach the extended tail too
+        const ensureTo = discoveryEnsureTarget(extendTo);
+        await discovery.ensure(ensureTo, ensureOpts); // discovery must reach the extended tail too
         // FIX 2: the floor is pinned from the spec at construction, so a factory sync always has a floor —
         // the former `discStartIdx === undefined` escape (which silently disabled this check on the very
         // chunks that fetched before requiredFactoryIntervals arrived) is gone.
         invariant(
           'INV-3',
-          spec.factories.length === 0 || discovery.through() >= desiredTo,
+          discoveryReady(extendTo),
           'chunk extend under a stale discovery watermark',
-          () => ({ idx, through: discovery.through(), desiredTo }),
+          () => ({ idx, ...discovery.snapshot(), desiredTo, extendTo }),
         );
-        await runStreams(cd, extendFrom, desiredTo, cached.token);
+        await runStreams(cd, extendFrom, extendTo, cached.token);
+        growFetchQuantum();
 
         return cd;
       })();
@@ -484,25 +569,29 @@ export const createPortalHistoricalSync = (
     }
 
     const token: RowToken = { rows: 0, freed: false };
+    const [from, to] = fetchBounds(gridFrom, desiredTo, activeNeed, quantum);
     const p = (async (): Promise<ChunkData> => {
-      await discovery.ensure(desiredTo, ensureOpts); // children ≤ this chunk are known (INV-3)
+      const ensureTo = discoveryEnsureTarget(to);
+      await discovery.ensure(ensureTo, ensureOpts); // children ≤ this fetch window are known (INV-3)
       // FIX 2: floor pinned from the spec at construction ⇒ no `discStartIdx === undefined` escape (see extend).
       invariant(
         'INV-3',
-        spec.factories.length === 0 || discovery.through() >= desiredTo,
+        discoveryReady(to),
         'data fetch under a stale discovery watermark',
-        () => ({ idx, through: discovery.through(), desiredTo }),
+        () => ({ idx, ...discovery.snapshot(), desiredTo, to }),
       );
       stats.dataChunks++;
       const cd = createChunkData();
-      await runStreams(cd, gridFrom, desiredTo, token);
+      await runStreams(cd, from, to, token);
+      growFetchQuantum();
 
       return cd;
     })();
     const entry: CacheEntry = {
       promise: p,
       specId: spec.id,
-      coveredTo: desiredTo,
+      coveredFrom: from,
+      coveredTo: to,
       token,
     };
     dataCache.set(idx, entry);
@@ -744,12 +833,22 @@ export const createPortalHistoricalSync = (
       // configs (see the construction-time note). Applied on EVERY call so an early spanning-chunk fetch
       // never runs without discovery.
       pinDiscoveryFloor();
+      if (cfg.warmupBlocks !== 0 && spec.factories.length > 0) {
+        discovery.seed(interval[0] - 1);
+      }
 
       const startIdx = idxOf(interval[0], chunkBlocks);
       const endIdx = idxOf(interval[1], chunkBlocks);
       const idxs: number[] = [];
       for (let i = startIdx; i <= endIdx; i++) idxs.push(i);
-      const data = await Promise.all(idxs.map(dataChunk));
+      const data = await Promise.all(
+        idxs.map((i) =>
+          dataChunk(i, [
+            Math.max(interval[0], i * chunkBlocks),
+            Math.min(interval[1], i * chunkBlocks + chunkBlocks - 1),
+          ]),
+        ),
+      );
 
       // INV-15: persist the children discovered within THIS interval's range NOW — dataChunk awaited
       // discovery through this interval (shared with the RPC-delegation path, see persistPendingChildren).

@@ -3,6 +3,7 @@ import { expect, test } from 'vitest';
 import {
   chunkRange,
   evictionPlan,
+  fetchBounds,
   idxOf,
   readAheadPlan,
   scaleChunkBlocks,
@@ -22,6 +23,82 @@ test('idxOf / chunkRange: grid-aligned span', () => {
   // clamped to the backfill window on both sides
   expect(chunkRange(0, 500_000, 100, INF)).toEqual([100, 499_999]);
   expect(chunkRange(1, 500_000, 0, 600_000)).toEqual([500_000, 600_000]);
+});
+
+test('#50 fetchBounds: bounded window is ordered and never exceeds desiredTo', () => {
+  fc.assert(
+    fc.property(
+      fc.integer({ min: 0, max: 5_000_000 }),
+      fc.integer({ min: 0, max: 5_000_000 }),
+      fc.integer({ min: 1, max: 1_000_000 }),
+      (gridFrom, span, quantum) => {
+        const desiredTo = gridFrom + span;
+        const [from, to] = fetchBounds(gridFrom, desiredTo, undefined, quantum);
+        expect(from).toBeLessThanOrEqual(to);
+        expect(to).toBeLessThanOrEqual(desiredTo);
+      },
+    ),
+  );
+});
+
+test('#50 fetchBounds: covers the clamped need interval', () => {
+  fc.assert(
+    fc.property(
+      fc.integer({ min: 0, max: 5_000_000 }),
+      fc.integer({ min: 0, max: 5_000_000 }),
+      fc.integer({ min: 1, max: 1_000_000 }),
+      (gridFrom, span, quantum) => {
+        const desiredTo = gridFrom + span;
+        const needLo = gridFrom + Math.floor(span / 3);
+        const needHi = gridFrom + Math.floor((span * 2) / 3);
+        const [from, to] = fetchBounds(
+          gridFrom,
+          desiredTo,
+          [needLo, needHi],
+          quantum,
+        );
+        expect(from).toBeLessThanOrEqual(needLo);
+        expect(to).toBeGreaterThanOrEqual(needHi);
+        expect(to).toBeLessThanOrEqual(desiredTo);
+      },
+    ),
+  );
+});
+
+test('#50 fetchBounds: no need fetches at least the quantum-sized prefix when available', () => {
+  fc.assert(
+    fc.property(
+      fc.integer({ min: 0, max: 5_000_000 }),
+      fc.integer({ min: 0, max: 5_000_000 }),
+      fc.integer({ min: 1, max: 1_000_000 }),
+      (gridFrom, span, quantum) => {
+        const desiredTo = gridFrom + span;
+        const [from, to] = fetchBounds(gridFrom, desiredTo, undefined, quantum);
+        expect(to - from + 1).toBe(Math.min(quantum, span + 1));
+      },
+    ),
+  );
+});
+
+test('#50 fetchBounds: infinite quantum preserves the legacy full-chunk identity', () => {
+  fc.assert(
+    fc.property(
+      fc.integer({ min: 0, max: 5_000_000 }),
+      fc.integer({ min: 0, max: 5_000_000 }),
+      fc.integer({ min: 0, max: 5_000_000 }),
+      (gridFrom, span, needPad) => {
+        const desiredTo = gridFrom + span;
+        const needLo = Math.max(0, gridFrom - needPad);
+        const [from, to] = fetchBounds(
+          gridFrom,
+          desiredTo,
+          [needLo, desiredTo],
+          Number.POSITIVE_INFINITY,
+        );
+        expect([from, to]).toEqual([gridFrom, desiredTo]);
+      },
+    ),
+  );
 });
 
 test('INV-2 support: chunks of an interval cover it, are disjoint, and are grid-aligned', () => {

@@ -88,6 +88,7 @@ test('planDiscovery: null when no floor or already covered; reaches endHint', ()
       chunkBlocks: 50,
       endHint: 100,
       discoveryWindows: 8,
+      quantum: Number.POSITIVE_INFINITY,
     }),
   ).toBeNull();
   expect(
@@ -95,15 +96,96 @@ test('planDiscovery: null when no floor or already covered; reaches endHint', ()
       chunkBlocks: 50,
       endHint: 100,
       discoveryWindows: 8,
+      quantum: Number.POSITIVE_INFINITY,
     }),
   ).toBeNull();
   const p = planDiscovery({ floor: 0, through: -1 }, 100, {
     chunkBlocks: 50,
     endHint: 500,
     discoveryWindows: 8,
+    quantum: Number.POSITIVE_INFINITY,
   });
   expect(p!.from).toBe(0);
   expect(p!.to).toBe(500); // reaches the endHint in one pass
+});
+
+test('#50 T9: discovery quantum doubles geometrically and converges without per-chunk laziness', async () => {
+  const WARMUP = 1000;
+  const END = 999_999;
+  const requests: [number, number][] = [];
+  const client: PortalClient = {
+    finalizedHead: async () => undefined,
+    finalizedHeadRetry: async () => undefined,
+    async *stream(_q, from, to) {
+      requests.push([from, to]);
+      yield [];
+    },
+  };
+  const d = createDiscovery({
+    client,
+    childAddresses: new Map([['f', new Map()]]),
+    factories: [factory()],
+    discoveryWindows: 1,
+    warmupBlocks: WARMUP,
+    stats: createStats(),
+  });
+  d.setFloor(0);
+
+  while (d.through() < END) {
+    await d.ensure(Math.max(0, d.through() + 1), {
+      chunkBlocks: 50_000,
+      endHint: END,
+    });
+  }
+
+  const spans = requests.map(([from, to]) => to - from + 1);
+  expect(spans[0]).toBe(WARMUP);
+  for (let i = 1; i < spans.length; i++) {
+    expect(requests[i]![0]).toBe(requests[i - 1]![1] + 1);
+    if (requests[i]![1] !== END) expect(spans[i]).toBe(spans[i - 1]! * 2);
+  }
+  expect(requests.length).toBeLessThanOrEqual(
+    Math.ceil(Math.log2((END + 1) / WARMUP)) + 2,
+  );
+});
+
+test('#50 T10: reset() restores the discovery slow-start — the first post-reset scan is warmup-bounded again', async () => {
+  const WARMUP = 1000;
+  const requests: [number, number][] = [];
+  const client: PortalClient = {
+    finalizedHead: async () => undefined,
+    finalizedHeadRetry: async () => undefined,
+    async *stream(_q, from, to) {
+      requests.push([from, to]);
+      yield [];
+    },
+  };
+  const d = createDiscovery({
+    client,
+    childAddresses: new Map([['f', new Map()]]),
+    factories: [factory()],
+    discoveryWindows: 1,
+    warmupBlocks: WARMUP,
+    stats: createStats(),
+  });
+  const opts = { chunkBlocks: 50_000, endHint: 10_000_000 };
+
+  // Grow the quantum well past its warmup seed across several successful scans.
+  d.setFloor(0);
+  for (let i = 0; i < 3; i++) {
+    await d.ensure(Math.max(0, d.through() + 1), opts);
+  }
+  expect(requests.at(-1)![1] - requests.at(-1)![0] + 1).toBeGreaterThan(WARMUP);
+
+  // A grid reset must forget the grown quantum, not just the watermark: the next scan slow-starts afresh.
+  d.reset();
+  const afterReset = requests.length;
+  d.setFloor(0);
+  await d.ensure(1, opts);
+
+  const first = requests[afterReset]!;
+  expect(first[0]).toBe(0);
+  expect(first[1] - first[0] + 1).toBe(WARMUP);
 });
 
 // ── #21 §1: the factory-range gate — scanWindow delegates matching to ponder's isLogFactoryMatched ──
@@ -131,6 +213,7 @@ test('#21 §1: a creation log BELOW factory.fromBlock is neither recorded nor qu
     childAddresses,
     factories: [gated],
     discoveryWindows: 4,
+    warmupBlocks: 0,
     stats: createStats(),
   });
   d.setFloor(0); // BELOW fromBlock on purpose: scanWindow streams block 50 to the matcher
@@ -166,6 +249,7 @@ test('INV-4: shuffled/overlapping discovery windows converge to the same earlies
     childAddresses,
     factories: [factory()],
     discoveryWindows: 4,
+    warmupBlocks: 0,
     stats: createStats(),
   });
   d.setFloor(0);
@@ -188,6 +272,7 @@ test('INV-3/G2: a failed scan rolls the watermark back; a later ensure recovers'
     childAddresses,
     factories: [factory()],
     discoveryWindows: 2,
+    warmupBlocks: 0,
     stats: createStats(),
   });
   d.setFloor(0);
@@ -219,6 +304,7 @@ test('INV-3: dedup — a second ensure within the watermark returns without re-s
     childAddresses: new Map([['f', new Map()]]),
     factories: [factory()],
     discoveryWindows: 1,
+    warmupBlocks: 0,
     stats: createStats(),
   });
   d.setFloor(0);
@@ -234,6 +320,7 @@ test('no factories → ensure is a no-op', async () => {
     childAddresses: new Map(),
     factories: [],
     discoveryWindows: 4,
+    warmupBlocks: 0,
     stats: createStats(),
   });
   d.setFloor(0);
@@ -275,6 +362,7 @@ test('INV-3/G2 interleaving: a successor extension rejects when its in-flight pr
     childAddresses,
     factories: [factory()],
     discoveryWindows: 1,
+    warmupBlocks: 0,
     stats: createStats(),
   });
   d.setFloor(0);
@@ -327,6 +415,7 @@ test('reset() during an in-flight scan: the stale completion never advances the 
     childAddresses,
     factories: [factory()],
     discoveryWindows: 1,
+    warmupBlocks: 0,
     stats: createStats(),
   });
   d.setFloor(0);
@@ -398,6 +487,7 @@ test('INV-3 property: random ensures + injected window failures → coverage bel
           childAddresses,
           factories: [factory()],
           discoveryWindows: 2,
+          warmupBlocks: 0,
           stats: createStats(),
         });
         d.setFloor(0);
@@ -508,6 +598,7 @@ test('DISCOVERY PATH: a mid-range 204 in a factory scan fails closed (rolls the 
     childAddresses,
     factories: [factory()],
     discoveryWindows: 1, // one window [0,500] so the mid-range 204 is deterministic
+    warmupBlocks: 0,
     stats: createStats(),
   });
   d.setFloor(0);
@@ -540,6 +631,7 @@ test('DISCOVERY PATH: a mid-range 204 in a factory scan fails closed (rolls the 
     childAddresses,
     factories: [factory()],
     discoveryWindows: 1,
+    warmupBlocks: 0,
     stats: createStats(),
   });
   d2.setFloor(0);

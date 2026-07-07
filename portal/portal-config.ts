@@ -7,8 +7,8 @@
  * result is frozen and injectable — tests build a config directly rather than mutating
  * `process.env`.
  *
- * Every knob below is documented API (names, defaults, semantics are frozen). One new knob:
- * `PORTAL_CHECKS=off|on|strict` (default `on`) selects the runtime invariant mode.
+ * Every knob below is documented API (names, defaults, semantics are frozen). `PORTAL_CHECKS=off|on|strict`
+ * (default `on`) selects the runtime invariant mode.
  *
  * Pure: the only impurity is the default argument `process.env`; pass an explicit `env` for
  * deterministic tests.
@@ -28,6 +28,8 @@ export type PortalConfig = Readonly<{
   apiKey: string | undefined;
   /** PORTAL_CHUNK_BLOCKS (500000) — base width of an aligned data chunk, pre density scaling. */
   chunkBlocks: number;
+  /** PORTAL_WARMUP_BLOCKS (25000) — initial fetch quantum; 0 disables warmup and restores legacy fetch shape. */
+  warmupBlocks: number;
   /** PORTAL_READAHEAD (6) — max parallel prefetch depth beyond the in-service chunk. */
   readahead: number;
   /** PORTAL_BUFFER_SIZE (100) — Portal `buffer_size` fan-out per stream request. */
@@ -111,6 +113,7 @@ export function loadPortalConfig(env: Env = process.env): PortalConfig {
   const cfg: PortalConfig = {
     apiKey: env.PORTAL_API_KEY || undefined,
     chunkBlocks: intKnob(env, 'PORTAL_CHUNK_BLOCKS', 500_000, { min: 1 }),
+    warmupBlocks: intKnob(env, 'PORTAL_WARMUP_BLOCKS', 25_000, { min: 0 }),
     readahead: intKnob(env, 'PORTAL_READAHEAD', 6, { min: 0 }),
     bufferSize: intKnob(env, 'PORTAL_BUFFER_SIZE', 100, { min: 1 }),
     discoveryWindows: intKnob(env, 'PORTAL_DISCOVERY_WINDOWS', 8, { min: 1 }),

@@ -56,12 +56,13 @@ export type DiscoveryPlanOpts = {
   chunkBlocks: number;
   endHint: number;
   discoveryWindows: number;
+  quantum: number;
 };
 
 /**
  * The next extension to scan to reach `needTo`, or null when already covered / no floor. Pure. `from`
- * continues past the current watermark; `to` reaches as far as the backfill will need (`endHint` —
- * usually the whole span at once) so discovery typically completes in one pass.
+ * continues past the current watermark; `to` reaches as far as the backfill will need, bounded by the
+ * discovery-plane slow-start quantum and never below `needTo`.
  */
 export function planDiscovery(
   state: DiscoveryState,
@@ -71,7 +72,10 @@ export function planDiscovery(
   if (state.floor < 0) return null;
   if (needTo <= state.through) return null;
   const from = state.through < 0 ? state.floor : state.through + 1;
-  const to = Math.max(needTo, opts.endHint);
+  const to = Math.max(
+    needTo,
+    Math.min(opts.endHint, state.through + opts.quantum),
+  );
   return {
     from,
     to,
@@ -85,6 +89,11 @@ export type PendingFlush = [Factory, Map<Address, number>][];
 export interface Discovery {
   /** Set the discovery floor (factory-start block). The shell clamps DOWNWARD (C4) before calling. */
   setFloor(floorBlock: number): void;
+  /**
+   * #50 / INV-3: adopt durable factory-interval coverage as the initial watermark. Virgin-state
+   * only; never below the floor.
+   */
+  seed(throughBlock: number): void;
   /** Grid reset: forget floor + watermark (dense-source chunk cap). Pending children stay queued. */
   reset(): void;
   /** Ensure discovery is complete through `needTo` (awaited before a data fetch). */
@@ -112,14 +121,26 @@ export type DiscoveryDeps = {
   childAddresses: ChildAddresses;
   factories: readonly Factory[];
   discoveryWindows: number;
+  warmupBlocks: number;
   stats: PortalStats;
 };
 
 export function createDiscovery(deps: DiscoveryDeps): Discovery {
-  const { client, childAddresses, factories, discoveryWindows, stats } = deps;
+  const {
+    client,
+    childAddresses,
+    factories,
+    discoveryWindows,
+    warmupBlocks,
+    stats,
+  } = deps;
   let floor = -1;
   let through = -1; // optimistic watermark (dedup + `from`)
   let confirmed = -1; // last SUCCESSFUL watermark (rollback target)
+  // The discovery slow-start seed: warmup-bounded, or unbounded (legacy full-range) when warmup is off.
+  const initialDiscoveryQuantum =
+    warmupBlocks === 0 ? Number.POSITIVE_INFINITY : warmupBlocks;
+  let discoveryQuantum = initialDiscoveryQuantum;
   let inflight: Promise<void> = Promise.resolve();
   // Bumped by reset(). Each scan captures the generation at plan time; a scan that resolves OR rejects
   // after a reset changed the generation must NOT touch the watermark. Otherwise a stale success advances
@@ -228,6 +249,7 @@ export function createDiscovery(deps: DiscoveryDeps): Discovery {
       chunkBlocks: opts.chunkBlocks,
       endHint: opts.endHint,
       discoveryWindows,
+      quantum: discoveryQuantum,
     });
     if (plan === null) return inflight; // no floor yet OR already covered
     const { to, windows } = plan;
@@ -247,6 +269,7 @@ export function createDiscovery(deps: DiscoveryDeps): Discovery {
       if (gen !== generation) return; // a reset() invalidated this scan — never confirm over it (issue #9)
 
       confirmed = to; // INV-3: advance the confirmed watermark ONLY on success (never past a gap)
+      discoveryQuantum *= 2;
     })();
     inflight = p;
     // On failure roll the optimistic watermark back to the last good one and drop the rejected promise so
@@ -264,12 +287,21 @@ export function createDiscovery(deps: DiscoveryDeps): Discovery {
     setFloor: (floorBlock: number) => {
       floor = floorBlock;
     },
+    seed: (throughBlock: number) => {
+      if (floor < 0) return;
+      if (through !== -1 || confirmed !== -1) return;
+      if (throughBlock < floor) return;
+
+      through = throughBlock;
+      confirmed = throughBlock;
+    },
     // pendingChildren survives a grid reset: re-discovery re-finds known children at prev === bn (not
     // re-queued), and still-unflushed children flush with their owning interval.
     reset: () => {
       floor = -1;
       through = -1;
       confirmed = -1;
+      discoveryQuantum = initialDiscoveryQuantum; // forget the grown quantum too: a reset slow-starts afresh
       inflight = Promise.resolve();
       generation++; // invalidate any in-flight scan stamped with the previous generation (issue #9)
     },
