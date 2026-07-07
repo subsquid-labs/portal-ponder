@@ -52,7 +52,7 @@ class of defect. A claim is only as strong as the layer that backs it.
 
 ### Layer A — Unit + invariant tests, on every supported upstream version
 
-The Portal layer (`portal/`) is organised around **explicit, numbered invariants** (INV-1 … INV-16),
+The Portal layer (`portal/`) is organised around **explicit, numbered invariants** (INV-1 … INV-18),
 each with a stable, grep-able identity across **doc ⟷ code ⟷ test**. The catalog and its rationale
 live in [`portal/INVARIANTS.md`](portal/INVARIANTS.md); the runtime asserts them under
 `PORTAL_CHECKS` (`on` = O(1) tripwires that throw `InvariantViolation`; `strict` = additional
@@ -766,7 +766,7 @@ works, not a blemish on it.
 
 **Proven today (with reproducible evidence in this repo):**
 
-- The Portal layer's invariants (INV-1 … INV-16) hold under property-based tests **on all three
+- The Portal layer's invariants (INV-1 … INV-18) hold under property-based tests **on all three
   supported upstream Ponder versions** (`0.15.17`, `0.16.6`, `0.16.7` — the last registered by
   [#74](../../pull/74) on a seam-identity + full-suite basis, §2), and every fix is backed by a
   mutation-verified regression test.
