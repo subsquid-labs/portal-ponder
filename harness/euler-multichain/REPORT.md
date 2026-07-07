@@ -2,7 +2,7 @@
 
 **One Ponder app indexing every Portal-supported Euler V2 chain (15), full history `[deploy → finalized head]`, the complete 24-event EVault superset — streamed from the SQD Portal into Postgres.** This is the production shape of an Euler indexer and a stress test of the Portal-backed fork.
 
-Captured on a single OVH box (Ubuntu 24.04). The run is deliberately bounded to a fixed head so it's a clean, reproducible benchmark; live/realtime is a separate mode (see *Roadmap*).
+Captured on a single 96-core Linux server. The run is deliberately bounded to a fixed head so it's a clean, reproducible benchmark; live/realtime is a separate mode (see *Roadmap*).
 
 ---
 
