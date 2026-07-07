@@ -442,7 +442,7 @@ auto-shrink** attempted (the failure precedes any diff), and **zero shrink attem
 | `rand#202.2@5000` | `[27500647, 27505647]` | **FAIL-FAST (#83)** | 6 | 40 s |
 | `rand#202.3@5000` | `[31915218, 31920218]` | **FAIL-FAST (#83)** | 6 | 41 s |
 
-The verbatim error (from the run, and reproduced offline against window `rand#201.0`
+The verbatim error (from the run, and reproduced post-run against window `rand#201.0`
 `[31019460, 31021460]`):
 
 ```
