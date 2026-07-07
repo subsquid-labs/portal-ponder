@@ -162,7 +162,36 @@
       ],
       "autoShrink": { "threshold": 50000 },
       "expectedRequestEstimate": 120000,
-      "notes": "Dense base: the cell that should surface A-side ResponseBodyTooLargeError windows Portal streams through."
+      "notes": "Dense base: the cell that should surface A-side ResponseBodyTooLargeError windows Portal streams through. Blocked by #83 (the base-mainnet dataset lacks transactions.logs_bloom — receipts backfills fail fast by design); run L-base-logs instead. Windows/receipts left as the record of what ran (8/8 fail-fast, 2026-07-07)."
+    },
+    {
+      "id": "L-base-logs",
+      "app": "erc20",
+      "chain": "base",
+      "chainId": 8453,
+      "sourceTypes": ["logs"],
+      "receipts": false,
+      "windows": [
+        {
+          "strategy": "seeded-random",
+          "seed": 201,
+          "from": 24000000,
+          "to": 40000000,
+          "count": 4,
+          "size": 2000
+        },
+        {
+          "strategy": "seeded-random",
+          "seed": 202,
+          "from": 24000000,
+          "to": 40000000,
+          "count": 4,
+          "size": 5000
+        }
+      ],
+      "autoShrink": { "threshold": 50000 },
+      "expectedRequestEstimate": 100000,
+      "notes": "Logs-only variant of the receipts cell L-base, which is blocked by finding #83 (base-mainnet lacks transactions.logs_bloom). Windows are intentionally identical to L-base for comparability; receipts dropped so the backfill does not fail fast on the missing column."
     },
     {
       "id": "L-arbitrum",
@@ -191,7 +220,36 @@
       ],
       "autoShrink": { "threshold": 50000 },
       "expectedRequestEstimate": 120000,
-      "notes": "High block-rate chain: exercises the density-scaled chunking (fewer, wider chunks)."
+      "notes": "High block-rate chain: exercises the density-scaled chunking (fewer, wider chunks). Blocked by #83 for receipts (the arbitrum-one dataset lacks transactions.logs_bloom — receipts backfills fail fast by design); logs-only variant L-arbitrum-logs added."
+    },
+    {
+      "id": "L-arbitrum-logs",
+      "app": "erc20",
+      "chain": "arbitrum",
+      "chainId": 42161,
+      "sourceTypes": ["logs"],
+      "receipts": false,
+      "windows": [
+        {
+          "strategy": "seeded-random",
+          "seed": 301,
+          "from": 250000000,
+          "to": 470000000,
+          "count": 4,
+          "size": 2000
+        },
+        {
+          "strategy": "seeded-random",
+          "seed": 302,
+          "from": 250000000,
+          "to": 470000000,
+          "count": 4,
+          "size": 5000
+        }
+      ],
+      "autoShrink": { "threshold": 50000 },
+      "expectedRequestEstimate": 100000,
+      "notes": "Logs-only variant of the receipts cell L-arbitrum, which is blocked by finding #83 (arbitrum-one lacks transactions.logs_bloom). Windows are intentionally identical to L-arbitrum for comparability; receipts dropped so the backfill does not fail fast on the missing column."
     },
     {
       "id": "L-polygon",
@@ -278,7 +336,36 @@
       ],
       "autoShrink": { "threshold": 50000 },
       "expectedRequestEstimate": 120000,
-      "notes": "Stratified logs+receipts."
+      "notes": "Stratified logs+receipts. Blocked by #83 for receipts (the avalanche-mainnet dataset lacks transactions.logs_bloom — receipts backfills fail fast by design); logs-only variant L-avalanche-logs added."
+    },
+    {
+      "id": "L-avalanche-logs",
+      "app": "erc20",
+      "chain": "avalanche",
+      "chainId": 43114,
+      "sourceTypes": ["logs"],
+      "receipts": false,
+      "windows": [
+        {
+          "strategy": "seeded-random",
+          "seed": 601,
+          "from": 57000000,
+          "to": 89000000,
+          "count": 4,
+          "size": 2000
+        },
+        {
+          "strategy": "seeded-random",
+          "seed": 602,
+          "from": 57000000,
+          "to": 89000000,
+          "count": 4,
+          "size": 5000
+        }
+      ],
+      "autoShrink": { "threshold": 50000 },
+      "expectedRequestEstimate": 100000,
+      "notes": "Logs-only variant of the receipts cell L-avalanche, which is blocked by finding #83 (avalanche-mainnet lacks transactions.logs_bloom). Windows are intentionally identical to L-avalanche for comparability; receipts dropped so the backfill does not fail fast on the missing column."
     },
     {
       "id": "F-full",
