@@ -8,6 +8,7 @@ import {
 import {
   isTransientError,
   PortalHttpError,
+  PortalIncompleteRangeError,
   PortalTruncatedBodyError,
 } from './portal-errors.js';
 import type { PortalQuery } from './portal-filters.js';
@@ -46,6 +47,13 @@ const doneRes = () => ({
   headers: { get: () => null },
   body: { cancel: async () => {} },
 });
+// A stream now ends by the Portal SERVING through `to` (the in-range range-end block-header anchor),
+// not by a bare 204 — a 204 below `to` is a mid-range gap that fails closed (issue #47). `servedTo(to)`
+// is the realistic clean terminal for the retry/backoff mechanics tests: a 200 whose last block reaches
+// `to`, so `stream`'s `while (cursor <= to)` exits. It yields one range-end block, so the completed
+// stream collects `[{ header: { number: to } }]` (previously `[]` under the old 204-terminates model).
+const servedTo = (to: number) => ndjsonRes([{ header: { number: to } }]);
+const endBlock = (to: number) => [{ header: { number: to } }];
 const throttleRes = (status: number, retryAfter?: string) => ({
   status,
   ok: false,
@@ -148,9 +156,11 @@ test('5xx and 409 are treated as throttle (retried)', async () => {
     let n = 0;
     const client = mk({
       fetchImpl: (async () =>
-        n++ === 0 ? throttleRes(status) : doneRes()) as any,
+        n++ === 0 ? throttleRes(status) : servedTo(10)) as any,
     });
-    await expect(collect(client.stream(QUERY, 0, 10))).resolves.toEqual([]); // eventually done
+    await expect(collect(client.stream(QUERY, 0, 10))).resolves.toEqual(
+      endBlock(10),
+    ); // eventually served through `to`
   }
 });
 
@@ -259,7 +269,7 @@ test('dataset-start 400 clamps the cursor forward, not a crash', async () => {
       const q = JSON.parse(init.body);
       if (q.fromBlock < 1000) return badRes('dataset starts from block 1000');
       clampedFrom = q.fromBlock;
-      return doneRes();
+      return servedTo(5000);
     }) as any,
   });
   await collect(client.stream(QUERY, 0, 5000));
@@ -278,7 +288,7 @@ test('dataset-start skip is LOUD: one warn naming the skipped range, then debug 
       const q = JSON.parse(init.body);
       if (q.fromBlock < 1000) return badRes('dataset starts from block 1000');
 
-      return doneRes();
+      return servedTo(q.toBlock);
     }) as any,
     logWarn: (m: string) => warns.push(m),
     logDebug: (m: string) => debugs.push(m),
@@ -385,6 +395,68 @@ test('a persistent zero-block 200 fails loud after the retry budget — it does 
   expect(fetches).toBe(11); // initial try + 10 retries, same as any transient failure
 });
 
+// ── mid-range 204: a serving replica that lags the requested `to` must NOT record phantom coverage (issue #47) ──
+
+test('DATA PATH: a mid-range 204 (replica served [from, mid] then 204d the tail) RETRIES and delivers the tail on a fresher replica — never silently drops it (issue #47)', async () => {
+  // Load-balanced replicas answer independently. First replica serves [0, 5] then 204s the tail [6, 10]
+  // ("above MY finalized head"). Pre-fix: the 204 → 'done' terminated the stream at block 5, and the
+  // caller cached [0,10] as covered — blocks 6..10 silently lost (a permanent gap in stream mode). Post-fix:
+  // the mid-range 204 is a transient PortalIncompleteRangeError → the retry from cursor 6 lands on a fresher
+  // replica that serves [6, 10]. The full range is delivered exactly once.
+  let call = 0;
+  const froms: number[] = [];
+  const client = mk({
+    fetchImpl: (async (_u: string, init: any) => {
+      call += 1;
+      const q = JSON.parse(init.body);
+      froms.push(q.fromBlock);
+      // 1st POST [0,10]: a lagging replica serves through block 5 (its finalized head), anchoring `last=5`.
+      if (call === 1)
+        return ndjsonRes([
+          { header: { number: 0 } },
+          { header: { number: 5 } },
+        ]);
+      // 2nd POST [6,10]: this replica's head is BELOW 6 → 204 the whole tail (the mid-range gap).
+      if (call === 2) return doneRes();
+      // 3rd POST [6,10] (the retry): a fresher replica now serves the tail through `to=10`.
+      return ndjsonRes([{ header: { number: 6 } }, { header: { number: 10 } }]);
+    }) as any,
+  });
+  const out = await collect(client.stream(QUERY, 0, 10));
+  // every block delivered exactly once — the tail was NOT dropped
+  expect((out as any[]).map((b) => b.header.number)).toEqual([0, 5, 6, 10]);
+  // the tail was re-requested from the SAME cursor (6→6) after the 204, not skipped
+  expect(froms).toEqual([0, 6, 6]);
+});
+
+test('DATA PATH: a PERSISTENT mid-range 204 fails LOUD after the retry budget — it never records phantom coverage (issue #47)', async () => {
+  // If NO replica can serve the tail (every retry 204s it), the range must fail closed — a loud throw — not
+  // silently terminate short. The transient budget bounds it to the same 11 attempts as any transient error.
+  let call = 0;
+  const client = mk({
+    fetchImpl: (async (_u: string, init: any) => {
+      call += 1;
+      const q = JSON.parse(init.body);
+      // serve [0,5] once, then 204 the tail [6,10] on every attempt — a replica pool wholly behind the head
+      if (q.fromBlock === 0)
+        return ndjsonRes([
+          { header: { number: 0 } },
+          { header: { number: 5 } },
+        ]);
+      return doneRes();
+    }) as any,
+  });
+  await expect(collect(client.stream(QUERY, 0, 10))).rejects.toThrow(
+    PortalIncompleteRangeError,
+  );
+  // 1 (serve [0,5]) + initial tail try + 10 retries = 12 POSTs; the tail 204 exhausts the transient budget
+  expect(call).toBe(12);
+});
+
+test('isTransientError: a mid-range PortalIncompleteRangeError is retryable (issue #47)', () => {
+  expect(isTransientError(new PortalIncompleteRangeError(6, 10))).toBe(true);
+});
+
 test('isTransientError: PortalTruncatedBodyError and gzip-truncation shapes are retryable', () => {
   expect(
     isTransientError(
@@ -480,7 +552,7 @@ test('retry-after: a numeric header sleeps ra*1000 capped at 30s', async () => {
       n++;
       if (n === 1) return throttleRes(429, '2'); //  2s advised
       if (n === 2) return throttleRes(429, '60'); // 60s advised → capped
-      return doneRes();
+      return servedTo(10);
     }) as any,
   });
   await collect(client.stream(QUERY, 0, 10));
@@ -521,7 +593,7 @@ test('retry-after: a header-less throttle storm backs off EXPONENTIALLY, never z
       sleeps.push(ms);
     },
     // three header-less 429s (the common LB 502/503 shape), then success
-    fetchImpl: (async () => (n++ < 3 ? throttleRes(429) : doneRes())) as any,
+    fetchImpl: (async () => (n++ < 3 ? throttleRes(429) : servedTo(10))) as any,
   });
   await collect(client.stream(QUERY, 0, 10));
   // pre-fix: Number(null)===0 → retryAfterMs 0 → the wait takes the advised branch = 0ms every attempt
@@ -538,10 +610,12 @@ test('retry-after: an HTTP-date header backs off instead of hard-throwing mid-ru
       sleeps.push(ms);
     },
     fetchImpl: (async () =>
-      n++ === 0 ? throttleRes(429, when) : doneRes()) as any,
+      n++ === 0 ? throttleRes(429, when) : servedTo(10)) as any,
   });
   // pre-fix: Number(date)→NaN→undefined→non-retryable→this REJECTS. now: parsed → retried → resolves.
-  await expect(collect(client.stream(QUERY, 0, 10))).resolves.toEqual([]);
+  await expect(collect(client.stream(QUERY, 0, 10))).resolves.toEqual(
+    endBlock(10),
+  );
   expect(sleeps).toHaveLength(1);
   expect(sleeps[0]).toBeGreaterThan(1_000); // backed off toward the advised instant
   expect(sleeps[0]).toBeLessThanOrEqual(30_000); // capped at the 30s ceiling
@@ -551,10 +625,12 @@ test('retry-after: a throttle with a garbage header still retries (exponential),
   let n = 0;
   const client = mk({
     fetchImpl: (async () =>
-      n++ === 0 ? throttleRes(429, 'garbage') : doneRes()) as any,
+      n++ === 0 ? throttleRes(429, 'garbage') : servedTo(10)) as any,
   });
   // a 429/5xx is always retryable; a malformed Retry-After must not turn it into a fatal error.
-  await expect(collect(client.stream(QUERY, 0, 10))).resolves.toEqual([]);
+  await expect(collect(client.stream(QUERY, 0, 10))).resolves.toEqual(
+    endBlock(10),
+  );
 });
 
 // ── HTTP-path deadlines: a hung request/body must abort-or-cancel, retry, and release its gate slot ──
@@ -598,10 +674,12 @@ test('timeout: a fetch that never sends headers is aborted at the connect deadli
           );
         });
 
-      return doneRes();
+      return servedTo(10);
     }) as any,
   });
-  await expect(collect(client.stream(QUERY, 0, 10))).resolves.toEqual([]);
+  await expect(collect(client.stream(QUERY, 0, 10))).resolves.toEqual(
+    endBlock(10),
+  );
   expect(n).toBe(2); // first hung → aborted + retried; second completed
   expect(gate.snapshot().active).toBe(0); // slot released (finally ran)
   expect(gate.peak()).toBeGreaterThanOrEqual(1); // it was acquired
@@ -629,10 +707,12 @@ test('timeout: a body that stalls without closing hits the SOFT idle timeout, is
         });
         return { status: 200, ok: true, headers: { get: () => null }, body };
       }
-      return doneRes();
+      return servedTo(10);
     }) as any,
   });
-  await expect(collect(client.stream(QUERY, 0, 10))).resolves.toEqual([]);
+  await expect(collect(client.stream(QUERY, 0, 10))).resolves.toEqual(
+    endBlock(10),
+  );
   expect(n).toBe(2); // stalled body → idle-timeout + retry; second completed
   expect(cancelled).toBe(true); // the stream was CANCELLED, never aborted
   expect(gate.snapshot().active).toBe(0); // slot released

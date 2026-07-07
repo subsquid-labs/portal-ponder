@@ -108,6 +108,32 @@ export class PortalTruncatedBodyError extends Error {
 }
 
 /**
+ * A `/finalized-stream` 204 received while the cursor is still at or below the requested `toBlock`
+ * (issue #47). A 204 means "fromBlock is above the SERVING replica's finalized head" — empirically
+ * confirmed: an in-range window (below head) that matches zero filter rows returns 200 carrying the
+ * range-end block header as a cursor anchor, never a 204. Load-balanced replicas answer independently,
+ * so a replica whose finalized height lags the cached head serves `[cursor, itsHead]` then 204s the
+ * tail `[itsHead+1, to]`. Treating that as clean completion recorded PHANTOM coverage — the tail blocks
+ * were never delivered yet the caller cached the range as synced (a permanent silent gap in stream mode,
+ * where nothing redelivers). So it is a TRANSIENT condition: retry lands on a fresher replica; the retry
+ * budget bounds it so a range genuinely no replica can serve fails LOUD rather than holing. Always
+ * transient (see `isTransientError`).
+ */
+export class PortalIncompleteRangeError extends Error {
+  readonly cursor: number;
+  readonly to: number;
+  constructor(cursor: number, to: number) {
+    super(
+      `Portal 204 mid-range @ ${cursor} (requested toBlock ${to}): serving replica's finalized head is ` +
+        `below the requested range end — retrying for a fresher replica rather than recording phantom coverage`,
+    );
+    this.name = 'PortalIncompleteRangeError';
+    this.cursor = cursor;
+    this.to = to;
+  }
+}
+
+/**
  * A violated runtime invariant (see portal-invariant.ts + INVARIANTS.md). The repo's
  * philosophy: a loud crash beats silent corruption. Carries the invariant `id` and a
  * structured `context` so a failure points straight at the catalog row.
@@ -172,5 +198,6 @@ export function isNetworkError(err: unknown): boolean {
 export function isTransientError(err: unknown): boolean {
   if (err instanceof PortalThrottleError) return true;
   if (err instanceof PortalTruncatedBodyError) return true;
+  if (err instanceof PortalIncompleteRangeError) return true;
   return isNetworkError(err);
 }

@@ -4,6 +4,55 @@ import { afterEach, beforeEach, expect, test } from 'vitest';
 import { createPortalHistoricalSync } from './portal.js';
 
 /**
+ * Range-END cursor anchor for an IN-RANGE `/finalized-stream` window (issue #47). The real Portal
+ * terminates an in-range stream by serving the range-end block HEADER as the cursor anchor — it does NOT
+ * 204 an in-range window (a 204 strictly means `fromBlock` is above the SERVING replica's finalized head).
+ * A mid-range 204 now fails closed (PortalIncompleteRangeError → retry-to-budget → throw), so a mock that
+ * models an in-range served-through terminal must emit this header-only record (NO logs/txs/traces → it
+ * registers no matched rows and asserts nothing) so the stream ends by REACHING `to` instead of 204-ing
+ * the served-through tail. Mirrors portal-shell.test.ts's `anchor`/`streamRes` semantics.
+ */
+const anchorHeader = (num: number) => ({
+  number: num,
+  hash: `0x${num.toString(16).padStart(64, '0')}`,
+  parentHash: `0x${'00'.repeat(32)}`,
+  timestamp: 1_700_000_000 + num,
+  logsBloom: `0x${'00'.repeat(256)}`,
+  miner: `0x${'99'.repeat(20)}`,
+  gasUsed: '0x1',
+  gasLimit: '0x1c9c380',
+  stateRoot: `0x${'22'.repeat(32)}`,
+  receiptsRoot: `0x${'33'.repeat(32)}`,
+  transactionsRoot: `0x${'44'.repeat(32)}`,
+  size: '0x500',
+  difficulty: '0x0',
+  extraData: '0x',
+});
+
+/**
+ * Terminate an in-range window at its range-end anchor: serve `blocks` (may be empty) PLUS a header-only
+ * anchor at `min(to, head)` — unless a served block already reaches that end (the Portal emits each block
+ * exactly once, so a duplicate would double-count). This is the in-range terminal; a 204 (fromBlock above
+ * the served head) stays a bare 204 at its own call site. `head` defaults to `to`.
+ */
+const anchorRes = (
+  res: http.ServerResponse,
+  to: number,
+  blocks: unknown[] = [],
+  head: number = to,
+) => {
+  const end = Math.min(to, head);
+  const maxServed = blocks.reduce(
+    (m, b) => Math.max(m, (b as any).header?.number ?? -1),
+    -1,
+  );
+  const out =
+    maxServed >= end ? blocks : [...blocks, { header: anchorHeader(end) }];
+  res.writeHead(200, { 'content-type': 'application/x-ndjson' });
+  res.end(`${out.map((b) => JSON.stringify(b)).join('\n')}\n`);
+};
+
+/**
  * Fixture: one Portal `/finalized-stream` NDJSON block carrying an Euler EVault
  * `Deposit` log AND its parent transaction (the `transaction` relation).
  *
@@ -271,12 +320,8 @@ test('regression (C1): a 2nd log filter sharing a chunk on a LATER call is still
         out.push(mkBlock(BN1, A1, T1, TXA));
       if (from <= BN2 && to >= BN2 && matches(q.logs, T2, A2))
         out.push(mkBlock(BN2, A2, T2, TXB));
-      if (out.length === 0) {
-        res.writeHead(204).end();
-        return;
-      }
-      res.writeHead(200, { 'content-type': 'application/x-ndjson' });
-      res.end(out.map((b) => JSON.stringify(b)).join('\n') + '\n');
+      // in-range window (head 1e9 ≫ chunk 0): terminate at the range-end anchor, never a mid-range 204
+      anchorRes(res, to, out);
     });
   });
   const p: number = await new Promise((r) =>
@@ -564,7 +609,9 @@ const missingLogsBloomServer = (serveData: boolean) =>
         res.end(JSON.stringify(FIXTURE_BLOCK) + '\n');
         return;
       }
-      res.writeHead(204).end();
+      // in-range window (head 2e9), logsBloom already dropped: terminate at the range-end anchor (the
+      // event-less case) instead of a mid-range 204 that would now fail closed (issue #47).
+      anchorRes(res, q.toBlock ?? 1e12);
     });
   });
 const runMissingLogsBloom = async (serveData: boolean) => {
@@ -688,7 +735,14 @@ const extendFieldDegradeServer = (opts: {
         res.end(JSON.stringify(mkExtendBlock(opts.tailBlock)) + '\n');
         return;
       }
-      res.writeHead(204).end();
+      // `to` is already head-clamped; an in-range window (from ≤ head) with no matched block terminates at
+      // the range-end anchor. A request whose from is ABOVE the head (from > to) stays a bare 204 (#47).
+      if (from > to) {
+        res.writeHead(204).end();
+        return;
+      }
+
+      anchorRes(res, to);
     });
   });
 const mkExtendBlock = (n: number) => ({
@@ -937,7 +991,14 @@ const extendReMatchDropServer = (opts: {
         );
         return;
       }
-      res.writeHead(204).end();
+      // `to` is head-clamped; an in-range no-match window terminates at the range-end anchor, and a
+      // from-above-head request (from > to) stays a bare 204 (issue #47).
+      if (from > to) {
+        res.writeHead(204).end();
+        return;
+      }
+
+      anchorRes(res, to);
     });
   });
 
@@ -1060,8 +1121,10 @@ test('regression: a dataset that starts after genesis (TAC starts at block 1) is
           return;
         }
         clampedTo = q.fromBlock;
-        res.writeHead(204).end();
-        return; // clamped query → empty, no crash
+        // the clamped in-range query [START, to] (head 2e9) has no matched data → terminate at the
+        // range-end anchor, not a mid-range 204 that would now fail closed (issue #47).
+        anchorRes(res, q.toBlock ?? 1e12);
+        return;
       }
       res.writeHead(204).end();
     });
@@ -1717,7 +1780,9 @@ test('merge: N same-address event filters collapse to ONE log request (unioned t
     req.on('end', () => {
       const q = body ? JSON.parse(body) : {};
       if (q.logs) dataQueries.push(q);
-      res.writeHead(204).end();
+      // in-range window (pinned head 2e9): terminate at the range-end anchor so the merged single request
+      // (asserted below) ends cleanly instead of a mid-range 204 that would now fail closed (issue #47).
+      anchorRes(res, q.toBlock ?? 1e12);
     });
   });
   const p = await new Promise<number>((r) =>
@@ -1919,12 +1984,9 @@ const factoryPortalServer = () =>
           ],
         });
       }
-      if (out.length === 0) {
-        res.writeHead(204).end();
-        return;
-      }
-      res.writeHead(200, { 'content-type': 'application/x-ndjson' });
-      res.end(out.map((b) => JSON.stringify(b)).join('\n') + '\n');
+      // in-range window (head 1e9 ≫ chunk 0): terminate at the range-end anchor (issue #47), carrying any
+      // matched discovery/data blocks — a mid-range 204 would now fail closed and hang the stream.
+      anchorRes(res, to, out);
     });
   });
 
@@ -2206,12 +2268,9 @@ const twoChildFactoryServer = () =>
           }
         }
       }
-      if (out.length === 0) {
-        res.writeHead(204).end();
-        return;
-      }
-      res.writeHead(200, { 'content-type': 'application/x-ndjson' });
-      res.end(out.map((b) => JSON.stringify(b)).join('\n') + '\n');
+      // in-range window (head 1e9 ≫ chunk 0): terminate at the range-end anchor, carrying any discovered
+      // ProxyCreated blocks; data requests (no match) still end cleanly instead of a mid-range 204 (#47).
+      anchorRes(res, to, out);
     });
   });
 
@@ -2946,7 +3005,9 @@ test('regression (#21 §2): in a mixed config the discovery scan starts at the f
       );
       if (isDiscovery) discoveryFroms.push(q.fromBlock ?? 0);
 
-      res.writeHead(204).end();
+      // in-range windows (head 20M) that match nothing terminate at the range-end anchor (min(to, head)),
+      // never a mid-range 204 (issue #47) — this asserts on the request fromBlocks, unaffected by the anchor.
+      anchorRes(res, q.toBlock ?? 1e12, [], 20_000_000);
     });
   });
   const p: number = await new Promise((r) =>
@@ -3059,12 +3120,9 @@ test('regression (#21 §1, INV-15 gate): a factory creation log BELOW factory.fr
           ],
         });
       }
-      if (out.length === 0) {
-        res.writeHead(204).end();
-        return;
-      }
-      res.writeHead(200, { 'content-type': 'application/x-ndjson' });
-      res.end(out.map((b) => JSON.stringify(b)).join('\n') + '\n');
+      // in-range window (head 1e9): terminate at the range-end anchor, carrying the sub-floor creation log
+      // when covered; a mid-range 204 would now fail closed (issue #47).
+      anchorRes(res, to, out);
     });
   });
   const p: number = await new Promise((r) =>
@@ -3215,12 +3273,15 @@ test('regression: frontier chunk truncated at a lagging Portal head is EXTENDED 
       const out = [A_BLOCK, B_BLOCK]
         .filter((n) => from <= n && to >= n)
         .map(mkBlock);
-      if (out.length === 0) {
+      // a real Portal 204s ONLY when `from` is above its finalized head; an in-range window terminates at
+      // the range-end anchor min(to, head) (issue #47). The frontier chunk is client-clamped to `head`, so
+      // in-range requests carry any covered block PLUS the anchor rather than 204-ing the served-through tail.
+      if (from > head) {
         res.writeHead(204).end();
         return;
       }
-      res.writeHead(200, { 'content-type': 'application/x-ndjson' });
-      res.end(out.map((b) => JSON.stringify(b)).join('\n') + '\n');
+
+      anchorRes(res, to, out, head);
     });
   });
   const p: number = await new Promise((r) =>
@@ -3338,12 +3399,14 @@ test('regression (FIX 1, BUG-B): a BOUNDED backfill whose toBlock is PAST the he
       const out = [A_BLOCK, B_BLOCK]
         .filter((n) => from <= n && to >= n)
         .map(mkBlock);
-      if (out.length === 0) {
+      // `to` is head-clamped; a from-above-head request (from > to) stays a bare 204, an in-range window
+      // terminates at the range-end anchor with any covered block (issue #47), never a served-through 204.
+      if (from > to) {
         res.writeHead(204).end();
         return;
       }
-      res.writeHead(200, { 'content-type': 'application/x-ndjson' });
-      res.end(out.map((b) => JSON.stringify(b)).join('\n') + '\n');
+
+      anchorRes(res, to, out);
     });
   });
   const p: number = await new Promise((r) =>
@@ -3563,12 +3626,14 @@ test('regression (FIX 1 discovery variant): a factory child CREATED in the newly
         wants(DEPOSIT_TOPIC0, CHILD_TAIL_ADDR)
       )
         out.push(childEventBlock(EVENT_TAIL, CHILD_TAIL_ADDR));
-      if (out.length === 0) {
+      // `to` is head-clamped; a from-above-head request (from > to) stays a bare 204, an in-range window
+      // terminates at the range-end anchor with any covered discovery/data block (issue #47).
+      if (from > to) {
         res.writeHead(204).end();
         return;
       }
-      res.writeHead(200, { 'content-type': 'application/x-ndjson' });
-      res.end(out.map((b) => JSON.stringify(b)).join('\n') + '\n');
+
+      anchorRes(res, to, out);
     });
   });
   const p: number = await new Promise((r) =>
@@ -3690,7 +3755,9 @@ test('regression: an undefined fromBlock is genesis — the [0, min) prefix of a
         return;
       }
 
-      res.writeHead(204).end();
+      // in-range window (head 1e9): the continuation past the served block-100 (and any non-matching
+      // window) terminates at the range-end anchor, not a mid-range 204 that would now fail closed (#47).
+      anchorRes(res, to);
     });
   });
   const p: number = await new Promise((r) =>
