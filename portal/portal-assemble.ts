@@ -195,6 +195,55 @@ export const buildRawLogMatcher = (
   return (raw, hdr, bn) => logMatched(toSyncLog(raw, hdr), bn);
 };
 
+/**
+ * Stream-seam parity for `runStreams`' needed-field growth check — the TRACE/TRANSFER analogue of
+ * `buildRawLogMatcher` (#20). The trace query is server-side UNFILTERED by design (INV-5: fetch every
+ * trace so `buildTraces` can rank over the full tree, THEN client-filter), so the tail returns traces
+ * assembly drops wholesale — traces matching no configured trace/transfer filter, a bounded filter's
+ * out-of-range traces, a factory child's pre-creation traces. Counting raw returned traces (the old
+ * `cd.traceBlocks.size` delta) toward "matched data this call added" armed the needed-field fatal for
+ * data the indexer never keeps → G1 evict → crash-loop. This mirrors `buildTraces`' KEEP decision
+ * EXACTLY: the same per-trace pre-skip (`transactionIndex == null` / `type === 'reward'`), the same
+ * `parityToCallFrame` frame (undefined ⇒ dropped, e.g. a non-call/create/suicide type), then the same
+ * `traceMatched`. `rankTraces` only assigns each matched frame its DFS `index`; the trace/transfer
+ * matchers (`isTraceFilterMatched`/`isTransferFilterMatched`) never read `index`, so ranking never turns
+ * a matched frame unmatched — a single-frame `parityToCallFrame(t, 0)` decides KEEP identically.
+ */
+export const buildRawTraceMatcher = (
+  spec: FetchSpec,
+  childAddresses: ChildAddresses,
+): ((raw: RawTrace, bn: number) => boolean) => {
+  const { traceMatched } = buildMatchers(spec, childAddresses);
+
+  return (raw, bn) => {
+    if (raw.transactionIndex == null || raw.type === 'reward') return false;
+
+    const frame = parityToCallFrame(raw, 0) as CallFrame | undefined;
+    if (frame === undefined) return false;
+
+    return traceMatched(frame, bn);
+  };
+};
+
+/**
+ * Stream-seam parity for `runStreams`' needed-field growth check — the TRANSACTION analogue of
+ * `buildRawLogMatcher` (#20). The account-tx query pushes only the merged from/to address sets
+ * (`txRequestsFor`) with NO per-filter block range, so — exactly like the log query — it over-returns:
+ * a bounded tx filter's out-of-range txs, a two-filter query's cross-matches (A's `from` set ∪ B's `to`
+ * set), and a factory child's pre-creation txs all ride the request and `assembleRange` re-matches them
+ * AWAY via `txFilterMatched` (`isTransactionFilterMatched` re-checks the block range + factory floor).
+ * Counting raw `cd.txBlocks.size` toward "matched data this call added" armed the same false-fatal. This
+ * mirrors assembly's per-tx re-match EXACTLY (same `buildMatchers` + `toSyncTransaction`).
+ */
+export const buildRawTxMatcher = (
+  spec: FetchSpec,
+  childAddresses: ChildAddresses,
+): ((raw: RawTx, hdr: RawHeader, bn: number) => boolean) => {
+  const { txFilterMatched } = buildMatchers(spec, childAddresses);
+
+  return (raw, hdr, bn) => txFilterMatched(toSyncTransaction(raw, hdr), bn);
+};
+
 /** Per-chunk trace assembly: full-tree ranking then client-side filtering (INV-5). `onReceipt` (FIX 4)
  * is invoked with each MATCHED trace's parent transaction so the caller can emit a receipt when a
  * trace/transfer filter has `hasTransactionReceipt` — the log/tx branches never see these txs. */
