@@ -10,7 +10,7 @@ A drop-in fork of [Ponder](https://github.com/ponder-sh/ponder) that runs the hi
 
 Ponder is mature, production-proven, and a pleasure to work with. Historical backfill speed was the one gap — this closes it and changes nothing else.
 
-> **~8× faster** full-history backfill · **15 chains, 28M events** in one app in **45 min** · logs **byte-identical** to `eth_getLogs`
+> **15 chains, 28,405,932 events** in one app in **51m 47s**, zero public RPC · **3.6× faster** single-chain full-history backfill · logs **byte-identical** to `eth_getLogs`
 
 ```ts
 // ponder.config.ts — add `portal:` per chain; nothing else changes
@@ -54,14 +54,16 @@ That's only half of it. A fast endpoint alone doesn't make a fast indexer — th
 
 ## Benchmarks
 
-Full Ethereum history, deploy → head (~5M blocks, 457,931 events), on a dedicated Portal:
+**Flagship — 15 chains, one app.** Euler V2 across all **15 Portal-supported chains**, full history, backfilled from the Portal into Postgres: **28,405,932 events in 51m 47s** on ~1 core and 16 GB, reproduced from scratch by the deterministic zero-RPC bench kit (2026-07-06). Whole-store parity against the frozen reference store is exact — **62/62 aggregate cells, 0 diffs** — and the run touched **zero external RPC** (all 90 startup anchors served from a committed snapshot). Full write-up: [`REPORT.md`](harness/euler-multichain/REPORT.md).
+
+**Single-chain full history.** The full recorded Euler V2 history on Ethereum, `[20529207, 25436954]` (4,907,748 blocks, 885,893 logs), backfilled two ways on the same host:
 
 | Backfill | Wall-clock | Speedup |
 |---|--:|--:|
-| Stock RPC | ~38 min | 1× |
-| The fork | **4m 45s** | **~8×** |
+| Stock RPC (`ponder@0.16.6`) | 6543 s (~109 min) | 1× |
+| The fork (Portal) | **1819 s (~30 min)** | **3.6×** |
 
-At scale, one app indexing a real protocol (Euler V2) across all **15 chains** it runs on backfilled **28,405,932 events in 45 minutes** on ~1 core and 16 GB, byte-verified complete against the Portal. Full write-up: [`REPORT.md`](harness/euler-multichain/REPORT.md) · methodology: [`BENCHMARKS.md`](harness/bench/BENCHMARKS.md).
+A single serial run, not an averaged gate: both legs are fetch-bound, so the ratio reflects the specific Portal dataset and metered RPC endpoint. The sync-store rows are byte-identical across every family ([VALIDATION.md §3.2](VALIDATION.md)) · methodology and caveats: [`BENCHMARKS.md`](harness/bench/BENCHMARKS.md).
 
 ## Compatibility
 
@@ -75,10 +77,11 @@ Full adoption path — check, swap, run, validate, roll back — in [`MIGRATION.
 
 ## Ponder versions
 
-`@subsquid/ponder@X.Y.Z-sqd.<rev>` is `ponder@X.Y.Z` plus the Portal layer, pinned to a known Ponder version; `-sqd.<rev>` ships a fork-side fix on the same Ponder version. The seam is stable across 0.15.17–0.16.6.
+`@subsquid/ponder@X.Y.Z-sqd.<rev>` is `ponder@X.Y.Z` plus the Portal layer, pinned to a known Ponder version; `-sqd.<rev>` ships a fork-side fix on the same Ponder version. The seam is stable across 0.15.17–0.16.7.
 
 | Ponder | `@subsquid/ponder` | Status |
 |---|---|---|
+| 0.16.7 | `0.16.7-sqd.1` | verified in CI · unpublished |
 | 0.16.6 | `0.16.6-sqd.1` | **latest** |
 | 0.15.17 | `0.15.17-sqd.1` | published |
 
@@ -99,7 +102,7 @@ The free public Portal is ideal for trying the fork and for development, but sha
 ## Learn more
 
 - [**How it works**](HOW-IT-WORKS.md) — the design story: why a streamed range beats per-topic RPC lookups, the historical-sync seam, the shared read-ahead controller, factory discovery over ranges, and where the single-thread ceiling honestly is. Operational reference: [`portal/INTEGRATION.md`](portal/INTEGRATION.md).
-- [**Invariants**](portal/INVARIANTS.md) — the catalog (INV-1…INV-15) the `portal/` layer is built around: each invariant's statement, how it's enforced, where it's checked at runtime, and the property test that proves it.
+- [**Invariants**](portal/INVARIANTS.md) — the catalog (INV-1…INV-18) the `portal/` layer is built around: each invariant's statement, how it's enforced, where it's checked at runtime, and the property test that proves it.
 - [**Observability**](portal/INTEGRATION.md) — `PORTAL_METRICS_FILE` writes a per-chain JSON metrics file (throughput, bytes, errors, RPC-fallback); `PORTAL_GATE_LOG=1` logs the adaptive controller.
 - **Portal-native realtime** (experimental) — realtime runs on your RPC by default; set `PORTAL_REALTIME=stream` to serve the tip from the Portal's fork-aware `/stream` instead of RPC.
 - [**Versioning & releases**](PUBLISHING.md) — `@subsquid/ponder@<ponder-version>-sqd.<rev>`, generated from upstream Ponder + a per-version patch.

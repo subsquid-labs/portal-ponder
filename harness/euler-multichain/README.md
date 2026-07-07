@@ -1,7 +1,7 @@
 # Euler multichain — full-history e2e
 
 Index **every Portal-supported Euler V2 chain (15) in a single Ponder app**, full history
-`[0 → finalized head]` per chain, streaming from the **SQD Portal** backfill into **Postgres**. This
+`[deploy → finalized head]` per chain, streaming from the **SQD Portal** backfill into **Postgres**. This
 is the production shape of an Euler indexer and a stress test of the `@subsquid/ponder` fork: one
 shared Portal endpoint, one database, fifteen chains backfilling concurrently.
 
@@ -50,11 +50,12 @@ CPU-bound, or *waiting on the client* (i.e. upstream decode is the limit).
 
 ### Hardware & wall-time
 The Portal is **not** the bottleneck here — Ponder indexes on a single thread, so local decode and DB
-write are, and that ceiling does not move with RAM or cores. The captured run capped the indexer at
-**16 GB / 2 cores** on an otherwise large box, and that modest cap was **faster** than a 32 GB
-configuration (**44m 55s** vs 67m 10s): extra heap and a deeper read-ahead buffer just sit idle when a
-single CPU thread is draining them. The lever past this ceiling is **sharding** — splitting chains
-across processes — not bigger hardware.
+write are, and that ceiling does not move with RAM or cores. The reproducible deterministic run
+backfilled all 15 chains in **51m 47s** (2026-07-06, REPORT.md); an earlier 2026-07-01 A/B on the same
+**16 GB / 2-core** envelope showed that modest cap beating a 32 GB configuration (**44m 55s** vs
+67m 10s): extra heap and a deeper read-ahead buffer just sit idle when a single CPU thread is draining
+them. The lever past this ceiling is **sharding** — splitting chains across processes — not bigger
+hardware.
 
 See **[REPORT.md](./REPORT.md)** for the captured full run — throughput, per-chain reach, the
 saturation analysis, and the 16 GB vs 32 GB comparison.

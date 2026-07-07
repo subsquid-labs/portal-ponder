@@ -1,6 +1,6 @@
 # Migrating a Ponder indexer onto `@subsquid/ponder`
 
-**What you get:** the historical backfill goes **~8× faster** (and finishes on chains where RPC backfill is impractical), the data is **byte-identical to RPC**, and **handlers + schema are unchanged**. Realtime/frontfill stays on your existing RPC, and it's reversible. One de-risking step, then one change.
+**What you get:** the historical backfill goes **3.6× faster on a full single-chain history** (VALIDATION.md §3.2; and it finishes on chains where RPC backfill is impractical), the data is **byte-identical to RPC**, and **handlers + schema are unchanged**. Realtime/frontfill stays on your existing RPC, and it's reversible. One de-risking step, then one change.
 
 > Which source types and chains are supported — and how to read the per-network capability notes — is in the README's [Compatibility](README.md#compatibility) section. This guide is the adoption path.
 

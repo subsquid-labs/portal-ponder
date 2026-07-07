@@ -23,8 +23,9 @@ by `scripts/sync-upstream.sh`. Keep that in mind for Step 2.
 3. If tests are missing, **write them** (Step 3 conventions) before proceeding, or flag it explicitly
    in the PR body under a `## Missing tests` section.
 
-The current source ↔ test pairs are `portal.ts`, `portal-transform.ts`,
-`portal-realtime.ts`, `portal-realtime-wire.ts` — each with a matching `*.test.ts`.
+The rule: every `portal/*.ts` source module has a co-located `portal/*.test.ts` (15 source
+modules today; the sole exception is the types-only error taxonomy `portal-errors.ts`). Don't
+hard-code the list — re-derive it from the tree with the Step 1 check above.
 
 ## Step 2: Run the Portal tests (they must be green)
 

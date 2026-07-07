@@ -1,7 +1,7 @@
 # Validation-campaign harness
 
-Tooling for the portal-ponder production validation campaign (canonical plan:
-`scratchpad/campaign-plan.md`). It runs the **cell matrix** (fork-vs-stock byte diffs across
+Tooling for the portal-ponder production validation campaign — proving fork-vs-stock byte parity
+across strata, crash/resume safety, and realtime A/B parity. It runs the **cell matrix** (fork-vs-stock byte diffs across
 strata), the **chaos/resume** harness, and the **Soak A/B** differ. This directory builds the
 tooling; the paid matrix runs come later. Everything runs with **bash + node only** (no pnpm, no
 extra npm deps) so it works on the box.
@@ -12,9 +12,9 @@ harness/chaos/        fault proxy (proxy.mjs), kill-loop.sh + verify-resume.sh (
 harness/soak-ab/      ab-diff.mjs (finalized-overlap differ), soak-b.service + deploy-soak-b.sh
 ```
 
-## Evidence-layer map (→ campaign-plan.md)
+## Evidence-layer map
 
-| Plan layer | What proves it | Here |
+| Layer | What proves it | Here |
 |---|---|---|
 | **2** — one full-range byte diff (Euler eth [deploy→head]) | constant-memory streaming diff + app-table hash | cell `F-full` → `run-cell.sh` with `diff-batched.mjs` |
 | **3** — stratified byte windows (chunk-grid, deploy-floor, format eras, empty, frontier, seeded-random; auto-shrink) | `run-cell.sh` per window via `harness/diff/run.sh` | cells `L-*`, `F-*`, `T-*`, `A-*`, `U-eth`, `E-eth`; windows expanded by `windows.mjs` |
@@ -121,12 +121,12 @@ require every configured fault actually fired (`missed==0`).
 ## Soak B + A/B
 
 ```bash
-# provision the Soak B unit (DB euler_rt_b, PORTAL_REALTIME=stream, PORTAL_CHECKS=on) — DOES NOT START it
+# provision the Soak B unit (its own dedicated DB, PORTAL_REALTIME=stream, PORTAL_CHECKS=on) — DOES NOT START it
 bash harness/soak-ab/deploy-soak-b.sh /path/subsquid-ponder-0.16.6-sqd.2.tgz
 sudo systemctl start soak-b.service     # operator starts deliberately
 
 # hourly finalized-overlap diff of Soak A (RPC realtime) vs Soak B (Portal realtime)
-DATABASE_URL_A=postgresql:///euler_rt DATABASE_URL_B=postgresql:///euler_rt_b \
+DATABASE_URL_A=postgresql:///<soak-a-db> DATABASE_URL_B=postgresql:///<soak-b-db> \
 CHAINS=1,8453,42161 CUTOVER=<block> STATUS_FILE=soak-ab-status.json \
   node harness/soak-ab/ab-diff.mjs
 ```
@@ -147,8 +147,9 @@ soak failure. The unit's `ExecStartPre` appends a UTC timestamp to `$SOAK_B_REST
 (re)start; `ab-diff.mjs` reads it into `restartCount`/`lastRestartAt` and raises a **crash-loop**
 alert when restarts exceed 3/hour. Point `ab-diff.mjs` at the same log via `RESTART_LOG=…`.
 
-**Guardrails** (`deploy-soak-b.sh`): DB is `euler_rt_b` and nothing else; port is never `:9547`; the
-`euler` prod DB is never touched; secrets are copied into a `chmod 600` env file, never printed/committed.
+**Guardrails** (`deploy-soak-b.sh`): the soak unit uses its own dedicated DB and nothing else; it never
+binds the production port or touches the production database used by other tenants; secrets are copied
+into a `chmod 600` env file, never printed/committed.
 
 ## Budget discipline
 

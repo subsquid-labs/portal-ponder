@@ -8,9 +8,11 @@ field per chain that routes the historical backfill through SQD Portal (realtime
 - **Version = `<ponder-version>-sqd.<rev>`.** `@subsquid/ponder@0.16.6-sqd.1` is `ponder@0.16.6` +
   the Portal layer (fork revision 1). The ponder version stays visible, and `-sqd.<rev>` lets the
   fork **re-cut a fix on the same ponder version** — npm permanently retires an unpublished version
-  number, so a plain mirror (`0.16.6`) can't be re-published after a bad build. Each release is
-  published with `--tag latest`, so `npm i @subsquid/ponder` resolves it (npm doesn't auto-pick a
-  prerelease otherwise); an exact build can be pinned as `@subsquid/ponder@0.16.6-sqd.1`.
+  number, so a plain mirror (`0.16.6`) can't be re-published after a bad build. The **newest** ponder
+  version's release is published with `--tag latest`, so `npm i @subsquid/ponder` resolves it (npm
+  doesn't auto-pick a prerelease otherwise); an **older** ponder version publishes under a
+  `ponder-<version>` dist-tag rather than clobbering `latest`, and is pinned as
+  `@subsquid/ponder@<version>-sqd.<rev>`.
 - **We don't hand-maintain a fork.** This repo holds only the **Portal layer** (`portal/`): the
   `portal-*.ts` modules (an invariant-first functional core behind the `portal.ts` shell — see
   `portal/INVARIANTS.md`) + a per-version `wiring/<ver>.patch` (the 4 one-line touch-points). That's
@@ -19,9 +21,10 @@ field per chain that routes the historical backfill through SQD Portal (realtime
   renames the package, and builds — producing the publishable package. Tracking a new ponder version is
   "author one small patch + run the script", not "merge a fork".
 - **Version-aware by construction.** `versions.json` is the source of truth: which ponder versions we
-  support, each with its wiring patch + status (`verified` / `planned` / `published`), and the
-  `compat.tested` list the CI matrix proves the seam against. We publish a fork release **only for the
-  ponder versions that are needed**, while tracking which past and future versions still hold.
+  support, each with its wiring patch, a `status` verification state (`verified` / `planned`) plus a
+  separate `published` boolean, and the `compat.tested` list the CI matrix proves the seam against.
+  We publish a fork release **only for the ponder versions that are needed**, while tracking which past
+  and future versions still hold.
 
 ## Releasing — automated (npm Trusted Publishing via OIDC, no token)
 
@@ -39,9 +42,14 @@ tokens for CI in favour of the GitHub integration). The job applies the Portal l
      after that is tokenless.
 2. *(When the repo is public)* add `--provenance` to the publish step for a signed provenance attestation.
 
-**Cut a release:** Actions → **release** → *Run workflow* → enter the ponder version (e.g. `0.16.6`),
-or push a tag `v0.16.6`. The workflow guards that the version is in `versions.json`, builds + tests, and
-publishes `@subsquid/ponder@<version>-sqd.<rev>`. Then flip that row's `status`→`published` in `versions.json`.
+**Cut a release:** Actions → **release** → *Run workflow* → enter the ponder version (e.g. `0.16.6`)
+and the `rev`. The workflow guards that the version is in `versions.json`, builds + tests, and
+publishes `@subsquid/ponder@<version>-sqd.<rev>`. A `v0.16.6` tag push also triggers it, but the
+**tag path always publishes `rev` 1** (`SYNC_REV` defaults to `1` on a tag — a tag can't express a
+revision), so a rev bump (`-sqd.2` and up) **must** go through the manual `workflow_dispatch` with the
+`rev` input. After a successful publish, set that row's `"published": true` in `versions.json` (leave
+`"status"` as its verification state — the schema tracks publish state in the separate `published`
+boolean, not via a `status` value).
 
 **Manual / local** (to seed the first publish, or as a fallback):
 
