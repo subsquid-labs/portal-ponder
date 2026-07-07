@@ -19,6 +19,7 @@ import {
   isTransientError,
   PortalDatasetStartError,
   PortalHttpError,
+  PortalIncompleteRangeError,
   PortalQueryTooLargeError,
   PortalSchemaFieldError,
   PortalThrottleError,
@@ -450,11 +451,15 @@ export function createPortalClient(deps: PortalClientDeps): PortalClient {
   const finalizedHeadTimeoutMs =
     deps.finalizedHeadTimeoutMs ?? FINALIZED_HEAD_TIMEOUT_MS;
 
-  // one POST+drain; returns blocks or "done" (204); throws a typed error (throttle carries retryAfterMs).
+  // one POST+drain over [cursor, to]; returns the drained blocks; throws a typed error (throttle carries
+  // retryAfterMs). A 204 while `cursor <= to` is a mid-range gap — the SERVING replica's finalized head is
+  // below the requested range end — so it throws the transient PortalIncompleteRangeError instead of
+  // reporting clean completion (issue #47); the retry loop lands on a fresher replica or fails loud.
   async function fetchBatch(
     body: string,
     cursor: number,
-  ): Promise<{ blocks: RawBlock[]; last: number } | 'done'> {
+    to: number,
+  ): Promise<{ blocks: RawBlock[]; last: number }> {
     // Proactive, uniform size guard — covers EVERY request type at the one POST choke point. A body over
     // MAX_RAW_QUERY_SIZE would 400; surface it explicitly with the real driver instead.
     if (body.length > MAX_RAW_QUERY_SIZE) {
@@ -515,9 +520,17 @@ export function createPortalClient(deps: PortalClientDeps): PortalClient {
       );
       disarmConnect(); // headers arrived — never abort() once the body is streaming (see above)
       stats.http++;
-      if (res.status === 204) {
-        gate.onOk();
-        return 'done';
+      if (res.status === 204 && cursor <= to) {
+        // A 204 strictly means "fromBlock is above the SERVING replica's finalized head" — empirically:
+        // an in-range (below head) window that matches zero filter rows returns 200 carrying the range-end
+        // block header as a cursor anchor, never a 204 (issue #47 probe). `stream` only ever calls with
+        // `cursor <= to`, so a 204 here means the replica served `[cursor, itsHead]` and 204'd the tail
+        // `[itsHead+1, to]`: a mid-range gap. Recording it as clean completion cached phantom coverage — a
+        // permanent silent hole in stream mode. Fail CLOSED: a transient error the retry loop re-issues (a
+        // fresher replica) and, past the budget, throws loud rather than holing. The `cursor <= to` guard
+        // is defensive — it is an invariant of the sole caller (`stream`'s loop condition), never false.
+        gate.onThrottle(); // treat the lagging replica as back-pressure — back off, then retry fresh
+        throw new PortalIncompleteRangeError(cursor, to);
       }
       // Transient, retry with back-off: 429/529 explicit throttle; ALL 5xx gateway/proxy hiccups; 409 on
       // the FINALIZED stream = a gateway "conflict" (finalized data doesn't reorg). Back off on any.
@@ -579,12 +592,14 @@ export function createPortalClient(deps: PortalClientDeps): PortalClient {
       }
       // A 200 (NOT 204) that drained to a CLEAN EOF with ZERO parsed blocks is a truncated/anomalous body:
       // an intermediary that cut the connection AT a line boundary — or before the first byte — yields a
-      // clean `done` with no partial line, so the mid-line PortalTruncatedBodyError guard above never fires.
-      // The Portal signals a genuinely empty range with 204 (→ 'done', handled earlier); a data 200 always
-      // carries ≥1 block. Returning `{ blocks: [], last: cursor }` here would let `stream` advance the cursor
-      // to cursor+1 and SILENTLY SKIP block `cursor` — one one-block hole per such cut. Treat it exactly like
-      // a mid-line truncation: a transient same-cursor retry (lossless, duplicate-free — nothing was
-      // yielded), bounded by the retry budget so a PERSISTENT zero-line 200 fails loud rather than holing. (wave 5)
+      // clean EOF with no partial line, so the mid-line PortalTruncatedBodyError guard above never fires.
+      // A 204 signals "fromBlock is above the serving replica's finalized head" — handled earlier (a 204
+      // below `to` is a mid-range gap → PortalIncompleteRangeError, issue #47); a data 200 always carries
+      // ≥1 block (an in-range served range anchors the range-end block header). Returning `{ blocks: [],
+      // last: cursor }` here would let `stream` advance the cursor to cursor+1 and SILENTLY SKIP block
+      // `cursor` — one one-block hole per such cut. Treat it exactly like a mid-line truncation: a transient
+      // same-cursor retry (lossless, duplicate-free — nothing was yielded), bounded by the retry budget so a
+      // PERSISTENT zero-line 200 fails loud rather than holing. (wave 5)
       if (blocks.length === 0)
         throw new PortalTruncatedBodyError(
           cursor,
@@ -628,7 +643,7 @@ export function createPortalClient(deps: PortalClientDeps): PortalClient {
           toBlock: to,
         });
         try {
-          batch = await fetchBatch(body, cursor);
+          batch = await fetchBatch(body, cursor, to);
         } catch (err) {
           if (err instanceof PortalQueryTooLargeError) {
             // Portal caps request BYTES, not range — bisecting blocks can't help. If a merged+batched
@@ -686,14 +701,17 @@ export function createPortalClient(deps: PortalClientDeps): PortalClient {
           await sleep(wait);
         }
       }
-      if (batch === 'done') return;
       if (onRows) onRows(countRows(batch.blocks));
       yield batch.blocks;
-      // Progress by construction (INV-13): fetchBatch initialises `last = cursor` and only ever raises
-      // it, so `cursor = last + 1 ≥ cursor + 1` — the cursor strictly advances on every yielded batch,
-      // and a 204 terminates. A zero-block 200 (a clean-EOF truncation) is now rejected as a
-      // PortalTruncatedBodyError in fetchBatch — never yielded — so a yielded batch is never empty and never
-      // steps the cursor over unfetched data (wave 5). No runtime guard is needed here (none could fire).
+      // Progress + completion by construction (INV-13): fetchBatch initialises `last = cursor` and only
+      // ever raises it, so `cursor = last + 1 ≥ cursor + 1` — the cursor strictly advances on every yielded
+      // batch. The loop TERMINATES when `cursor > to`: an in-range served response always carries the
+      // range-end block header as a cursor anchor (issue #47 probe), so the final batch reaches `last = to`
+      // and the `while (cursor <= to)` guard exits — no 204 is needed to end a fully-served range, and a 204
+      // BELOW `to` no longer silently terminates (it throws PortalIncompleteRangeError → retry/fail-loud).
+      // A zero-block 200 (a clean-EOF truncation) is rejected as a PortalTruncatedBodyError in fetchBatch —
+      // never yielded — so a yielded batch is never empty and never steps the cursor over unfetched data
+      // (wave 5). No runtime guard is needed here (none could fire).
       cursor = batch.last + 1;
     }
   }

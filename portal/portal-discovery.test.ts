@@ -2,13 +2,15 @@ import fc from 'fast-check';
 import type { Address } from 'viem';
 import { expect, test } from 'vitest';
 import type { Factory } from '@/internal/types.js';
-import type { PortalClient } from './portal-client.js';
+import { createPortalClient, type PortalClient } from './portal-client.js';
 import {
   createDiscovery,
   planDiscovery,
   splitWindows,
 } from './portal-discovery.js';
+import { PortalIncompleteRangeError } from './portal-errors.js';
 import type { ChildAddresses } from './portal-filters.js';
+import type { Gate } from './portal-gate.js';
 import { createStats } from './portal-metrics.js';
 
 fc.configureGlobal({ seed: 1337 }); // deterministic CI
@@ -428,4 +430,121 @@ test('INV-3 property: random ensures + injected window failures → coverage bel
     ),
     { numRuns: 30 },
   );
+});
+
+// ── issue #47 (discovery path): a mid-range 204 during a factory scan must fail closed, not confirm phantom coverage ──
+// The SHARED client.stream() drives BOTH the data path and this discovery scanWindow. A serving replica that
+// lags the requested `to` serves [lo, mid] then 204s the tail [mid+1, hi]. Pre-fix, the 204 → 'done' ended
+// the scan silently: scanWindow returned, `ensure` resolved, and the watermark CONFIRMED coverage of a range
+// whose tail — including any factory child created there — was never scanned. A missed child is a permanent
+// silent data hole (its events are never backfilled). Post-fix, the mid-range 204 is a transient
+// PortalIncompleteRangeError → scanWindow throws → `ensure` rejects → the watermark rolls back; the retry lands
+// on a fresher replica that serves the tail and discovers the child. This exercises the fix through the REAL
+// client (not the fake-throw stub), so it fails on the pre-fix code (child silently missed, `through` advances)
+// and passes on the fixed code.
+
+const fakeGate: Gate = {
+  acquire: async () => {},
+  release() {},
+  onOk() {},
+  onThrottle() {},
+  addRows() {},
+  freeRows() {},
+  saturated: () => false,
+  snapshot: () => ({ limit: 0, active: 0, rows: 0 }),
+};
+
+const ndjson = (blocks: unknown[]) => ({
+  status: 200,
+  ok: true,
+  headers: { get: () => null },
+  body: new ReadableStream<Uint8Array>({
+    start(c) {
+      c.enqueue(
+        new TextEncoder().encode(
+          `${blocks.map((b) => JSON.stringify(b)).join('\n')}\n`,
+        ),
+      );
+      c.close();
+    },
+  }),
+});
+const res204 = () => ({
+  status: 204,
+  ok: true,
+  headers: { get: () => null },
+  body: { cancel: async () => {} },
+});
+
+test('DISCOVERY PATH: a mid-range 204 in a factory scan fails closed (rolls the watermark back), then discovers the tail child on retry — never silently misses it (issue #47)', async () => {
+  // The child is created at block 300, which lives in the TAIL the lagging replica 204s.
+  const tailChild = '0xaaa';
+  let sawTail204 = false;
+  const client = createPortalClient({
+    portalUrl: 'http://p',
+    headers: {},
+    gate: fakeGate,
+    stats: createStats(),
+    bufferSize: 100,
+    chainName: 'c',
+    sleepImpl: async () => {},
+    // The discovery scan requests [0, 500] (one window). A lagging replica serves the range-head block only,
+    // anchoring last=200, then 204s the re-issued tail [201, 500] (its finalized head is below 201). The child
+    // at 300 is in that 204'd tail — pre-fix it is silently lost; post-fix the 204 fails the scan closed.
+    fetchImpl: (async (_u: string, init: any) => {
+      const q = JSON.parse(init.body);
+      if (q.fromBlock === 0) return ndjson([{ header: { number: 200 } }]);
+      // the tail [201,500] carrying the child at 300 is 204'd by this lagging replica
+      sawTail204 = true;
+      return res204();
+    }) as any,
+  } as any);
+
+  const childAddresses: ChildAddresses = new Map([
+    ['f', new Map<Address, number>()],
+  ]);
+  const d = createDiscovery({
+    client,
+    childAddresses,
+    factories: [factory()],
+    discoveryWindows: 1, // one window [0,500] so the mid-range 204 is deterministic
+    stats: createStats(),
+  });
+  d.setFloor(0);
+
+  // Fail closed: the mid-range 204 propagates as PortalIncompleteRangeError → ensure rejects.
+  await expect(
+    d.ensure(500, { chunkBlocks: 1000, endHint: 500 }),
+  ).rejects.toThrow(PortalIncompleteRangeError);
+  expect(sawTail204).toBe(true); // the tail really did 204 (the scenario fired)
+  expect(d.through()).toBe(-1); // watermark rolled back — NO phantom coverage of [0,500]
+  expect(childAddresses.get('f')!.has(tailChild as Address)).toBe(false);
+
+  // Recover on a fresher replica that serves the whole range (child at 300 in the tail).
+  const fresh = createPortalClient({
+    portalUrl: 'http://p',
+    headers: {},
+    gate: fakeGate,
+    stats: createStats(),
+    bufferSize: 100,
+    chainName: 'c',
+    sleepImpl: async () => {},
+    fetchImpl: (async () =>
+      ndjson([
+        proxy(tailChild, 300), // the child creation log, now delivered
+        { header: { number: 500 } }, // range-end anchor
+      ])) as any,
+  } as any);
+  const d2 = createDiscovery({
+    client: fresh,
+    childAddresses,
+    factories: [factory()],
+    discoveryWindows: 1,
+    stats: createStats(),
+  });
+  d2.setFloor(0);
+  await d2.ensure(500, { chunkBlocks: 1000, endHint: 500 });
+
+  expect(d2.through()).toBe(500); // now confirmed, legitimately
+  expect(childAddresses.get('f')!.get(tailChild as Address)).toBe(300); // the tail child discovered on retry
 });

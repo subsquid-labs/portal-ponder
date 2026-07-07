@@ -65,6 +65,42 @@ const mkBlock = (num: number) => ({
   ],
 });
 
+// A header-only NDJSON record (NO logs/txs, so it registers no rows) used as the range-END cursor
+// anchor. The real Portal terminates an in-range /finalized-stream by serving the range-end block header
+// as the cursor anchor — it does NOT 204 an in-range window (issue #47 probe). A mid-range 204 now fails
+// closed (PortalIncompleteRangeError), so these mocks must anchor the range end to end the stream cleanly
+// instead of 204-ing the served-through tail — otherwise `stream` retries the 204 to the budget and hangs.
+const anchor = (num: number) => ({ header: mkHeader(num) });
+
+// Serve a Portal-accurate /finalized-stream response over [from, to]: the matching `blocks` (may be empty)
+// PLUS the range-end header anchor at min(to, head) whenever the window is in range (from ≤ head); a bare
+// 204 ONLY when `from` is above the served head. `head` defaults to `to` (the request's own ceiling) — the
+// common case where the mock has no separate finalized-head notion. Blocks past the anchor are dropped
+// (the replica can't serve them); their absence is exactly what a lagging tail looks like.
+const streamRes = (
+  res: http.ServerResponse,
+  from: number,
+  to: number,
+  blocks: unknown[],
+  head: number = to,
+) => {
+  if (from > head) {
+    res.writeHead(204).end();
+    return;
+  }
+  const end = Math.min(to, head);
+  // Only append the header-only anchor if no served block already reaches `end` — the real Portal emits a
+  // given block exactly once; a duplicate would double-insert / double-count.
+  const maxServed = blocks.reduce(
+    (m, b) => Math.max(m, (b as any).header?.number ?? -1),
+    -1,
+  );
+  const out = maxServed >= end ? blocks : [...blocks, anchor(end)];
+  const lines = out.map((b) => JSON.stringify(b));
+  res.writeHead(200, { 'content-type': 'application/x-ndjson' });
+  res.end(`${lines.join('\n')}\n`);
+};
+
 const stubLogger = () => ({
   debug() {},
   info() {},
@@ -166,7 +202,8 @@ test('G1: a failed chunk is evicted (rows freed) and a later call refetches inst
         res.end('boom — not a recognized 400 variant');
         return;
       }
-      res.writeHead(204).end();
+      // the refetch's tail [11,100]: anchor the range end so the stream terminates (not a mid-range 204)
+      streamRes(res, q.fromBlock ?? 0, q.toBlock ?? 0, []);
     });
   });
   const port = await listen(srv);
@@ -229,7 +266,8 @@ test('G3: buffered rows are visible to the gate MID-CHUNK (registered per arrivi
       }
       // the chunk is still in flight (cursor advanced past batch 1) — observe the gate NOW
       rowsSeenMidChunk = sharedGate(loadPortalConfig({})).snapshot().rows;
-      res.writeHead(204).end();
+      // anchor the tail so the stream terminates cleanly (a mid-range 204 would now fail closed)
+      streamRes(res, q.fromBlock ?? 0, q.toBlock ?? 0, []);
     });
   });
   const port = await listen(srv);
@@ -280,12 +318,9 @@ test('frontier extend streams ONLY the newly-finalized tail (the extend request 
       const out = [A_BLOCK, B_BLOCK]
         .filter((n) => from <= n && to >= n)
         .map(mkBlock);
-      if (out.length === 0) {
-        res.writeHead(204).end();
-        return;
-      }
-      res.writeHead(200, { 'content-type': 'application/x-ndjson' });
-      res.end(`${out.map((b) => JSON.stringify(b)).join('\n')}\n`);
+      // anchor the range end at the current head so an in-range window ends cleanly (a 204 fires only past
+      // the head); a served-through tail must NOT 204 mid-range (issue #47).
+      streamRes(res, from, to, out, head);
     });
   });
   const port = await listen(srv);
@@ -346,7 +381,10 @@ const headServer = (headFn: () => number | 'fail') =>
         res.end(JSON.stringify({ number: h }));
         return;
       }
-      res.writeHead(204).end();
+      // an in-range stream POST (the client only POSTs data below the observed head) has no matching logs
+      // here → 200 with just the range-end header anchor at its own toBlock; never a mid-range 204 (#47).
+      const q = body ? JSON.parse(body) : {};
+      streamRes(res, q.fromBlock ?? 0, q.toBlock ?? 0, []);
     });
   });
 
@@ -595,17 +633,12 @@ test('INV-9 (FIX 5): a PORTAL_FINALIZED_HEAD pin survives ensureChunkSize probin
         return;
       }
       const q = body ? JSON.parse(body) : {};
-      // serve one block for the sub-pin interval A (block 10), nothing else
-      if (
-        req.url?.includes('finalized-stream') &&
-        (q.fromBlock ?? 0) <= 10 &&
-        (q.toBlock ?? 1e12) >= 10
-      ) {
-        res.writeHead(200, { 'content-type': 'application/x-ndjson' });
-        res.end(`${JSON.stringify(mkBlock(10))}\n`);
-        return;
-      }
-      res.writeHead(204).end();
+      const from = q.fromBlock ?? 0;
+      const to = q.toBlock ?? 0;
+      // serve one block for the sub-pin interval A (block 10); ALWAYS anchor the range end at `to` so an
+      // in-range window (incl. the served-through tail [11,50]) terminates cleanly — never a mid-range 204.
+      const out = from <= 10 && to >= 10 ? [mkBlock(10)] : ([] as unknown[]);
+      streamRes(res, from, to, out);
     });
   });
   const port = await listen(srv);
@@ -675,11 +708,13 @@ const oneBlockServer = () =>
         (q.fromBlock ?? 0) <= 10 &&
         (q.toBlock ?? 1e12) >= 10
       ) {
+        // batch 1: block 10 only (below `to`), so the cursor advances into the tail as before
         res.writeHead(200, { 'content-type': 'application/x-ndjson' });
         res.end(`${JSON.stringify(mkBlock(10))}\n`);
         return;
       }
-      res.writeHead(204).end();
+      // the served-through tail [11, to]: anchor the range end so the stream terminates (not a 204)
+      streamRes(res, q.fromBlock ?? 0, q.toBlock ?? 0, []);
     });
   });
 
@@ -784,11 +819,17 @@ test("INV-12: 'on' mode keeps overwrite semantics for an upstream range retry; '
 
 // ── S1: row accounting is keyed to the FETCH, not the idx ───────────────────────────────────────────
 
-test('S1: rows return to baseline after chunks settle and are evicted (no double-free, no orphans)', async () => {
+test('S1: rows settle to exactly the LIVE cache after chunks are evicted (no double-free, no orphans)', async () => {
   // Serve every chunk with one block at its start; the read-ahead prefetches extra chunks whose rows
-  // register asynchronously. Then jump far ahead (evicting everything behind) and let all in-flight
-  // fetches settle: the gate's row count must equal exactly the LIVE cache's rows — here 0, because the
-  // final far interval has no data and everything behind was evicted + freed via per-fetch tokens.
+  // register asynchronously. Then jump far ahead (evicting everything behind) and let all in-flight fetches
+  // settle: the gate's row count must equal EXACTLY the LIVE cache's rows — every evicted/stale fetch's
+  // token freed once, no orphan rows. Post-#47 the live cache is NOT empty: an in-range window always
+  // carries the range-end block HEADER as a cursor anchor (a header-only block → countRows counts 1 per
+  // block, so 1 row), so the far interval's live chunk plus its one live read-ahead chunk legitimately hold
+  // one anchor row each. The invariant is thus (i) rows == that live total and (ii) rows are STABLE across
+  // the settle — a stale read-ahead fetch that lands AFTER its eviction must add nothing (the token.freed
+  // guard). Pre-#47 the far window 204'd (no anchor) so this total was 0; the guarded orphan-freeing is
+  // identical, only the legitimate live baseline shifted.
   process.env.PORTAL_READAHEAD = '2';
   // Pin the chunk width so the mock's chunk-boundary math below is exact (density scaling is already
   // off via PORTAL_CHUNK_FIXED in beforeEach; this fixes the grid to a known 500k regardless).
@@ -806,20 +847,23 @@ test('S1: rows return to baseline after chunks settle and are evicted (no double
       }
       const from = q.fromBlock ?? 0;
       const to = q.toBlock ?? 0;
-      // EXACTLY one block per chunk, positioned at the chunk boundary; a continuation request past that
-      // boundary (from = block+1, no longer chunk-aligned) or a chunk at/after 3M gets a 204 so the
-      // stream terminates. Returning a block for every `from` instead makes the client re-request one
-      // block at a time across the whole 500k-wide chunk (~45k round-trips/chunk) — the stream drains
-      // fine but takes seconds, and under full-suite contention that overran the per-test timeout.
+      // EXACTLY one block per chunk, positioned at the chunk boundary; the block-only batch advances the
+      // cursor into the chunk, and the CONTINUATION request [boundary+11, to] carries just the range-end
+      // header anchor at `to` so the stream terminates by REACHING `to` — not by a mid-range 204, which now
+      // fails closed (issue #47). Preserving the two-response shape keeps the read-ahead timing/row-accounting
+      // race intact. The anchor is header-only (no logs/txs) but still counts as one block-row (countRows
+      // counts 1 per block); a live chunk therefore retains that single anchor row (see the assertion below).
       const boundary = Math.ceil(from / CHUNK_BLOCKS) * CHUNK_BLOCKS;
-      if (boundary < 3_000_000 && boundary <= to) {
-        res.writeHead(200, { 'content-type': 'application/x-ndjson' });
+      const servesBlock =
+        boundary < 3_000_000 && boundary <= to && from <= boundary + 10;
+      if (servesBlock) {
         const payload = `${JSON.stringify(mkBlock(boundary + 10))}\n`;
-        // The read-ahead chunks (boundary ≥ CHUNK_BLOCKS — i.e. NOT chunk 0) respond SLOWLY so they are
-        // still in flight when the far-ahead interval evicts and frees their tokens. That is the exact
-        // race the per-fetch `token.freed` guard exists to close: a stale stream that outlives its
-        // eviction must not register orphan rows into an already-freed budget. Chunk 0 (boundary 0)
-        // answers immediately so the first interval's await returns promptly.
+        // The read-ahead chunks (boundary ≥ CHUNK_BLOCKS — i.e. NOT chunk 0) respond SLOWLY so they are still
+        // in flight when the far-ahead interval evicts and frees their tokens. That is the exact race the
+        // per-fetch `token.freed` guard exists to close: a stale stream that outlives its eviction must not
+        // register orphan rows into an already-freed budget. Chunk 0 (boundary 0) answers immediately so the
+        // first interval's await returns promptly.
+        res.writeHead(200, { 'content-type': 'application/x-ndjson' });
         if (boundary >= CHUNK_BLOCKS) {
           setTimeout(() => res.end(payload), 150);
           return;
@@ -827,7 +871,8 @@ test('S1: rows return to baseline after chunks settle and are evicted (no double
         res.end(payload);
         return;
       }
-      res.writeHead(204).end();
+      // continuation / past-3M / empty in-range window → terminate at the range-end anchor (never a 204)
+      streamRes(res, from, to, []);
     });
   });
   const port = await listen(srv);
@@ -853,7 +898,10 @@ test('S1: rows return to baseline after chunks settle and are evicted (no double
       requiredFactoryIntervals: [],
       syncStore,
     });
-    // let any in-flight read-ahead fetches settle, then evict everything behind once more
+    // let ALL in-flight fetches settle — the slow read-ahead chunks from BEHIND the jump (evicted, tokens
+    // freed) AND the far interval's OWN read-ahead chunk (still live) — then re-issue the far interval so a
+    // second eviction pass runs. A stale fetch that lands after its eviction must register NOTHING (the
+    // token.freed guard); only the two LIVE chunks may hold rows.
     await new Promise((r) => setTimeout(r, 300));
     await sync.syncBlockRangeData({
       interval: i2,
@@ -862,8 +910,12 @@ test('S1: rows return to baseline after chunks settle and are evicted (no double
       syncStore,
     });
 
-    // every token was freed exactly once; no stale fetch registered rows into an evicted slot
-    expect(gate.snapshot().rows).toBe(baseline);
+    // The gate holds EXACTLY the live cache's rows: the far interval's chunk plus its ONE prefetched
+    // read-ahead chunk — each an empty (no-log) window carrying a single range-end anchor row (post-#47 an
+    // in-range window always anchors the range end; a header-only block counts as 1 row). Everything BEHIND
+    // the jump was evicted and freed exactly once — a single leaked orphan row would make this 3+.
+    expect(gate.snapshot().rows).toBe(2);
+    expect(baseline).toBe(0); // sanity: the gate started empty (the residual is all live, not pre-existing)
   } finally {
     srv.close();
     delete process.env.PORTAL_READAHEAD;
