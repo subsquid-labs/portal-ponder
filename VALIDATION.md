@@ -146,7 +146,7 @@ the operator (see `harness/validate/README.md`).
 | `CTRL` | erc20 | eth | logs, receipts | 10 × 1k (seeded) | **DONE (2026-07-06)** | `UPSTREAM_PONDER_VERSION=0.16.6 bash harness/validate/ctrl-cell.sh CTRL` |
 | `L-eth` | erc20 | eth | logs, receipts | 4×2k + 4×5k (seeded) | **DONE (2026-07-06) — PASS under documented tolerance (#76)** | `bash harness/validate/run-cell.sh L-eth` |
 | `L-base` | erc20 | base | logs, receipts | 4×2k + 4×5k (seeded) | **FAIL-FAST (by design), 2026-07-07 — #83** | `bash harness/validate/run-cell.sh L-base` |
-| `L-base-logs` | erc20 | base | logs | 4×2k + 4×5k (seeded) | PENDING (logs-only variant of `L-base`, #83) | `bash harness/validate/run-cell.sh L-base-logs` |
+| `L-base-logs` | erc20 | base | logs | 4×2k + 4×5k (seeded) | **DIFFER-FAIL (benign, by design), 2026-07-07 — base lacks `transactions.access_list` (#83-family); logs byte-identical (§3.5.1)** | `bash harness/validate/run-cell.sh L-base-logs` |
 | `L-arbitrum` | erc20 | arbitrum | logs, receipts | 4×2k + 4×5k (seeded) | PENDING — **blocked for receipts by #83** (logs-only variant pending) | `bash harness/validate/run-cell.sh L-arbitrum` |
 | `L-arbitrum-logs` | erc20 | arbitrum | logs | 4×2k + 4×5k (seeded) | PENDING (logs-only variant of `L-arbitrum`, #83) | `bash harness/validate/run-cell.sh L-arbitrum-logs` |
 | `L-polygon` | erc20 | polygon | logs, receipts | 4×2k + 4×5k (seeded) | PENDING | `bash harness/validate/run-cell.sh L-polygon` |
@@ -187,6 +187,10 @@ Notes:
   receipts** and each has a **logs-only variant** (`L-base-logs` / `L-arbitrum-logs` /
   `L-avalanche-logs`) that drops receipts but keeps the *identical* windows for comparability. Full
   record — the 8-window run, the verbatim error, the probe table, and the disposition — in §3.5.
+  The **`L-base-logs`** logs-only variant has since **run (2026-07-07)** and surfaced a *second*,
+  distinct base-mainnet dataset gap in the same #83 family — the dataset also lacks
+  `transactions.access_list` — but with a **categorically benign** disposition (the field is
+  droppable/nullable, the load-bearing `logs` are byte-identical): full record in §3.5.1.
 - **`F-full`** is the flagship byte diff — full Euler history on eth, `[20529207 → 25436954]`, head
   **pinned in `cells.json` for reproducibility**, every sync-store row diffed by the constant-memory
   `diff-batched.mjs` plus an app-table checkpoint hash. **DONE (2026-07-06): byte-identical across all
@@ -500,7 +504,10 @@ PONDER_RPC_URL_1=<any base archive RPC> \
 ```
 
 **Disposition.** This is an **upstream dataset gap**, reported and tracked in
-[#83](../../issues/83) (the issue stays open as the upstream tracker). The matrix does **not** re-prove
+[#83](../../issues/83), which was **closed as completed on 2026-07-07**; a re-probe the same day shows
+`base-mainnet` **still returns 400** on `transaction.logsBloom`, so the underlying gap **persists** —
+the closure is administrative, not an upstream fix, and the matrix **continues logs-only** on the
+affected chains. The matrix does **not** re-prove
 the known gap on the other two affected chains; instead it **continues logs-only** on base, arbitrum,
 and avalanche via the new `L-base-logs` / `L-arbitrum-logs` / `L-avalanche-logs` cells — identical
 windows to their blocked receipts counterparts, `receipts: false`, so the Portal-vs-RPC byte-identity
@@ -509,6 +516,97 @@ these three chains remain **unusable until the datasets add the column** (the pr
 the column already exists on eth / polygon / bsc, so it is dataset backfill work, not schema design);
 a fork-side bloom synthesis from the transaction's full log set is *possible future work* but is not
 planned. `L-base` above is kept as the **record of what ran**.
+
+### 3.5.1 Matrix cell — L-base-logs (differ-FAIL, benign — base-mainnet dataset lacks access_list, #83-family)
+
+The logs-only variant of `L-base`: the erc20 app on base mainnet (chain 8453, USDC
+`0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913`), **`receipts: false`**, over the **same 8 seeded-random
+windows** as `L-base` — **4 × 2 000 blocks (seed 201)** and **4 × 5 000 blocks (seed 202)**. It ran
+**2026-07-07** and is recorded here **exactly as it ran** — a differ-FAIL — because a gate that reports
+only its clean runs is not a gate. Unlike `L-base` (§3.5) this failure is **benign and by design**: it
+is a *second*, distinct base-mainnet dataset gap in the **same family as [#83](../../issues/83)**, on a
+**droppable/nullable** column, so the cell runs to completion and the load-bearing `logs` are
+byte-identical.
+
+**What ran — 8 / 8 windows failed the byte-diff, but ran to completion.** Every window synced fully
+(unlike `L-base`, which failed fast in 6 requests before any diff), then the byte-differ flagged
+**`transactions.access_list`** *after* the sync. Each window **auto-shrank once** (the differ halves a
+failed window to localise the divergence) and the shrunk half reproduced the **identical** divergence —
+**16 differ records, all FAIL**. In every record `logs` / `transaction_receipts` (0) / `traces` (0) /
+`blocks` were **byte-identical**; the **only** divergence is `transactions.access_list`. Per-window
+(original, pre-shrink) request counts:
+
+| Window (tag) | Range | Result | Requests |
+|--------------|-------|--------|---------:|
+| `rand#201.0@2000` | `[31019460, 31021460]` | **DIFFER-FAIL — `access_list` only** | 2033 |
+| `rand#201.1@2000` | `[30915789, 30917789]` | **DIFFER-FAIL — `access_list` only** | 2034 |
+| `rand#201.2@2000` | `[30022073, 30024073]` | **DIFFER-FAIL — `access_list` only** | 2032 |
+| `rand#201.3@2000` | `[37474954, 37476954]` | **DIFFER-FAIL — `access_list` only** | 2035 |
+| `rand#202.0@5000` | `[26059226, 26064226]` | **DIFFER-FAIL — `access_list` only** | 5024 |
+| `rand#202.1@5000` | `[39409152, 39414152]` | **DIFFER-FAIL — `access_list` only** | 5063 |
+| `rand#202.2@5000` | `[27500647, 27505647]` | **DIFFER-FAIL — `access_list` only** | 5043 |
+| `rand#202.3@5000` | `[31915218, 31920218]` | **DIFFER-FAIL — `access_list` only** | 5047 |
+
+The divergence is identical on every window: the Portal store has `transactions.access_list = "[]"`
+(empty) where the RPC ground truth carries the populated access list, on base typed txs. Across all 16
+records (the 8 originals plus their 8 auto-shrunk halves) the cell made **42 553 metered requests**.
+
+**Root cause — one missing column, proven by a live probe (2026-07-07).** The `base-mainnet` Portal
+dataset lacks the `access_list` column. Requesting `transaction.accessList` returns:
+
+```
+HTTP 400  Bad request: couldn't parse request: column 'access_list_size' is not found in 'transactions'
+```
+
+Without that field the same request returns **200** and serves txs fine; the `ethereum-mainnet` control
+serves `accessList` (**200**) — which is why the `L-eth` cell (§3.4) passed on `transactions`. This is
+the **same failure mode as [#83](../../issues/83)** (base-mainnet lacks `transactions.logs_bloom`), on a
+different column:
+
+| dataset | `transaction.accessList` probe |
+|---------|--------------------------------|
+| `ethereum-mainnet` (control) | **200** — `accessList` served |
+| `base-mainnet` | **400** — `couldn't parse request: column 'access_list_size' is not found in 'transactions'` |
+
+**Disposition — BENIGN, by design (and this is the crucial contrast with #83).**
+`transaction.accessList` is in the fork's **DROPPABLE_FIELDS** (`portal/portal-filters.ts`): it is
+**NULLABLE** in Ponder's sync-store **and** non-load-bearing (Ponder never reads it internally). When a
+dataset lacks it, the fork's schema-field-error handling **drops the field and stores it empty** — the
+correct graceful degradation, and **byte-for-byte what upstream Ponder itself persists** when an RPC
+provider omits `accessList`. So this is **neither a fork bug nor a Portal correctness bug**: the
+load-bearing data (`logs`) is byte-identical, and the empty `access_list` is exactly what Ponder writes
+in the same situation on the stock path. The byte-differ is **strict on `transactions`** (no
+`accessList` tolerance), so it reports FAIL — a **known benign field gap**, analogous to how the
+`block.size` class (§5.3) is a real-but-tolerated upstream-dataset divergence.
+
+**Fail-fast (#83) vs differ-FAIL (this), the exact distinction.** In `L-base` (§3.5) the missing column
+is `logs_bloom`, which is **load-bearing / NOT NULL / never fabricated**, so the fork's guard **fails
+fast** (6 requests/window, before any diff; receipts **unusable**; **not** tolerable). Here the missing
+column is `access_list`, which is **droppable / nullable**, so the cell **runs to completion** and the
+differ flags the empty field **after the fact** — a tolerable/benign field gap, not a refusal to serve
+data.
+
+**Not to be conflated with #27/#32.** Those are **RPC-mode realtime** (Layer D, Leg-A) findings — the
+RPC *provider* omits `accessList` so the RPC leg persists NULL, while the Portal `/stream` leg
+**preserves** the real list (§5.1). This finding is the **opposite leg and layer**: **historical
+backfill**, where the **Portal dataset** (base-mainnet) lacks the column and stores empty. Different
+chain-mode, different mechanism — do not merge them.
+
+**Repro.** The underlying dataset gap reproduces with a single `curl`, no harness (swap
+`base-mainnet` for `ethereum-mainnet` to see the 200):
+
+```bash
+curl -s -X POST "https://portal.sqd.dev/datasets/base-mainnet/finalized-stream" \
+  -H 'content-type: application/json' \
+  -d '{"type":"evm","fromBlock":31019460,"toBlock":31019460,"fields":{"transaction":{"accessList":true}},"transactions":[{}]}'
+```
+
+The whole-cell run reproduces through the harness (the operator supplies any base archive RPC):
+
+```bash
+SQD_PONDER_TARBALL=<tarball> SQD_RPC_KEY=<paid-rpc-key> \
+  bash harness/validate/run-cell.sh L-base-logs
+```
 
 ---
 
@@ -845,18 +943,24 @@ belong in the open too.
 
 ### 5.6 Validation-matrix data findings (Layer E) — upstream-dataset gaps
 
-The paid matrix (Layer E) surfaced two confirmed **upstream SQD Portal dataset** issues — and, unlike
-the Layer-D cross-validation findings above, **neither is a portal-ponder fork defect**: both are
+The paid matrix (Layer E) surfaced three confirmed **upstream SQD Portal dataset** gaps — and, unlike
+the Layer-D cross-validation findings above, **none is a portal-ponder fork defect**: all are
 defects/gaps in the dataset the fork reads, caught precisely because the gate does not wave data
 through. The first ([#76](../../issues/76)) is a `block.size` off-by-one the L-eth cell (§3.4) flagged,
 held the stores for, and re-verdicted clean once bounded. The second ([#83](../../issues/83)) is a
-**missing column** on three datasets that the L-base cell (§3.5) surfaced as an **8 / 8 fail-fast** —
-the fork's dataset-completeness guard refusing to serve incomplete data, exactly as designed.
+**missing `logs_bloom` column** on three datasets that the L-base cell (§3.5) surfaced as an **8 / 8
+fail-fast** — the fork's dataset-completeness guard refusing to serve incomplete data, exactly as
+designed. The third (same #83 family, no separate tracker) is a **missing `access_list` column** on
+base-mainnet that the L-base-logs cell (§3.5.1) surfaced as an **8 / 8 differ-FAIL** — but a
+**categorically benign** one: `access_list` is droppable/nullable, so the cell runs to completion, the
+load-bearing `logs` stay byte-identical, and the fork stores the field empty exactly as upstream Ponder
+does when an RPC provider omits it.
 
 | Issue | State | Finding | Attribution / layer |
 |-------|-------|---------|---------------------|
 | [#76](../../issues/76) | OPEN (tolerance **merged [#77](../../pull/77)**; upstream dataset fix tracked in #76) | **Upstream Portal dataset `block.size` off-by-one at the RLP 2^16 boundary.** On blocks whose canonical RLP-encoded size is **≥ 65 540**, the Portal dataset reports `block.size` **one byte low** (`rpc = portal + 1`); every other `blocks` column, and every `logs` / `transactions` / `transaction_receipts` / `traces` row, is byte-identical. Surfaced by the **L-eth** cell (§3.4): of the 11 first-run records, 8 failed on `blocks` **only** and the 2 whose diffs wedged (#78) re-verdicted with the same signature — all 10 preserved stores carry it, and the one remaining window passed outright. **Publicly reproducible** against any public archive node — e.g. block **19963775** (in the `rand#3` 2k window) reports `size` **66755** from the Portal endpoint vs **66756** from a public RPC. | A defect in the **upstream dataset** (the SQD Portal), not the portal-ponder fork or the diff tool: the fork faithfully persists what the dataset serves, and the RPC ground truth breaks the tie. Tolerated by a precisely-scoped, self-retiring diff class (§5.3) **merged in [#77](../../pull/77)**, under which the L-eth strict tables re-verdict clean; the underlying dataset fix is tracked in [#76](../../issues/76). |
-| [#83](../../issues/83) | OPEN (upstream dataset gap; matrix continues logs-only) | **Upstream Portal datasets missing `transactions.logs_bloom` on base / arbitrum / avalanche.** The `base-mainnet`, `arbitrum-one`, and `avalanche-mainnet` datasets do **not** serve the `logs_bloom` column on the `transactions` table (probe returns **400** `couldn't parse request: column 'logs_bloom' is not found in 'transactions'`), while `ethereum-mainnet` / `polygon-mainnet` / `binance-mainnet` serve it (**200**). The gap is **exactly this one column** — the other receipt fields (`status`, `cumulativeGasUsed`, `effectiveGasPrice`, `gasUsed`, `contractAddress`) all probe 200 on the affected datasets. Surfaced by the **L-base** cell (§3.5, 2026-07-07): all **8 / 8** windows **failed fast** (48 metered requests total, 6/window) with the dataset-completeness error, because a `includeTransactionReceipts: true` app needs `transaction.logsBloom` and `receipts.logsBloom` is NOT NULL / never substituted (`portal-filters.ts` / `portal-transform.ts`). **Publicly reproducible** with a single `curl` against `portal.sqd.dev` (§3.5), no harness. | A gap in the **upstream dataset** (the SQD Portal), not the portal-ponder fork: the fork's dataset-completeness guard **correctly fails fast** rather than persisting a receipt row with a fabricated bloom that would silently diverge from RPC ground truth. Reported and tracked in [#83](../../issues/83). The matrix does not re-prove the known gap on receipts; it **continues logs-only** on the three chains via `L-base-logs` / `L-arbitrum-logs` / `L-avalanche-logs` (identical windows, `receipts: false`). Removed when the datasets add the column (already present on eth / polygon / bsc, so it is dataset backfill work). |
+| [#83](../../issues/83) | CLOSED (completed 2026-07-07); underlying gap persists — re-probed 2026-07-07, `base-mainnet` still **400** on `logs_bloom`; matrix continues logs-only | **Upstream Portal datasets missing `transactions.logs_bloom` on base / arbitrum / avalanche.** The `base-mainnet`, `arbitrum-one`, and `avalanche-mainnet` datasets do **not** serve the `logs_bloom` column on the `transactions` table (probe returns **400** `couldn't parse request: column 'logs_bloom' is not found in 'transactions'`), while `ethereum-mainnet` / `polygon-mainnet` / `binance-mainnet` serve it (**200**). The gap is **exactly this one column** — the other receipt fields (`status`, `cumulativeGasUsed`, `effectiveGasPrice`, `gasUsed`, `contractAddress`) all probe 200 on the affected datasets. Surfaced by the **L-base** cell (§3.5, 2026-07-07): all **8 / 8** windows **failed fast** (48 metered requests total, 6/window) with the dataset-completeness error, because a `includeTransactionReceipts: true` app needs `transaction.logsBloom` and `receipts.logsBloom` is NOT NULL / never substituted (`portal-filters.ts` / `portal-transform.ts`). **Publicly reproducible** with a single `curl` against `portal.sqd.dev` (§3.5), no harness. | A gap in the **upstream dataset** (the SQD Portal), not the portal-ponder fork: the fork's dataset-completeness guard **correctly fails fast** rather than persisting a receipt row with a fabricated bloom that would silently diverge from RPC ground truth. Reported and tracked in [#83](../../issues/83). The matrix does not re-prove the known gap on receipts; it **continues logs-only** on the three chains via `L-base-logs` / `L-arbitrum-logs` / `L-avalanche-logs` (identical windows, `receipts: false`). Removed when the datasets add the column (already present on eth / polygon / bsc, so it is dataset backfill work). |
+| #83-family (recorded here; no separate tracker) | **BENIGN / by design** (droppable field gap; matrix logs-only continues) | **Upstream Portal dataset `base-mainnet` missing `transactions.access_list`.** Requesting `transaction.accessList` returns **400** `couldn't parse request: column 'access_list_size' is not found in 'transactions'` (probe re-verified 2026-07-07); `ethereum-mainnet` serves it **200**. Surfaced by the **L-base-logs** cell (§3.5.1, 2026-07-07): all **8 / 8** windows (16 differ records incl. auto-shrinks, 42 553 metered requests) ran to completion and **differ-FAIL** on **`transactions.access_list` only** — the Portal store holds `"[]"` where RPC has the populated list — while `logs` / receipts(0) / traces(0) / `blocks` are byte-identical. Same failure family as [#83](../../issues/83) (`base-mainnet` lacks a `transactions` column), on a different column. | A gap in the **upstream dataset** (the SQD Portal), **not** a fork defect and **not** a Portal correctness bug. Unlike `logs_bloom`, `transaction.accessList` is in the fork's **DROPPABLE_FIELDS** (`portal-filters.ts`): **NULLABLE** and non-load-bearing (Ponder never reads it), so the fork **drops it and stores empty** — byte-for-byte what **upstream Ponder itself** persists when an RPC provider omits `accessList`. The load-bearing `logs` are byte-identical; the byte-differ is strict on `transactions`, so it reports FAIL — a known benign field gap (contrast: the `logs_bloom` gap above is load-bearing → **fail-fast**, this one is droppable → **differ-FAIL after a full sync**). **Distinct from #27/#32**, which are RPC-mode realtime (Leg-A) findings where the *RPC provider* omits `accessList` and the Portal `/stream` leg **preserves** it (§5.1) — this is the opposite leg (historical backfill) and layer (the Portal *dataset* lacks the column). |
 
 **Why the L-base cell fails fast, and why that is correct.** Unlike the tolerated `block.size` class
 above, the `logs_bloom` gap is **not tolerable**: `receipts.logsBloom` is a NOT NULL, bloom-load-bearing
