@@ -79,12 +79,21 @@ SPEEDUP=$(awk -v p="${WALL_portal:-0}" -v r="${WALL_rpc:-0}" 'BEGIN{ if (p>0) pr
 echo "⏱ BACKFILL WALL-CLOCK [$START,$END] — Portal ${WALL_portal}s vs RPC ${WALL_rpc}s  →  $SPEEDUP"
 echo ""
 echo "▶ diffing ponder_sync stores"
-# DIFF_SCRIPT defaults to the in-memory diff.mjs; the validation harness points it at
-# harness/validate/diff-batched.mjs for the full-range F-full cell (constant-memory streaming diff).
-DIFF_SCRIPT="${DIFF_SCRIPT:-$ROOT/harness/diff/diff.mjs}"
+# DIFF_SCRIPT defaults to the PAGED differ (byte-aware keyset pages, constant memory): the legacy
+# in-memory diff.mjs materializes each table in one unbounded select and wedges PGlite's WASM heap
+# on dense windows — >30min at 100% CPU above ~70k logs/side vs seconds paged (issue #78). Point
+# DIFF_SCRIPT at harness/diff/diff.mjs to get the old differ back for small stores.
+DIFF_SCRIPT="${DIFF_SCRIPT:-$ROOT/harness/validate/diff-batched.mjs}"
 cp "$DIFF_SCRIPT" "$WORK/diff.mjs"   # run from $WORK so @electric-sql/pglite resolves
-node "$WORK/diff.mjs" "$WORK/dbPortal" "$WORK/dbRpc" ${DIFF_ARGS:-}
+# Bound the diff phase: a wedged differ otherwise blocks a (paid) cell indefinitely (issue #78).
+# GNU timeout exits 124 on TERM, 137 after the -k KILL escalation — both non-zero, so the rescue
+# path below preserves the expensive backfilled stores exactly as for any other failing diff.
+DIFF_TIMEOUT="${DIFF_TIMEOUT:-600}"
+timeout -k 10 "$DIFF_TIMEOUT" node "$WORK/diff.mjs" "$WORK/dbPortal" "$WORK/dbRpc" ${DIFF_ARGS:-}
 DIFF_RC=$?
+if [ "$DIFF_RC" -eq 124 ] || [ "$DIFF_RC" -eq 137 ]; then
+  echo "‼ diff timed out after ${DIFF_TIMEOUT}s (rc=$DIFF_RC) — differ killed, stores rescued below"
+fi
 
 # On a NON-ZERO diff exit, rescue the backfilled stores before the EXIT trap removes $WORK. The
 # stores are the EXPENSIVE artifact (they may have cost paid RPC on the stock side); the diff itself

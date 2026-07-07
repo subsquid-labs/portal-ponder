@@ -7,13 +7,22 @@
 // lazily inside main() so the exports load with zero dependencies in the repo test runner.
 
 // strict byte-identity is required for these four paths
-const STRICT = ['logs', 'transactions', 'transaction_receipts', 'traces'];
+// (exported so a verdict-parity test can assert this differ and the paged diff-batched.mjs cover the
+//  same tables — the run.sh default now routes the cell path through diff-batched.mjs, issue #78)
+export const STRICT = [
+  'logs',
+  'transactions',
+  'transaction_receipts',
+  'traces',
+];
 
 // total_difficulty is meaningless post-Merge and RPC-dependent (null vs "0" vs the frozen TTD),
 // so it's not a Portal-vs-RPC parity signal — exclude it from the block comparison.
 const BLOCK_DROP = new Set(['total_difficulty']);
 
-const norm = (row, drop) => {
+// exported so a verdict-parity test can normalize fixture rows with THIS differ's own normalizer and
+// prove it matches diff-batched.mjs `normRow` byte-for-byte (issue #78 route-a parity).
+export const norm = (row, drop) => {
   const o = {};
   for (const k of Object.keys(row).sort()) {
     if (drop?.has(k)) continue;
