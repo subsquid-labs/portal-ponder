@@ -56,12 +56,13 @@ export type DiscoveryPlanOpts = {
   chunkBlocks: number;
   endHint: number;
   discoveryWindows: number;
+  quantum: number;
 };
 
 /**
  * The next extension to scan to reach `needTo`, or null when already covered / no floor. Pure. `from`
- * continues past the current watermark; `to` reaches as far as the backfill will need (`endHint` —
- * usually the whole span at once) so discovery typically completes in one pass.
+ * continues past the current watermark; `to` reaches as far as the backfill will need, bounded by the
+ * discovery-plane slow-start quantum and never below `needTo`.
  */
 export function planDiscovery(
   state: DiscoveryState,
@@ -71,7 +72,10 @@ export function planDiscovery(
   if (state.floor < 0) return null;
   if (needTo <= state.through) return null;
   const from = state.through < 0 ? state.floor : state.through + 1;
-  const to = Math.max(needTo, opts.endHint);
+  const to = Math.max(
+    needTo,
+    Math.min(opts.endHint, state.through + opts.quantum),
+  );
   return {
     from,
     to,
@@ -117,14 +121,24 @@ export type DiscoveryDeps = {
   childAddresses: ChildAddresses;
   factories: readonly Factory[];
   discoveryWindows: number;
+  warmupBlocks: number;
   stats: PortalStats;
 };
 
 export function createDiscovery(deps: DiscoveryDeps): Discovery {
-  const { client, childAddresses, factories, discoveryWindows, stats } = deps;
+  const {
+    client,
+    childAddresses,
+    factories,
+    discoveryWindows,
+    warmupBlocks,
+    stats,
+  } = deps;
   let floor = -1;
   let through = -1; // optimistic watermark (dedup + `from`)
   let confirmed = -1; // last SUCCESSFUL watermark (rollback target)
+  let discoveryQuantum =
+    warmupBlocks === 0 ? Number.POSITIVE_INFINITY : warmupBlocks;
   let inflight: Promise<void> = Promise.resolve();
   // Bumped by reset(). Each scan captures the generation at plan time; a scan that resolves OR rejects
   // after a reset changed the generation must NOT touch the watermark. Otherwise a stale success advances
@@ -233,6 +247,7 @@ export function createDiscovery(deps: DiscoveryDeps): Discovery {
       chunkBlocks: opts.chunkBlocks,
       endHint: opts.endHint,
       discoveryWindows,
+      quantum: discoveryQuantum,
     });
     if (plan === null) return inflight; // no floor yet OR already covered
     const { to, windows } = plan;
@@ -252,6 +267,7 @@ export function createDiscovery(deps: DiscoveryDeps): Discovery {
       if (gen !== generation) return; // a reset() invalidated this scan — never confirm over it (issue #9)
 
       confirmed = to; // INV-3: advance the confirmed watermark ONLY on success (never past a gap)
+      discoveryQuantum *= 2;
     })();
     inflight = p;
     // On failure roll the optimistic watermark back to the last good one and drop the rejected promise so

@@ -125,6 +125,7 @@ export const createPortalHistoricalSync = (
     childAddresses: args.childAddresses,
     factories: spec.factories,
     discoveryWindows: cfg.discoveryWindows,
+    warmupBlocks: cfg.warmupBlocks,
     stats,
   });
 
@@ -445,15 +446,12 @@ export const createPortalHistoricalSync = (
     const activeNeed = cfg.warmupBlocks === 0 ? undefined : need;
     const needTo = activeNeed === undefined ? desiredTo : activeNeed[1];
     const quantum = Math.min(fetchQuantum, chunkBlocks);
-    const quantumActive = fetchQuantum < chunkBlocks;
-    // Discovery scans as far as the backfill will need in one pass once warmup has converged; while
-    // slow-start is active it scans only through the bounded fetch target.
     const de = dataEnd();
     const legacyEndHint = Number.isFinite(de) ? de : desiredTo;
-    const ensureOpts = (target: number) => ({
+    const ensureOpts = {
       chunkBlocks,
-      endHint: quantumActive ? target : legacyEndHint,
-    });
+      endHint: legacyEndHint,
+    };
     const discoveryEnsureTarget = (target: number): number => {
       if (spec.factories.length === 0) return target;
 
@@ -506,7 +504,7 @@ export const createPortalHistoricalSync = (
         const repaired = (async (): Promise<ChunkData> => {
           const cd = await prev;
           const ensureTo = discoveryEnsureTarget(prefixTo);
-          await discovery.ensure(ensureTo, ensureOpts(ensureTo));
+          await discovery.ensure(ensureTo, ensureOpts);
           invariant(
             'INV-3',
             discoveryReady(prefixTo),
@@ -544,7 +542,7 @@ export const createPortalHistoricalSync = (
       const extended = (async (): Promise<ChunkData> => {
         const cd = await prev;
         const ensureTo = discoveryEnsureTarget(extendTo);
-        await discovery.ensure(ensureTo, ensureOpts(ensureTo)); // discovery must reach the extended tail too
+        await discovery.ensure(ensureTo, ensureOpts); // discovery must reach the extended tail too
         // FIX 2: the floor is pinned from the spec at construction, so a factory sync always has a floor —
         // the former `discStartIdx === undefined` escape (which silently disabled this check on the very
         // chunks that fetched before requiredFactoryIntervals arrived) is gone.
@@ -574,7 +572,7 @@ export const createPortalHistoricalSync = (
     const [from, to] = fetchBounds(gridFrom, desiredTo, activeNeed, quantum);
     const p = (async (): Promise<ChunkData> => {
       const ensureTo = discoveryEnsureTarget(to);
-      await discovery.ensure(ensureTo, ensureOpts(ensureTo)); // children ≤ this fetch window are known (INV-3)
+      await discovery.ensure(ensureTo, ensureOpts); // children ≤ this fetch window are known (INV-3)
       // FIX 2: floor pinned from the spec at construction ⇒ no `discStartIdx === undefined` escape (see extend).
       invariant(
         'INV-3',

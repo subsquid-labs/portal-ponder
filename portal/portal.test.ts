@@ -160,6 +160,7 @@ afterEach(() => {
   server.close();
   delete process.env.PORTAL_CHUNK_FIXED;
   delete process.env.PORTAL_CHUNK_BLOCKS;
+  delete process.env.PORTAL_DISCOVERY_WINDOWS;
   delete process.env.PORTAL_FINALIZED_HEAD;
   delete process.env.PORTAL_WARMUP_BLOCKS;
   delete process.env.PORTAL_READAHEAD;
@@ -2081,6 +2082,21 @@ const cx50PlainFilter = (toBlock = 100_000): any => ({
   include: [],
 });
 
+const cx50FactoryTraceFilter = (factory: any, toBlock = 10_000_000): any => ({
+  type: 'trace',
+  chainId: 1,
+  sourceId: 'cx50:factory-trace',
+  fromAddress: undefined,
+  toAddress: factory,
+  functionSelector: undefined,
+  callType: undefined,
+  includeReverted: false,
+  fromBlock: 0,
+  toBlock,
+  hasTransactionReceipt: false,
+  include: [],
+});
+
 const cx50SyncStore = (insertedLogs?: any[]): any => ({
   insertLogs: (x: any) => {
     insertedLogs?.push(...x.logs);
@@ -2230,6 +2246,86 @@ test('#50 T2: first factory discovery scan is warmup-bounded', async () => {
     expect(
       Math.max(...discoveryRequests.map((q) => q.toBlock)),
     ).toBeLessThanOrEqual(1_000);
+  } finally {
+    srv.close();
+  }
+});
+
+test('#50 T8: dense factory trace discovery is bounded by the discovery warmup quantum', async () => {
+  process.env.PORTAL_READAHEAD = '0';
+  process.env.PORTAL_DISCOVERY_WINDOWS = '1';
+  const discoveryRequests: any[] = [];
+  const srv = http.createServer((req, res) => {
+    let body = '';
+    req.on('data', (c) => {
+      body += c;
+    });
+    req.on('end', () => {
+      const q = body ? JSON.parse(body) : {};
+      if (cx50HasTopic(q, PROXY_CREATED_TOPIC0.toLowerCase())) {
+        discoveryRequests.push(q);
+      }
+      anchorRes(res, q.toBlock ?? 1e12);
+    });
+  });
+  const p: number = await new Promise((r) =>
+    srv.listen(0, () => r((srv.address() as AddressInfo).port)),
+  );
+  try {
+    const factory = mkFactory();
+    const filter = cx50FactoryTraceFilter(factory);
+    const sync = cx50Sync(p, filter, new Map([[factory.id, new Map()]]));
+    const interval: [number, number] = [0, 25];
+    await sync.syncBlockRangeData({
+      interval,
+      requiredIntervals: [{ interval, filter }],
+      requiredFactoryIntervals: [{ interval, factory }],
+      syncStore: cx50SyncStore(),
+    });
+
+    expect(discoveryRequests.length).toBeGreaterThan(0);
+    expect(discoveryRequests[0]!.toBlock).toBeLessThanOrEqual(25_000);
+  } finally {
+    srv.close();
+  }
+});
+
+test('#50 parity: PORTAL_WARMUP_BLOCKS=0 keeps a factory discovery scan full-range', async () => {
+  process.env.PORTAL_WARMUP_BLOCKS = '0';
+  process.env.PORTAL_READAHEAD = '0';
+  process.env.PORTAL_DISCOVERY_WINDOWS = '1';
+  const discoveryRequests: any[] = [];
+  const srv = http.createServer((req, res) => {
+    let body = '';
+    req.on('data', (c) => {
+      body += c;
+    });
+    req.on('end', () => {
+      const q = body ? JSON.parse(body) : {};
+      if (cx50HasTopic(q, PROXY_CREATED_TOPIC0.toLowerCase())) {
+        discoveryRequests.push(q);
+      }
+      anchorRes(res, q.toBlock ?? 1e12);
+    });
+  });
+  const p: number = await new Promise((r) =>
+    srv.listen(0, () => r((srv.address() as AddressInfo).port)),
+  );
+  try {
+    const factory = mkFactory();
+    const filter = { ...mkFactoryFilter(factory), toBlock: 10_000_000 };
+    const sync = cx50Sync(p, filter, new Map([[factory.id, new Map()]]));
+    const interval: [number, number] = [0, 25];
+    await sync.syncBlockRangeData({
+      interval,
+      requiredIntervals: [{ interval, filter }],
+      requiredFactoryIntervals: [{ interval, factory }],
+      syncStore: cx50SyncStore(),
+    });
+
+    expect(discoveryRequests).toHaveLength(1);
+    expect(discoveryRequests[0]!.fromBlock).toBe(0);
+    expect(discoveryRequests[0]!.toBlock).toBe(10_000_000);
   } finally {
     srv.close();
   }
