@@ -1101,6 +1101,459 @@ test('regression (wave 4): an extend tail whose only new logs are RE-MATCH-DROPP
   }
 });
 
+// ── #20: the needed-field growth check counts TRACES/TRANSFERS post-re-match, not raw cd.traceBlocks.size
+// The trace query is server-side UNFILTERED by design (INV-5: fetch every trace, rank the full tree, THEN
+// client-filter). So an EXTEND tail can return traces that assembly drops wholesale — traces matching NO
+// configured trace/transfer filter. FIX 3 made the check extend-local but still counted raw
+// `cd.traceBlocks.size`, which grows whenever the tail returns ANY trace — even ALL-unmatched ones. A
+// tail of all-unmatched traces over a dataset missing a NEEDED field (logsBloom, needed via
+// hasTransactionReceipt) therefore armed the needed-field fatal → G1 evict → crash-loop for data the
+// indexer never keeps. This is the residual #20 flagged. Only traces surviving `traceMatched` may count.
+// This server serves a base MATCHED trace (to TARGET, WITH logsBloom) at H1, then over the newly-finalized
+// tail 400s the logsBloom column and — once dropped — returns a trace whose `to` is `tailTo` (OTHER ⇒
+// client-unmatched; TARGET ⇒ matched, the genuine-fatal companion).
+const TRACE_TARGET = '0x000000000000000000000000000000000000dead';
+const TRACE_OTHER = '0x000000000000000000000000000000000000beef';
+const mkTraceBlock = (n: number, to: string, value: string) => ({
+  header: {
+    ...FIXTURE_BLOCK.header,
+    number: n,
+    hash: `0x${n.toString(16).padStart(64, '0')}`,
+  },
+  traces: [
+    {
+      transactionIndex: 0,
+      traceAddress: [],
+      type: 'call',
+      subtraces: 0,
+      error: null,
+      revertReason: null,
+      action: {
+        from: TRACE_OTHER,
+        to,
+        value,
+        gas: '0x1000',
+        input: '0x',
+        sighash: '0x',
+        type: 'call',
+        callType: 'call',
+      },
+      result: { gasUsed: '0x10', output: '0x' },
+    },
+  ],
+  transactions: [
+    {
+      transactionIndex: 0,
+      hash: `0x${(n + 5_000_000).toString(16).padStart(64, '0')}`,
+      from: TRACE_OTHER,
+      to,
+      input: '0x',
+      value,
+      nonce: 1,
+      gas: '0x100000',
+      gasPrice: '0x1',
+      type: 0,
+      r: `0x${'11'.repeat(32)}`,
+      s: `0x${'22'.repeat(32)}`,
+      v: '0x1',
+      status: '0x1',
+      cumulativeGasUsed: '0x5208',
+      gasUsed: '0x5208',
+      effectiveGasPrice: '0x1',
+      logsBloom: `0x${'00'.repeat(256)}`,
+      contractAddress: null,
+    },
+  ],
+});
+const extendTraceServer = (opts: {
+  headFn: () => number;
+  baseBlock: number;
+  baseTo: string;
+  tailBlock: number;
+  tailTo: string; // TRACE_OTHER ⇒ client-unmatched tail; TRACE_TARGET ⇒ matched tail (genuine fatal)
+  value: string; // '0x0' for a trace filter; '0x1' for a transfer filter (needs non-zero value)
+  tailFrom: number; // the extend tail starts here (coveredTo+1); only this region degrades logsBloom
+}) =>
+  http.createServer((req, res) => {
+    let body = '';
+    req.on('data', (c) => {
+      body += c;
+    });
+    req.on('end', () => {
+      if (req.url?.includes('finalized-head')) {
+        res.writeHead(200, { 'content-type': 'application/json' });
+        res.end(JSON.stringify({ number: opts.headFn() }));
+        return;
+      }
+      const q = body ? JSON.parse(body) : {};
+      const from = q.fromBlock ?? 0;
+      const to = Math.min(q.toBlock ?? 1e12, opts.headFn());
+      const wantsBloom = q.fields?.transaction?.logsBloom !== undefined;
+      const isTail = from >= opts.tailFrom;
+      // The EXTEND tail lacks logsBloom → 400 while it's requested (the BASE region never degrades).
+      if (isTail && wantsBloom) {
+        res.writeHead(400);
+        res.end(
+          "Bad request: couldn't parse request: column 'logs_bloom' is not found in 'transactions'",
+        );
+        return;
+      }
+      // BASE: a matched trace (cached under the base fetch, WITH logsBloom).
+      if (!isTail && from <= opts.baseBlock && to >= opts.baseBlock) {
+        res.writeHead(200, { 'content-type': 'application/x-ndjson' });
+        res.end(
+          `${JSON.stringify(mkTraceBlock(opts.baseBlock, opts.baseTo, opts.value))}\n`,
+        );
+        return;
+      }
+      // TAIL (logsBloom dropped): a trace whose match depends on `tailTo`.
+      if (isTail && from <= opts.tailBlock && to >= opts.tailBlock) {
+        res.writeHead(200, { 'content-type': 'application/x-ndjson' });
+        res.end(
+          `${JSON.stringify(mkTraceBlock(opts.tailBlock, opts.tailTo, opts.value))}\n`,
+        );
+        return;
+      }
+      if (from > to) {
+        res.writeHead(204).end();
+        return;
+      }
+
+      anchorRes(res, to);
+    });
+  });
+
+const runTraceExtend = async (opts: {
+  filterType: 'trace' | 'transfer';
+  value: string;
+  tailTo: string; // TRACE_OTHER (unmatched tail) | TRACE_TARGET (matched tail)
+}): Promise<{ traceCount: number }> => {
+  delete process.env.PORTAL_FINALIZED_HEAD; // probe the mock so the head advances
+  let head = 100;
+  const srv = extendTraceServer({
+    headFn: () => head,
+    baseBlock: 50,
+    baseTo: TRACE_TARGET, // base trace is matched → cached under the base fetch
+    tailBlock: 150,
+    tailTo: opts.tailTo,
+    value: opts.value,
+    tailFrom: 101, // the extend tail is (H1=100, H2]; only it degrades logsBloom
+  });
+  const p: number = await new Promise((r) =>
+    srv.listen(0, () => r((srv.address() as AddressInfo).port)),
+  );
+  try {
+    const inserted = { traces: [] as any[] };
+    const syncStore: any = {
+      insertLogs: () => {},
+      insertBlocks: () => {},
+      insertTransactions: () => {},
+      insertTransactionReceipts: () => {},
+      insertTraces: (x: any) => inserted.traces.push(...x.traces),
+    };
+    const filter: any = {
+      type: opts.filterType,
+      chainId: 1,
+      sourceId: 't',
+      fromAddress: undefined,
+      toAddress: TRACE_TARGET,
+      functionSelector: undefined,
+      callType: undefined,
+      includeReverted: false,
+      fromBlock: 0,
+      toBlock: undefined, // unbounded → the frontier chunk that extends as the head advances
+      hasTransactionReceipt: true, // ← makes logsBloom a NEEDED field (RECEIPT_FIELDS on the tx projection)
+      include: [],
+    };
+    const sync = createPortalHistoricalSync({
+      common: {
+        logger: { debug() {}, info() {}, warn() {}, error() {}, trace() {} },
+      } as any,
+      chain: { id: 1, name: 'mainnet', portal: `http://localhost:${p}` } as any,
+      childAddresses: new Map(),
+      eventCallbacks: [{ filter }],
+    } as any);
+
+    const iA: [number, number] = [50, 50];
+    await sync.syncBlockRangeData({
+      interval: iA,
+      requiredIntervals: [{ interval: iA, filter }],
+      requiredFactoryIntervals: [],
+      syncStore,
+    });
+    await sync.syncBlockData({ interval: iA, logs: [], syncStore } as any);
+
+    head = 200; // Portal advances → interval B extends chunk 0 over the tail
+
+    const iB: [number, number] = [150, 150];
+    await sync.syncBlockRangeData({
+      interval: iB,
+      requiredIntervals: [{ interval: iB, filter }],
+      requiredFactoryIntervals: [],
+      syncStore,
+    });
+    await sync.syncBlockData({ interval: iB, logs: [], syncStore } as any);
+
+    return { traceCount: inserted.traces.length };
+  } finally {
+    srv.close();
+  }
+};
+
+test('regression (#20): a TRACE extend tail whose only new traces are client-UNMATCHED while lacking a needed field is TOLERATED (not crash-looped)', async () => {
+  // Base trace at block 50 (matched, WITH logsBloom) is cached truncated at head H1=100. The head advances
+  // to H2=200 and interval B extends chunk 0 over (100, 200]. The tail lacks logsBloom (400s) and — once
+  // dropped — returns ONLY a trace to TRACE_OTHER (not the configured toAddress), which `traceMatched`
+  // drops. BEFORE the fix: runStreams counted raw cd.traceBlocks.size, which grew by the tail block →
+  // neededMissing={logs_bloom} armed → threw "missing … matched data" → evict → crash-loop for a trace the
+  // indexer never keeps. AFTER: only traceMatched-surviving traces count → the tail contributes 0 →
+  // tolerated. Only the base's matched trace is stored.
+  const { traceCount } = await runTraceExtend({
+    filterType: 'trace',
+    value: '0x0',
+    tailTo: TRACE_OTHER,
+  });
+  expect(traceCount).toBe(1); // base block 50 only; the unmatched tail contributed nothing
+});
+
+test('regression (#20): a TRACE extend tail that DOES add a MATCHED trace while lacking a needed field STILL fails LOUD (the crash is not lost)', async () => {
+  // The anti-silent-data-loss companion: same base + extend, but the tail — once logsBloom is dropped —
+  // returns a trace to TRACE_TARGET (matched). Now the extend adds a MATCHED trace with a needed field
+  // absent, so the indexer would process an incomplete event: it MUST crash. Pins that the #20 fix narrows
+  // the check to exactly the false-positive WITHOUT muting a genuinely-incomplete trace tail.
+  await expect(
+    runTraceExtend({
+      filterType: 'trace',
+      value: '0x0',
+      tailTo: TRACE_TARGET,
+    }),
+  ).rejects.toThrow(/logs_bloom.*matched data|matched data.*logs_bloom/);
+});
+
+test('regression (#20): a TRANSFER extend tail whose only new transfers are client-UNMATCHED while lacking a needed field is TOLERATED (not crash-looped)', async () => {
+  // The transfer sibling of the trace case: a `type:'transfer'` source rides the SAME unfiltered trace
+  // query and is client-matched only at assembly (isTransferFilterMatched). A non-zero-value trace to
+  // TRACE_OTHER is re-matched away (wrong toAddress). Same false-fatal, same fix.
+  const { traceCount } = await runTraceExtend({
+    filterType: 'transfer',
+    value: '0x1', // NON-ZERO ⇒ a transfer can match (a zero-value frame never matches)
+    tailTo: TRACE_OTHER,
+  });
+  expect(traceCount).toBe(1); // base transfer only; the unmatched tail contributed nothing
+});
+
+test('regression (#20): a TRANSFER extend tail that DOES add a MATCHED transfer while lacking a needed field STILL fails LOUD (the crash is not lost)', async () => {
+  // The transfer-side anti-silent-data-loss guard: the tail returns a non-zero-value trace to TRACE_TARGET
+  // → isTransferFilterMatched keeps it → a matched transfer with a needed field absent MUST crash.
+  await expect(
+    runTraceExtend({
+      filterType: 'transfer',
+      value: '0x1',
+      tailTo: TRACE_TARGET,
+    }),
+  ).rejects.toThrow(/logs_bloom.*matched data|matched data.*logs_bloom/);
+});
+
+// ── #20 (tx path): the needed-field growth check counts account TXS post-re-match, not raw cd.txBlocks.size
+// The account-tx query (`txRequestsFor`) pushes only the merged from/to address sets with NO per-filter
+// block range, so — exactly like the log query — it over-returns: a bounded tx filter's OUT-OF-RANGE txs
+// ride the merged request and `assembleRange` re-matches them away (isTransactionFilterMatched re-checks
+// the range). Raw `cd.txBlocks.size` therefore has the identical false-fatal, so the fix counts
+// txFilterMatched-surviving txs only. This server serves a base tx matched by unbounded filter A (WITH
+// logsBloom) at H1, then over the tail 400s logsBloom and — once dropped — returns a tx matching bounded
+// filter B ABOVE B.toBlock (out of range → re-matched away by assembly).
+const SENDER_A = '0x00000000000000000000000000000000000000a1';
+const SENDER_B = '0x00000000000000000000000000000000000000b2';
+const mkTxBlock = (n: number, from: string) => ({
+  header: {
+    ...FIXTURE_BLOCK.header,
+    number: n,
+    hash: `0x${n.toString(16).padStart(64, '0')}`,
+  },
+  transactions: [
+    {
+      transactionIndex: 0,
+      hash: `0x${(n + 7_000_000).toString(16).padStart(64, '0')}`,
+      from,
+      to: '0x000000000000000000000000000000000000cccc',
+      input: '0x',
+      value: '0x0',
+      nonce: 1,
+      gas: '0x100000',
+      gasPrice: '0x1',
+      type: 0,
+      r: `0x${'11'.repeat(32)}`,
+      s: `0x${'22'.repeat(32)}`,
+      v: '0x1',
+      status: '0x1',
+      cumulativeGasUsed: '0x5208',
+      gasUsed: '0x5208',
+      effectiveGasPrice: '0x1',
+      logsBloom: `0x${'00'.repeat(256)}`,
+      contractAddress: null,
+    },
+  ],
+});
+const extendTxServer = (opts: {
+  headFn: () => number;
+  baseBlock: number;
+  baseFrom: string;
+  tailBlock: number;
+  tailFrom: string; // SENDER_B ⇒ matches only the bounded filter B (out of range at the tail → dropped)
+  tailRegionFrom: number; // the extend tail starts here (coveredTo+1); only this region degrades logsBloom
+}) =>
+  http.createServer((req, res) => {
+    let body = '';
+    req.on('data', (c) => {
+      body += c;
+    });
+    req.on('end', () => {
+      if (req.url?.includes('finalized-head')) {
+        res.writeHead(200, { 'content-type': 'application/json' });
+        res.end(JSON.stringify({ number: opts.headFn() }));
+        return;
+      }
+      const q = body ? JSON.parse(body) : {};
+      const from = q.fromBlock ?? 0;
+      const to = Math.min(q.toBlock ?? 1e12, opts.headFn());
+      const wantsBloom = q.fields?.transaction?.logsBloom !== undefined;
+      const isTail = from >= opts.tailRegionFrom;
+      if (isTail && wantsBloom) {
+        res.writeHead(400);
+        res.end(
+          "Bad request: couldn't parse request: column 'logs_bloom' is not found in 'transactions'",
+        );
+        return;
+      }
+      // BASE: a tx matched by unbounded filter A (cached under the base fetch, WITH logsBloom).
+      if (!isTail && from <= opts.baseBlock && to >= opts.baseBlock) {
+        res.writeHead(200, { 'content-type': 'application/x-ndjson' });
+        res.end(
+          `${JSON.stringify(mkTxBlock(opts.baseBlock, opts.baseFrom))}\n`,
+        );
+        return;
+      }
+      // TAIL (logsBloom dropped): a tx the merged from/to request returns but assembly re-matches away.
+      if (isTail && from <= opts.tailBlock && to >= opts.tailBlock) {
+        res.writeHead(200, { 'content-type': 'application/x-ndjson' });
+        res.end(
+          `${JSON.stringify(mkTxBlock(opts.tailBlock, opts.tailFrom))}\n`,
+        );
+        return;
+      }
+      if (from > to) {
+        res.writeHead(204).end();
+        return;
+      }
+
+      anchorRes(res, to);
+    });
+  });
+
+const runTxExtend = async (opts: {
+  tailFrom: string; // SENDER_B ⇒ out-of-range/unmatched tail; SENDER_A ⇒ matched tail (genuine fatal)
+}): Promise<{ txCount: number }> => {
+  delete process.env.PORTAL_FINALIZED_HEAD;
+  let head = 100;
+  const srv = extendTxServer({
+    headFn: () => head,
+    baseBlock: 50,
+    baseFrom: SENDER_A, // matched by unbounded filter A → cached
+    tailBlock: 150,
+    tailFrom: opts.tailFrom,
+    tailRegionFrom: 101,
+  });
+  const p: number = await new Promise((r) =>
+    srv.listen(0, () => r((srv.address() as AddressInfo).port)),
+  );
+  try {
+    const inserted = { txs: [] as any[] };
+    const syncStore: any = {
+      insertLogs: () => {},
+      insertBlocks: () => {},
+      insertTransactions: (x: any) => inserted.txs.push(...x.transactions),
+      insertTransactionReceipts: () => {},
+      insertTraces: () => {},
+    };
+    const filterA: any = {
+      type: 'transaction',
+      chainId: 1,
+      sourceId: 'a',
+      fromAddress: SENDER_A,
+      toAddress: undefined,
+      includeReverted: false,
+      fromBlock: 0,
+      toBlock: undefined, // unbounded → the frontier chunk that extends as the head advances
+      hasTransactionReceipt: true, // ← makes logsBloom a NEEDED field
+      include: [],
+    };
+    const filterB: any = {
+      type: 'transaction',
+      chainId: 1,
+      sourceId: 'b',
+      fromAddress: SENDER_B,
+      toAddress: undefined,
+      includeReverted: false,
+      fromBlock: 0,
+      toBlock: 50, // bounded at 50 → its `from` set rides the merged request but a 150 tx is out of range
+      hasTransactionReceipt: true,
+      include: [],
+    };
+    const sync = createPortalHistoricalSync({
+      common: {
+        logger: { debug() {}, info() {}, warn() {}, error() {}, trace() {} },
+      } as any,
+      chain: { id: 1, name: 'mainnet', portal: `http://localhost:${p}` } as any,
+      childAddresses: new Map(),
+      eventCallbacks: [{ filter: filterA }, { filter: filterB }],
+    } as any);
+
+    const iA: [number, number] = [50, 50];
+    await sync.syncBlockRangeData({
+      interval: iA,
+      requiredIntervals: [{ interval: iA, filter: filterA }],
+      requiredFactoryIntervals: [],
+      syncStore,
+    });
+    await sync.syncBlockData({ interval: iA, logs: [], syncStore } as any);
+
+    head = 200; // Portal advances → interval B extends chunk 0 over the tail
+
+    const iB: [number, number] = [150, 150];
+    await sync.syncBlockRangeData({
+      interval: iB,
+      requiredIntervals: [{ interval: iB, filter: filterA }],
+      requiredFactoryIntervals: [],
+      syncStore,
+    });
+    await sync.syncBlockData({ interval: iB, logs: [], syncStore } as any);
+
+    return { txCount: inserted.txs.length };
+  } finally {
+    srv.close();
+  }
+};
+
+test('regression (#20 tx path): a TRANSACTION extend tail whose only new txs are RE-MATCH-DROPPED (out of a bounded filter range) while lacking a needed field is TOLERATED (not crash-looped)', async () => {
+  // Base tx at block 50 (matched by unbounded filter A, WITH logsBloom) is cached truncated at head H1=100.
+  // The head advances to H2=200 and interval B extends chunk 0 over (100, 200]. The tail lacks logsBloom
+  // (400s) and — once dropped — returns ONLY a tx from SENDER_B at block 150, ABOVE filter B.toBlock=50:
+  // `txFilterMatched` re-matches it AWAY (out of B's range; SENDER_B is not A's `from`). BEFORE the fix:
+  // runStreams counted raw cd.txBlocks.size, which grew by the tail block → neededMissing={logs_bloom}
+  // armed → threw → evict → crash-loop for a tx the indexer never keeps. AFTER: only txFilterMatched
+  // survivors count → the tail contributes 0 → tolerated.
+  const { txCount } = await runTxExtend({ tailFrom: SENDER_B });
+  expect(txCount).toBe(1); // base block 50 (filter A) only; the out-of-range B tx contributed nothing
+});
+
+test('regression (#20 tx path): a TRANSACTION extend tail that DOES add a MATCHED tx while lacking a needed field STILL fails LOUD (the crash is not lost)', async () => {
+  // The tx-side anti-silent-data-loss guard: the tail returns a tx from SENDER_A (matched by unbounded
+  // filter A, in range) at block 150. A matched tx with a needed field absent MUST crash.
+  await expect(runTxExtend({ tailFrom: SENDER_A })).rejects.toThrow(
+    /logs_bloom.*matched data|matched data.*logs_bloom/,
+  );
+});
+
 test('regression: a dataset that starts after genesis (TAC starts at block 1) is clamped forward, not crashed on', async () => {
   // The Portal 400s "dataset starts from block N" when queried below its first block. The fork must
   // clamp the cursor to N and continue — NOT throw an unhandledRejection (which killed the whole

@@ -32,6 +32,8 @@ import {
   type AssembledRange,
   assembleRange,
   buildRawLogMatcher,
+  buildRawTraceMatcher,
+  buildRawTxMatcher,
   type ChunkData,
   createChunkData,
 } from './portal-assemble.js';
@@ -301,23 +303,34 @@ export const createPortalHistoricalSync = (
     token: RowToken,
   ): Promise<void> => {
     const neededMissing = new Set<string>();
-    // FIX 3 + wave-4 log re-match: the needed-field crash check must consider ONLY the rows THIS call adds
-    // that assembly will actually KEEP. On a frontier EXTEND `cd` already carries the base chunk's data; the
-    // tail streams the disjoint range (coveredTo, desiredTo] whose block numbers are all > coveredTo (new
-    // map keys), so a size delta over the append-only trace/tx/block maps captures exactly the tail's added
-    // rows (inspecting the whole accumulated `cd`, as before FIX 3, let a data-bearing base + an event-less
-    // tail whose dataset lacks a needed column throw fatally → evict → crash-loop). LOGS need more: the
-    // Portal's server-side log filter over-returns rows assembly re-matches AWAY — a factory child's
-    // pre-creation logs and a bounded filter's out-of-range logs — so a raw `cd.logs.size` delta would count
-    // logs the indexer never keeps and arm the same false fatal (the exact class of #20's trace/transfer
-    // residual, created here by the new re-match boundary). Count only logs surviving the SAME re-match
-    // assembly applies; discovery is complete through this range (asserted below), so the seam agrees.
+    // FIX 3 + wave-4 log re-match + #20 trace/tx re-match: the needed-field crash check must consider ONLY
+    // the rows THIS call adds that assembly will actually KEEP. On a frontier EXTEND `cd` already carries the
+    // base chunk's data; the tail streams the disjoint range (coveredTo, desiredTo] whose block numbers are
+    // all > coveredTo (new map keys). Inspecting the whole accumulated `cd` (as before FIX 3) let a
+    // data-bearing base + an event-less tail whose dataset lacks a needed column throw fatally → evict →
+    // crash-loop, so the check is EXTEND-LOCAL. But a per-call size delta over a source's raw map is only
+    // sound where that map holds ONLY matched rows: the Portal over-returns on every re-matched source. LOGS
+    // (server log filter is the merged set, no per-child/per-range floor), TRACES/TRANSFERS (the trace query
+    // is server-side UNFILTERED by INV-5 design — every trace fetched, client-matched only at assembly), and
+    // account TXS (the tx query pushes merged from/to sets with no per-filter block range) all return rows
+    // assembly re-matches AWAY. A raw size delta over any of them would count rows the indexer never keeps
+    // and arm the same false fatal (#20). So each re-matched source is counted POST-re-match via its
+    // build*Matcher, mirroring assembly EXACTLY; discovery is complete through this range (asserted below),
+    // so the seam agrees. Only BLOCK headers stay a raw size delta — `cd.blockHeaders` is filtered inline at
+    // fetch time (below) to hold ONLY BlockFilter-matched headers, so its size IS the matched count.
     const logMatchedRaw = spec.logFilters.length
       ? buildRawLogMatcher(spec, args.childAddresses)
       : undefined;
     let matchedLogsAdded = 0;
-    const otherMatchedSize = (): number =>
-      cd.traceBlocks.size + cd.txBlocks.size + cd.blockHeaders.size;
+    const traceMatchedRaw = spec.needTraces
+      ? buildRawTraceMatcher(spec, args.childAddresses)
+      : undefined;
+    let matchedTracesAdded = 0;
+    const txMatchedRaw = spec.needTxFilter
+      ? buildRawTxMatcher(spec, args.childAddresses)
+      : undefined;
+    let matchedTxsAdded = 0;
+    const otherMatchedSize = (): number => cd.blockHeaders.size;
     const otherMatchedBefore = otherMatchedSize();
     const onRows = (n: number): void => {
       if (token.freed) return;
@@ -369,6 +382,10 @@ export const createPortalHistoricalSync = (
                 traces: b.traces,
                 txs: b.transactions ?? [],
               });
+            if (traceMatchedRaw)
+              matchedTracesAdded += b.traces.filter((raw) =>
+                traceMatchedRaw(raw, b.header.number),
+              ).length;
           }
       }
     const bq = spec.blockQuery();
@@ -405,15 +422,24 @@ export const createPortalHistoricalSync = (
                 header: b.header,
                 txs: b.transactions,
               });
+            if (txMatchedRaw)
+              matchedTxsAdded += b.transactions.filter((raw) =>
+                txMatchedRaw(raw, b.header, b.header.number),
+              ).length;
           }
       }
     // A NEEDED field the dataset lacked on THIS range: crash ONLY IF this call added MATCHED data — an
-    // event the indexer processes would be incomplete. Logs count post-re-match (kept-only, wave 4);
-    // trace/tx/block sources by size delta. An event-less (old/irrelevant) range — or an event-less /
-    // all-re-match-dropped EXTEND tail over a data-bearing base (FIX 3) — proceeds.
+    // event the indexer processes would be incomplete. Logs, traces/transfers, and account txs each count
+    // POST-re-match (kept-only — wave 4 for logs, #20 for traces/txs), because each source over-returns
+    // rows assembly drops. Only BLOCK headers are a raw size delta (already matched-only at fetch time). An
+    // event-less (old/irrelevant) range — or an event-less / all-re-match-dropped EXTEND tail over a
+    // data-bearing base (FIX 3) — proceeds.
     if (
       neededMissing.size &&
-      (matchedLogsAdded > 0 || otherMatchedSize() > otherMatchedBefore)
+      (matchedLogsAdded > 0 ||
+        matchedTracesAdded > 0 ||
+        matchedTxsAdded > 0 ||
+        otherMatchedSize() > otherMatchedBefore)
     ) {
       throw new Error(
         `Portal dataset for ${chain.name} is missing [${[...neededMissing].join(', ')}] on blocks [${from},${to}], which contain matched data your indexer needs — a Portal dataset-completeness gap. Failing fast rather than serving incomplete data; report the gap to SQD, or start your indexer past the affected range.`,
