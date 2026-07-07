@@ -1,6 +1,6 @@
 ---
 name: portal-ponder-release
-description: Cut a new @subsquid/ponder release — the Portal fork of ponder, versioned <ponder-version>-sqd.<rev>. Bump/confirm the target ponder version in versions.json, trigger the release workflow (workflow_dispatch; a v<version> tag also works but only for rev 1), watch it build+test+publish to npm via Trusted Publishing, then flip the versions.json row to published and write GitHub release notes for the v<version> tag. Use when the user asks to "release", "publish", "cut a version", "ship", or "re-cut a fork revision" for @subsquid/ponder / portal-ponder.
+description: Cut a new @subsquid/ponder release — the Portal fork of ponder, versioned <ponder-version>-sqd.<rev>. Bump/confirm the target ponder version in versions.json, trigger the release workflow (workflow_dispatch; a v<version> tag also works but only for rev 1), watch it build+test+publish to npm via Trusted Publishing, then set the row's published: true and write GitHub release notes for the v<version> tag. Use when the user asks to "release", "publish", "cut a version", "ship", or "re-cut a fork revision" for @subsquid/ponder / portal-ponder.
 ---
 
 # @subsquid/ponder release
@@ -134,7 +134,11 @@ This is a real state change other releases and CI read — don't skip it.
 **Required — every release gets one.** `release.yml` publishes to npm only; it does **not** create a
 GitHub Release, so this is a manual step you always do. **Order matters:** creating any `v*.*.*` tag —
 including implicitly via `gh release create` — fires the publish workflow, so create the release/tag
-only *after* the npm publish has succeeded (the step ordering here already does). Write curated, Portal-layer-scoped highlights
+only *after* the npm publish has succeeded (the step ordering here already does). Note this isn't
+fully clean even then: after a `workflow_dispatch` publish, creating the `v<version>` tag/release
+still re-triggers the workflow, which re-runs and **fails at the publish step on the already-published
+version** — a guaranteed red run, harmless to npm. Expect and ignore it until a planned workflow
+idempotency guard lands. Write curated, Portal-layer-scoped highlights
 (what the fork changed vs plain `ponder@<version>`: the Portal backfill seam, wiring touch-points,
 correctness fixes, tests) — **not** a restatement of ponder's own changelog. Use
 [release-template.md](release-template.md) as the shape, and source highlights from the commits since

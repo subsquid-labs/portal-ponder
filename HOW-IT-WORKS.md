@@ -17,7 +17,7 @@ JSON-RPC was built to serve transactions and single-object reads, not to scan hi
 - One `eth_getBlockByNumber` **per matched block**, to attach the header and timestamp every event needs.
 - More per-item calls for transactions, receipts, and traces when a source needs them.
 
-Each call is a round-trip that re-establishes almost no context, and the total scales with the data. A single protocol's Ethereum history — 885,893 matched events across ~252,000 distinct blocks, deploy to head (the committed `F-full` cell, VALIDATION.md §3.2) — needs a header fetch for each of those blocks, so the header fetches _alone_ are hundreds of thousands of serial requests. A **factory** makes it worse in a way that matters: you can't query a child contract's logs until you've discovered the child, and children are created continuously across history, so you first scan for addresses and then fan out per-child log queries. This is the shape RPC forces — many small requests, in sequence, mostly waiting.
+Each call is a round-trip that re-establishes almost no context, and the total scales with the data. A single protocol's Ethereum history — 885,893 matched logs across ~252,000 distinct blocks, deploy to head (the committed `F-full` cell, VALIDATION.md §3.2) — needs a header fetch for each of those blocks, so the header fetches _alone_ are hundreds of thousands of serial requests. A **factory** makes it worse in a way that matters: you can't query a child contract's logs until you've discovered the child, and children are created continuously across history, so you first scan for addresses and then fan out per-child log queries. This is the shape RPC forces — many small requests, in sequence, mostly waiting.
 
 ## The Portal model: a range as one streamed pass
 
