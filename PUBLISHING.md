@@ -39,9 +39,14 @@ tokens for CI in favour of the GitHub integration). The job applies the Portal l
      after that is tokenless.
 2. *(When the repo is public)* add `--provenance` to the publish step for a signed provenance attestation.
 
-**Cut a release:** Actions → **release** → *Run workflow* → enter the ponder version (e.g. `0.16.6`),
-or push a tag `v0.16.6`. The workflow guards that the version is in `versions.json`, builds + tests, and
-publishes `@subsquid/ponder@<version>-sqd.<rev>`. Then flip that row's `status`→`published` in `versions.json`.
+**Cut a release:** Actions → **release** → *Run workflow* → enter the ponder version (e.g. `0.16.6`)
+and the `rev`. The workflow guards that the version is in `versions.json`, builds + tests, and
+publishes `@subsquid/ponder@<version>-sqd.<rev>`. A `v0.16.6` tag push also triggers it, but the
+**tag path always publishes `rev` 1** (`SYNC_REV` defaults to `1` on a tag — a tag can't express a
+revision), so a rev bump (`-sqd.2` and up) **must** go through the manual `workflow_dispatch` with the
+`rev` input. After a successful publish, set that row's `"published": true` in `versions.json` (leave
+`"status"` as its verification state — the schema tracks publish state in the separate `published`
+boolean, not via a `status` value).
 
 **Manual / local** (to seed the first publish, or as a fallback):
 
