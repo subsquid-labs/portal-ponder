@@ -1,7 +1,7 @@
 # Euler multichain — full-history e2e
 
 Index **every Portal-supported Euler V2 chain (15) in a single Ponder app**, full history
-`[0 → finalized head]` per chain, streaming from the **SQD Portal** backfill into **Postgres**. This
+`[deploy → finalized head]` per chain, streaming from the **SQD Portal** backfill into **Postgres**. This
 is the production shape of an Euler indexer and a stress test of the `@subsquid/ponder` fork: one
 shared Portal endpoint, one database, fifteen chains backfilling concurrently.
 

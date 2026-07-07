@@ -13,7 +13,7 @@ export PORTAL_API_KEY=…                 # dedicated portal
 export PONDER_RPC_URL_1=…  PONDER_RPC_URL_8453=…   # SQD RPC per chain (finality + readContract)
 node --experimental-strip-types harness/bench/bench-all.ts          # all
 node --experimental-strip-types harness/bench/bench-all.ts uniswap,traces   # subset (comma list)
-# → harness/bench/results.{json,md}
+# → harness/bench/results.json
 ```
 
 ## What's in the base
