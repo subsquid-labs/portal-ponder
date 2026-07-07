@@ -49,7 +49,11 @@ import {
 import { createPortalClient } from './portal-client.js';
 import { loadPortalConfig } from './portal-config.js';
 import { createDiscovery, type PendingFlush } from './portal-discovery.js';
-import { type ChildAddresses, compileFetchSpec } from './portal-filters.js';
+import {
+  type ChildAddresses,
+  compileFetchSpec,
+  RECEIPT_FIELDS,
+} from './portal-filters.js';
 import { sharedGate } from './portal-gate.js';
 import {
   invariant,
@@ -58,6 +62,15 @@ import {
 } from './portal-invariant.js';
 import { createStats, startGateLog, writeMetrics } from './portal-metrics.js';
 import { isFinalityGap } from './portal-transform.js';
+
+// #94: the table-qualified field keys of the receipt columns (RECEIPT_FIELDS ride the `transaction`
+// projection). A `neededMissing` entry is `"${fieldKey} (${tag})"` with fieldKey like `transaction.logsBloom`
+// (portal-client `colToFieldKey`), so a missing column is a RECEIPT field iff its fieldKey is one of these.
+// `block.logsBloom` is a BLOCK_FIELD (fieldKey `block.logsBloom`) and is deliberately NOT here — a block's
+// bloom is non-receipt and must arm on any matched row.
+const RECEIPT_FIELD_KEYS = new Set(
+  Object.keys(RECEIPT_FIELDS).map((f) => `transaction.${f}`),
+);
 
 type CreateHistoricalSyncParameters = {
   common: Common;
@@ -122,6 +135,11 @@ export const createPortalHistoricalSync = (
     logWarn: (msg) => log.warn({ service: 'portal', msg }),
   });
   const spec = compileFetchSpec(args.eventCallbacks ?? [], args.childAddresses);
+  // #94: mirror `assembleRange`'s trace/transfer receipt-emit gate EXACTLY — a matched trace/transfer emits
+  // a receipt iff ANY trace OR transfer filter wants receipts (not the specific filter that matched it).
+  const needTraceReceipts =
+    spec.traceFilters.some((f) => f.hasTransactionReceipt) ||
+    spec.transferFilters.some((f) => f.hasTransactionReceipt);
   const discovery = createDiscovery({
     client,
     childAddresses: args.childAddresses,
@@ -434,16 +452,61 @@ export const createPortalHistoricalSync = (
     // rows assembly drops. Only BLOCK headers are a raw size delta (already matched-only at fetch time). An
     // event-less (old/irrelevant) range — or an event-less / all-re-match-dropped EXTEND tail over a
     // data-bearing base (FIX 3) — proceeds.
-    if (
-      neededMissing.size &&
-      (matchedLogsAdded > 0 ||
+    //
+    // #94: the missing field must be scoped to the rows that ACTUALLY consume it, not any matched row.
+    // RECEIPT_FIELDS (transaction.logsBloom/status/gasUsed/…) are projected SPEC-WIDE onto the log, trace,
+    // AND tx queries whenever ANY filter on the spec wants receipts (portal-filters `needReceipts` →
+    // `txFields()`), but a receipt row is EMITTED per-source and only lands those columns in the store via
+    // `toSyncReceipt`. So a matched row on a source that emits NO receipt cannot corrupt a missing receipt
+    // column, yet before #94 any matched log/trace/tx armed the fatal on a spec-wide-projected receipt field
+    // it never persisted → false-fatal → G1 evict → crash-loop. Split the check by field category and arm
+    // each from ONLY the rows that consume it:
+    //   • NON-receipt fields (LOG_FIELDS/TX_FIELDS/TRACE_FIELDS/BLOCK_FIELDS) are projected PER-SOURCE-TYPE,
+    //     so any matched log/trace/tx/block genuinely needs them → armed exactly as before (no change).
+    //   • RECEIPT fields arm ONLY from a receipt-EMITTING matched row, mirroring assembly's per-source emit
+    //     gate EXACTLY so the seam and `assembleRange` agree by construction (the FIX-3/wave-4/#20 discipline):
+    //       – logs:   assembly emits a receipt for a kept log's parent tx iff `spec.needReceipts` (SPEC-WIDE,
+    //         portal-assemble log branch) — NOT the matched log's own filter flag. So gate matchedLogsAdded
+    //         by `spec.needReceipts`. (Per-log-filter would UNDER-fire: a non-receipt log filter's kept log
+    //         still gets a spec-wide receipt row → would silently drop a real gap. Never under-fire.)
+    //       – traces: assembly wires `onReceipt` iff `needTraceReceipts` (any trace OR transfer filter wants
+    //         receipts), then emits for EVERY matched trace regardless of which filter matched it. So gate
+    //         matchedTracesAdded by `needTraceReceipts` (same reason per-filter would under-fire).
+    //       – txs:    every txFilterMatched tx gets a receipt UNCONDITIONALLY (upstream types
+    //         TransactionFilter.hasTransactionReceipt as literal `true`) → arm on any matchedTxsAdded.
+    //   • BLOCK headers never emit a receipt → never arm a receipt field (block.* columns are non-receipt
+    //     and armed by the non-receipt branch). Same for `block.logsBloom`: it is a BLOCK_FIELD, table-keyed
+    //     `block.…`, so it is NOT in the receipt set below — a missing block bloom still fatals on any match.
+    if (neededMissing.size) {
+      // Each entry is `"${fieldKey} (${tag})"` (portal-client) — the table-qualified fieldKey is the head
+      // up to the first space (fieldKeys never contain one). A RECEIPT field is `transaction.<X>` with
+      // <X> ∈ RECEIPT_FIELDS.
+      const receiptMissing = [...neededMissing].filter((entry) => {
+        const spaceAt = entry.indexOf(' ');
+        const fieldKey = spaceAt === -1 ? entry : entry.slice(0, spaceAt);
+
+        return RECEIPT_FIELD_KEYS.has(fieldKey);
+      });
+      const nonReceiptMissing = neededMissing.size - receiptMissing.length;
+
+      const nonReceiptArmed =
+        matchedLogsAdded > 0 ||
         matchedTracesAdded > 0 ||
         matchedTxsAdded > 0 ||
-        otherMatchedSize() > otherMatchedBefore)
-    ) {
-      throw new Error(
-        `Portal dataset for ${chain.name} is missing [${[...neededMissing].join(', ')}] on blocks [${from},${to}], which contain matched data your indexer needs — a Portal dataset-completeness gap. Failing fast rather than serving incomplete data; report the gap to SQD, or start your indexer past the affected range.`,
-      );
+        otherMatchedSize() > otherMatchedBefore;
+      const receiptArmed =
+        (spec.needReceipts && matchedLogsAdded > 0) ||
+        (needTraceReceipts && matchedTracesAdded > 0) ||
+        matchedTxsAdded > 0;
+
+      if (
+        (nonReceiptMissing > 0 && nonReceiptArmed) ||
+        (receiptMissing.length > 0 && receiptArmed)
+      ) {
+        throw new Error(
+          `Portal dataset for ${chain.name} is missing [${[...neededMissing].join(', ')}] on blocks [${from},${to}], which contain matched data your indexer needs — a Portal dataset-completeness gap. Failing fast rather than serving incomplete data; report the gap to SQD, or start your indexer past the affected range.`,
+        );
+      }
     }
   };
 
