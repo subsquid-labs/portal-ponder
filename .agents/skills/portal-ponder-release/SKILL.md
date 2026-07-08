@@ -134,11 +134,14 @@ This is a real state change other releases and CI read — don't skip it.
 **Required — every release gets one.** `release.yml` publishes to npm only; it does **not** create a
 GitHub Release, so this is a manual step you always do. **Order matters:** creating any `v*.*.*` tag —
 including implicitly via `gh release create` — fires the publish workflow, so create the release/tag
-only *after* the npm publish has succeeded (the step ordering here already does). Note this isn't
-fully clean even then: after a `workflow_dispatch` publish, creating the `v<version>` tag/release
-still re-triggers the workflow, which re-runs and **fails at the publish step on the already-published
-version** — a guaranteed red run, harmless to npm. Expect and ignore it until a planned workflow
-idempotency guard lands. Write curated, Portal-layer-scoped highlights
+only *after* the npm publish has succeeded (the step ordering here already does). Note the tag
+re-trigger: creating the `v<version>` tag/release re-fires the publish workflow. As of the #86
+idempotency guard (`e06d304`), a run whose **tagged commit includes the guard** detects the version is
+already published and **no-ops green** — no republish attempt. The catch: `on: push: tags` runs
+`release.yml` *at the tagged commit*, so a tag pinned to a **pre-guard commit** runs the old, unguarded
+workflow and still **fails at the publish step on the already-published version** (npm 403) — a
+harmless red run (nothing republishes). For a clean green re-trigger, target release tags at a commit
+that includes the guard; a tag on an older commit will still red (harmless to npm). Write curated, Portal-layer-scoped highlights
 (what the fork changed vs plain `ponder@<version>`: the Portal backfill seam, wiring touch-points,
 correctness fixes, tests) — **not** a restatement of ponder's own changelog. Use
 [release-template.md](release-template.md) as the shape, and source highlights from the commits since
