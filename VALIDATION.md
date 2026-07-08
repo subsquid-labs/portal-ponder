@@ -667,7 +667,7 @@ Each passing window is byte-identical across `logs` / `transactions` / `transact
 #76 divergence seen on eth did not appear on any polygon window.
 
 **The 4 no-verdict windows — the RPC *oracle* leg failed to complete, not the fork.** Four windows
-recorded `pass:false` with the identical signature: the **Portal leg completed** (13–19 s), then the
+recorded `pass:false` with the identical signature: the **Portal leg completed** (10–19 s), then the
 JSON-RPC leg emitted `✗ rpc did not complete` and `Started shutdown sequence` **before** the byte diff
 was ever reached, so no matched-log count and no A/B comparison exist for them:
 
