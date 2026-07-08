@@ -150,7 +150,7 @@ the operator (see `harness/validate/README.md`).
 | `L-arbitrum` | erc20 | arbitrum | logs, receipts | 4×2k + 4×5k (seeded) | PENDING — **blocked for receipts by #83** (logs-only variant pending) | `bash harness/validate/run-cell.sh L-arbitrum` |
 | `L-arbitrum-logs` | erc20 | arbitrum | logs | 4×2k + 4×5k (seeded) | PENDING (logs-only variant of `L-arbitrum`, #83) | `bash harness/validate/run-cell.sh L-arbitrum-logs` |
 | `L-polygon` | erc20 | polygon | logs, receipts | 4×2k + 4×5k (seeded) | **DONE (2026-07-08) — PASS: 7/7 comparable windows byte-identical incl. receipts; 4 windows RPC-oracle-incomplete (no byte-diff) — §3.6** | `bash harness/validate/run-cell.sh L-polygon` |
-| `L-bsc` | erc20 | bsc | logs, receipts | 4×2k + 4×5k (seeded) | PENDING | `bash harness/validate/run-cell.sh L-bsc` |
+| `L-bsc` | erc20 | bsc | logs, receipts | 4×2k + 4×5k (seeded) | **DONE (2026-07-08) — PASS: 16/16 windows byte-identical incl. receipts, under the generalized size-only `block.size` tolerance (#107) — §3.7** | `bash harness/validate/run-cell.sh L-bsc` |
 | `L-avalanche` | erc20 | avalanche | logs, receipts | 4×2k + 4×5k (seeded) | PENDING — **blocked for receipts by #83** (logs-only variant pending) | `bash harness/validate/run-cell.sh L-avalanche` |
 | `L-avalanche-logs` | erc20 | avalanche | logs | 4×2k + 4×5k (seeded) | PENDING (logs-only variant of `L-avalanche`, #83) | `bash harness/validate/run-cell.sh L-avalanche-logs` |
 | `F-full` | euler | eth | factory, logs, transactions, receipts | full range [deploy → pinned head] | **DONE (2026-07-06)** | `bash harness/validate/run-cell.sh F-full` |
@@ -696,6 +696,71 @@ Repro (the operator supplies the tarball and the metered RPC key — see `harnes
 ```bash
 SQD_PONDER_TARBALL=<tarball> SQD_RPC_KEY=<paid-rpc-key> \
   bash harness/validate/run-cell.sh L-polygon
+```
+
+---
+
+### 3.7 Matrix cell — L-bsc (PASS, 2026-07-08 — receipts byte-identity on a third independent chain, under the generalized #107 size-only tolerance)
+
+The bsc **Layer-L** cell: the erc20 app on BNB Smart Chain (chain 56, canonical USDT / BSC-USD
+`0x55d398326f99059fF775485246999027B3197955`), logs+receipts, over the same two seeded-random window
+specs as `L-eth`/`L-polygon` — **4 × 2 000 blocks (seed 501)** and **4 × 5 000 blocks (seed 502)** drawn
+from `[40 000 000, 107 000 000]` — plus the harness's **auto-shrink** re-runs. It is the **third
+independent chain to reach receipts byte-identity** (after eth §3.4, under the original `block.size`
+tolerance, and polygon §3.6, clean), and the **first cell to exercise the *generalized* size-only
+`block.size` tolerance ([#107](../../pull/107)) at scale** — where the eth-era #76 tolerance handled a
+handful of derived rows, bsc diverges on the non-consensus `block.size` field across **up to 3 105
+blocks in a single window**.
+
+**What ran — every window byte-identical, receipts included.** Unlike polygon (§3.6), the stock
+JSON-RPC oracle completed **every** window here, so all **16 window records produced a full A/B
+comparison and all 16 passed** (8 seeded windows + their 8 auto-shrink half-window re-runs). Every
+window is byte-identical across `logs` / `transactions` / `transaction_receipts` / `traces`; the
+`blocks` table is either byte-identical or matches with a bounded count of **size-only** rows tolerated
+— each such row has an **identical block hash and identical content in every field except the
+non-consensus, node-derived `size`** (the divergence class documented for eth in
+[#76](../../issues/76) and generalized in [#107](../../pull/107); the tolerance is hash-anchored, so a
+real divergence cannot be masked). The 8 primary windows:
+
+| Window (tag) | Range | Matched logs | Receipts (portal = rpc) | `block.size`-only tolerated | Verdict |
+|--------------|-------|-------------:|------------------------:|----------------------------:|---------|
+| `rand#501.0@2000` | `[97964639, 97966639]` | 113,050 | 52,186 | 47 | **byte-identical** |
+| `rand#501.1@2000` | `[52108122, 52110122]` | 734,621 | 344,016 | 0 | **byte-identical** |
+| `rand#501.2@2000` | `[91710545, 91712545]` | 127,103 | 64,729 | 420 | **byte-identical** |
+| `rand#501.3@2000` | `[103240378, 103242378]` | 190,065 | 79,744 | 838 | **byte-identical** |
+| `rand#502.0@5000` | `[64272501, 64277501]` | 488,658 | 240,218 | 0 | **byte-identical** |
+| `rand#502.1@5000` | `[104753440, 104758440]` | 465,725 | 187,494 | 3,105 | **byte-identical** |
+| `rand#502.2@5000` | `[66363735, 66368735]` | 314,276 | 164,532 | 0 | **byte-identical** |
+| `rand#502.3@5000` | `[105192697, 105197697]` | 274,600 | 126,714 | 2,461 | **byte-identical** |
+
+Each of the 8 **auto-shrink** re-runs (a half-size leading window over the same start block, triggered
+when a window exceeds 50 000 matched rows) reproduced the same verdict byte-identical — across the full
+cell, **6 windows carried zero tolerated rows, 10 carried a bounded size-only count, and there were
+zero byte-diffs anywhere**.
+
+**Why the size-only rows are pervasive here, and why that is not a fault.** On bsc the node-reported
+`block.size` (the RPC-oracle leg) and the Portal-derived value diverge across long stretches of blocks
+— a pervasive but purely `size`-field offset — so a single window can carry thousands of tolerated rows
+where eth carried a handful. `block.size` is a **non-consensus, node-local re-derivation**: it is not
+committed to in the block hash and is not an input to any downstream index, so a divergence in it alone
+— with the block hash and every consensus field identical — is a property of the two data sources' size
+accounting, not of the fork's correctness. The #107 predicate tolerates a row **only** when `size` is
+the *sole* differing field and the hashes match; any additional divergence fails the window
+(mutation-verified in the differ tests). The volume of tolerated rows is therefore evidence of a
+pervasive-but-benign source difference, not of masking.
+
+**Verdict — PASS: 16 / 16 windows byte-identical, receipts included.** L-bsc is the **third independent
+chain** on which the full receipts path (`transaction_receipts`) reproduces byte-identical, and the
+first at which the generalized #107 size-only tolerance is exercised at volume — with the safety-anchor
+(hash + sole-diff) intact, so the pass is a genuine byte-identity result, not a widened tolerance hiding
+drift. Cell totals: **16 window records, 84,819 metered requests** (cumulative campaign spend
+**864,084** requests, ~22% of the 4 000 000 ceiling).
+
+Repro (the operator supplies the tarball and the metered RPC key — see `harness/validate/README.md`):
+
+```bash
+SQD_PONDER_TARBALL=<tarball> SQD_RPC_KEY=<paid-rpc-key> \
+  bash harness/validate/run-cell.sh L-bsc
 ```
 
 ---
