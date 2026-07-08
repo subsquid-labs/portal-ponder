@@ -83,6 +83,7 @@ TO="${CHAOS_TO:-20579207}"
 
 # ── small-fixed-chunk params (issue #50) — wired into the app env so partial durable states exist ──
 T1_CHUNK_BLOCKS="${CHAOS_CHUNK_BLOCKS:-2000}"
+T1_WARMUP_BLOCKS="${CHAOS_WARMUP_BLOCKS:-${PORTAL_WARMUP_BLOCKS:-2000}}"
 T1_CHUNK_FIXED="${CHAOS_CHUNK_FIXED:-1}"
 T1_READAHEAD="${CHAOS_READAHEAD:-1}"
 
@@ -1128,6 +1129,134 @@ reap_group () {
 # ── install the app once into a fresh workspace (SAME steps as v3 / kill-loop.sh) ──────────────────
 RUN_WORK=""
 RUN_NPM_CACHE=""
+write_dense_fetch_hook () {
+  cat > "$RUN_WORK/chaos-dense-fetch-log.cjs" <<'NODE'
+const fs = require('node:fs');
+
+const traceFile = process.env.CHAOS_DENSE_TRACE_FILE;
+let requestSeq = 0;
+let scanSeq = 0;
+let pendingDiscovery = [];
+let pendingTimer;
+
+function append(event) {
+  if (!traceFile) return;
+  const record = {
+    ts: new Date().toISOString(),
+    pid: process.pid,
+    run: Number(process.env.CHAOS_RUN || 0),
+    attempt: Number(process.env.CHAOS_ATTEMPT || 0),
+    ...event,
+  };
+  try {
+    fs.appendFileSync(traceFile, `${JSON.stringify(record)}\n`);
+  } catch {
+    // Tracing is evidence-only; never perturb the app under test.
+  }
+}
+
+function classifyQuery(q) {
+  const logs = Array.isArray(q?.logs) ? q.logs : [];
+  const hasTransactionData =
+    Array.isArray(q?.transactions) ||
+    Array.isArray(q?.traces) ||
+    Array.isArray(q?.transactionReceipts);
+  const hasFactoryTopic = logs.some(
+    (log) => Array.isArray(log?.topic0) && log.topic0.length > 0,
+  );
+  const fields = q?.fields ?? {};
+  const discoveryFields =
+    fields?.block?.number === true &&
+    fields?.log?.address === true &&
+    fields?.log?.topics === true;
+
+  return !hasTransactionData && hasFactoryTopic && discoveryFields
+    ? 'discovery'
+    : 'data';
+}
+
+function flushDiscovery() {
+  const group = pendingDiscovery;
+  pendingDiscovery = [];
+  if (group.length === 0) return;
+
+  group.sort(
+    (a, b) => a.fromBlock - b.fromBlock || a.toBlock - b.toBlock || a.seq - b.seq,
+  );
+  const fromBlock = Math.min(...group.map((g) => g.fromBlock));
+  const toBlock = Math.max(...group.map((g) => g.toBlock));
+  append({
+    event: 'portal-dense-discovery-scan',
+    seq: ++scanSeq,
+    fromBlock,
+    toBlock,
+    span: toBlock - fromBlock + 1,
+    windows: group.length,
+    windowSpans: group.map((g) => g.span),
+  });
+}
+
+function queueDiscoveryWindow(record) {
+  pendingDiscovery.push(record);
+  if (pendingTimer !== undefined) return;
+  pendingTimer = setTimeout(() => {
+    pendingTimer = undefined;
+    flushDiscovery();
+  }, 10);
+  pendingTimer.unref?.();
+}
+
+const originalFetch = globalThis.fetch;
+if (typeof originalFetch !== 'function') {
+  append({ event: 'portal-dense-env', error: 'global fetch is unavailable' });
+} else {
+  globalThis.fetch = function portalDenseFetch(input, init) {
+    try {
+      const url =
+        typeof input === 'string'
+          ? input
+          : input instanceof URL
+            ? input.href
+            : input?.url;
+      const body = typeof init?.body === 'string' ? init.body : undefined;
+      if (url?.includes('/finalized-stream') && body !== undefined) {
+        const q = JSON.parse(body);
+        const fromBlock = Number(q.fromBlock);
+        const toBlock = Number(q.toBlock);
+        if (Number.isFinite(fromBlock) && Number.isFinite(toBlock)) {
+          const kind = classifyQuery(q);
+          const record = {
+            event: 'portal-dense-request',
+            seq: ++requestSeq,
+            kind,
+            fromBlock,
+            toBlock,
+            span: toBlock - fromBlock + 1,
+            logFilters: Array.isArray(q.logs) ? q.logs.length : 0,
+          };
+          append(record);
+          if (kind === 'discovery') queueDiscoveryWindow(record);
+        }
+      }
+    } catch (error) {
+      append({
+        event: 'portal-dense-trace-error',
+        message: error instanceof Error ? error.message : String(error),
+      });
+    }
+
+    return originalFetch.apply(this, arguments);
+  };
+
+  append({
+    event: 'portal-dense-env',
+    warmupBlocks: process.env.PORTAL_WARMUP_BLOCKS ?? '',
+    chunkBlocks: process.env.PORTAL_CHUNK_BLOCKS ?? '',
+  });
+}
+NODE
+}
+
 install_app () {
   RUN_WORK="$(mktemp -d)"
   RUN_NPM_CACHE="$(mktemp -d)"
@@ -1135,6 +1264,7 @@ install_app () {
   SQD_PONDER_TARBALL="$TARBALL" node -e "const p=require('$RUN_WORK/package.json');p.dependencies['@subsquid/ponder']='file:'+process.env.SQD_PONDER_TARBALL;require('fs').writeFileSync('$RUN_WORK/package.json',JSON.stringify(p,null,2))"
   ( cd "$RUN_WORK" && npm install --no-audit --no-fund --silent --cache "$RUN_NPM_CACHE" ) >/dev/null 2>&1 || return 1
   [ -x "$RUN_WORK/node_modules/.bin/ponder" ] || return 1
+  write_dense_fetch_hook
 
   return 0
 }
@@ -1278,10 +1408,14 @@ launch_app () {
   : > "$run_log"
   # background the app; $! is captured synchronously (no `( ... & echo $! > f )` subshell echo race).
   ( cd "$RUN_WORK" && \
-    PONDER_START="$FROM" PONDER_END="$TO" CHAOS_PG_URL="$run_url" \
+    printf '[chaos-pg-driver] PORTAL_WARMUP_BLOCKS=%s PORTAL_CHUNK_BLOCKS=%s CHAOS_DENSE_TRACE_FILE=%s\n' "$T1_WARMUP_BLOCKS" "$T1_CHUNK_BLOCKS" "${DENSE_TRACE_FILE:-}" && \
+    PONDER_START="$FROM" PONDER_END="$TO" CHAOS_PG_URL="$run_url" CHAOS3_PG_URL="$run_url" \
     PORTAL_URL_1="$PORTAL" PONDER_RPC_URL_1="$RPC" CHAIN_ID="$CHAIN_ID" EULER_FACTORY="$FACTORY" \
     PORTAL_CHECKS=strict PORTAL_GATE_LOG=1 PONDER_LOG_LEVEL="${PONDER_LOG_LEVEL:-info}" CI=true \
-    PORTAL_CHUNK_BLOCKS="$T1_CHUNK_BLOCKS" PORTAL_CHUNK_FIXED="$T1_CHUNK_FIXED" PORTAL_READAHEAD="$T1_READAHEAD" \
+    PORTAL_CHUNK_BLOCKS="$T1_CHUNK_BLOCKS" PORTAL_WARMUP_BLOCKS="$T1_WARMUP_BLOCKS" \
+    PORTAL_CHUNK_FIXED="$T1_CHUNK_FIXED" PORTAL_READAHEAD="$T1_READAHEAD" \
+    CHAOS_DENSE_TRACE_FILE="${DENSE_TRACE_FILE:-}" CHAOS_RUN="$PG_GATE_N" CHAOS_ATTEMPT="$PG_GATE_ATTEMPT" \
+    NODE_OPTIONS="--require $RUN_WORK/chaos-dense-fetch-log.cjs${NODE_OPTIONS:+ $NODE_OPTIONS}" \
     exec setsid ./node_modules/.bin/ponder start --schema chaos --port "$PONDER_PORT" >"$run_log" 2>&1 ) &
   LAUNCH_PID="$!"
   LAUNCH_PGID="$LAUNCH_PID"
@@ -1299,11 +1433,13 @@ run_one () {
   local META="$WORK_ROOT/run-$N.meta.json"
   local RUN_LOG="$ART/run-$N.app.log"
   local SNAP_FILE="$ART/run-$N.snapshots.jsonl"
+  local DENSE_TRACE_FILE="$ART/run-$N.dense-trace.jsonl"
   local VR_LOG="$ART/run-$N.verify.log"
   local INV_EVENTS="$ART/run-$N.invariant-events.jsonl"
   local PIDFILE="$WORK_ROOT/run-$N.pid"
   rm -f "$META" "$PIDFILE" "$PIDFILE.tmp"
   : > "$SNAP_FILE"
+  : > "$DENSE_TRACE_FILE"
   : > "$INV_EVENTS"
 
   # per-run gate wiring (read by pg_single_writer_gate / record_driver_invariant).
@@ -1314,7 +1450,7 @@ run_one () {
   PG_GATE_ATTEMPT=0
   DRIVER_INVARIANTS=0
 
-  log "── RUN $N  range=[$FROM,$TO]  MEAN=${MEAN}s  MAX_KILLS=$MAX_KILLS  chunk=${T1_CHUNK_BLOCKS}(fixed=$T1_CHUNK_FIXED) readahead=$T1_READAHEAD  db=$RUN_DB"
+  log "── RUN $N  range=[$FROM,$TO]  MEAN=${MEAN}s  MAX_KILLS=$MAX_KILLS  chunk=${T1_CHUNK_BLOCKS}(fixed=$T1_CHUNK_FIXED) warmup=$T1_WARMUP_BLOCKS readahead=$T1_READAHEAD  db=$RUN_DB"
   local t0
   t0="$(date +%s)"
 
@@ -1590,7 +1726,7 @@ NODE
   log "✓ backend label (observed): $backend_label"
 
   local params_json
-  params_json="{\"from\":$FROM,\"to\":$TO,\"maxKills\":$MAX_KILLS,\"minKills\":$MIN_KILLS,\"trigger\":\"poisson\",\"targetKillsPerRun\":$TARGET_KILLS,\"meanFloorSec\":$MEAN_FLOOR,\"meanCeilSec\":$MEAN_CEIL,\"backend\":\"$backend_label\",\"pgPort\":$PGPORT,\"storeIdentity\":\"logical-digest\",\"baselineDigest\":\"$baseline_digest\",\"tier1\":{\"chunkBlocks\":$T1_CHUNK_BLOCKS,\"chunkFixed\":$T1_CHUNK_FIXED,\"readahead\":$T1_READAHEAD}}"
+  params_json="{\"from\":$FROM,\"to\":$TO,\"maxKills\":$MAX_KILLS,\"minKills\":$MIN_KILLS,\"trigger\":\"poisson\",\"targetKillsPerRun\":$TARGET_KILLS,\"meanFloorSec\":$MEAN_FLOOR,\"meanCeilSec\":$MEAN_CEIL,\"backend\":\"$backend_label\",\"pgPort\":$PGPORT,\"storeIdentity\":\"logical-digest\",\"baselineDigest\":\"$baseline_digest\",\"tier1\":{\"chunkBlocks\":$T1_CHUNK_BLOCKS,\"warmupBlocks\":$T1_WARMUP_BLOCKS,\"chunkFixed\":$T1_CHUNK_FIXED,\"readahead\":$T1_READAHEAD}}"
   local accept_json
   accept_json="{\"kills\":$ACCEPT_KILLS,\"runs\":$ACCEPT_RUNS,\"partialCoverageKills\":$ACCEPT_PARTIAL_KILLS,\"completionsFromPartial\":$ACCEPT_COMPLETIONS_FROM_PARTIAL,\"maxRuns\":$MAX_RUNS,\"maxWallSec\":$MAX_WALL_SEC}"
 

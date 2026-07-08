@@ -20,6 +20,13 @@ CDIR="$(cd "$(dirname "$0")" && pwd)"
 ROOT="$(cd "$CDIR/../.." && pwd)"
 
 APP="${CHAOS_APP:-$ROOT/harness/diff/euler-app}"
+if [ "${CHAOS_DENSE:-0}" = "1" ]; then
+  CHAOS_FROM="${CHAOS_FROM:-20529207}"
+  CHAOS_TO="${CHAOS_TO:-20579207}"
+  export PORTAL_WARMUP_BLOCKS="${PORTAL_WARMUP_BLOCKS:-${CHAOS_WARMUP_BLOCKS:-2000}}"
+  export PORTAL_CHUNK_BLOCKS="${PORTAL_CHUNK_BLOCKS:-${CHAOS_CHUNK_BLOCKS:-2000}}"
+  TRIGGER="${TRIGGER:-on-discovery-log}"
+fi
 FROM="${CHAOS_FROM:?set CHAOS_FROM}"; TO="${CHAOS_TO:?set CHAOS_TO}"
 PORTAL="${CHAOS_PORTAL:-https://portal.sqd.dev/datasets/ethereum-mainnet}"
 RPC="${CHAOS_RPC:-https://ethereum-rpc.publicnode.com}"
