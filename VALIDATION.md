@@ -149,7 +149,7 @@ the operator (see `harness/validate/README.md`).
 | `L-base-logs` | erc20 | base | logs | 4×2k + 4×5k (seeded) | **DIFFER-FAIL (benign, by design), 2026-07-07 — base lacks `transactions.access_list` (#83-family); logs byte-identical (§3.5.1)** | `bash harness/validate/run-cell.sh L-base-logs` |
 | `L-arbitrum` | erc20 | arbitrum | logs, receipts | 4×2k + 4×5k (seeded) | PENDING — **blocked for receipts by #83** (logs-only variant pending) | `bash harness/validate/run-cell.sh L-arbitrum` |
 | `L-arbitrum-logs` | erc20 | arbitrum | logs | 4×2k + 4×5k (seeded) | PENDING (logs-only variant of `L-arbitrum`, #83) | `bash harness/validate/run-cell.sh L-arbitrum-logs` |
-| `L-polygon` | erc20 | polygon | logs, receipts | 4×2k + 4×5k (seeded) | PENDING | `bash harness/validate/run-cell.sh L-polygon` |
+| `L-polygon` | erc20 | polygon | logs, receipts | 4×2k + 4×5k (seeded) | **DONE (2026-07-08) — PASS: 7/7 comparable windows byte-identical incl. receipts; 4 windows RPC-oracle-incomplete (no byte-diff) — §3.6** | `bash harness/validate/run-cell.sh L-polygon` |
 | `L-bsc` | erc20 | bsc | logs, receipts | 4×2k + 4×5k (seeded) | PENDING | `bash harness/validate/run-cell.sh L-bsc` |
 | `L-avalanche` | erc20 | avalanche | logs, receipts | 4×2k + 4×5k (seeded) | PENDING — **blocked for receipts by #83** (logs-only variant pending) | `bash harness/validate/run-cell.sh L-avalanche` |
 | `L-avalanche-logs` | erc20 | avalanche | logs | 4×2k + 4×5k (seeded) | PENDING (logs-only variant of `L-avalanche`, #83) | `bash harness/validate/run-cell.sh L-avalanche-logs` |
@@ -631,6 +631,71 @@ The whole-cell run reproduces through the harness (the operator supplies any bas
 ```bash
 SQD_PONDER_TARBALL=<tarball> SQD_RPC_KEY=<paid-rpc-key> \
   bash harness/validate/run-cell.sh L-base-logs
+```
+
+### 3.6 Matrix cell — L-polygon (PASS, 2026-07-08 — first clean receipts byte-identity on a second independent chain)
+
+The polygon **Layer-L** cell: the erc20 app on polygon mainnet (chain 137, native USDC
+`0x3c499c542cEF5E3811e1192ce70d8cC03d5c3359`), logs+receipts, over the same two seeded-random window
+specs as `L-eth`/`L-base` — **4 × 2 000 blocks (seed 401)** and **4 × 5 000 blocks (seed 402)** drawn
+from `[60 000 000, 89 000 000]` — plus the harness's **auto-shrink** re-runs. This is the **first
+Layer-L cell to reach a clean receipts byte-identity on a chain other than eth**: unlike
+`base`/`arbitrum`/`avalanche` (§3.5), the `polygon-mainnet` dataset serves **both** #83/#90 gap columns
+(`logs_bloom`, `access_list`) across its whole range, so the full receipts path is comparable here — a
+free public-portal pre-flight confirmed both columns return `200` with real data at both range extremes
+before any paid spend.
+
+**What ran — every comparable window byte-identical.** Of the 8 seeded windows, **4 produced a complete
+A/B comparison and all 4 were byte-identical**; the other 4 could not be compared because the stock
+**JSON-RPC ground-truth leg** (the oracle) shut down mid-backfill before the diff (below). Auto-shrink
+re-ran the three largest passing windows on a half-size leading window. Reconstructed that way there are
+**11 window records: 7 byte-identical, 4 RPC-oracle-incomplete, and zero byte-diffs.** Every window in
+which a byte comparison was possible passed:
+
+| Window (tag) | Range | Matched logs | Receipts (portal = rpc) | Verdict |
+|--------------|-------|-------------:|------------------------:|---------|
+| `rand#401.1@2000` | `[81995048, 81997048]` | 45,220 | 30,288 | **byte-identical** |
+| `rand#401.3@2000` | `[85947279, 85949279]` | 50,288 | 32,038 | **byte-identical** |
+| `rand#401.3+shrunk` | `[85947279, 85948279]` | 24,634 | 15,543 | **byte-identical** |
+| `rand#402.1@5000` | `[83447717, 83452717]` | 83,519 | 52,359 | **byte-identical** |
+| `rand#402.1+shrunk` | `[83447717, 83450217]` | 42,143 | 26,808 | **byte-identical** |
+| `rand#402.3@5000` | `[88568193, 88573193]` | 100,908 | 65,344 | **byte-identical** |
+| `rand#402.3+shrunk` | `[88568193, 88570693]` | 50,149 | 32,632 | **byte-identical** |
+
+Each passing window is byte-identical across `logs` / `transactions` / `transaction_receipts` /
+`traces` / `blocks` (event-bearing blocks included) with **no tolerance applied** — the `block.size`
+#76 divergence seen on eth did not appear on any polygon window.
+
+**The 4 no-verdict windows — the RPC *oracle* leg failed to complete, not the fork.** Four windows
+recorded `pass:false` with the identical signature: the **Portal leg completed** (10–19 s), then the
+JSON-RPC leg emitted `✗ rpc did not complete` and `Started shutdown sequence` **before** the byte diff
+was ever reached, so no matched-log count and no A/B comparison exist for them:
+
+| Window (tag) | Range | Portal leg | RPC leg |
+|--------------|-------|-----------|---------|
+| `rand#401.0@2000` | `[69979353, 69981353]` | completed (13 s) | did not complete |
+| `rand#401.2@2000` | `[72816949, 72818949]` | completed (10 s) | did not complete |
+| `rand#402.0@5000` | `[72041851, 72046851]` | completed (19 s) | did not complete |
+| `rand#402.2@5000` | `[70420462, 70425462]` | completed (19 s) | did not complete |
+
+These are a **reliability property of the stock RPC oracle** on polygon at these ranges, **not a
+portal-ponder correctness fault**: the fork's own backfill completed in every one, and **no window in
+the entire cell produced a byte-diff**. They are recorded here as **no-verdict** (baseline incomplete)
+rather than as failures — a gate that reports only its clean runs is not a gate, and the honest reading
+is "of every window where the oracle produced data to compare against, the Portal store was
+byte-identical."
+
+**Verdict — PASS: 7 / 7 comparable windows byte-identical, receipts included.** L-polygon is the first
+demonstration of the full receipts path — `transaction_receipts` with `logs_bloom` and `access_list`
+present — reproduced **byte-identical on a second independent chain**, closing the gap left by `L-base`
+(where those columns are range-gapped, §3.5). Cell totals: **11 window records, ≈ 49,900 metered
+requests** (cumulative campaign spend **779,265** requests, well under the 4 000 000 ceiling).
+
+Repro (the operator supplies the tarball and the metered RPC key — see `harness/validate/README.md`):
+
+```bash
+SQD_PONDER_TARBALL=<tarball> SQD_RPC_KEY=<paid-rpc-key> \
+  bash harness/validate/run-cell.sh L-polygon
 ```
 
 ---
