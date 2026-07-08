@@ -4781,3 +4781,359 @@ test('regression: an undefined fromBlock is genesis — the [0, min) prefix of a
     srv.close();
   }
 });
+
+// ── #94: the needed-field fatal is scoped PER-FILTER to receipt-need, not any matched row ──────────────
+// RECEIPT_FIELDS (transaction.logsBloom/status/gasUsed/…) are projected SPEC-WIDE: needReceipts (ANY filter
+// wants receipts) → txFields() adds RECEIPT_FIELDS onto the LOG, TRACE, and TX queries alike. But a receipt
+// is EMITTED per-source: assembly gates trace/transfer receipt emission on `needTraceReceipts` (any trace OR
+// transfer filter wants receipts), NOT the spec-wide flag. So a spec with (A) a receipt-needing LOG filter
+// [sets needReceipts → RECEIPT_FIELDS ride the trace query] and (B) a NON-receipt TRACE/TRANSFER filter can
+// see the trace tail 400 on logsBloom, match a trace on B, and — before #94 — arm the fatal on a receipt
+// field B never persists (needTraceReceipts is false → no receipt row for B's trace). That is the #94
+// false-fatal. This server drives BOTH a log query (filter A) and a trace query (filter B): the extend tail
+// degrades transaction.logsBloom; the log stream returns NOTHING matched on the tail (A adds no matched row),
+// while the trace stream returns a trace whose `to` decides B's match. `tailTo`=OTHER ⇒ the trace is
+// client-UNMATCHED (nothing armed at all); `tailTo`=TARGET_B ⇒ B matches but is NON-receipt (the #94 case).
+// The `bReceipt` variant makes B itself receipt-needing → a matched trace with a missing receipt field MUST
+// still fatal (the never-under-fire guard).
+const TARGET_B = '0x00000000000000000000000000000000000000b9';
+const mk94TraceBlock = (n: number, to: string) => ({
+  header: {
+    ...FIXTURE_BLOCK.header,
+    number: n,
+    hash: `0x${n.toString(16).padStart(64, '0')}`,
+  },
+  traces: [
+    {
+      transactionIndex: 0,
+      traceAddress: [],
+      type: 'call',
+      subtraces: 0,
+      error: null,
+      revertReason: null,
+      action: {
+        from: TRACE_OTHER,
+        to,
+        value: '0x1', // non-zero so a transfer filter can also match (a zero-value frame never transfers)
+        gas: '0x1000',
+        input: '0x',
+        sighash: '0x',
+        type: 'call',
+        callType: 'call',
+      },
+      result: { gasUsed: '0x10', output: '0x' },
+    },
+  ],
+  transactions: [
+    {
+      transactionIndex: 0,
+      hash: `0x${(n + 9_000_000).toString(16).padStart(64, '0')}`,
+      from: TRACE_OTHER,
+      to,
+      input: '0x',
+      value: '0x1',
+      nonce: 1,
+      gas: '0x100000',
+      gasPrice: '0x1',
+      type: 0,
+      r: `0x${'11'.repeat(32)}`,
+      s: `0x${'22'.repeat(32)}`,
+      v: '0x1',
+      status: '0x1',
+      cumulativeGasUsed: '0x5208',
+      gasUsed: '0x5208',
+      effectiveGasPrice: '0x1',
+      logsBloom: `0x${'00'.repeat(256)}`,
+      contractAddress: null,
+    },
+  ],
+});
+// A log block matched by filter A, WITH logsBloom — used only for the BASE range so A caches a matched log.
+const mk94LogBlock = (n: number) => ({
+  ...FIXTURE_BLOCK,
+  header: {
+    ...FIXTURE_BLOCK.header,
+    number: n,
+    hash: `0x${n.toString(16).padStart(64, '0')}`,
+  },
+  logs: [
+    {
+      ...FIXTURE_BLOCK.logs[0],
+      transactionHash: `0x${(n + 8_000_000).toString(16).padStart(64, '0')}`,
+    },
+  ],
+  transactions: [
+    {
+      ...FIXTURE_BLOCK.transactions[0],
+      hash: `0x${(n + 8_000_000).toString(16).padStart(64, '0')}`,
+    },
+  ],
+});
+const extend94Server = (opts: {
+  headFn: () => number;
+  baseBlock: number;
+  tailBlock: number;
+  tailTo: string; // TRACE_OTHER ⇒ unmatched tail; TARGET_B ⇒ B matches (its receipt-need decides fatal)
+  tailFrom: number; // the extend tail starts here; only this region degrades logsBloom
+  nonReceiptDrop?: 'trace.error'; // instead degrade a NON-receipt trace column (T-C)
+  tailLogMatches?: boolean;
+}) =>
+  http.createServer((req, res) => {
+    let body = '';
+    req.on('data', (c) => {
+      body += c;
+    });
+    req.on('end', () => {
+      if (req.url?.includes('finalized-head')) {
+        res.writeHead(200, { 'content-type': 'application/json' });
+        res.end(JSON.stringify({ number: opts.headFn() }));
+        return;
+      }
+      const q = body ? JSON.parse(body) : {};
+      const from = q.fromBlock ?? 0;
+      const to = Math.min(q.toBlock ?? 1e12, opts.headFn());
+      const isTrace = Array.isArray(q.traces);
+      const isTail = from >= opts.tailFrom;
+      // The EXTEND tail lacks the degraded column → 400 while it's requested (the BASE never degrades).
+      if (isTail && opts.nonReceiptDrop === 'trace.error') {
+        // Degrade a NON-receipt TRACE column (trace.error) so the missing field is non-receipt (T-C).
+        if (q.fields?.trace?.error !== undefined) {
+          res.writeHead(400);
+          res.end(
+            "Bad request: couldn't parse request: column 'error' is not found in 'traces'",
+          );
+          return;
+        }
+      } else if (isTail && q.fields?.transaction?.logsBloom !== undefined) {
+        res.writeHead(400);
+        res.end(
+          "Bad request: couldn't parse request: column 'logs_bloom' is not found in 'transactions'",
+        );
+        return;
+      }
+      // BASE trace: a matched trace (to TRACE_TARGET) so the trace source caches under the base fetch.
+      if (
+        isTrace &&
+        !isTail &&
+        from <= opts.baseBlock &&
+        to >= opts.baseBlock
+      ) {
+        res.writeHead(200, { 'content-type': 'application/x-ndjson' });
+        res.end(
+          `${JSON.stringify(mk94TraceBlock(opts.baseBlock, TARGET_B))}\n`,
+        );
+        return;
+      }
+      // TAIL trace: a trace whose `to` decides B's match (and thus whether the fatal is armed).
+      if (isTrace && isTail && from <= opts.tailBlock && to >= opts.tailBlock) {
+        res.writeHead(200, { 'content-type': 'application/x-ndjson' });
+        res.end(
+          `${JSON.stringify(mk94TraceBlock(opts.tailBlock, opts.tailTo))}\n`,
+        );
+        return;
+      }
+      // BASE log: a log matched by filter A (so needReceipts is genuinely exercised on real matched data).
+      if (
+        !isTrace &&
+        !isTail &&
+        from <= opts.baseBlock &&
+        to >= opts.baseBlock
+      ) {
+        res.writeHead(200, { 'content-type': 'application/x-ndjson' });
+        res.end(`${JSON.stringify(mk94LogBlock(opts.baseBlock))}\n`);
+        return;
+      }
+      // TAIL log: filter A matches NOTHING on the tail → the log source adds no matched row there.
+      if (
+        opts.tailLogMatches &&
+        !isTrace &&
+        isTail &&
+        from <= opts.tailBlock &&
+        to >= opts.tailBlock
+      ) {
+        res.writeHead(200, { 'content-type': 'application/x-ndjson' });
+        res.end(`${JSON.stringify(mk94LogBlock(opts.tailBlock))}\n`);
+        return;
+      }
+      if (from > to) {
+        res.writeHead(204).end();
+        return;
+      }
+
+      anchorRes(res, to);
+    });
+  });
+
+// Drive the base+extend two-call sequence for #94. Filter A = a receipt-needing LOG filter (sets the
+// spec-wide needReceipts → RECEIPT_FIELDS ride the trace query). Filter B = a TRACE/TRANSFER filter whose
+// receipt-need is `bReceipt`.
+const run94 = async (opts: {
+  bType: 'trace' | 'transfer';
+  bReceipt: boolean;
+  tailTo: string;
+  nonReceiptDrop?: 'trace.error';
+  tailLogMatches?: boolean;
+}): Promise<{ traceCount: number }> => {
+  delete process.env.PORTAL_FINALIZED_HEAD; // probe the mock so the head advances
+  let head = 100;
+  const srv = extend94Server({
+    headFn: () => head,
+    baseBlock: 50,
+    tailBlock: 150,
+    tailTo: opts.tailTo,
+    tailFrom: 101,
+    nonReceiptDrop: opts.nonReceiptDrop,
+    tailLogMatches: opts.tailLogMatches,
+  });
+  const p: number = await new Promise((r) =>
+    srv.listen(0, () => r((srv.address() as AddressInfo).port)),
+  );
+  try {
+    const inserted = { traces: [] as any[] };
+    const syncStore: any = {
+      insertLogs: () => {},
+      insertBlocks: () => {},
+      insertTransactions: () => {},
+      insertTransactionReceipts: () => {},
+      insertTraces: (x: any) => inserted.traces.push(...x.traces),
+    };
+    // A: a receipt-needing LOG filter → spec-wide needReceipts is true (RECEIPT_FIELDS on every query).
+    const filterA: any = {
+      type: 'log',
+      chainId: 1,
+      sourceId: 'a',
+      address: VAULT,
+      topic0: DEPOSIT_TOPIC0,
+      topic1: null,
+      topic2: null,
+      topic3: null,
+      fromBlock: 0,
+      toBlock: undefined,
+      hasTransactionReceipt: true,
+      include: [],
+    };
+    // B: a trace/transfer filter to TARGET_B; its own receipt-need is `bReceipt`.
+    const filterB: any = {
+      type: opts.bType,
+      chainId: 1,
+      sourceId: 'b',
+      fromAddress: undefined,
+      toAddress: TARGET_B,
+      functionSelector: undefined,
+      callType: undefined,
+      includeReverted: false,
+      fromBlock: 0,
+      toBlock: undefined,
+      hasTransactionReceipt: opts.bReceipt,
+      include: [],
+    };
+    const sync = createPortalHistoricalSync({
+      common: {
+        logger: { debug() {}, info() {}, warn() {}, error() {}, trace() {} },
+      } as any,
+      chain: { id: 1, name: 'mainnet', portal: `http://localhost:${p}` } as any,
+      childAddresses: new Map(),
+      eventCallbacks: [{ filter: filterA }, { filter: filterB }],
+    } as any);
+
+    const iA: [number, number] = [50, 50];
+    await sync.syncBlockRangeData({
+      interval: iA,
+      requiredIntervals: [
+        { interval: iA, filter: filterA },
+        { interval: iA, filter: filterB },
+      ],
+      requiredFactoryIntervals: [],
+      syncStore,
+    });
+    await sync.syncBlockData({ interval: iA, logs: [], syncStore } as any);
+
+    head = 200; // Portal advances → interval B extends chunk 0 over the tail
+
+    const iB: [number, number] = [150, 150];
+    await sync.syncBlockRangeData({
+      interval: iB,
+      requiredIntervals: [
+        { interval: iB, filter: filterA },
+        { interval: iB, filter: filterB },
+      ],
+      requiredFactoryIntervals: [],
+      syncStore,
+    });
+    await sync.syncBlockData({ interval: iB, logs: [], syncStore } as any);
+
+    return { traceCount: inserted.traces.length };
+  } finally {
+    srv.close();
+  }
+};
+
+test('#94 (T-A trace): a matched trace on a NON-receipt trace filter, tail missing a RECEIPT field, is TOLERATED (not crash-looped)', async () => {
+  // Spec = A (receipt-needing LOG filter → needReceipts=true → RECEIPT_FIELDS ride the trace query) + B (a
+  // NON-receipt TRACE filter to TARGET_B). The extend tail 400s transaction.logsBloom; the tail trace is to
+  // TARGET_B → B matches it, but `needTraceReceipts` is FALSE (B doesn't want receipts) so assembly emits NO
+  // receipt for it → the missing logsBloom is never persisted for B's trace. BEFORE #94: any matched trace
+  // armed the fatal on the spec-wide-projected receipt field → threw → G1 evict → crash-loop. AFTER #94: the
+  // receipt field arms only from `needTraceReceipts` traces → B's trace does not arm it → tolerated. Both the
+  // base trace (block 50) and the tail trace (block 150) are matched by B and stored.
+  const { traceCount } = await run94({
+    bType: 'trace',
+    bReceipt: false,
+    tailTo: TARGET_B,
+  });
+
+  expect(traceCount).toBe(2); // base + tail traces, both matched by B; no crash
+});
+
+test('#94 (T-A transfer): a matched transfer on a NON-receipt transfer filter, tail missing a RECEIPT field, is TOLERATED', async () => {
+  // The transfer sibling of T-A: B is a `type:'transfer'` filter to TARGET_B, hasTransactionReceipt=false.
+  // mk94TraceBlock carries a non-zero value so isTransferFilterMatched keeps it. The receipt field must NOT
+  // arm off B → tolerated post-#94.
+  const { traceCount } = await run94({
+    bType: 'transfer',
+    bReceipt: false,
+    tailTo: TARGET_B,
+  });
+
+  expect(traceCount).toBe(2); // base + tail transfers, both matched by B; no crash
+});
+
+test('#94 (T-B): a matched trace on a RECEIPT-needing trace filter, tail missing a RECEIPT field, STILL fails LOUD (never under-fire)', async () => {
+  // Same tail, same missing logsBloom, but B is now receipt-needing (hasTransactionReceipt=true) →
+  // `needTraceReceipts` is TRUE → assembly WOULD emit a receipt (reading logsBloom) for B's matched trace →
+  // a real dataset-completeness gap. The fatal MUST still fire — the anti-silent-data-loss guarantee.
+  await expect(
+    run94({ bType: 'trace', bReceipt: true, tailTo: TARGET_B }),
+  ).rejects.toThrow(/logs_bloom.*matched data|matched data.*logs_bloom/);
+});
+
+test('#94 (T-C): a matched trace with a missing NON-receipt trace field STILL fails LOUD (unchanged behavior)', async () => {
+  // A missing NON-receipt column (trace.error) arms on ANY matched trace regardless of receipt-need — the
+  // non-receipt branch is unchanged by #94. B is non-receipt, but trace.error is projected per-source-type
+  // onto the trace query and a matched trace genuinely needs it → still fatal.
+  await expect(
+    run94({
+      bType: 'trace',
+      bReceipt: false,
+      tailTo: TARGET_B,
+      nonReceiptDrop: 'trace.error',
+    }),
+  ).rejects.toThrow(/error.*matched data|matched data.*error/);
+});
+
+test('#94 (T-B log): a matched LOG on a RECEIPT-needing log filter, tail missing a RECEIPT field, STILL fails LOUD (never under-fire on the LOG path)', async () => {
+  // The LOG-path sibling of T-B, guarding the fix's headline deviation: assembly emits a receipt for a kept
+  // log's parent tx iff `spec.needReceipts` (SPEC-WIDE), so the guard arms the receipt field off
+  // `spec.needReceipts && matchedLogsAdded > 0`. Here filter A (receipt-needing LOG) matches a log on the
+  // tail while logsBloom is degraded → a real dataset-completeness gap → the fatal MUST fire. B is
+  // non-receipt AND UNMATCHED on the tail (tailTo=TRACE_OTHER) so ONLY the matched log arms the fatal,
+  // isolating the log-branch term. A future regression to a per-log-filter gate would silently under-fire here.
+  await expect(
+    run94({
+      bType: 'trace',
+      bReceipt: false,
+      tailTo: TRACE_OTHER,
+      tailLogMatches: true,
+    }),
+  ).rejects.toThrow(/logs_bloom.*matched data|matched data.*logs_bloom/);
+});
