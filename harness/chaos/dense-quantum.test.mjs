@@ -273,6 +273,10 @@ test('resume re-seeds discovery from the durable frontier instead of reusing a s
 test('PORTAL_WARMUP_BLOCKS is forwarded into the tier-1 app env (load-bearing driver passthrough)', {
   skip: noTraceSkip,
 }, () => {
+  // Mirrors the driver's `${CHAOS_WARMUP_BLOCKS:-${PORTAL_WARMUP_BLOCKS:-2000}}`
+  // default (chaos-pg-driver.sh) — `||` matches bash `:-` on both unset and empty.
+  // A custom campaign driven via CHAOS_WARMUP_BLOCKS=N must also export
+  // PORTAL_WARMUP_BLOCKS=N to this test's env, or the value-match will false-fail.
   const configuredWarmup = Number(process.env.PORTAL_WARMUP_BLOCKS || 2000);
 
   const forwarded = trace.env.filter(
