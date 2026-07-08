@@ -59,8 +59,18 @@ test('accessList matches the RPC shape: legacy → none, typed → [] or list', 
   expect(
     (toSyncTransaction({ type: 2, accessList: al }, h) as any).accessList,
   ).toEqual(al);
-  // typed but Portal omitted the field → default to [] (never null on a typed tx)
-  expect((toSyncTransaction({ type: 1 }, h) as any).accessList).toEqual([]);
+  // typed but Portal DROPPED the column (arbitrum/avalanche backfill) → field omitted → unknown,
+  // must be undefined (SQL NULL), NEVER a fabricated [] that falsely claims "empty access list".
+  expect((toSyncTransaction({ type: 1 }, h) as any).accessList).toBeUndefined();
+  // typed with an explicit null (droppable-field degradation) → undefined, not []
+  expect(
+    (toSyncTransaction({ type: 2, accessList: null }, h) as any).accessList,
+  ).toBeUndefined();
+  // typed with the field omitted (undefined) → undefined, not []
+  expect(
+    (toSyncTransaction({ type: 2, accessList: undefined }, h) as any)
+      .accessList,
+  ).toBeUndefined();
 });
 
 test('receipt: decimal status/type → hex; gas fields stay hex (BigInt-able)', () => {

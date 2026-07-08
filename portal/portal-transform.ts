@@ -136,8 +136,13 @@ export const toSyncTransaction = (tx: any, h: RawHeader): SyncTransaction =>
         ? hx(tx.yParity)
         : undefined,
     // accessList exists only on typed txs (EIP-2930/1559/4844 → type ≥ 1); legacy (type 0) has none.
-    // Portal returns [] regardless, so normalize to match the RPC path: legacy → undefined (null).
-    accessList: Number(tx.type) >= 1 ? (tx.accessList ?? []) : undefined,
+    // Portal serves it as an array on most chains, but DROPS the column on some backfill datasets
+    // (arbitrum/avalanche) → an omitted/null field means "unknown", NOT empty. Preserve the array
+    // only when Portal actually returned one; otherwise → undefined (SQL NULL), never a fabricated [].
+    accessList:
+      Number(tx.type) >= 1 && Array.isArray(tx.accessList)
+        ? tx.accessList
+        : undefined,
   }) as unknown as SyncTransaction;
 
 /** receipt fields ride on Portal's transaction object; status/type are DECIMAL → hex. */
