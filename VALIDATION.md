@@ -846,6 +846,35 @@ self-consistent under kills.
 
 ---
 
+### 4.4 Tier 1 — dense/factory-source re-acceptance on the current `main` build (ACCEPTED 2026-07-08)
+
+To stress the dense-source / factory-child discovery path (many concurrent `dataChunk` fan-outs feeding a large first interval) under the Poisson kill-loop, a **Phase-2 chaos campaign** was run **2026-07-08** on the current `main` build. It re-runs the Layer-C acceptance logic but explicitly exercises the discovery-heavy code paths fixed in #50/#92/#96, verifying byte/logical store identity to a clean baseline after resume. Harness commit is `82c71e6`; tarball is `subsquid-ponder-0.16.6-sqd.2.tgz` (sha256 `7bf524d3dee791b3b8a1576a932129d02b0dd2bdf91d28714227881f9fc1f037`). Backend is `postgres16` (`fsync=on`), chain 1 (ethereum) range `[20529207, 20579207]` (span 50000). Poisson kill trigger targeted ~2 kills/run. The baseline logical digest is `360af5126a0efffc49b871594b8ac3ea`. Wall clock: `2026-07-08T04:56:58Z` → `2026-07-08T05:47:10Z` (~50 min). Artifacts are in `chaos-3/phase2-artifacts/` (`finalVerdict: PASS`).
+
+**Acceptance thresholds vs. observed (all four cleared):**
+
+| metric | threshold | observed |
+|---|---|---|
+| kills | ≥ 200 | 202 |
+| completed-and-verified runs | ≥ 25 | 33 |
+| kills at partial coverage | ≥ 25 | 153 |
+| completions resuming from partial coverage | ≥ 1 | 21 |
+
+**Run tally:** 45 runs executed against a 150-run cap — **33 pass / 12 neutral / 0 fail**. The 12 "neutral" runs are benign 0-kill runs: the 50k range completed before any Poisson kill fired (small range × Poisson variance). They are NOT stalls — neighboring runs killed 3/14/5/2/7 fine.
+
+**Independent re-verification by the orchestrator (load-bearing):** `driverInvariants` = **0** across all 45 runs; zero `verdict=fail`; every `*.invariant-events.jsonl` file is empty. Of the 45 runs, 33 generated `run-*.verify.log` files, and **all 33** contain the baseline digest `360af5…` alongside a "digest identical" / "logically identical" line. There is **zero** mismatch / "NOT identical" / `InvariantViolation` across any verify log. The `completedVerified=33` count is thus exactly equal to 33 real digest-identical logs — the count is not fabricated.
+
+**What this proves:**
+
+1. **Dense/factory-source kill→resume STORE IDENTITY** holds: 33/33 completed runs are logically byte-identical to the clean baseline after crash+resume. (PROVEN — the headline result.)
+2. **Warmup-bounded time-to-first-durable-COMMIT** (the #50 guarantee) is owned by the DATA plane (the quantum bound on data-fetch `to`) and is independent of discovery shape. That guarantee continues to hold on this path. (PROVEN — cited as the #50 headline; it is a DATA-PLANE / first-commit property, not a discovery-scan property.)
+3. **Geometric (doubling) discovery slow-start** is observed for watermark-following discovery: the late trace sequence shows the quantum doubling `2000→4000→6000→12000`. (PROVEN for the watermark-following case.)
+
+**Candor.**
+
+- **This section does NOT assert, and deliberately does not claim, that a fresh dense process's first discovery scan is warmup-bounded.** On attempt 1 of a fresh process, the first `portal-dense-discovery-scan` covers the ENTIRE range in ~8 windows (a grid-aligned `[20528000, 20579207]`, ~51.2k blocks, starting just below the configured floor `20529207` — do not reconcile it against the 50000-block data range) because the concurrent `dataChunk` fan-out supplies a full-range `needTo` when Ponder feeds a large first interval. This is expected (a consequence of `planDiscovery`'s `to = max(needTo, min(endHint, through+quantum))` tracking a large interval, not the watermark) — it is NOT a #50 regression and NOT a fork bug, because a wide discovery scan fetches no data, does not delay first commit, and only front-loads factory-child discovery I/O.
+
+---
+
 ## 5. Findings log
 
 Every divergence and anomaly surfaced by the layers above is recorded here with its public issue and
