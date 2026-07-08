@@ -11,7 +11,7 @@
       "wiring": "wiring/0.16.7.patch",
       "rev": 1,
       "status": "verified",
-      "published": false,
+      "published": true,
       "note": "0.16.7-sqd.1 is cut from the SAME Portal layer as 0.16.6-sqd.2 (invariant-first re-architecture INV-1…INV-18 + the correctness wave through the #47 mid-range-204 fix, the #50 bounded-time-to-first-commit warmup, and the #20/#94 needed-field scoping), grafted onto ponder@0.16.7. Seam identical to 0.16.6 — the 0.16.6 wiring patch applies cleanly (zero rejects, 10/10 files), builds, and passes the full Portal suite (302 tests) on ponder@0.16.7 (CI matrix). 0.16.6→0.16.7 is one DB-layer PR (ponder-sh/ponder#2314: live-query notification batching, drops the 100-table limit) touching database/actions, drizzle/onchain, build/schema, bin/createViews — none of the graft surfaces (sync-historical, runtime/historical, sync-store, rpc, sync). No fresh RPC byte-diff on 0.16.7; compat rests on seam-identity + the full suite, as for 0.15.17. As the newest ponder version it publishes with --tag latest."
     },
     {
@@ -19,7 +19,7 @@
       "wiring": "wiring/0.16.6.patch",
       "rev": 2,
       "status": "verified",
-      "published": false,
+      "published": true,
       "note": "0.16.6-sqd.2 re-cuts ponder@0.16.6 with the full current Portal layer: the invariant-first re-architecture (INV-1…INV-18, portal/INVARIANTS.md) plus the correctness wave through the #47 mid-range-204 close, the #50 bounded-time-to-first-commit warmup, and the #20/#94 needed-field scoping. Full Portal suite (302 tests) green on ponder@0.16.6. The earlier 0.16.6-sqd.1 (published --tag latest, byte-identical vs RPC across logs/tx/receipts/traces + the early C-series fixes) predates that wave and is superseded by this cut. No longer the newest ponder version, so this rev publishes under dist-tag ponder-0.16.6, not latest."
     },
     {
@@ -27,7 +27,7 @@
       "wiring": "wiring/0.15.17.patch",
       "rev": 2,
       "status": "verified",
-      "published": false,
+      "published": true,
       "note": "0.15.17-sqd.2 re-cuts ponder@0.15.17 with the full current Portal layer: the invariant-first re-architecture (INV-1…INV-18, portal/INVARIANTS.md) plus the correctness wave through the #47 mid-range-204 close, the #50 bounded-time-to-first-commit warmup, and the #20/#94 needed-field scoping. Seam identical to 0.16.6 — the 0.16.6 wiring patch applies cleanly, builds, and passes the full Portal suite (302 tests) on ponder@0.15.17 (CI matrix). The earlier 0.15.17-sqd.1 predates that wave and is superseded by this cut. Publishes under dist-tag ponder-0.15.17."
     }
   ],
