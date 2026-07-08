@@ -49,13 +49,32 @@ jobs:
         run: |
           node -e "const v='${{ steps.v.outputs.version }}'; const j=require('./versions.json'); if(!j.versions.some(r=>r.ponder===v)){console.error('✗ '+v+' not in versions.json — add a row + portal/wiring/'+v+'.patch first (PUBLISHING.md)');process.exit(1)} console.log('✓ '+v+' declared')"
 
+      - name: Idempotency guard — no-op if this exact version is already on npm
+        id: published
+        # Creating a `v<version>` tag (e.g. via `gh release create` after a dispatch publish)
+        # re-triggers this workflow with rev=1. npm can never re-publish an existing version, so
+        # detect that case and end the run green without building — a tag-triggered re-run is a
+        # no-op, not a failure (#86). On an npm-lookup error we fall through to a normal
+        # build+publish attempt (fail-safe: worst case is today's behavior, a duplicate-publish red).
+        run: |
+          FULL='${{ steps.v.outputs.version }}-sqd.${{ github.event.inputs.rev || '1' }}'
+          if npm view "@subsquid/ponder@$FULL" version >/dev/null 2>&1; then
+            echo "✓ @subsquid/ponder@$FULL is already published — nothing to do (tag-triggered re-run)."
+            echo "exists=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "→ @subsquid/ponder@$FULL not on npm yet — proceeding to build + publish."
+            echo "exists=false" >> "$GITHUB_OUTPUT"
+          fi
+
       - name: Build + test the fork (apply Portal layer to ponder@<version>)
+        if: steps.published.outputs.exists != 'true'
         run: bash scripts/sync-upstream.sh "${{ steps.v.outputs.version }}" --test
         env:
           SYNC_WORKDIR: ${{ runner.temp }}/fork
           SYNC_REV: ${{ github.event.inputs.rev || '1' }}
 
       - name: Publish to npm (Trusted Publishing via OIDC — no token)
+        if: steps.published.outputs.exists != 'true'
         working-directory: ${{ runner.temp }}/fork/${{ steps.v.outputs.version }}/packages/core
         # `latest` ONLY for the newest ponder version in versions.json, so publishing an older version
         # (e.g. 0.15.17 after 0.16.6) does not clobber the default `npm install`. Older versions get a
