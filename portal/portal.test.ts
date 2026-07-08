@@ -4876,6 +4876,7 @@ const extend94Server = (opts: {
   tailTo: string; // TRACE_OTHER ⇒ unmatched tail; TARGET_B ⇒ B matches (its receipt-need decides fatal)
   tailFrom: number; // the extend tail starts here; only this region degrades logsBloom
   nonReceiptDrop?: 'trace.error'; // instead degrade a NON-receipt trace column (T-C)
+  tailLogMatches?: boolean;
 }) =>
   http.createServer((req, res) => {
     let body = '';
@@ -4943,6 +4944,17 @@ const extend94Server = (opts: {
         return;
       }
       // TAIL log: filter A matches NOTHING on the tail → the log source adds no matched row there.
+      if (
+        opts.tailLogMatches &&
+        !isTrace &&
+        isTail &&
+        from <= opts.tailBlock &&
+        to >= opts.tailBlock
+      ) {
+        res.writeHead(200, { 'content-type': 'application/x-ndjson' });
+        res.end(`${JSON.stringify(mk94LogBlock(opts.tailBlock))}\n`);
+        return;
+      }
       if (from > to) {
         res.writeHead(204).end();
         return;
@@ -4960,6 +4972,7 @@ const run94 = async (opts: {
   bReceipt: boolean;
   tailTo: string;
   nonReceiptDrop?: 'trace.error';
+  tailLogMatches?: boolean;
 }): Promise<{ traceCount: number }> => {
   delete process.env.PORTAL_FINALIZED_HEAD; // probe the mock so the head advances
   let head = 100;
@@ -4970,6 +4983,7 @@ const run94 = async (opts: {
     tailTo: opts.tailTo,
     tailFrom: 101,
     nonReceiptDrop: opts.nonReceiptDrop,
+    tailLogMatches: opts.tailLogMatches,
   });
   const p: number = await new Promise((r) =>
     srv.listen(0, () => r((srv.address() as AddressInfo).port)),
@@ -5105,4 +5119,21 @@ test('#94 (T-C): a matched trace with a missing NON-receipt trace field STILL fa
       nonReceiptDrop: 'trace.error',
     }),
   ).rejects.toThrow(/error.*matched data|matched data.*error/);
+});
+
+test('#94 (T-B log): a matched LOG on a RECEIPT-needing log filter, tail missing a RECEIPT field, STILL fails LOUD (never under-fire on the LOG path)', async () => {
+  // The LOG-path sibling of T-B, guarding the fix's headline deviation: assembly emits a receipt for a kept
+  // log's parent tx iff `spec.needReceipts` (SPEC-WIDE), so the guard arms the receipt field off
+  // `spec.needReceipts && matchedLogsAdded > 0`. Here filter A (receipt-needing LOG) matches a log on the
+  // tail while logsBloom is degraded → a real dataset-completeness gap → the fatal MUST fire. B is
+  // non-receipt AND UNMATCHED on the tail (tailTo=TRACE_OTHER) so ONLY the matched log arms the fatal,
+  // isolating the log-branch term. A future regression to a per-log-filter gate would silently under-fire here.
+  await expect(
+    run94({
+      bType: 'trace',
+      bReceipt: false,
+      tailTo: TRACE_OTHER,
+      tailLogMatches: true,
+    }),
+  ).rejects.toThrow(/logs_bloom.*matched data|matched data.*logs_bloom/);
 });
