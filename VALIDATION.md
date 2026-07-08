@@ -184,7 +184,8 @@ Notes:
   the seeded windows sit below it), so the fork's dataset-completeness guard refuses the range rather than
   serving an incomplete receipt row. This is an **upstream dataset gap ([#83](../../issues/83))**, not a
   fork defect; the guard did exactly its job. The same gap affects `L-arbitrum` and `L-avalanche`
-  (`arbitrum-one` / `avalanche-mainnet` gate it below their own boundaries — ~458 M and ~89 M), so those
+  (`arbitrum-one` / `avalanche-mainnet` gate it below their own boundaries — probe-confirmed served by
+  460 M and 89.4 M respectively), so those
   two are **blocked for receipts** on the seeded windows and each has a **logs-only variant** (`L-base-logs` / `L-arbitrum-logs` /
   `L-avalanche-logs`) that drops receipts but keeps the *identical* windows for comparability. Full
   record — the 8-window run, the verbatim error, the probe table, and the disposition — in §3.5.
@@ -480,9 +481,11 @@ three affected datasets:
 sampled *below* each chain's boundary; at and above it the identical request serves `logs_bloom`.
 Confirmed by direct probes (2026-07-08, no auth): `base-mainnet` **400 at block 45,000,000 → 200 at
 45,398,144 and 46,000,000**; `arbitrum-one` **400 at 450 M → 200 at 460 M**; `avalanche-mainnet` **400 at
-88 M → 200 at 89.4 M**. So the practical boundaries are **base ≈ 45.4 M, arbitrum ≈ 457–458 M, avalanche
-≈ 89.1–89.4 M**: a receipts-enabled backfill whose `fromBlock` is at/above its chain's boundary works
-today. The seeded `L-base` windows (§3.5, blocks 30–39 M) all fall **below** base's boundary — which is
+88 M → 200 at 89.4 M**. So each chain's boundary sits just below its probe-confirmed served block —
+**base in (45.0 M, 45,398,144], arbitrum in (450 M, 460 M], avalanche in (88 M, 89.4 M]** (the probes
+bound the interval; the exact first-served block within it was not bisected): a receipts-enabled
+backfill whose `fromBlock` is at/above the confirmed served block (base 45,398,144, arbitrum 460 M,
+avalanche 89.4 M) works today. The seeded `L-base` windows (§3.5, blocks 30–39 M) all fall **below** base's boundary — which is
 why they fail fast, and why range-scoped is the accurate framing, not a chain-wide block.
 
 **Why fail-fast is the designed correct behavior.** A Ponder app with `includeTransactionReceipts:
@@ -570,9 +573,10 @@ The divergence is identical on every window: the Portal store has `transactions.
 records (the 8 originals plus their 8 auto-shrunk halves) the cell made **42 553 metered requests**.
 
 **Root cause — one missing column, range-scoped (live probe 2026-07-07; re-confirmed 2026-07-08).**
-Below base-mainnet's ~45.4 M boundary — the **same per-chain boundary as `logs_bloom`** (§3.5) — the
-`base-mainnet` dataset does not serve the `access_list` column; at/above it the column is served
-(`transaction.accessList` **400 at block 45,000,000 → 200 at 46,000,000**). The seeded windows here run
+Below base-mainnet's ~45 M boundary — a boundary in the **same ~45 M region as `logs_bloom`** (§3.5;
+the `accessList` probes bound it only to (45.0 M, 46.0 M]) — the `base-mainnet` dataset does not serve
+the `access_list` column; at/above it the column is served (`transaction.accessList` **400 at block
+45,000,000 → 200 at 46,000,000**). The seeded windows here run
 below the boundary. Requesting `transaction.accessList` below the boundary returns:
 
 ```
