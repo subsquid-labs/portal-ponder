@@ -114,10 +114,12 @@ test('blocks mode: a PORTAL-only (A-only) block FAILS (asymmetric — #19)', asy
   assert.equal(r.shared, 2);
 });
 
-// ── issue #76: tolerated upstream block.size off-by-one (blocks mode only) ───────────────────────
-// Mirrors harness/diff/diff.mjs blocksVerdict. A=portal, B=rpc. A shared block whose ONLY differing
-// field is `size` with rpc==portal+1 and rpc>=65540 is counted in res.sizeTolerated (not res.mismatch)
-// and does NOT fail. Everything else about size, a second differing field, and strict mode all FAIL.
+// ── issues #76, #106: tolerated upstream block.size-only derivation artifact (blocks mode only) ───
+// Mirrors harness/diff/diff.mjs blocksVerdict. A=portal, B=rpc. `size` is a node-derived, non-consensus
+// field NOT committed by the block hash. A shared block whose SOLE differing field is `size` — any
+// delta magnitude or sign — is counted in res.sizeTolerated (not res.mismatch) and does NOT fail,
+// ANCHORED on both rows carrying a present, equal `hash`. A second differing field (including hash), a
+// missing/empty hash, and strict mode all FAIL.
 const szBlock = (number, size, extra = {}) => ({
   number,
   hash: 'h',
@@ -125,9 +127,54 @@ const szBlock = (number, size, extra = {}) => ({
   ...extra,
 });
 
-// MUTATION: run this against origin/main's diff-batched.mjs (no sizeTolerated branch) → na!==nb sets
-// res.mismatch and res.fail, so r.fail is true and r.sizeTolerated is undefined → this test FAILS.
-test('blocks mode #76: a lone size off-by-one at/above 65540 is tolerated, not a mismatch', async () => {
+// T-bsc-plus1 — the #106 BSC pervasive signature: portal === rpc + 1 (rpc = portal − 1), BELOW 65540,
+// hash equal → tolerated. MUTATION: on origin/main (rpc === portal + 1 && rpc ≥ 65540) the sign is
+// wrong AND sub-threshold, so na!==nb sets res.mismatch/res.fail and r.sizeTolerated is undefined →
+// this test FAILS on the pre-fix code.
+test('blocks mode #106: a lone size-only diff below 65540 (BSC portal=rpc+1) is tolerated', async () => {
+  const r = await mergeCompare(
+    [szBlock(97964878, 33097)],
+    [szBlock(97964878, 33096)],
+    {
+      keyFn: blockKey,
+      mode: 'blocks',
+    },
+  );
+  assert.equal(
+    r.fail,
+    false,
+    'a lone BSC size-only diff (hash equal) does not fail',
+  );
+  assert.equal(r.sizeTolerated, 1);
+  assert.equal(r.mismatch, 0, 'the tolerated row is not counted as a mismatch');
+  assert.equal(r.shared, 1);
+});
+
+// T-bsc-large — the #106 occasional large size-only delta, hash equal → tolerated regardless of
+// magnitude. MUTATION: origin/main tolerates only rpc === portal + 1, so this large delta lands in
+// res.mismatch and r.fail is true → this test FAILS on the pre-fix code.
+test('blocks mode #106: a lone LARGE size-only delta (hash equal) is tolerated', async () => {
+  const r = await mergeCompare(
+    [szBlock(97964870, 171807)],
+    [szBlock(97964870, 40542)],
+    {
+      keyFn: blockKey,
+      mode: 'blocks',
+    },
+  );
+  assert.equal(
+    r.fail,
+    false,
+    'a lone large size-only delta (hash equal) does not fail',
+  );
+  assert.equal(r.sizeTolerated, 1);
+  assert.equal(r.mismatch, 0);
+  assert.equal(r.shared, 1);
+});
+
+// T-eth76 — regression: the original #76 signature (rpc === portal + 1, ≥ 65540, hash equal) must
+// still be tolerated after the generalization.
+test('blocks mode #76: a lone size off-by-one at/above 65540 is still tolerated (regression)', async () => {
   const r = await mergeCompare(
     [szBlock(19963775, 66755)],
     [szBlock(19963775, 66756)],
@@ -136,51 +183,18 @@ test('blocks mode #76: a lone size off-by-one at/above 65540 is tolerated, not a
       mode: 'blocks',
     },
   );
-  assert.equal(r.fail, false, 'a lone size off-by-one at scale does not fail');
+  assert.equal(
+    r.fail,
+    false,
+    'the original #76 off-by-one still does not fail',
+  );
   assert.equal(r.sizeTolerated, 1);
   assert.equal(r.mismatch, 0, 'the tolerated row is not counted as a mismatch');
   assert.equal(r.shared, 1);
 });
 
-test('blocks mode #76: a sub-threshold size delta (< 65540) still FAILS', async () => {
-  const r = await mergeCompare([szBlock(100, 30000)], [szBlock(100, 30001)], {
-    keyFn: blockKey,
-    mode: 'blocks',
-  });
-  assert.equal(
-    r.fail,
-    true,
-    'below the 65540 boundary the off-by-one is a real mismatch',
-  );
-  assert.equal(r.mismatch, 1);
-  assert.equal(r.sizeTolerated, 0);
-});
-
-test('blocks mode #76: a size delta of 2 (not exactly +1) still FAILS', async () => {
-  const r = await mergeCompare([szBlock(100, 66754)], [szBlock(100, 66756)], {
-    keyFn: blockKey,
-    mode: 'blocks',
-  });
-  assert.equal(r.fail, true, 'only an exact +1 delta is tolerated');
-  assert.equal(r.mismatch, 1);
-  assert.equal(r.sizeTolerated, 0);
-});
-
-test('blocks mode #76: portal LARGER than rpc (opposite sign) still FAILS', async () => {
-  const r = await mergeCompare([szBlock(100, 66757)], [szBlock(100, 66756)], {
-    keyFn: blockKey,
-    mode: 'blocks',
-  });
-  assert.equal(
-    r.fail,
-    true,
-    'only rpc == portal+1 is tolerated, never portal > rpc',
-  );
-  assert.equal(r.mismatch, 1);
-  assert.equal(r.sizeTolerated, 0);
-});
-
-test('blocks mode #76: size within tolerance but a SECOND field also differs still FAILS', async () => {
+// T-safety-2field — a second differing field defeats the tolerance even when size is a valid delta.
+test('blocks mode: size differs AND a SECOND field (gas_used) differs still FAILS', async () => {
   const portal = [szBlock(100, 66755, { gas_used: 100n })];
   const rpc = [szBlock(100, 66756, { gas_used: 200n })];
   const r = await mergeCompare(portal, rpc, {
@@ -196,7 +210,9 @@ test('blocks mode #76: size within tolerance but a SECOND field also differs sti
   assert.equal(r.sizeTolerated, 0);
 });
 
-test('blocks mode #76: a consensus-field (hash) divergence at large size is NEVER masked', async () => {
+// T-safety-hash — the load-bearing anti-masking test: `hash` differs (a real reorg/wrong-block
+// divergence) AND size differs → hash is the SECOND diff, NEVER masked (the safety invariant).
+test('blocks mode: a consensus-field (hash) divergence alongside a size diff is NEVER masked', async () => {
   const portal = [szBlock(100, 66755, { hash: '0xAAA' })];
   const rpc = [szBlock(100, 66756, { hash: '0xZZZ' })];
   const r = await mergeCompare(portal, rpc, {
@@ -206,13 +222,33 @@ test('blocks mode #76: a consensus-field (hash) divergence at large size is NEVE
   assert.equal(
     r.fail,
     true,
-    'a differing hash is a real mismatch even alongside a size off-by-one',
+    'a differing hash is a real mismatch even alongside a size difference',
   );
   assert.equal(r.mismatch, 1);
   assert.equal(r.sizeTolerated, 0);
 });
 
-test('strict mode #76: the size off-by-one is NOT tolerated under strict (scoped to blocks mode)', async () => {
+// T-no-hash-anchor — defensive: a size-only diff with an empty hash on one side is NOT anchored → the
+// hash-match safety proof does not hold → NOT tolerated → mismatch.
+test('blocks mode: a size-only diff with a missing/empty hash is NOT anchored → FAILS', async () => {
+  const r = await mergeCompare(
+    [szBlock(100, 33097, { hash: '' })],
+    [szBlock(100, 33096, { hash: '' })],
+    {
+      keyFn: blockKey,
+      mode: 'blocks',
+    },
+  );
+  assert.equal(
+    r.fail,
+    true,
+    'an empty hash cannot anchor the size tolerance (no identical-block proof)',
+  );
+  assert.equal(r.mismatch, 1);
+  assert.equal(r.sizeTolerated, 0);
+});
+
+test('strict mode: a size-only diff is NOT tolerated under strict (scoped to blocks mode)', async () => {
   // The tolerance is calibrated for the asymmetric portal-vs-rpc blocks comparison only. Under strict
   // (logs/txs/receipts/traces, and portal-vs-portal STRICT_BLOCKS) a size difference is a real mismatch.
   const r = await mergeCompare([szBlock(100, 66755)], [szBlock(100, 66756)], {

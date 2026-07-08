@@ -188,7 +188,7 @@ test('#78 parity: STRICT-table verdict matches diff.mjs on identical / mismatch 
   assert.equal(await batchedStrict(onlyB_p, onlyB_r), false);
 });
 
-test('#78 parity: blocks verdict matches diff.mjs incl. the #77 tolerated size off-by-one', async () => {
+test('#78 parity: blocks verdict matches diff.mjs incl. the #76/#106 tolerated size-only diff', async () => {
   // identical → both OK, nothing tolerated
   const same = [blockRow(100), blockRow(102)];
   assert.deepEqual(diffMjsBlocks(same, same.slice()), {
@@ -202,7 +202,7 @@ test('#78 parity: blocks verdict matches diff.mjs incl. the #77 tolerated size o
     mismatch: 0,
   });
 
-  // #77 tolerated: the lone upstream block.size off-by-one at/above 65540 (rpc == portal + 1) →
+  // #76 tolerated: the lone upstream block.size off-by-one at/above 65540 (rpc == portal + 1) →
   // both differs classify it sizeTolerated (NOT a mismatch) and do NOT fail.
   const tolP = [blockRow(19963775, { size: 66755 })];
   const tolR = [blockRow(19963775, { size: 66756 })];
@@ -212,18 +212,32 @@ test('#78 parity: blocks verdict matches diff.mjs incl. the #77 tolerated size o
   assert.deepEqual(
     batchedTol,
     mjsTol,
-    'both differs tolerate the #77 size off-by-one identically',
+    'both differs tolerate the #76 size off-by-one identically',
   );
 
-  // a sub-threshold (<65540) +1 size delta is NOT the #77 signature → both FAIL it as a mismatch.
-  const subP = [blockRow(100, { size: 30000 })];
-  const subR = [blockRow(100, { size: 30001 })];
-  assert.deepEqual(diffMjsBlocks(subP, subR), {
+  // #106 tolerated: a lone size-only diff BELOW 65540 (BSC portal == rpc + 1) over an equal hash →
+  // both differs classify it sizeTolerated identically (the generalized, hash-anchored tolerance).
+  const bscP = [blockRow(97964878, { size: 33097 })];
+  const bscR = [blockRow(97964878, { size: 33096 })];
+  const mjsBsc = diffMjsBlocks(bscP, bscR);
+  const batchedBsc = await batchedBlocks(bscP, bscR);
+  assert.deepEqual(mjsBsc, { ok: true, sizeTolerated: 1, mismatch: 0 });
+  assert.deepEqual(
+    batchedBsc,
+    mjsBsc,
+    'both differs tolerate the #106 sub-threshold size-only diff identically',
+  );
+
+  // a size-only diff with a differing hash is NOT anchored → both FAIL it as a mismatch (the safety
+  // invariant: hash is the second diff, so it is never masked).
+  const badSzP = [blockRow(100, { size: 30000, hash: '0xAAA' })];
+  const badSzR = [blockRow(100, { size: 30001, hash: '0xZZZ' })];
+  assert.deepEqual(diffMjsBlocks(badSzP, badSzR), {
     ok: false,
     sizeTolerated: 0,
     mismatch: 1,
   });
-  assert.deepEqual(await batchedBlocks(subP, subR), {
+  assert.deepEqual(await batchedBlocks(badSzP, badSzR), {
     ok: false,
     sizeTolerated: 0,
     mismatch: 1,

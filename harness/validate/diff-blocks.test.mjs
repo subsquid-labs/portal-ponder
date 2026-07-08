@@ -93,24 +93,32 @@ test('blocksVerdict: multi-chain — chain-1 differs at height 100 while chain-2
   );
 });
 
-// ── issue #76: tolerated upstream block.size off-by-one ─────────────────────────────────────────
-// The SQD Portal dataset reports eth-mainnet block.size one byte short whenever the RLP length crosses
-// 2^16 (canonical size ≥ 65540): portal.size === rpc.size − 1, with the hash and every consensus field
-// identical. blocksVerdict must classify EXACTLY that signature (size the sole differing field, delta
-// +1, rpc ≥ 65540) as sizeTolerated — not mismatch — so it does not fail; everything else about size
-// (sub-threshold delta, delta ≠ 1, opposite sign) and any second differing field still FAILS.
-// A `size`-bearing block row: same (chain_id, number, hash) on both sides so `size` is the SOLE diff.
+// ── issues #76, #106: tolerated upstream block.size-only derivation artifact ─────────────────────
+// `size` is a node-derived, non-consensus field NOT committed by the block hash. Two dataset
+// signatures observed, both with an IDENTICAL hash: #76 (eth-mainnet, rpc === portal + 1 only at/above
+// 65540) and #106 (BSC, pervasive portal === rpc + 1 below 65540 plus occasional large size-only
+// deltas). blocksVerdict tolerates a shared block whose SOLE differing field is `size` — regardless of
+// delta magnitude or sign — ANCHORED on both rows carrying a present, equal `hash`. Any SECOND
+// differing field (including `hash` itself) still FAILS; a size-only diff with a missing/empty hash is
+// not anchored and FAILS. A `size`-bearing block row: same (chain_id, number, hash) both sides so
+// `size` is the SOLE diff by default.
 const sizeBlock = (number, size, hash = '0xdeadbeef', chain_id = 1) =>
   JSON.stringify({ chain_id, hash, number, size });
 
-// MUTATION: run this test against origin/main's diff.mjs (no sizeTolerated split) → the off-by-one is
-// a MISMATCH so v.ok is false and v.sizeTolerated is undefined → this test FAILS on the pre-fix code.
-test('blocksVerdict #76: a lone size off-by-one at/above 65540 is tolerated, not a mismatch', () => {
-  const portal = [sizeBlock(19963775, 66755)];
-  const rpc = [sizeBlock(19963775, 66756)];
+// T-bsc-plus1 — the #106 BSC pervasive signature: portal === rpc + 1 (rpc = portal − 1), BELOW 65540,
+// hash equal → tolerated. MUTATION: on origin/main's predicate (rpc === portal + 1 && rpc ≥ 65540) the
+// sign is wrong AND it is sub-threshold, so this lands in `mismatch` not `sizeTolerated` and v.ok is
+// false → this test FAILS on the pre-fix code.
+test('blocksVerdict #106: a lone size-only diff below 65540 (BSC portal=rpc+1) is tolerated', () => {
+  const portal = [sizeBlock(97964878, 33097)];
+  const rpc = [sizeBlock(97964878, 33096)];
   const v = blocksVerdict(portal, rpc);
-  assert.equal(v.ok, true, 'a lone size off-by-one at scale does not fail');
-  assert.deepEqual(v.sizeTolerated, ['1:19963775']);
+  assert.equal(
+    v.ok,
+    true,
+    'a lone BSC size-only diff (hash equal) does not fail',
+  );
+  assert.deepEqual(v.sizeTolerated, ['1:97964878']);
   assert.equal(
     v.mismatch.length,
     0,
@@ -119,37 +127,37 @@ test('blocksVerdict #76: a lone size off-by-one at/above 65540 is tolerated, not
   assert.equal(v.shared.length, 1);
 });
 
-test('blocksVerdict #76: a sub-threshold size delta (< 65540) still FAILS', () => {
-  const v = blocksVerdict([sizeBlock(100, 30000)], [sizeBlock(100, 30001)]);
+// T-bsc-large — the #106 occasional large size-only delta, hash equal → tolerated regardless of
+// magnitude. MUTATION: origin/main tolerates only rpc === portal + 1, so a 131265-wide delta lands in
+// `mismatch` and v.ok is false → this test FAILS on the pre-fix code.
+test('blocksVerdict #106: a lone LARGE size-only delta (hash equal) is tolerated', () => {
+  const portal = [sizeBlock(97964870, 171807)];
+  const rpc = [sizeBlock(97964870, 40542)];
+  const v = blocksVerdict(portal, rpc);
   assert.equal(
     v.ok,
-    false,
-    'below the 65540 boundary the off-by-one is a real mismatch',
+    true,
+    'a lone large size-only delta (hash equal) does not fail',
   );
-  assert.deepEqual(v.mismatch, ['1:100']);
-  assert.equal(v.sizeTolerated.length, 0);
+  assert.deepEqual(v.sizeTolerated, ['1:97964870']);
+  assert.equal(v.mismatch.length, 0);
+  assert.equal(v.shared.length, 1);
 });
 
-test('blocksVerdict #76: a size delta of 2 (not exactly +1) still FAILS', () => {
-  const v = blocksVerdict([sizeBlock(100, 66754)], [sizeBlock(100, 66756)]);
-  assert.equal(v.ok, false, 'only an exact +1 delta is tolerated');
-  assert.deepEqual(v.mismatch, ['1:100']);
-  assert.equal(v.sizeTolerated.length, 0);
+// T-eth76 — regression: the original #76 signature (rpc === portal + 1, ≥ 65540, hash equal) must
+// still be tolerated after the generalization.
+test('blocksVerdict #76: a lone size off-by-one at/above 65540 is still tolerated (regression)', () => {
+  const portal = [sizeBlock(19963775, 66755)];
+  const rpc = [sizeBlock(19963775, 66756)];
+  const v = blocksVerdict(portal, rpc);
+  assert.equal(v.ok, true, 'the original #76 off-by-one still does not fail');
+  assert.deepEqual(v.sizeTolerated, ['1:19963775']);
+  assert.equal(v.mismatch.length, 0);
+  assert.equal(v.shared.length, 1);
 });
 
-test('blocksVerdict #76: portal LARGER than rpc (opposite sign) still FAILS', () => {
-  const v = blocksVerdict([sizeBlock(100, 66757)], [sizeBlock(100, 66756)]);
-  assert.equal(
-    v.ok,
-    false,
-    'only rpc == portal+1 is tolerated, never portal > rpc',
-  );
-  assert.deepEqual(v.mismatch, ['1:100']);
-  assert.equal(v.sizeTolerated.length, 0);
-});
-
-test('blocksVerdict #76: size within tolerance but a SECOND field also differs still FAILS', () => {
-  // size is a valid off-by-one, but gas_used also differs → not the isolated-size signature.
+// T-safety-2field — a second differing field defeats the tolerance even when size is a valid delta.
+test('blocksVerdict: size differs AND a SECOND field (gas_used) differs still FAILS', () => {
   const portal = [
     JSON.stringify({
       chain_id: 1,
@@ -178,8 +186,10 @@ test('blocksVerdict #76: size within tolerance but a SECOND field also differs s
   assert.equal(v.sizeTolerated.length, 0);
 });
 
-test('blocksVerdict #76: a consensus-field (hash) divergence at large size is NEVER masked', () => {
-  // hash differs (a real reorg divergence) AND size is off-by-one — the tolerance must not swallow it.
+// T-safety-hash — the load-bearing anti-masking test: `hash` differs (a real reorg/wrong-block
+// divergence) AND size differs → hash is the SECOND diff, so it is NEVER masked. This is the safety
+// invariant the generalization rests on: hash-match ⟺ identical canonical block.
+test('blocksVerdict: a consensus-field (hash) divergence alongside a size diff is NEVER masked', () => {
   const v = blocksVerdict(
     [sizeBlock(100, 66755, '0xAAA')],
     [sizeBlock(100, 66756, '0xZZZ')],
@@ -187,7 +197,22 @@ test('blocksVerdict #76: a consensus-field (hash) divergence at large size is NE
   assert.equal(
     v.ok,
     false,
-    'a differing hash is a real mismatch even alongside a size off-by-one',
+    'a differing hash is a real mismatch even alongside a size difference',
+  );
+  assert.deepEqual(v.mismatch, ['1:100']);
+  assert.equal(v.sizeTolerated.length, 0);
+});
+
+// T-no-hash-anchor — defensive: a size-only diff with an empty hash on one side is NOT anchored (the
+// hash-match safety proof does not hold) → NOT tolerated → mismatch.
+test('blocksVerdict: a size-only diff with a missing/empty hash is NOT anchored → FAILS', () => {
+  const portal = [sizeBlock(100, 33097, '')];
+  const rpc = [sizeBlock(100, 33096, '')];
+  const v = blocksVerdict(portal, rpc);
+  assert.equal(
+    v.ok,
+    false,
+    'an empty hash cannot anchor the size tolerance (no identical-block proof)',
   );
   assert.deepEqual(v.mismatch, ['1:100']);
   assert.equal(v.sizeTolerated.length, 0);
