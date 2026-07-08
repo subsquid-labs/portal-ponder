@@ -1161,9 +1161,15 @@ function classifyQuery(q) {
     Array.isArray(q?.transactions) ||
     Array.isArray(q?.traces) ||
     Array.isArray(q?.transactionReceipts);
-  const hasFactoryTopic = logs.some(
-    (log) => Array.isArray(log?.topic0) && log.topic0.length > 0,
-  );
+  const hasFactoryTopic = logs.some((log) => {
+    const t = log?.topic0;
+
+    if (typeof t === "string") {
+      return t.length > 0;
+    }
+
+    return Array.isArray(t) && t.length > 0;
+  });
   const fields = q?.fields ?? {};
   const discoveryFields =
     fields?.block?.number === true &&

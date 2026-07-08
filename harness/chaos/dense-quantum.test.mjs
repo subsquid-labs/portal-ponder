@@ -29,11 +29,7 @@ function findTraceFiles() {
   for (const dir of DEFAULT_TRACE_DIRS) {
     if (!fs.existsSync(dir)) continue;
     for (const name of fs.readdirSync(dir)) {
-      if (
-        name.endsWith('.dense-trace.jsonl') ||
-        name.endsWith('.app.log') ||
-        name.startsWith('chaos-attempt-')
-      ) {
+      if (name.endsWith('.dense-trace.jsonl')) {
         files.push(path.join(dir, name));
       }
     }
@@ -277,12 +273,21 @@ test('resume re-seeds discovery from the durable frontier instead of reusing a s
 test('PORTAL_WARMUP_BLOCKS is forwarded into the tier-1 app env (load-bearing driver passthrough)', {
   skip: noTraceSkip,
 }, () => {
+  // Mirrors the driver's `${CHAOS_WARMUP_BLOCKS:-${PORTAL_WARMUP_BLOCKS:-2000}}`
+  // default (chaos-pg-driver.sh) — `||` matches bash `:-` on both unset and empty.
+  // A custom campaign driven via CHAOS_WARMUP_BLOCKS=N must also export
+  // PORTAL_WARMUP_BLOCKS=N to this test's env, or the value-match will false-fail.
+  const configuredWarmup = Number(process.env.PORTAL_WARMUP_BLOCKS || 2000);
+
   const forwarded = trace.env.filter(
-    (record) => Number.isFinite(record.warmupBlocks) && record.warmupBlocks > 0,
+    (record) =>
+      Number.isFinite(record.warmupBlocks) &&
+      record.warmupBlocks === configuredWarmup,
   );
+
   assert.ok(
     forwarded.length > 0,
-    `no portal-dense-env record carried a positive warmupBlocks — the driver did not forward PORTAL_WARMUP_BLOCKS into the app, so the geometric warmup shape would be driven by the app default rather than the chaos knob (env records: ${JSON.stringify(
+    `no portal-dense-env record carried warmupBlocks === ${configuredWarmup} (configured PORTAL_WARMUP_BLOCKS); the driver forwarded a different value or omitted the knob, so the geometric warmup shape would be driven by the app default rather than the chaos knob (env records: ${JSON.stringify(
       trace.env,
     )})`,
   );
