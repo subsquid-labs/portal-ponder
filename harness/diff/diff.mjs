@@ -50,24 +50,31 @@ export function setDiff(a, b) {
   return { ok, onlyA, onlyB };
 }
 
-// ── known upstream defect: block.size off-by-one (issue #76) ─────────────────────────────────────
-// The SQD Portal eth-mainnet dataset computes a block's `size` with a fixed 2-byte RLP
-// length-of-length prefix, so every block whose RLP payload crosses 2^16 (canonical size ≥ 65540,
-// which needs a 3-byte length prefix) is reported one byte short: portal.size === rpc.size − 1. The
-// block hash and every consensus field are identical, and logs/transactions/receipts/traces are
-// byte-identical; only this one derived header field differs, on ~0.3% of mainnet blocks (the large
-// ones). The fork's transform is a pass-through, so the value is upstream data, not our code (issue
-// #76 tracks the dataset fix). We tolerate a shared block row whose ONLY differing field is `size`
-// with EXACTLY that signature — delta precisely +1, only at/above the 65540 boundary. Anything else
-// about size (a different delta, the opposite sign, a sub-threshold delta) OR any second differing
-// field still FAILS. Self-retiring: once the dataset is fixed the rows compare equal and this never
-// fires.
-const SIZE_TOLERANCE_MIN = 65540;
+// ── known upstream derivation artifact: block.size only-diff (issues #76, #106) ──────────────────
+// `size` is a node-DERIVED, non-consensus header field — it is NOT committed by the block hash, so
+// different sources legitimately compute it differently. Two dataset signatures have been observed,
+// both with an IDENTICAL block hash and byte-identical logs/transactions/receipts/traces:
+//   • #76 (eth-mainnet): a fixed 2-byte RLP length-of-length prefix reports every block whose RLP
+//     payload crosses 2^16 (canonical size ≥ 65540) one byte short — portal.size === rpc.size − 1.
+//   • #106 (BSC / chain 56): pervasive portal === rpc + 1 (opposite sign, below 65540) plus
+//     occasional large size-only deltas — same block hash on both sides throughout.
+// Both are instances of the same thing: a source-side size derivation artifact, never a Portal
+// content defect. So we tolerate a shared block row whose SOLE differing field is `size`, regardless
+// of the delta's magnitude or sign.
+//
+// SAFETY INVARIANT (why this cannot mask a real divergence): `hash` is a COMPARED field. The block
+// hash commits every consensus field, so an equal, non-empty hash on both sides ⟺ the same canonical
+// block — a size-only difference over a matching hash is provably a derivation artifact. We anchor on
+// exactly that: tolerate only when both rows carry a present (non-null/non-empty) and EQUAL `hash`.
+// Any SECOND differing field — including `hash` itself (a reorg/wrong-block divergence) — is the
+// second diff, so the predicate returns false and blocksVerdict FAILS. Self-retiring: once a source
+// aligns its size derivation the rows compare equal and this never fires.
 
 // portalRow / rpcRow are normalized block row-strings (norm output: sorted keys, bigint→decimal,
-// bytes→hex, total_difficulty dropped). Returns true iff `size` is the SOLE differing field and the
-// pair matches the issue-#76 off-by-one signature (rpc === portal + 1, rpc ≥ 65540).
-function sizeOffByOneTolerated(portalRow, rpcRow) {
+// bytes→hex, total_difficulty dropped). Returns true iff `size` is the SOLE differing field AND both
+// rows carry a present, equal `hash` (the safety anchor above). Delta magnitude and sign are
+// irrelevant — a matching hash proves the canonical block is identical (issues #76, #106).
+function sizeOnlyDiffTolerated(portalRow, rpcRow) {
   const p = JSON.parse(portalRow);
   const r = JSON.parse(rpcRow);
 
@@ -82,23 +89,20 @@ function sizeOffByOneTolerated(portalRow, rpcRow) {
 
   if (diffField !== 'size') return false;
 
-  const portalSize = Number(p.size);
-  const rpcSize = Number(r.size);
+  // Safety anchor: a size-only diff is a derivation artifact ONLY over an identical canonical block,
+  // which a present, equal hash proves. A missing/empty hash on either side is not anchored → FAIL.
+  const { hash } = p;
 
-  return (
-    Number.isFinite(portalSize) &&
-    Number.isFinite(rpcSize) &&
-    rpcSize === portalSize + 1 &&
-    rpcSize >= SIZE_TOLERANCE_MIN
-  );
+  return hash !== null && hash !== undefined && hash !== '' && hash === r.hash;
 }
 
 // Block-identity keyed by (CHAIN_ID, NUMBER) — parsed from each normalized row-string. Rules:
 //   • a (chain,number) PRESENT on both sides whose full-row string differs → MISMATCH → FAIL
 //     (keying by hash would hide a same-number/different-hash reorg divergence as two one-sided
-//      extras that the old `ok` never checked) — EXCEPT the known upstream block.size off-by-one
-//      (issue #76): a shared block whose ONLY differing field is `size` with rpc === portal + 1 and
-//      rpc ≥ 65540 is classified `sizeTolerated`, not `mismatch`, so it does not fail (self-retiring)
+//      extras that the old `ok` never checked) — EXCEPT the known upstream block.size derivation
+//      artifact (issues #76, #106): a shared block whose ONLY differing field is `size`, over a
+//      present+equal hash, is classified `sizeTolerated`, not `mismatch`, so it does not fail
+//      (any second differing field, including hash, still FAILS; self-retiring)
 //   • a portal-only (chain,number) (in A, not B) → FAIL — the Portal path invented a block RPC never saw
 //   • an rpc-only (chain,number) (in B, not A) → tolerated: the stock RPC path stores inert event-less
 //     blocks it traced (never referenced)
@@ -123,14 +127,14 @@ export function blocksVerdict(
   const b = new Map(bRows.map((r) => [keyOf(r), r]));
   const shared = [...a.keys()].filter((n) => b.has(n));
 
-  // A shared key whose row-strings differ is a MISMATCH, EXCEPT the tolerated upstream size
-  // off-by-one (issue #76) — those are split into sizeTolerated and do NOT fail.
+  // A shared key whose row-strings differ is a MISMATCH, EXCEPT the tolerated upstream size-only
+  // derivation artifact (issues #76, #106) — those are split into sizeTolerated and do NOT fail.
   const mismatch = [];
   const sizeTolerated = [];
   for (const n of shared) {
     if (a.get(n) === b.get(n)) continue;
 
-    if (sizeOffByOneTolerated(a.get(n), b.get(n))) {
+    if (sizeOnlyDiffTolerated(a.get(n), b.get(n))) {
       sizeTolerated.push(n);
     } else {
       mismatch.push(n);
@@ -212,7 +216,7 @@ async function main() {
     console.log(
       `  ${v.ok ? '✅' : '❌'} ${'blocks'.padEnd(20)} portal=${String(v.aSize).padStart(6)}  rpc=${String(v.bSize).padStart(6)}  shared=${v.shared.length} match` +
         (v.sizeTolerated.length
-          ? `, ${v.sizeTolerated.length} tolerated (upstream size off-by-one, issue #76)`
+          ? `, ${v.sizeTolerated.length} tolerated (upstream size-only derivation, issues #76/#106)`
           : '') +
         (v.rpcExtra.length
           ? `, +${v.rpcExtra.length} inert event-less (RPC-only)`
