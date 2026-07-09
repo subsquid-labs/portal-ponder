@@ -25,7 +25,12 @@ const v2RouterAbi = [
 // 2k-block span already exercises all five source types (dense Swap volume + receipts, router
 // call-traces, block intervals, WETH account txs). Widen via PONDER_START / PONDER_END.
 const START = Number(process.env.PONDER_START ?? 22_200_000);
-const END = Number(process.env.PONDER_END ?? 22_202_000);
+const FULL = process.env.PONDER_FULL === '1'; // run the full history (no endBlock bound)
+const END = FULL
+  ? undefined
+  : process.env.PONDER_END
+    ? Number(process.env.PONDER_END)
+    : START + 2_000;
 
 export default createConfig({
   chains: {

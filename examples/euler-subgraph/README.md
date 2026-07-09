@@ -18,6 +18,8 @@ production, set your own RPC and widen the window:
 PONDER_RPC_URL_1=<your-archive-rpc> PONDER_END=25436954 npm run dev
 ```
 
+Set `PONDER_FULL=1` to run the complete history with no endBlock bound.
+
 Verified (fresh clone, zero env): 4 vaults discovered via the factory (eUSDT-2 / eUSDC-2 /
 ewstETH-2, with on-chain `asset`/`symbol`/`decimals`), deposits/borrows/withdraws indexed, the
 Counter aggregation, and APY-derived `VaultStatus` — backfilled in ~1m over the default 91k-block

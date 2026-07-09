@@ -15,11 +15,14 @@ const proxyCreated = parseAbiItem(
 //    vault-metadata calls, which read historical state). Rate-limits under load; set
 //    PONDER_RPC_URL_1 to your own for real work.
 //  - endBlock: defaults to a short window (~91k blocks) so the demo finishes in ~1-2 min. Set
-//    PONDER_END to backfill further.
+//    PONDER_END to backfill further, or PONDER_FULL=1 to run the unbounded full history.
 const START = Number(process.env.PONDER_START ?? 20_529_207); // subgraph mainnet startBlock
-const END = process.env.PONDER_END
-  ? Number(process.env.PONDER_END)
-  : START + 91_000;
+const FULL = process.env.PONDER_FULL === '1'; // run the full history (no endBlock bound)
+const END = FULL
+  ? undefined
+  : process.env.PONDER_END
+    ? Number(process.env.PONDER_END)
+    : START + 91_000;
 
 export default createConfig({
   chains: {

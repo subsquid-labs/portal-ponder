@@ -24,4 +24,6 @@ for a longer backfill or production set your own RPC and window:
 PONDER_RPC_URL_1=<your-rpc> PONDER_START=22200000 PONDER_END=22300000 npm run dev
 ```
 
+Set `PONDER_FULL=1` to run the complete history with no endBlock bound.
+
 See [`.env.example`](.env.example) for all overridable values.
