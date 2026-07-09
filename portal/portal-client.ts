@@ -23,6 +23,7 @@ import {
   PortalQueryTooLargeError,
   PortalSchemaFieldError,
   PortalThrottleError,
+  PortalThrottleExhaustedError,
   PortalTruncatedBodyError,
 } from './portal-errors.js';
 import {
@@ -311,6 +312,13 @@ export type PortalClientDeps = {
 
 /** Head probe deadline — a small GET; if it hangs, callers stay conservative rather than block. */
 const FINALIZED_HEAD_TIMEOUT_MS = 10_000;
+
+/**
+ * How many times a transient (throttle / network) error is retried with back-off before the stream gives
+ * up and throws. On a PERSISTENT throttle the terminal throw carries an ACTIONABLE message
+ * (`PortalThrottleExhaustedError`) rather than the bare `Portal 429`. (issue #116)
+ */
+const MAX_TRANSIENT_RETRIES = 10;
 
 /**
  * GET `/finalized-head`, bounded — the SINGLE probe implementation, shared by the historical client's
@@ -686,7 +694,24 @@ export function createPortalClient(deps: PortalClientDeps): PortalClient {
               );
             continue;
           }
-          if (!isTransientError(err) || attempt++ >= 10) throw err;
+          if (!isTransientError(err)) throw err;
+          if (attempt++ >= MAX_TRANSIENT_RETRIES) {
+            // A throttle that PERSISTED through the whole budget: surface an ACTIONABLE terminal error
+            // instead of the opaque `Portal 429` the fire-and-forget prefetch fan-out would otherwise
+            // crash on (issue #116). Only throttles get enriched — a persistent NETWORK error keeps its
+            // own diagnostic message (connectivity, not a shared-endpoint rate limit).
+            if (err instanceof PortalThrottleError) {
+              throw new PortalThrottleExhaustedError(
+                err.status,
+                err.retryAfterMs,
+                portalUrl,
+                chainName,
+                attempt,
+              );
+            }
+
+            throw err;
+          }
           stats.errors++;
           stats.retries++;
           // Honor a POSITIVE server-advised back-off (capped 30s); otherwise — including an absent or

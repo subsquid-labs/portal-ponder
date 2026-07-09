@@ -243,6 +243,74 @@ test('G1: a failed chunk is evicted (rows freed) and a later call refetches inst
   }
 });
 
+// ── issue #116: a REJECTING read-ahead prefetch must never escape to unhandledRejection ─────────────
+
+test('issue #116: a read-ahead prefetch chunk that REJECTS is caught — never an unhandledRejection (the persistent-throttle crash class)', async () => {
+  // The concurrent read-ahead prefetches the NEXT chunk (`void dataChunk(d).catch(...)`) while the main
+  // loop only awaits the CURRENT interval's chunks. If that prefetched promise rejects — the shape a
+  // persistent Portal 429 takes once the retry budget exhausts — with nothing awaiting it, it must NOT
+  // reach `process.on('unhandledRejection')` (which crashes the process, issue #116). Deterministic: the
+  // prefetch chunk hard-fails with an UNRECOGNIZED 400 (non-transient ⇒ immediate reject, no timers), the
+  // exact rejecting-prefetched-chunk promise the fan-out must contain.
+  process.env.PORTAL_READAHEAD = '1';
+  const CHUNK = CHUNK_BLOCKS;
+  const srv = http.createServer((req, res) => {
+    let body = '';
+    req.on('data', (c) => {
+      body += c;
+    });
+    req.on('end', () => {
+      const q = body ? JSON.parse(body) : {};
+      if (!req.url?.includes('finalized-stream')) {
+        res.writeHead(204).end();
+        return;
+      }
+      const from = q.fromBlock ?? 0;
+      if (from >= CHUNK) {
+        // the read-ahead prefetch chunk (chunk 1): reject immediately (non-transient 400 → no retries)
+        res.writeHead(400);
+        res.end('boom — persistent throttle proxy (prefetch)');
+        return;
+      }
+      // chunk 0 (serves the awaited interval): terminate at the in-range range-end anchor
+      streamRes(res, from, q.toBlock ?? 0, [], CHUNK - 1);
+    });
+  });
+  const port = await listen(srv);
+
+  const unhandled: unknown[] = [];
+  const onUnhandled = (e: unknown) => unhandled.push(e);
+  process.on('unhandledRejection', onUnhandled);
+  try {
+    const filter = mkFilter({ fromBlock: 0, toBlock: 100_000_000 });
+    const sync = mkSync(port, filter, {
+      chain: {
+        id: 1,
+        name: 'mainnet',
+        portal: `http://localhost:${port}`,
+        finalityBlockCount: 10,
+      },
+    });
+    // interval [0,100] lives entirely in chunk 0 → the fan-out awaits chunk 0, prefetches chunk 1 (rejects)
+    const interval: [number, number] = [0, 100];
+    const logs = await sync.syncBlockRangeData({
+      interval,
+      requiredIntervals: [{ interval, filter }],
+      requiredFactoryIntervals: [],
+      syncStore: mkSyncStore(),
+    });
+    expect(logs).toHaveLength(0); // chunk 0 is an empty in-range window (anchor only) — served cleanly
+
+    // let the rejected prefetch settle and the reject-microtask flush — an escaped rejection fires HERE
+    await new Promise((r) => setTimeout(r, 200));
+    expect(unhandled).toHaveLength(0);
+  } finally {
+    process.off('unhandledRejection', onUnhandled);
+    srv.close();
+    delete process.env.PORTAL_READAHEAD;
+  }
+});
+
 // ── G3 (INV-7): rows are registered per ARRIVING batch, not on chunk completion ─────────────────────
 
 test('G3: buffered rows are visible to the gate MID-CHUNK (registered per arriving batch)', async () => {

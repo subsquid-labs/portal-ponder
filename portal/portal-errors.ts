@@ -48,6 +48,34 @@ export class PortalThrottleError extends Error {
 }
 
 /**
+ * A throttle that PERSISTED through the whole retry budget — the terminal shape. A single 429 is a
+ * transient `PortalThrottleError` the stream retries with back-off; when the endpoint keeps throttling
+ * for `attempts` retries the loop gives up and throws THIS instead of the bare `Portal 429`. It extends
+ * `PortalThrottleError` (so any existing `instanceof` / `isTransientError` classification still holds —
+ * the difference is purely the actionable MESSAGE), which the historical sync's fire-and-forget prefetch
+ * fan-out would otherwise surface as an opaque `Error: Portal 429`. The message names the likely cause (a
+ * shared/rate-limited endpoint, e.g. the free public Portal under a full-history backfill) and the two
+ * levers a dev has: point at a DEDICATED Portal, or bound the range (`PONDER_END` / a per-source
+ * `endBlock`) so the demo grinds through a smaller window. (issue #116)
+ */
+export class PortalThrottleExhaustedError extends PortalThrottleError {
+  constructor(
+    status: number | undefined,
+    retryAfterMs: number | undefined,
+    endpoint: string,
+    chainName: string,
+    attempts: number,
+  ) {
+    super(status, retryAfterMs);
+    this.name = 'PortalThrottleExhaustedError';
+    this.message =
+      `Portal ${status ?? 'throttle'} for ${chainName}: the endpoint kept throttling across ${attempts} attempts (${endpoint}). ` +
+      'This usually means a SHARED / rate-limited Portal (e.g. the free public Portal under a full-history backfill). ' +
+      'Use a DEDICATED Portal endpoint, or bound the backfill to a smaller window (set PONDER_END, or a per-source endBlock) so a rate-limited endpoint can keep up.';
+  }
+}
+
+/**
  * A dataset that cannot serve a requested field on this chunk — either the parquet
  * column is absent ("column not found") or the schema doesn't know the field at all
  * ("unknown field"). `fieldKey` is the `<table>.<field>` key we requested (so the
