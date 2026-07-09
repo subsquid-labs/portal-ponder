@@ -28,10 +28,10 @@ export default createConfig({
   chains: {
     mainnet: {
       id: 1,
-      // realtime tip + state reads (keyless public node; the shared public RPC rate-limits
-      // under load, so set PONDER_RPC_URL_1 to your own for anything beyond this bounded demo)
-      rpc:
-        process.env.PONDER_RPC_URL_1 ?? 'https://ethereum-rpc.publicnode.com',
+      // realtime tip + state reads. Defaults to a keyless *archive* public RPC (drpc.org); the
+      // shared public RPC rate-limits under load, so set PONDER_RPC_URL_1 to your own for
+      // anything beyond this bounded demo.
+      rpc: process.env.PONDER_RPC_URL_1 ?? 'https://eth.drpc.org',
       portal:
         process.env.PORTAL_URL ??
         'https://portal.sqd.dev/datasets/ethereum-mainnet',

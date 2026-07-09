@@ -22,8 +22,9 @@ const PORTAL = (slug: string) => `https://portal.sqd.dev/datasets/${slug}`;
 
 // Zero-config defaults so `npm run dev` works from a fresh clone with no .env:
 //  - portal: the free public Portal per chain (already defaulted via PORTAL()).
-//  - rpc: keyless public nodes (realtime tip + state reads). The shared public RPC rate-limits
-//    under load; set PONDER_RPC_URL_<chainId> to your own for real work.
+//  - rpc: keyless *archive* public RPCs (drpc.org) — realtime tip + state reads. Archive is
+//    required because reads happen at historical blocks. Rate-limited under load; set
+//    PONDER_RPC_URL_<chainId> to your own for real work.
 //  - endBlock: each chain defaults to a short window (~DEMO_SPAN blocks from its factory deploy)
 //    so the multichain demo finishes in ~1-2 min. Set PONDER_FULL=1 to backfill full history.
 const DEMO_SPAN = Number(process.env.PONDER_DEMO_SPAN ?? 200_000);
@@ -42,20 +43,17 @@ export default createConfig({
   chains: {
     mainnet: {
       id: 1,
-      rpc:
-        process.env.PONDER_RPC_URL_1 ?? 'https://ethereum-rpc.publicnode.com',
+      rpc: process.env.PONDER_RPC_URL_1 ?? 'https://eth.drpc.org',
       portal: PORTAL('ethereum-mainnet'),
     },
     base: {
       id: 8453,
-      rpc: process.env.PONDER_RPC_URL_8453 ?? 'https://base-rpc.publicnode.com',
+      rpc: process.env.PONDER_RPC_URL_8453 ?? 'https://base.drpc.org',
       portal: PORTAL('base-mainnet'),
     },
     arbitrum: {
       id: 42161,
-      rpc:
-        process.env.PONDER_RPC_URL_42161 ??
-        'https://arbitrum-one-rpc.publicnode.com',
+      rpc: process.env.PONDER_RPC_URL_42161 ?? 'https://arbitrum.drpc.org',
       portal: PORTAL('arbitrum-one'),
     },
   },

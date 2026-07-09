@@ -12,8 +12,9 @@ npm install && npm run dev
 ```
 
 Two keyless data planes per chain are wired by default: **history from the free public Portal**
-(`portal.sqd.dev`, dataset per chain) and the **realtime tip + state reads from public RPCs**
-(`*-rpc.publicnode.com`). Both are shared and rate-limited under load — fine for this bounded demo.
+(`portal.sqd.dev`, dataset per chain) and the **realtime tip + state reads from public archive
+RPCs** (`{eth,base,arbitrum}.drpc.org` — archive, because reads happen at historical blocks).
+Both are shared and rate-limited under load — fine for this bounded demo.
 By default each chain indexes a ~200k-block window from its factory deploy. For a longer backfill
 or production, set your own RPC per chain and widen the window:
 

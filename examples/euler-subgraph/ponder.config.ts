@@ -11,8 +11,9 @@ const proxyCreated = parseAbiItem(
 // Zero-config defaults so `npm run dev` works from a fresh clone with no .env:
 //  - portal: defaults to the free public Portal (historical backfill). Leaving this unset would
 //    SILENTLY fall back to stock RPC historical sync — the demo would not use the Portal at all.
-//  - rpc: defaults to a keyless public node (realtime tip + the readContract vault-metadata calls).
-//    The shared public RPC rate-limits under load; set PONDER_RPC_URL_1 to your own for real work.
+//  - rpc: defaults to a keyless *archive* public RPC (realtime tip + the readContract
+//    vault-metadata calls, which read historical state). Rate-limits under load; set
+//    PONDER_RPC_URL_1 to your own for real work.
 //  - endBlock: defaults to a short window (~91k blocks) so the demo finishes in ~1-2 min. Set
 //    PONDER_END to backfill further.
 const START = Number(process.env.PONDER_START ?? 20_529_207); // subgraph mainnet startBlock
@@ -24,9 +25,10 @@ export default createConfig({
   chains: {
     mainnet: {
       id: 1,
-      // realtime + the readContract vault-metadata calls (keyless public node; override for real work)
-      rpc:
-        process.env.PONDER_RPC_URL_1 ?? 'https://ethereum-rpc.publicnode.com',
+      // realtime tip + the readContract vault-metadata calls. Defaults to a keyless *archive*
+      // public RPC (drpc.org) — the vault reads happen at historical blocks, so a non-archive
+      // node rejects them. Rate-limited under load; set PONDER_RPC_URL_1 to your own for real work.
+      rpc: process.env.PONDER_RPC_URL_1 ?? 'https://eth.drpc.org',
       // ← historical backfill from the free public Portal (drop-in @subsquid/ponder)
       portal:
         process.env.PORTAL_URL_1 ??

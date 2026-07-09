@@ -16,9 +16,9 @@ npm install && npm run dev
 ```
 
 Two keyless data planes are wired by default: **history from the free public Portal**
-(`portal.sqd.dev`) and the **realtime tip + state reads from a public RPC**
-(`ethereum-rpc.publicnode.com`). Both are shared and rate-limited under load — fine for this
-bounded demo, but for a longer backfill or production set your own RPC and window:
+(`portal.sqd.dev`) and the **realtime tip + state reads from a public archive RPC**
+(`eth.drpc.org`). Both are shared and rate-limited under load — fine for this bounded demo, but
+for a longer backfill or production set your own RPC and window:
 
 ```bash
 PONDER_RPC_URL_1=<your-rpc> PONDER_START=22200000 PONDER_END=22300000 npm run dev
