@@ -401,7 +401,13 @@ test('resolveTableSpecs: STRICT_BLOCKS flips only the blocks table to strict', (
     'override promotes blocks to strict',
   );
   assert.equal(strict.logs.mode, 'strict', 'logs unchanged');
-  assert.equal(strict.transactions.mode, 'strict', 'transactions unchanged');
+  // transactions has its own tolerant mode (the access_list column gap, #83/#32); the STRICT_BLOCKS
+  // flag must leave it unchanged — it flips ONLY blocks.
+  assert.equal(
+    strict.transactions.mode,
+    'transactions',
+    'transactions unchanged (its own access_list-tolerant mode is untouched by STRICT_BLOCKS)',
+  );
   // total_difficulty must still be dropped under the override — the promotion changes mode only.
   assert.ok(strict.blocks.drop.has('total_difficulty'));
   // the default spec object must not be mutated in place
