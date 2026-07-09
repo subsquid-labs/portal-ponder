@@ -5,7 +5,7 @@ liquidations across **Ethereum, Base, and Arbitrum** in one Ponder app, with eac
 historical backfill routed through **SQD Portal**. One `factory()` per chain discovers the child
 EVaults; the five action events are indexed into immutable log tables.
 
-Run it with **zero config** — no `.env`, no keys — and it finishes in ~1–2 minutes:
+Run it with **zero config** — no `.env`, no keys — and it finishes in ~2 minutes:
 
 ```bash
 npm install && npm run dev
@@ -15,8 +15,12 @@ Two keyless data planes per chain are wired by default: **history from the free 
 (`portal.sqd.dev`, dataset per chain) and the **realtime tip + state reads from public archive
 RPCs** (`{eth,base,arbitrum}.drpc.org` — archive, because reads happen at historical blocks).
 Both are shared and rate-limited under load — fine for this bounded demo.
-By default each chain indexes a ~200k-block window from its factory deploy. For a longer backfill
-or production, set your own RPC per chain and widen the window:
+
+By default each chain indexes a ~200k-block window from its factory deploy — enough to see the
+Ethereum vaults and their deposits/withdraws/borrows populate (~4 vaults, ~20 events). The Base
+and Arbitrum legs are wired identically and backfill cleanly through the Portal, but index 0 rows
+in this short opening window (their vault activity is sparse there) — widen the window (below) to
+reach it. For a longer backfill or production, set your own RPC per chain and widen the window:
 
 ```bash
 # your own RPCs (recommended beyond the demo) + full history on every chain
