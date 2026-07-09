@@ -1,0 +1,32 @@
+{
+  "pin": "0.16.6-sqd.2",
+  "readyTimeoutMs": 360000,
+  "chains": [{ "chainId": 1 }, { "chainId": 8453 }, { "chainId": 42161 }],
+  "graphql": [
+    {
+      "query": "query MultichainCounts {\n  vaults {\n    totalCount\n  }\n  mainnetVaults: vaults(where: { chain: \"mainnet\" }) {\n    totalCount\n  }\n  baseVaults: vaults(where: { chain: \"base\" }) {\n    totalCount\n  }\n  arbitrumVaults: vaults(where: { chain: \"arbitrum\" }) {\n    totalCount\n  }\n  vaultEvents {\n    totalCount\n  }\n  mainnetEvents: vaultEvents(where: { chain: \"mainnet\" }) {\n    totalCount\n  }\n  baseEvents: vaultEvents(where: { chain: \"base\" }) {\n    totalCount\n  }\n  arbitrumEvents: vaultEvents(where: { chain: \"arbitrum\" }) {\n    totalCount\n  }\n  deposits: vaultEvents(where: { type: \"deposit\" }) {\n    totalCount\n  }\n  withdraws: vaultEvents(where: { type: \"withdraw\" }) {\n    totalCount\n  }\n  borrows: vaultEvents(where: { type: \"borrow\" }) {\n    totalCount\n  }\n  repays: vaultEvents(where: { type: \"repay\" }) {\n    totalCount\n  }\n  liquidates: vaultEvents(where: { type: \"liquidate\" }) {\n    totalCount\n  }\n}",
+      "path": "vaults.totalCount",
+      "min": 5
+    },
+    {
+      "query": "query MultichainCounts {\n  vaults {\n    totalCount\n  }\n  mainnetVaults: vaults(where: { chain: \"mainnet\" }) {\n    totalCount\n  }\n  baseVaults: vaults(where: { chain: \"base\" }) {\n    totalCount\n  }\n  arbitrumVaults: vaults(where: { chain: \"arbitrum\" }) {\n    totalCount\n  }\n  vaultEvents {\n    totalCount\n  }\n  mainnetEvents: vaultEvents(where: { chain: \"mainnet\" }) {\n    totalCount\n  }\n  baseEvents: vaultEvents(where: { chain: \"base\" }) {\n    totalCount\n  }\n  arbitrumEvents: vaultEvents(where: { chain: \"arbitrum\" }) {\n    totalCount\n  }\n  deposits: vaultEvents(where: { type: \"deposit\" }) {\n    totalCount\n  }\n  withdraws: vaultEvents(where: { type: \"withdraw\" }) {\n    totalCount\n  }\n  borrows: vaultEvents(where: { type: \"borrow\" }) {\n    totalCount\n  }\n  repays: vaultEvents(where: { type: \"repay\" }) {\n    totalCount\n  }\n  liquidates: vaultEvents(where: { type: \"liquidate\" }) {\n    totalCount\n  }\n}",
+      "path": "mainnetVaults.totalCount",
+      "min": 5
+    },
+    {
+      "query": "query MultichainCounts {\n  vaults {\n    totalCount\n  }\n  mainnetVaults: vaults(where: { chain: \"mainnet\" }) {\n    totalCount\n  }\n  baseVaults: vaults(where: { chain: \"base\" }) {\n    totalCount\n  }\n  arbitrumVaults: vaults(where: { chain: \"arbitrum\" }) {\n    totalCount\n  }\n  vaultEvents {\n    totalCount\n  }\n  mainnetEvents: vaultEvents(where: { chain: \"mainnet\" }) {\n    totalCount\n  }\n  baseEvents: vaultEvents(where: { chain: \"base\" }) {\n    totalCount\n  }\n  arbitrumEvents: vaultEvents(where: { chain: \"arbitrum\" }) {\n    totalCount\n  }\n  deposits: vaultEvents(where: { type: \"deposit\" }) {\n    totalCount\n  }\n  withdraws: vaultEvents(where: { type: \"withdraw\" }) {\n    totalCount\n  }\n  borrows: vaultEvents(where: { type: \"borrow\" }) {\n    totalCount\n  }\n  repays: vaultEvents(where: { type: \"repay\" }) {\n    totalCount\n  }\n  liquidates: vaultEvents(where: { type: \"liquidate\" }) {\n    totalCount\n  }\n}",
+      "path": "vaultEvents.totalCount",
+      "min": 1
+    },
+    {
+      "query": "query MultichainCounts {\n  vaults {\n    totalCount\n  }\n  mainnetVaults: vaults(where: { chain: \"mainnet\" }) {\n    totalCount\n  }\n  baseVaults: vaults(where: { chain: \"base\" }) {\n    totalCount\n  }\n  arbitrumVaults: vaults(where: { chain: \"arbitrum\" }) {\n    totalCount\n  }\n  vaultEvents {\n    totalCount\n  }\n  mainnetEvents: vaultEvents(where: { chain: \"mainnet\" }) {\n    totalCount\n  }\n  baseEvents: vaultEvents(where: { chain: \"base\" }) {\n    totalCount\n  }\n  arbitrumEvents: vaultEvents(where: { chain: \"arbitrum\" }) {\n    totalCount\n  }\n  deposits: vaultEvents(where: { type: \"deposit\" }) {\n    totalCount\n  }\n  withdraws: vaultEvents(where: { type: \"withdraw\" }) {\n    totalCount\n  }\n  borrows: vaultEvents(where: { type: \"borrow\" }) {\n    totalCount\n  }\n  repays: vaultEvents(where: { type: \"repay\" }) {\n    totalCount\n  }\n  liquidates: vaultEvents(where: { type: \"liquidate\" }) {\n    totalCount\n  }\n}",
+      "path": "mainnetEvents.totalCount",
+      "min": 1
+    },
+    {
+      "query": "query MultichainCounts {\n  vaults {\n    totalCount\n  }\n  mainnetVaults: vaults(where: { chain: \"mainnet\" }) {\n    totalCount\n  }\n  baseVaults: vaults(where: { chain: \"base\" }) {\n    totalCount\n  }\n  arbitrumVaults: vaults(where: { chain: \"arbitrum\" }) {\n    totalCount\n  }\n  vaultEvents {\n    totalCount\n  }\n  mainnetEvents: vaultEvents(where: { chain: \"mainnet\" }) {\n    totalCount\n  }\n  baseEvents: vaultEvents(where: { chain: \"base\" }) {\n    totalCount\n  }\n  arbitrumEvents: vaultEvents(where: { chain: \"arbitrum\" }) {\n    totalCount\n  }\n  deposits: vaultEvents(where: { type: \"deposit\" }) {\n    totalCount\n  }\n  withdraws: vaultEvents(where: { type: \"withdraw\" }) {\n    totalCount\n  }\n  borrows: vaultEvents(where: { type: \"borrow\" }) {\n    totalCount\n  }\n  repays: vaultEvents(where: { type: \"repay\" }) {\n    totalCount\n  }\n  liquidates: vaultEvents(where: { type: \"liquidate\" }) {\n    totalCount\n  }\n}",
+      "path": "deposits.totalCount",
+      "min": 1
+    }
+  ]
+}

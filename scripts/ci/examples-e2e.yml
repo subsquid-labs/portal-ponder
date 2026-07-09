@@ -1,0 +1,48 @@
+name: examples-e2e
+
+on:
+  schedule:
+    - cron: "17 3 * * 1"
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Exact @subsquid/ponder version to force-install, e.g. 0.16.6-sqd.2"
+        required: false
+        type: string
+  pull_request:
+    paths:
+      - "examples/**"
+      - "portal/**"
+      - "scripts/examples-e2e.mjs"
+
+jobs:
+  examples-e2e:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        example:
+          - euler-subgraph
+          - euler-multichain
+          - uniswap-portal
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      - name: Run ${{ matrix.example }} e2e
+        run: |
+          args=("${{ matrix.example }}")
+          if [ -n "$PONDER_VERSION" ]; then
+            args+=("--ponder-version" "$PONDER_VERSION")
+          fi
+          if [ "${{ github.event_name }}" = "schedule" ]; then
+            args+=("--check-pins")
+          fi
+          node scripts/examples-e2e.mjs "${args[@]}"
+        env:
+          PONDER_VERSION: ${{ inputs.version || '' }}
+          # Fork PRs do not receive these secrets; the harness falls back to public defaults and may flake.
+          E2E_RPC_URL_1: ${{ secrets.E2E_RPC_URL_1 }}
+          E2E_RPC_URL_8453: ${{ secrets.E2E_RPC_URL_8453 }}
+          E2E_RPC_URL_42161: ${{ secrets.E2E_RPC_URL_42161 }}
