@@ -8,8 +8,8 @@ Exercises **every Ponder source type in one app**, all backfilled through **SQD 
 - **block intervals** — a source firing every 1000 blocks (`BlockFilter`),
 - **accounts** — transactions to/from WETH (`TransactionFilter`).
 
-Run it with **zero config** — no `.env`, no keys — over a bounded 10k-block window
-(`22,200,000 → 22,210,000`), finishing in ~1–2 minutes:
+Run it with **zero config** — no `.env`, no keys — over a bounded 2k-block window
+(`22,200,000 → 22,202,000`), finishing in ~1–2 minutes:
 
 ```bash
 npm install && npm run dev
