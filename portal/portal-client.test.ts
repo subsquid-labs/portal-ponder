@@ -9,6 +9,8 @@ import {
   isTransientError,
   PortalHttpError,
   PortalIncompleteRangeError,
+  PortalThrottleError,
+  PortalThrottleExhaustedError,
   PortalTruncatedBodyError,
 } from './portal-errors.js';
 import type { PortalQuery } from './portal-filters.js';
@@ -149,6 +151,43 @@ test('throttle 429 → retried, then succeeds (a header-less throttle backs off 
   expect(out).toHaveLength(1);
   expect(stats.retries).toBe(1);
   expect(sleeps).toEqual([1_000]); // 500·2^1 exponential — no advice ⇒ NOT a 0ms prompt retry (issue #9)
+});
+
+test('issue #116: a PERSISTENT 429 exhausts the retry budget and throws an ACTIONABLE PortalThrottleExhaustedError (not the bare `Portal 429`)', async () => {
+  // Every fetch throttles → the stream retries to the budget then gives up. The terminal error must be the
+  // enriched, actionable shape: a bare `Error: Portal 429` is what an unawaited prefetch would surface as an
+  // opaque unhandledRejection with nothing for the user to act on.
+  let posts = 0;
+  const stats = createStats();
+  const client = mk({
+    stats,
+    chainName: 'mainnet',
+    portalUrl: 'http://portal.example',
+    fetchImpl: (async () => {
+      posts++;
+      return throttleRes(429);
+    }) as any,
+  });
+
+  const err = await collect(client.stream(QUERY, 0, 10)).then(
+    () => undefined,
+    (e) => e,
+  );
+
+  // terminal error is the actionable subclass (still an `instanceof PortalThrottleError`, so any existing
+  // classification / `isTransientError` handling is unchanged — only the message is enriched)
+  expect(err).toBeInstanceOf(PortalThrottleExhaustedError);
+  expect(err).toBeInstanceOf(PortalThrottleError);
+  expect(isTransientError(err)).toBe(true);
+  // the message names the shared/rate-limited cause AND the two actionable levers (dedicated Portal / bound
+  // the range) AND the endpoint + chain — everything a dev needs, none of which the bare `Portal 429` carried.
+  expect((err as Error).message).toMatch(/dedicated portal/i);
+  expect((err as Error).message).toMatch(/PONDER_END|endBlock/);
+  expect((err as Error).message).toContain('mainnet');
+  expect((err as Error).message).toContain('http://portal.example');
+  // it gave up only AFTER exhausting the retry budget (1 initial + 10 retries = 11 posts), not on the first 429
+  expect(posts).toBe(11);
+  expect(stats.retries).toBe(10);
 });
 
 test('5xx and 409 are treated as throttle (retried)', async () => {
