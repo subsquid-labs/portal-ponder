@@ -1,9 +1,18 @@
 import { readFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { expect, test } from 'vitest';
+import { afterEach, expect, test, vi } from 'vitest';
 import type { Gate } from './portal-gate.js';
-import { createStats, writeMetrics } from './portal-metrics.js';
+import {
+  createCompletionSummary,
+  createStats,
+  startProgressLog,
+  writeMetrics,
+} from './portal-metrics.js';
+
+afterEach(() => {
+  vi.useRealTimers();
+});
 
 // GOLDEN: the metrics-file JSON shape is a FROZEN contract — the bench harness parses it field by
 // field. Any rename/removal/addition must fail here first.
@@ -115,4 +124,101 @@ test('writeMetrics: unset metricsFile and an unknown head are handled (no file /
   } finally {
     rmSync(`${file}.5`, { force: true });
   }
+});
+
+test('progress ticker: emits on counter advance, then stays silent until the next advance', () => {
+  vi.useFakeTimers();
+  vi.setSystemTime(0);
+
+  const stats = createStats();
+  let through = -1;
+  const logs: string[] = [];
+  const stop = startProgressLog({
+    chainName: 'mainnet',
+    stats,
+    intervalMs: 100,
+    startTime: () => 0,
+    discovery: () => ({ floor: 0, through }),
+    logInfo: ({ msg }) => logs.push(msg),
+  });
+
+  vi.advanceTimersByTime(100);
+  expect(logs).toHaveLength(0);
+
+  stats.blocks = 10;
+  stats.bytes = 1024 * 1024;
+  stats.discChunks = 2;
+  through = 99;
+  vi.advanceTimersByTime(100);
+  expect(logs).toHaveLength(1);
+  expect(logs[0]).toContain('blocks_streamed=10');
+  expect(logs[0]).toContain('mb_streamed=1.00');
+  expect(logs[0]).toContain('blocks_per_s=50.0');
+  expect(logs[0]).toContain('discChunks=2');
+  expect(logs[0]).toContain('scanned=100');
+
+  vi.advanceTimersByTime(100);
+  expect(logs).toHaveLength(1);
+
+  stats.bytes += 1024 * 1024;
+  vi.advanceTimersByTime(100);
+  expect(logs).toHaveLength(2);
+
+  stop();
+  stats.bytes += 1024 * 1024;
+  vi.advanceTimersByTime(100);
+  expect(logs).toHaveLength(2);
+});
+
+test('progress ticker: disabled interval and logger failures never throw', () => {
+  vi.useFakeTimers();
+  const disabledStats = createStats();
+  const disabledLogs: string[] = [];
+  const disabled = startProgressLog({
+    chainName: 'mainnet',
+    stats: disabledStats,
+    intervalMs: 0,
+    startTime: () => 0,
+    discovery: () => ({ floor: -1, through: -1 }),
+    logInfo: ({ msg }) => disabledLogs.push(msg),
+  });
+  disabledStats.bytes = 1;
+  vi.advanceTimersByTime(1000);
+  expect(disabledLogs).toHaveLength(0);
+  expect(disabled()).toBeUndefined();
+
+  const stats = createStats();
+  const stop = startProgressLog({
+    chainName: 'mainnet',
+    stats,
+    intervalMs: 100,
+    startTime: () => 0,
+    discovery: () => ({ floor: 0, through: 0 }),
+    logInfo: () => {
+      throw new Error('logger failed');
+    },
+  });
+  stats.bytes = 1;
+  expect(() => vi.advanceTimersByTime(100)).not.toThrow();
+  stop();
+});
+
+test('completion summary: fires exactly once with final totals', () => {
+  const stats = createStats();
+  stats.blocks = 40;
+  stats.bytes = 2 * 1024 * 1024;
+  const logs: string[] = [];
+  const complete = createCompletionSummary({
+    chainName: 'mainnet',
+    stats,
+    startTime: () => 500,
+    now: () => 2500,
+    logInfo: ({ msg }) => logs.push(msg),
+  });
+
+  expect(complete()).toBe(true);
+  expect(complete()).toBe(false);
+  expect(logs).toEqual([
+    'Portal mainnet complete: blocks=40 mb_streamed=2.00 elapsed=2.0s avg_blocks_per_s=20.0',
+  ]);
 });

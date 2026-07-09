@@ -60,6 +60,8 @@ export type PortalConfig = Readonly<{
   metricsFile: string | undefined;
   /** PORTAL_GATE_LOG — periodically log the AIMD/backpressure snapshot. */
   gateLog: boolean;
+  /** PORTAL_PROGRESS_INTERVAL (10000ms) — default-level per-chain Portal progress ticker; 0 disables it. */
+  progressInterval: number;
   /** PORTAL_CHECKS (on) — runtime invariant mode. */
   checks: CheckMode;
 }>;
@@ -135,6 +137,9 @@ export function loadPortalConfig(env: Env = process.env): PortalConfig {
     realtime: env.PORTAL_REALTIME,
     metricsFile: env.PORTAL_METRICS_FILE || undefined,
     gateLog: Boolean(env.PORTAL_GATE_LOG),
+    progressInterval: intKnob(env, 'PORTAL_PROGRESS_INTERVAL', 10_000, {
+      min: 0,
+    }),
     checks: parseChecks(env.PORTAL_CHECKS),
   };
   return Object.freeze(cfg);

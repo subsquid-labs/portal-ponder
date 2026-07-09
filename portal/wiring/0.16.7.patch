@@ -375,7 +375,28 @@ index 0bd78dc..1eec426 100644
      );
  
      const finalizedBlockNumber = hexToNumber(finalizedBlock.number);
-@@ -1221,7 +1382,9 @@ export async function* getLocalSyncGenerator(params: {
+@@ -1203,7 +1364,9 @@ export async function* getLocalSyncGenerator(params: {
+       return;
+     } else if (params.isCatchup === false) {
+       params.common.logger.info({
+-        msg: "Started fetching backfill JSON-RPC data",
++        msg: params.chain.portal
++          ? "Started fetching backfill data from SQD Portal"
++          : "Started fetching backfill JSON-RPC data",
+         chain: params.chain.name,
+         chain_id: params.chain.id,
+         cached_block: hexToNumber(params.syncProgress.current.number),
+@@ -1214,14 +1377,18 @@ export async function* getLocalSyncGenerator(params: {
+     first = hexToNumber(params.syncProgress.current.number) + 1;
+   } else {
+     params.common.logger.info({
+-      msg: "Started fetching backfill JSON-RPC data",
++      msg: params.chain.portal
++        ? "Started fetching backfill data from SQD Portal"
++        : "Started fetching backfill JSON-RPC data",
+       chain: params.chain.name,
+       chain_id: params.chain.id,
+       cache_rate: "0%",
      });
    }
  

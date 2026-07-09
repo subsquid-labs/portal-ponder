@@ -10,6 +10,13 @@
 import { writeFileSync } from 'node:fs';
 import type { Gate } from './portal-gate.js';
 
+export type PortalProgressDiscovery = Readonly<{
+  floor: number;
+  through: number;
+}>;
+
+type PortalInfoLog = (entry: { service: 'portal'; msg: string }) => void;
+
 /** Mutable per-chain counters accumulated across a backfill. */
 export type PortalStats = {
   dataChunks: number;
@@ -147,4 +154,109 @@ export function stopGateLog(): void {
     clearInterval(ticker);
     ticker = undefined;
   }
+}
+
+const formatMb = (bytes: number): string => (bytes / (1024 * 1024)).toFixed(2);
+
+const formatRate = (blocks: number, elapsedMs: number): string => {
+  if (elapsedMs <= 0) return '0.0';
+
+  return (blocks / (elapsedMs / 1000)).toFixed(1);
+};
+
+const discoveryScannedBlocks = (d: PortalProgressDiscovery): number => {
+  if (d.floor < 0 || d.through < d.floor) return 0;
+
+  return d.through - d.floor + 1;
+};
+
+const progressFingerprint = (
+  stats: PortalStats,
+  discovery: PortalProgressDiscovery,
+): string =>
+  [
+    stats.blocks,
+    stats.bytes,
+    stats.dataChunks,
+    stats.extends,
+    stats.discChunks,
+    stats.logs,
+    stats.txs,
+    stats.receipts,
+    stats.traces,
+    stats.rpcFallback,
+    discoveryScannedBlocks(discovery),
+  ].join(':');
+
+export function startProgressLog(args: {
+  chainName: string;
+  stats: PortalStats;
+  intervalMs: number;
+  startTime: () => number;
+  discovery: () => PortalProgressDiscovery;
+  logInfo: PortalInfoLog;
+  now?: () => number;
+}): () => void {
+  const {
+    chainName,
+    stats,
+    intervalMs,
+    startTime,
+    discovery,
+    logInfo,
+    now = Date.now,
+  } = args;
+  if (intervalMs === 0) return () => {};
+
+  const createdAt = now();
+  let last = progressFingerprint(stats, discovery());
+  const t = setInterval(() => {
+    try {
+      const d = discovery();
+      const next = progressFingerprint(stats, d);
+      if (next === last) return;
+
+      last = next;
+      const startedAt = startTime() || createdAt;
+      const elapsedMs = Math.max(0, now() - startedAt);
+      logInfo({
+        service: 'portal',
+        msg: `Portal ${chainName} progress: blocks_streamed=${stats.blocks} mb_streamed=${formatMb(stats.bytes)} blocks_per_s=${formatRate(stats.blocks, elapsedMs)} discChunks=${stats.discChunks} scanned=${discoveryScannedBlocks(d)}`,
+      });
+    } catch {
+      /* progress logging is best-effort */
+    }
+  }, intervalMs);
+  t.unref?.();
+
+  return () => clearInterval(t);
+}
+
+export function createCompletionSummary(args: {
+  chainName: string;
+  stats: PortalStats;
+  startTime: () => number;
+  logInfo: PortalInfoLog;
+  now?: () => number;
+}): () => boolean {
+  const { chainName, stats, startTime, logInfo, now = Date.now } = args;
+  let done = false;
+
+  return () => {
+    if (done) return false;
+
+    done = true;
+    try {
+      const startedAt = startTime() || now();
+      const elapsedMs = Math.max(0, now() - startedAt);
+      logInfo({
+        service: 'portal',
+        msg: `Portal ${chainName} complete: blocks=${stats.blocks} mb_streamed=${formatMb(stats.bytes)} elapsed=${(elapsedMs / 1000).toFixed(1)}s avg_blocks_per_s=${formatRate(stats.blocks, elapsedMs)}`,
+      });
+    } catch {
+      /* completion logging is best-effort */
+    }
+
+    return true;
+  };
 }
