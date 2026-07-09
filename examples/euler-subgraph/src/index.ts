@@ -18,6 +18,7 @@ const base = (event: any) => ({
   blockNumber: event.block.number,
   txHash: event.transaction.hash,
 });
+let vaultCount = 0;
 
 // computeAPYs — ported from the subgraph's src/utils/math.ts: per-second RAY interest rate → APY.
 const SECONDS_PER_YEAR = 365.2425 * 86_400;
@@ -38,12 +39,9 @@ function computeAPYs(
   };
 }
 
-// loadOrCreateEulerVault — the subgraph's ~15-call eth_call fan-out, gated by an EXISTENCE
-// CHECK so it runs once per vault (the subgraph caches the same way; otherwise readContract
-// hammers RPC). Portal serves the logs cheaply; these state reads still hit `rpc`.
-async function ensureVault(event: any, context: any) {
-  const id = event.log.address as `0x${string}`;
-  if (await context.db.find(vault, { id })) return;
+// readVaultMetadata — the subgraph's eth_call fan-out. Portal serves logs cheaply; these state
+// reads still hit `rpc`, so each read is best-effort and vault rows never depend on RPC health.
+async function readVaultMetadata(context: any, id: `0x${string}`) {
   const read = (functionName: string) =>
     context.client
       .readContract({ abi: EVaultAbi, address: id, functionName })
@@ -58,17 +56,35 @@ async function ensureVault(event: any, context: any) {
       read('creator'),
       read('EVC'),
     ]);
+
+  return {
+    asset,
+    name,
+    symbol,
+    decimals: decimals == null ? null : Number(decimals),
+    oracle,
+    creator,
+    evc,
+  };
+}
+
+// ensureVault remains a cheap fallback for action handlers in case an action references a vault
+// whose factory event was outside the configured window.
+async function ensureVault(event: any, context: any) {
+  const id = event.log.address as `0x${string}`;
+  if (await context.db.find(vault, { id })) return;
+
   await context.db
     .insert(vault)
     .values({
       id,
-      asset,
-      name,
-      symbol,
-      decimals: decimals == null ? null : Number(decimals),
-      oracle,
-      creator,
-      evc,
+      asset: null,
+      name: null,
+      symbol: null,
+      decimals: null,
+      oracle: null,
+      creator: null,
+      evc: null,
       createdBlock: event.block.number,
     })
     .onConflictDoNothing();
@@ -83,6 +99,23 @@ async function bump(context: any, type: string) {
       .onConflictDoUpdate((r: any) => ({ value: r.value + 1n }));
   }
 }
+
+ponder.on('EVaultFactory:ProxyCreated', async ({ event, context }) => {
+  const id = event.args.proxy;
+  const metadata = await readVaultMetadata(context, id);
+  await context.db
+    .insert(vault)
+    .values({
+      id,
+      ...metadata,
+      createdBlock: event.block.number,
+    })
+    .onConflictDoNothing();
+  vaultCount++;
+  console.log(
+    `  ▸ vault #${vaultCount} discovered: ${id} (${metadata.symbol ?? 'unknown'})`,
+  );
+});
 
 ponder.on('EVault:Deposit', async ({ event, context }) => {
   await ensureVault(event, context);
