@@ -75,6 +75,10 @@ export const hx = (v: unknown): Hex => {
 export const opt = (v: unknown): Hex | undefined =>
   v === undefined || v === null ? undefined : hx(v);
 
+/** The tx-type set that carries an EIP access list — EIP-2930 (1), EIP-1559 (2), EIP-4844 (3),
+ * EIP-7702 (4). Mirrors ponder's RPC-path validation set exactly (rpc/actions.ts). */
+const ACCESS_LIST_TX_TYPES = new Set([1, 2, 3, 4]);
+
 export const toSyncLog = (l: any, h: RawHeader): SyncLog =>
   ({
     address: (l.address as string).toLowerCase(),
@@ -135,12 +139,15 @@ export const toSyncTransaction = (tx: any, h: RawHeader): SyncTransaction =>
       tx.yParity !== undefined && tx.yParity !== null
         ? hx(tx.yParity)
         : undefined,
-    // accessList exists only on typed txs (EIP-2930/1559/4844 → type ≥ 1); legacy (type 0) has none.
-    // Portal serves it as an array on most chains, but DROPS the column on some backfill datasets
-    // (arbitrum/avalanche) → an omitted/null field means "unknown", NOT empty. Preserve the array
-    // only when Portal actually returned one; otherwise → undefined (SQL NULL), never a fabricated [].
+    // accessList is EIP-defined only on typed envelopes {1: EIP-2930, 2: EIP-1559, 3: EIP-4844,
+    // 4: EIP-7702}; ponder's RPC-path `standardizeTransactions` requires it on exactly those types
+    // and leaves every other type untouched (rpc/actions.ts). Portal fabricates `accessList: []` from
+    // a dropped/absent column (the #110 root cause), and `encode.ts` stores a truthy `[]` as "[]", not
+    // NULL — so keeping that `[]` on a non-EIP type (legacy 0x0, OP deposit 0x7e, system envelopes)
+    // would store "[]" where the RPC path's absent field yields NULL. Gate on the exact set, not
+    // `type >= 1`, and preserve the array only when Portal returned one on a typed tx.
     accessList:
-      Number(tx.type) >= 1 && Array.isArray(tx.accessList)
+      ACCESS_LIST_TX_TYPES.has(Number(tx.type)) && Array.isArray(tx.accessList)
         ? tx.accessList
         : undefined,
   }) as unknown as SyncTransaction;

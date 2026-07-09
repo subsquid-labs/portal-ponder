@@ -73,6 +73,60 @@ test('accessList matches the RPC shape: legacy → none, typed → [] or list', 
   ).toBeUndefined();
 });
 
+// The RPC path (ponder `standardizeTransactions`) treats accessList as an access-list column on
+// EXACTLY the four EIP-typed envelopes {1,2,3,4} and leaves every other type untouched; downstream
+// `encode.ts` stores a truthy `[]` as the string "[]" (NOT null). Portal, though, FABRICATES
+// `accessList: []` on EVERY tx regardless of type (verified live: eth/polygon serve `[]` on all
+// legacy-0 txs). So on any non-{1,2,3,4} type (OP-stack deposit 0x7e = 126, or an unknown/system
+// envelope), that fabricated `[]` must NOT be propagated — it would store "[]" where the RPC path
+// stores NULL. Gating on the exact {1,2,3,4} set (not `type ≥ 1`) is what drops it. This mutation
+// fails on the old `Number(tx.type) >= 1` gate, which kept the `[]` for types ≥ 5.
+test('accessList: non-EIP typed tx (0x7e deposit / exotic) with Portal-fabricated [] → undefined, not []', () => {
+  const h = { hash: '0xb10c', number: 100 } as any;
+
+  // OP-stack deposit (type 0x7e = 126): carries no EIP access list; Portal's `[]` must drop.
+  expect(
+    (toSyncTransaction({ type: 126, accessList: [] }, h) as any).accessList,
+  ).toBeUndefined();
+
+  // Unknown/system envelope (e.g. Arbitrum-internal 0x6a = 106): same — `[]` must drop.
+  expect(
+    (toSyncTransaction({ type: 106, accessList: [] }, h) as any).accessList,
+  ).toBeUndefined();
+
+  // A real (non-empty) list on a non-EIP type is likewise dropped — the RPC path stores no
+  // access list on these envelopes, so the Portal transform must not either.
+  const al = [{ address: '0xabc', storageKeys: ['0x1'] }];
+  expect(
+    (toSyncTransaction({ type: 126, accessList: al }, h) as any).accessList,
+  ).toBeUndefined();
+
+  // Guard the boundary: type 4 (EIP-7702) is inside the set → a real list is preserved.
+  expect(
+    (toSyncTransaction({ type: 4, accessList: al }, h) as any).accessList,
+  ).toEqual(al);
+
+  // type may arrive as a hex string ("0x7e") on the wire — Number() must still classify it as
+  // exotic and drop the fabricated `[]`, and a real EIP list on a hex-typed envelope must survive.
+  expect(
+    (toSyncTransaction({ type: '0x7e', accessList: [] }, h) as any).accessList,
+  ).toBeUndefined();
+
+  expect(
+    (toSyncTransaction({ type: '0x2', accessList: al }, h) as any).accessList,
+  ).toEqual(al);
+
+  // Lower boundary: legacy (type 0) and absent type both fall outside the set → dropped, matching
+  // the RPC path leaving legacy/untyped txs without an access list.
+  expect(
+    (toSyncTransaction({ type: 0, accessList: [] }, h) as any).accessList,
+  ).toBeUndefined();
+
+  expect(
+    (toSyncTransaction({ accessList: [] }, h) as any).accessList,
+  ).toBeUndefined();
+});
+
 test('receipt: decimal status/type → hex; gas fields stay hex (BigInt-able)', () => {
   const ok = allTx.find(({ t }) => t.status === 1)!;
   const r = toSyncReceipt(ok.t, ok.h) as any;
