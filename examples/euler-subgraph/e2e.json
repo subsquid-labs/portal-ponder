@@ -1,0 +1,32 @@
+{
+  "pin": "0.16.6-sqd.2",
+  "readyTimeoutMs": 360000,
+  "chains": [{ "chainId": 1 }],
+  "graphql": [
+    {
+      "query": "query DemoCounts {\n  vaults {\n    totalCount\n  }\n  deposits {\n    totalCount\n  }\n  withdraws {\n    totalCount\n  }\n  borrows {\n    totalCount\n  }\n  repays {\n    totalCount\n  }\n  liquidates {\n    totalCount\n  }\n  vaultStatuss {\n    totalCount\n  }\n}",
+      "path": "vaults.totalCount",
+      "min": 5
+    },
+    {
+      "query": "query DemoCounts {\n  vaults {\n    totalCount\n  }\n  deposits {\n    totalCount\n  }\n  withdraws {\n    totalCount\n  }\n  borrows {\n    totalCount\n  }\n  repays {\n    totalCount\n  }\n  liquidates {\n    totalCount\n  }\n  vaultStatuss {\n    totalCount\n  }\n}",
+      "path": "deposits.totalCount",
+      "min": 1
+    },
+    {
+      "query": "query DemoCounts {\n  vaults {\n    totalCount\n  }\n  deposits {\n    totalCount\n  }\n  withdraws {\n    totalCount\n  }\n  borrows {\n    totalCount\n  }\n  repays {\n    totalCount\n  }\n  liquidates {\n    totalCount\n  }\n  vaultStatuss {\n    totalCount\n  }\n}",
+      "path": "withdraws.totalCount",
+      "min": 1
+    },
+    {
+      "query": "query DemoCounts {\n  vaults {\n    totalCount\n  }\n  deposits {\n    totalCount\n  }\n  withdraws {\n    totalCount\n  }\n  borrows {\n    totalCount\n  }\n  repays {\n    totalCount\n  }\n  liquidates {\n    totalCount\n  }\n  vaultStatuss {\n    totalCount\n  }\n}",
+      "path": "borrows.totalCount",
+      "min": 1
+    },
+    {
+      "query": "query DemoCounts {\n  vaults {\n    totalCount\n  }\n  deposits {\n    totalCount\n  }\n  withdraws {\n    totalCount\n  }\n  borrows {\n    totalCount\n  }\n  repays {\n    totalCount\n  }\n  liquidates {\n    totalCount\n  }\n  vaultStatuss {\n    totalCount\n  }\n}",
+      "path": "repays.totalCount",
+      "min": 1
+    }
+  ]
+}

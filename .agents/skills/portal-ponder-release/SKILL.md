@@ -84,14 +84,18 @@ Two ways in, same `publish` job:
 ### 2. Watch the workflow
 
 ```sh
-gh run watch --repo subsquid-labs/portal-ponder --exit-status
-```
-
-Or grab the latest run explicitly:
-
-```sh
 RUN_ID=$(gh run list --repo subsquid-labs/portal-ponder --workflow=release.yml --limit 1 --json databaseId --jq '.[0].databaseId')
-gh run watch "$RUN_ID" --repo subsquid-labs/portal-ponder --exit-status
+while :; do
+  STATE=$(gh run view "$RUN_ID" --repo subsquid-labs/portal-ponder --json status,conclusion)
+  echo "$STATE"
+  STATUS=$(echo "$STATE" | jq -r .status)
+  CONCLUSION=$(echo "$STATE" | jq -r .conclusion)
+  if [ "$STATUS" = "completed" ]; then
+    [ "$CONCLUSION" = "success" ] || exit 1
+    break
+  fi
+  sleep 20
+done
 ```
 
 The single `publish` job runs: resolve version → **guard against `versions.json`** →
@@ -113,7 +117,39 @@ npm view @subsquid/ponder@<version>-sqd.<rev> version   # confirm the exact buil
 `latest` should point at the newest ponder version's `-sqd` build; an older release should sit under
 `ponder-<version>` and users pin the exact `@subsquid/ponder@<version>-sqd.<rev>`.
 
-### 4. Flip the versions.json row to published
+### 4. Run examples e2e against the published build
+
+After npm shows the just-published package exists, require the examples e2e gate to pass against that
+exact build before opening or merging any example pin-bump PR. The local path is the most direct:
+
+```sh
+node scripts/examples-e2e.mjs --all --ponder-version <version>-sqd.<rev>
+```
+
+The GitHub Actions path is acceptable too, but poll it with `gh run view`; **NEVER** use
+`gh run watch` from the box because the PAT gets 403 on annotations:
+
+```sh
+gh workflow run examples-e2e.yml --repo subsquid-labs/portal-ponder \
+  -f version=<version>-sqd.<rev>
+RUN_ID=$(gh run list --repo subsquid-labs/portal-ponder --workflow=examples-e2e.yml --limit 1 --json databaseId --jq '.[0].databaseId')
+while :; do
+  STATE=$(gh run view "$RUN_ID" --repo subsquid-labs/portal-ponder --json status,conclusion)
+  echo "$STATE"
+  STATUS=$(echo "$STATE" | jq -r .status)
+  CONCLUSION=$(echo "$STATE" | jq -r .conclusion)
+  if [ "$STATUS" = "completed" ]; then
+    [ "$CONCLUSION" = "success" ] || exit 1
+    break
+  fi
+  sleep 20
+done
+```
+
+Pin policy: examples pin the exact newest published Portal line, and pins move only through the
+release flow after this e2e gate is green.
+
+### 5. Flip the versions.json row to published
 
 After a successful publish, update the row in [`versions.json`](../../../versions.json): set
 `"published": true` (leave `"status"` as the verification state — `"verified"`; the schema tracks
@@ -129,7 +165,7 @@ git push
 
 This is a real state change other releases and CI read — don't skip it.
 
-### 5. Write the GitHub release notes
+### 6. Write the GitHub release notes
 
 **Required — every release gets one.** `release.yml` publishes to npm only; it does **not** create a
 GitHub Release, so this is a manual step you always do. **Order matters:** creating any `v*.*.*` tag —
@@ -172,7 +208,7 @@ the revision, give it a tag name that **cannot** match `v*.*.*` (e.g. `sqd/<vers
 `v<version>-sqd.<rev>` tag has three dots, matches the workflow's `tags: ['v*.*.*']` trigger, and would
 fire a publish run that then fails the `versions.json` guard (harmless to npm, but a guaranteed red run).
 
-### 6. Print the summary
+### 7. Print the summary
 
 ```sh
 echo "npm:    @subsquid/ponder@<version>-sqd.<rev>"

@@ -1,0 +1,27 @@
+{
+  "pin": "0.16.6-sqd.2",
+  "readyTimeoutMs": 360000,
+  "chains": [{ "chainId": 1 }],
+  "graphql": [
+    {
+      "query": "query UniswapPortalCounts {\n  swaps {\n    totalCount\n  }\n  routerCalls {\n    totalCount\n  }\n  blockTicks {\n    totalCount\n  }\n  accountTxs {\n    totalCount\n  }\n}",
+      "path": "swaps.totalCount",
+      "min": 1
+    },
+    {
+      "query": "query UniswapPortalCounts {\n  swaps {\n    totalCount\n  }\n  routerCalls {\n    totalCount\n  }\n  blockTicks {\n    totalCount\n  }\n  accountTxs {\n    totalCount\n  }\n}",
+      "path": "routerCalls.totalCount",
+      "min": 1
+    },
+    {
+      "query": "query UniswapPortalCounts {\n  swaps {\n    totalCount\n  }\n  routerCalls {\n    totalCount\n  }\n  blockTicks {\n    totalCount\n  }\n  accountTxs {\n    totalCount\n  }\n}",
+      "path": "blockTicks.totalCount",
+      "min": 1
+    },
+    {
+      "query": "query UniswapPortalCounts {\n  swaps {\n    totalCount\n  }\n  routerCalls {\n    totalCount\n  }\n  blockTicks {\n    totalCount\n  }\n  accountTxs {\n    totalCount\n  }\n}",
+      "path": "accountTxs.totalCount",
+      "min": 1
+    }
+  ]
+}
