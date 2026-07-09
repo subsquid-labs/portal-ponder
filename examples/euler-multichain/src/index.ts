@@ -1,6 +1,8 @@
 import { ponder } from 'ponder:registry';
 import { vault, vaultEvent } from 'ponder:schema';
 
+const vaultCounts = new Map<string, number>();
+
 async function record(context: any, event: any, type: string) {
   const chain: string = context.chain.name;
   const id = `${chain}:${event.log.address}`;
@@ -16,6 +18,19 @@ async function record(context: any, event: any, type: string) {
     blockNumber: event.block.number,
   });
 }
+
+ponder.on('EVaultFactory:ProxyCreated', async ({ event, context }) => {
+  const chain: string = context.chain.name;
+  const address = event.args.proxy;
+  const id = `${chain}:${address}`;
+  const count = (vaultCounts.get(chain) ?? 0) + 1;
+  vaultCounts.set(chain, count);
+  await context.db
+    .insert(vault)
+    .values({ id, chain, address, eventCount: 0 })
+    .onConflictDoNothing();
+  console.log(`  ▸ ${chain} vault #${count} discovered: ${address}`);
+});
 
 ponder.on('EVault:Deposit', ({ event, context }) =>
   record(context, event, 'deposit'),

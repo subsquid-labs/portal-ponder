@@ -26,4 +26,32 @@ PONDER_RPC_URL_1=<your-rpc> PONDER_START=22200000 PONDER_END=22300000 npm run de
 
 Set `PONDER_FULL=1` to run the complete history with no endBlock bound.
 
+Verified (fresh clone, zero env, July 9, 2026): SQD Portal completed the default
+`22,200,000 → 22,202,000` backfill in **1m 29s**. GraphQL returned **848 swaps**, **1,676 router
+calls**, **3 block ticks**, and **1,871 WETH account transactions**.
+
+## See the result
+
+Paste this query into `http://localhost:42069/graphql` after `npm run dev` completes:
+
+```graphql
+query UniswapPortalCounts {
+  swaps {
+    totalCount
+  }
+  routerCalls {
+    totalCount
+  }
+  blockTicks {
+    totalCount
+  }
+  accountTxs {
+    totalCount
+  }
+}
+```
+
+The verified response returned `848` swaps, `1,676` router calls, `3` block ticks, and `1,871`
+account transactions.
+
 See [`.env.example`](.env.example) for all overridable values.

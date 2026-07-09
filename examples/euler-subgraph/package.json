@@ -8,6 +8,7 @@
     "db": "ponder db",
     "codegen": "ponder codegen",
     "serve": "ponder serve",
+    "summary": "node scripts/summary.mjs",
     "lint": "eslint .",
     "typecheck": "tsc"
   },
