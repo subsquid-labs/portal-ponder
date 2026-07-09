@@ -6,7 +6,12 @@
 // row width to keep the per-query detoast payload bounded (default ≤32MB, override --byte-target),
 // because PGlite's WASM allocator wedges on a too-large single-query detoast volume. Tolerances match
 // diff.mjs exactly:
-//   - logs / transactions / transaction_receipts / traces : strict set + field identity
+//   - logs / transaction_receipts / traces : strict set + field identity
+//   - transactions : strict one-sided + field identity, plus the scoped access_list column-gap
+//     tolerance (issues #83, #32) — a shared tx whose ONLY differing column is `access_list`, with the
+//     Portal side (A) SQL NULL, on a #83-family chain (base/arbitrum/avalanche), is tolerated, not
+//     failed; a non-NULL Portal value (incl. #110's fabricated "[]"), any second differing column, or
+//     an out-of-scope chain still FAILS (self-retiring). Mirrors diff.mjs `transactionsVerdict`.
 //   - blocks : total_difficulty excluded; ASYMMETRIC by default — a portal-only block (A) FAILS (the
 //     Portal path invented a block RPC never saw); only an rpc-only block (B) is tolerated (the stock
 //     RPC path stores inert event-less blocks it traced); a shared-key field mismatch always FAILS,
@@ -130,6 +135,59 @@ function sizeOnlyDiffTolerated(portalRow, rpcRow) {
   return hash !== null && hash !== undefined && hash !== '' && hash === r.hash;
 }
 
+// ── known upstream dataset gap: transactions.access_list column dropped (issues #83, #32) ─────────
+// Mirrors harness/diff/diff.mjs exactly. The SQD Portal dataset for base-mainnet, arbitrum-one, and
+// avalanche-mainnet DROPS the `transactions.access_list` column (upstream #83-family gap, refining
+// #32). On those chains the Portal-backfill leg (A) therefore stores an HONEST SQL NULL for that
+// column — the fork records the dropped value faithfully as NULL, not a fabricated `"[]"` (the old
+// fork defect, fixed by #110/#111). The stock-RPC leg (B) backfills from a full node and stores the
+// REAL populated access list. So on exactly these three chains a `transactions` row can differ on the
+// `access_list` column alone, while every other column and all logs/blocks are byte-identical.
+//
+// REGRESSION-SENTINEL INVARIANT (why this cannot mask a real divergence, incl. the #110 fork defect):
+// the tolerance fires ONLY when the Portal side (A) is SQL NULL — the honest dropped-column value. If
+// the Portal side is NON-NULL and differs from RPC (in particular a reappearing fabricated `"[]"`, the
+// exact #110 defect), the predicate returns false → real MISMATCH → FAIL. Two differing NON-NULL
+// values are NEVER tolerated. Any SECOND differing column also returns false, so the tolerance is
+// column-scoped, not row-scoped. Self-retiring: if the Portal ever serves the column the rows compare
+// equal and this never fires. SCOPED to the #83-family chains only — a chain that DOES serve the
+// column must never get this leniency, so an access_list divergence there is a hard FAIL.
+
+// The chain_id set the SQD Portal drops transactions.access_list for (base-mainnet 8453, arbitrum-one
+// 42161, avalanche-mainnet 43114 — see harness/validate/cells.json). chain_id is a COMPARED column
+// present in every transactions row (the PK leads with it), so the scope is read from the row itself —
+// no env threading. A chain outside this set is never tolerated.
+export const ACCESS_LIST_GAP_CHAINS = new Set([8453, 42161, 43114]);
+
+// portalRow / rpcRow are normalized transactions row-strings (normRow output: sorted keys,
+// bigint→decimal, bytes→hex). Returns true iff `access_list` is the SOLE differing field, the Portal
+// side (A) is SQL NULL, AND the row's chain_id is an in-scope #83-family chain. The RPC side (B) may be
+// anything (a populated list, "[]", …) — only Portal-IS-NULL is tolerated (issues #83, #32).
+function accessListColumnGapTolerated(portalRow, rpcRow) {
+  const p = JSON.parse(portalRow);
+  const r = JSON.parse(rpcRow);
+
+  // Scope guard: only the #83-family chains that drop the column. chain_id is normalized to a decimal
+  // string (bigint→decimal in normRow); compare numerically against the scope set.
+  if (!ACCESS_LIST_GAP_CHAINS.has(Number(p.chain_id))) return false;
+
+  let diffField = null;
+  for (const k of new Set([...Object.keys(p), ...Object.keys(r)])) {
+    if (p[k] === r[k]) continue;
+
+    if (diffField !== null) return false;
+
+    diffField = k;
+  }
+
+  if (diffField !== 'access_list') return false;
+
+  // Regression sentinel: tolerate ONLY the honest dropped-column value (Portal side SQL NULL). A
+  // non-NULL Portal value that differs from RPC — e.g. a reappearing fabricated "[]" (#110) — is a real
+  // divergence and must FAIL. Two differing non-NULL values are never tolerated.
+  return p.access_list === null;
+}
+
 // Streaming merge-compare of two key-ordered async row streams. Modes:
 //   • 'strict' : ANY only-one-side row fails, plus any shared-key field mismatch.
 //   • 'blocks' : ASYMMETRIC, mirroring harness/diff/diff.mjs `blocksVerdict`. A is the Portal store
@@ -142,6 +200,13 @@ function sizeOnlyDiffTolerated(portalRow, rpcRow) {
 //     NOT fail; any second differing field (including hash) still FAILS (self-retiring). Before the #19
 //     fix 'blocks' was vacuous — it failed only on a shared mismatch and let a portal-only block sail
 //     through the F-full differ.
+//   • 'transactions' : STRICT one-sided semantics (a portal-only OR rpc-only tx FAILS, exactly like
+//     strict), plus ONE tolerated shared-key class — the upstream access_list column gap (issues #83,
+//     #32). A shared tx whose ONLY differing column is `access_list`, where the Portal side (A) is SQL
+//     NULL and the row's chain_id is a #83-family chain (base/arbitrum/avalanche), is counted in
+//     res.accessListTolerated, not res.mismatch, and does NOT fail. A non-NULL Portal value (incl. a
+//     reappearing fabricated "[]" — the #110 defect), any second differing column, or an out-of-scope
+//     chain still FAILS (regression sentinel; self-retiring). All other tables stay strict.
 // Returns counters and small samples (never the whole diff) so memory stays bounded.
 //
 // `onOnlyB` (optional): a callback invoked with each B-only row's value AS the merge encounters it, in
@@ -169,6 +234,7 @@ export async function streamingDiff(
     onlyB: 0,
     mismatch: 0,
     sizeTolerated: 0,
+    accessListTolerated: 0,
     shared: 0,
     samples: [],
   };
@@ -193,9 +259,11 @@ export async function streamingDiff(
     if (step < 0) {
       res.aCount++;
       res.onlyA++;
-      // A-only (portal-only) fails under BOTH strict and blocks: strict tolerates nothing, and a
-      // portal-only block is a block the Portal path invented that RPC never saw (asymmetric blocks).
-      if (mode === 'strict' || mode === 'blocks') {
+      // A-only (portal-only) fails under strict, blocks, AND transactions: strict/transactions tolerate
+      // no one-sided rows, and a portal-only block is one the Portal path invented that RPC never saw
+      // (asymmetric blocks). The transactions access_list tolerance is a SHARED-key class only — a
+      // one-sided tx is still a hard fail.
+      if (mode === 'strict' || mode === 'blocks' || mode === 'transactions') {
         res.fail = true;
         sample('A-only', normRow(a.value, drop));
       }
@@ -203,9 +271,10 @@ export async function streamingDiff(
     } else if (step > 0) {
       res.bCount++;
       res.onlyB++;
-      // B-only (rpc-only) fails ONLY under strict; under blocks it is the tolerated inert event-less
-      // block the stock RPC path traced but never referenced.
-      if (mode === 'strict') {
+      // B-only (rpc-only) fails under strict AND transactions (a strict table — a one-sided tx is a real
+      // gap); under blocks it is the tolerated inert event-less block the stock RPC path traced but
+      // never referenced.
+      if (mode === 'strict' || mode === 'transactions') {
         res.fail = true;
         sample('B-only', normRow(b.value, drop));
       }
@@ -222,10 +291,19 @@ export async function streamingDiff(
       const na = normRow(a.value, drop);
       const nb = normRow(b.value, drop);
       if (na !== nb) {
-        // The tolerated upstream size-only derivation artifact (issues #76, #106) applies ONLY to the
-        // asymmetric blocks comparison (A=portal, B=rpc); strict mode tolerates nothing. Else FAILS.
+        // Two tolerated shared-key classes, each scoped to exactly one mode; strict tolerates nothing.
+        //   • blocks mode: the upstream size-only derivation artifact (issues #76, #106).
+        //   • transactions mode: the upstream access_list column gap (issues #83, #32) — Portal-side
+        //     NULL on a #83-family chain, access_list the sole differing column.
+        // Anything else (a second differing column, a non-NULL Portal access_list incl. #110's "[]",
+        // an out-of-scope chain) FAILS.
         if (mode === 'blocks' && sizeOnlyDiffTolerated(na, nb)) {
           res.sizeTolerated++;
+        } else if (
+          mode === 'transactions' &&
+          accessListColumnGapTolerated(na, nb)
+        ) {
+          res.accessListTolerated++;
         } else {
           res.mismatch++;
           res.fail = true;
@@ -279,7 +357,9 @@ export const TABLES = {
   logs: { keys: ['chain_id', 'block_number', 'log_index'], mode: 'strict' },
   transactions: {
     keys: ['chain_id', 'block_number', 'transaction_index'],
-    mode: 'strict',
+    // 'transactions' = strict one-sided + the scoped access_list column-gap tolerance (issues #83/#32,
+    // Portal-NULL only, on base/arbitrum/avalanche); see streamingDiff modes + accessListColumnGapTolerated.
+    mode: 'transactions',
   },
   transaction_receipts: {
     keys: ['chain_id', 'block_number', 'transaction_index'],
@@ -554,18 +634,25 @@ async function diffStores(
       fail = 1;
     }
 
-    const extra =
-      spec.mode === 'blocks'
-        ? `  shared=${r.shared} match` +
-          (r.sizeTolerated
-            ? `, ${r.sizeTolerated} tolerated (upstream size-only derivation, issues #76/#106)`
-            : '') +
-          (r.onlyB ? `, +${r.onlyB} inert event-less (RPC-only)` : '') +
-          (r.onlyA ? `, +${r.onlyA} portal-only` : '') +
-          (r.mismatch ? `  | ${r.mismatch} shared MISMATCH` : '')
-        : r.fail
-          ? `  | portal-only=${r.onlyA} rpc-only=${r.onlyB} mismatch=${r.mismatch}`
-          : '  identical';
+    let extra;
+    if (spec.mode === 'blocks') {
+      extra =
+        `  shared=${r.shared} match` +
+        (r.sizeTolerated
+          ? `, ${r.sizeTolerated} tolerated (upstream size-only derivation, issues #76/#106)`
+          : '') +
+        (r.onlyB ? `, +${r.onlyB} inert event-less (RPC-only)` : '') +
+        (r.onlyA ? `, +${r.onlyA} portal-only` : '') +
+        (r.mismatch ? `  | ${r.mismatch} shared MISMATCH` : '');
+    } else if (r.fail) {
+      extra = `  | portal-only=${r.onlyA} rpc-only=${r.onlyB} mismatch=${r.mismatch}`;
+    } else if (r.accessListTolerated) {
+      // transactions mode: byte-identical except the tolerated access_list column gap — surface the
+      // count so a tolerated cell is never reported as a silent "identical" (issues #83/#32).
+      extra = `  identical (${r.accessListTolerated} tolerated: Portal access_list column gap, issues #83/#32)`;
+    } else {
+      extra = '  identical';
+    }
     console.log(
       `  ${ok ? '✅' : '❌'} ${table.padEnd(20)} portal=${String(r.aCount).padStart(8)}  rpc=${String(r.bCount).padStart(8)}${extra}`,
     );
