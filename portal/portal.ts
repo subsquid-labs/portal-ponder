@@ -60,7 +60,13 @@ import {
   invariantStrict,
   setCheckMode,
 } from './portal-invariant.js';
-import { createStats, startGateLog, writeMetrics } from './portal-metrics.js';
+import {
+  createCompletionSummary,
+  createStats,
+  startGateLog,
+  startProgressLog,
+  writeMetrics,
+} from './portal-metrics.js';
 import { isFinalityGap } from './portal-transform.js';
 
 // #94: the table-qualified field keys of the receipt columns (RECEIPT_FIELDS ride the `transaction`
@@ -113,6 +119,10 @@ export const createPortalHistoricalSync = (
   const log = args.common.logger;
   const chain = args.chain;
   const portalUrl = chain.portal!.replace(/\/$/, '');
+  log.info({
+    service: 'portal',
+    msg: `Portal backfill active for ${chain.name}: ${portalUrl}`,
+  });
   const headers: Record<string, string> = {
     'content-type': 'application/json',
     'accept-encoding': 'gzip',
@@ -147,6 +157,20 @@ export const createPortalHistoricalSync = (
     discoveryWindows: cfg.discoveryWindows,
     warmupBlocks: cfg.warmupBlocks,
     stats,
+  });
+  const stopProgressLog = startProgressLog({
+    chainName: chain.name,
+    stats,
+    intervalMs: cfg.progressInterval,
+    startTime: () => startTime,
+    discovery: () => discovery.snapshot(),
+    logInfo: (entry) => log.info(entry),
+  });
+  const completeOnce = createCompletionSummary({
+    chainName: chain.name,
+    stats,
+    startTime: () => startTime,
+    logInfo: (entry) => log.info(entry),
   });
 
   // ── mutable shell state ──────────────────────────────────────────────────────────────────────────
@@ -237,6 +261,13 @@ export const createPortalHistoricalSync = (
       spec.backfillEnd ?? Number.POSITIVE_INFINITY,
       portalHead ?? Number.POSITIVE_INFINITY,
     );
+
+  const maybeComplete = (interval: Interval): void => {
+    const end = dataEnd();
+    if (!Number.isFinite(end) || interval[1] < end) return;
+
+    if (completeOnce()) stopProgressLog();
+  };
 
   const growFetchQuantum = (): void => {
     if (cfg.warmupBlocks === 0) return;
@@ -1001,11 +1032,18 @@ export const createPortalHistoricalSync = (
       const key = ikey(interval);
       if (delegated.has(key)) {
         delegated.delete(key);
-        return rpcFallback().syncBlockData(params);
+        const closest = await rpcFallback().syncBlockData(params);
+        maybeComplete(interval);
+
+        return closest;
       }
       const s = stash.get(key);
       stash.delete(key); // INV-12: consumed exactly once
-      if (!s) return undefined;
+      if (!s) {
+        maybeComplete(interval);
+
+        return undefined;
+      }
       const chainId = chain.id;
       // merge log blocks/txs with trace blocks/txs (a trace-only block isn't in the log set)
       const blocks = new Map<string, SyncBlockHeader>();
@@ -1021,7 +1059,11 @@ export const createPortalHistoricalSync = (
         if (th) txs.set(th, transaction as unknown as SyncTransaction);
       }
       const blockArr = [...blocks.values()];
-      if (blockArr.length === 0) return s.closest;
+      if (blockArr.length === 0) {
+        maybeComplete(interval);
+
+        return s.closest;
+      }
       await syncStore.insertBlocks({ blocks: blockArr, chainId });
       if (txs.size)
         await syncStore.insertTransactions({
@@ -1048,6 +1090,8 @@ export const createPortalHistoricalSync = (
         gate,
         startTime,
       });
+      maybeComplete(interval);
+
       return s.closest;
     },
   };

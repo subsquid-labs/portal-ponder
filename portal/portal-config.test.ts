@@ -19,6 +19,7 @@ test('INV-14: empty env → documented defaults, frozen', () => {
   expect(c.idleTimeout).toBe(60_000);
   expect(c.chunkFixed).toBe(false);
   expect(c.gateLog).toBe(false);
+  expect(c.progressInterval).toBe(10_000);
   expect(c.checks).toBe('on');
   expect(c.apiKey).toBeUndefined();
   expect(c.finalizedHead).toBeUndefined();
@@ -38,6 +39,7 @@ test('INV-14: valid overrides parse', () => {
     PORTAL_METRICS_FILE: '/tmp/m',
     PORTAL_REALTIME: 'stream',
     PORTAL_GATE_LOG: '1',
+    PORTAL_PROGRESS_INTERVAL: '250',
     PORTAL_REQUEST_TIMEOUT: '15000',
     PORTAL_IDLE_TIMEOUT: '45000',
   });
@@ -51,8 +53,21 @@ test('INV-14: valid overrides parse', () => {
   expect(c.metricsFile).toBe('/tmp/m');
   expect(c.realtime).toBe('stream');
   expect(c.gateLog).toBe(true);
+  expect(c.progressInterval).toBe(250);
   expect(c.requestTimeout).toBe(15_000);
   expect(c.idleTimeout).toBe(45_000);
+});
+
+test('INV-14: PORTAL_PROGRESS_INTERVAL parses milliseconds and 0 disables the ticker', () => {
+  expect(
+    loadPortalConfig({ PORTAL_PROGRESS_INTERVAL: '0' }).progressInterval,
+  ).toBe(0);
+  expect(
+    loadPortalConfig({ PORTAL_PROGRESS_INTERVAL: '10000' }).progressInterval,
+  ).toBe(10_000);
+  expect(() => loadPortalConfig({ PORTAL_PROGRESS_INTERVAL: '-1' })).toThrow(
+    /PORTAL_PROGRESS_INTERVAL/,
+  );
 });
 
 test('INV-14: a below-floor timeout is rejected (no spurious-abort footgun)', () => {

@@ -163,6 +163,7 @@ afterEach(() => {
   delete process.env.PORTAL_DISCOVERY_WINDOWS;
   delete process.env.PORTAL_FINALIZED_HEAD;
   delete process.env.PORTAL_WARMUP_BLOCKS;
+  delete process.env.PORTAL_PROGRESS_INTERVAL;
   delete process.env.PORTAL_READAHEAD;
   delete process.env.PORTAL_CHECKS;
 });
@@ -228,6 +229,74 @@ test("regression: matched log's transaction is fetched, transformed, and inserte
     '0x4b5ccdb3b7e44475d1f0a06499f12acbd4fc0032',
   );
   expect(inserted.txs[0].transactionIndex).toBe('0x1');
+});
+
+test('default logs: Portal startup and completion are visible without JSON-RPC wording', async () => {
+  process.env.PORTAL_PROGRESS_INTERVAL = '0';
+  const info: string[] = [];
+  const inserted = { logs: [] as any[], blocks: [] as any[], txs: [] as any[] };
+  const syncStore: any = {
+    insertLogs: (p: any) => inserted.logs.push(...p.logs),
+    insertBlocks: (p: any) => inserted.blocks.push(...p.blocks),
+    insertTransactions: (p: any) => inserted.txs.push(...p.transactions),
+    insertTransactionReceipts: () => {},
+    insertTraces: () => {},
+  };
+  const filter: any = {
+    type: 'log',
+    chainId: 1,
+    sourceId: 'evault:deposit',
+    address: VAULT,
+    topic0: DEPOSIT_TOPIC0,
+    topic1: null,
+    topic2: null,
+    topic3: null,
+    fromBlock: 20558652,
+    toBlock: 20558652,
+    hasTransactionReceipt: false,
+    include: [],
+  };
+  const interval: [number, number] = [20558652, 20558652];
+  const sync = createPortalHistoricalSync({
+    common: {
+      logger: {
+        debug() {},
+        info(entry: any) {
+          info.push(entry.msg);
+        },
+        warn() {},
+        error() {},
+        trace() {},
+      },
+    } as any,
+    chain: {
+      id: 1,
+      name: 'mainnet',
+      portal: `http://localhost:${port}`,
+    } as any,
+    childAddresses: new Map(),
+    eventCallbacks: [{ filter }],
+  } as any);
+
+  const logs = await sync.syncBlockRangeData({
+    interval,
+    requiredIntervals: [{ interval, filter }],
+    requiredFactoryIntervals: [],
+    syncStore,
+  });
+  await sync.syncBlockData({ interval, logs, syncStore } as any);
+
+  expect(info[0]).toBe(
+    `Portal backfill active for mainnet: http://localhost:${port}`,
+  );
+  expect(
+    info.filter((msg) => msg.startsWith('Portal mainnet complete:')),
+  ).toHaveLength(1);
+  await sync.syncBlockData({ interval, logs, syncStore } as any);
+  expect(
+    info.filter((msg) => msg.startsWith('Portal mainnet complete:')),
+  ).toHaveLength(1);
+  expect(info.join('\n')).not.toContain('JSON-RPC');
 });
 
 test('regression (C1): a 2nd log filter sharing a chunk on a LATER call is still fetched — no silent gap', async () => {
