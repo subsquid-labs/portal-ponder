@@ -20,21 +20,40 @@ const eVaultAbi = [
 
 const PORTAL = (slug: string) => `https://portal.sqd.dev/datasets/${slug}`;
 
+// Zero-config defaults so `npm run dev` works from a fresh clone with no .env:
+//  - portal: the free public Portal per chain (already defaulted via PORTAL()).
+//  - rpc: keyless *archive* public RPCs (drpc.org) — realtime tip + state reads. Archive is
+//    required because reads happen at historical blocks. Rate-limited under load; set
+//    PONDER_RPC_URL_<chainId> to your own for real work.
+//  - endBlock: each chain defaults to a short window (~DEMO_SPAN blocks from its factory deploy)
+//    so the multichain demo finishes in ~1-2 min. Set PONDER_FULL=1 to backfill full history.
+const DEMO_SPAN = Number(process.env.PONDER_DEMO_SPAN ?? 200_000);
+const FULL = process.env.PONDER_FULL === '1';
+
+// Bound the demo to [start, min(start + DEMO_SPAN, fullEnd)] unless PONDER_FULL=1.
+const bound = (start: number, fullEnd: number) => {
+  if (FULL) {
+    return fullEnd;
+  }
+
+  return Math.min(start + DEMO_SPAN, fullEnd);
+};
+
 export default createConfig({
   chains: {
     mainnet: {
       id: 1,
-      rpc: process.env.PONDER_RPC_URL_1,
+      rpc: process.env.PONDER_RPC_URL_1 ?? 'https://eth.drpc.org',
       portal: PORTAL('ethereum-mainnet'),
     },
     base: {
       id: 8453,
-      rpc: process.env.PONDER_RPC_URL_8453,
+      rpc: process.env.PONDER_RPC_URL_8453 ?? 'https://base.drpc.org',
       portal: PORTAL('base-mainnet'),
     },
     arbitrum: {
       id: 42161,
-      rpc: process.env.PONDER_RPC_URL_42161,
+      rpc: process.env.PONDER_RPC_URL_42161 ?? 'https://arbitrum.drpc.org',
       portal: PORTAL('arbitrum-one'),
     },
   },
@@ -49,7 +68,7 @@ export default createConfig({
             parameter: 'proxy',
           }),
           startBlock: 20_429_973,
-          endBlock: 25_423_884,
+          endBlock: bound(20_429_973, 25_423_884),
         },
         base: {
           address: factory({
@@ -58,7 +77,7 @@ export default createConfig({
             parameter: 'proxy',
           }),
           startBlock: 18_000_000,
-          endBlock: 47_979_047,
+          endBlock: bound(18_000_000, 47_979_047),
         },
         arbitrum: {
           address: factory({
@@ -67,7 +86,7 @@ export default createConfig({
             parameter: 'proxy',
           }),
           startBlock: 255_000_000,
-          endBlock: 478_620_027,
+          endBlock: bound(255_000_000, 478_620_027),
         },
       },
     },

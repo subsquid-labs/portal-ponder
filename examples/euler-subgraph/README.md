@@ -2,17 +2,28 @@
 
 A faithful port of the official **Euler V2 subgraph** ([`euler-xyz/euler-subgraph`](https://github.com/euler-xyz/euler-subgraph)) to Ponder, with the historical backfill routed through **SQD Portal** — i.e. the full *subgraph → Ponder → Portal* path. It exercises every migration concern in one example.
 
-Run (drop-in `@subsquid/ponder`; backfill from Portal, `readContract` + realtime on `rpc`):
+Run it with **zero config** — no `.env`, no keys — and it finishes in ~1–2 minutes:
 
 ```bash
-PORTAL_URL_1=https://portal.sqd.dev/datasets/ethereum-mainnet \
-PONDER_RPC_URL_1=<archive-rpc> PONDER_START=20529207 PONDER_END=20620000 \
-ponder start
+npm install && npm run dev
 ```
 
-Verified: 4 vaults discovered via the factory (eUSDT-2 / eUSDC-2 / ewstETH-2, with on-chain
-`asset`/`symbol`/`decimals`), deposits/borrows/withdraws indexed, the Counter aggregation, and
-APY-derived `VaultStatus` — backfilled in ~1m over 91k blocks.
+Two keyless data planes are wired by default: **history from the free public Portal**
+(`portal.sqd.dev`) and the **realtime tip + `readContract` state reads from a public archive
+RPC** (`eth.drpc.org` — archive, because the vault reads happen at historical blocks). Both are
+shared and rate-limited under load — fine for this bounded demo, but for a longer backfill or
+production, set your own RPC and widen the window:
+
+```bash
+PONDER_RPC_URL_1=<your-archive-rpc> PONDER_END=25436954 npm run dev
+```
+
+Set `PONDER_FULL=1` to run the complete history with no endBlock bound.
+
+Verified (fresh clone, zero env): 4 vaults discovered via the factory (eUSDT-2 / eUSDC-2 /
+ewstETH-2, with on-chain `asset`/`symbol`/`decimals`), deposits/borrows/withdraws indexed, the
+Counter aggregation, and APY-derived `VaultStatus` — backfilled in ~1m over the default 91k-block
+window (start block 20,529,207).
 
 ## How each subgraph construct maps
 

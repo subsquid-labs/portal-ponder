@@ -21,14 +21,25 @@ const v2RouterAbi = [
   ),
 ] as const;
 
+// Bounded to a short window so `npm run dev` finishes in ~1-2 min from a fresh clone. This
+// 2k-block span already exercises all five source types (dense Swap volume + receipts, router
+// call-traces, block intervals, WETH account txs). Widen via PONDER_START / PONDER_END.
 const START = Number(process.env.PONDER_START ?? 22_200_000);
-const END = Number(process.env.PONDER_END ?? 22_210_000);
+const FULL = process.env.PONDER_FULL === '1'; // run the full history (no endBlock bound)
+const END = FULL
+  ? undefined
+  : process.env.PONDER_END
+    ? Number(process.env.PONDER_END)
+    : START + 2_000;
 
 export default createConfig({
   chains: {
     mainnet: {
       id: 1,
-      rpc: process.env.PONDER_RPC_URL_1,
+      // realtime tip + state reads. Defaults to a keyless *archive* public RPC (drpc.org); the
+      // shared public RPC rate-limits under load, so set PONDER_RPC_URL_1 to your own for
+      // anything beyond this bounded demo.
+      rpc: process.env.PONDER_RPC_URL_1 ?? 'https://eth.drpc.org',
       portal:
         process.env.PORTAL_URL ??
         'https://portal.sqd.dev/datasets/ethereum-mainnet',

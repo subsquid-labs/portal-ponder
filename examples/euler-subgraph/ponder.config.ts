@@ -8,12 +8,34 @@ const proxyCreated = parseAbiItem(
   'event ProxyCreated(address indexed proxy, bool upgradeable, address implementation, bytes trailingData)',
 );
 
+// Zero-config defaults so `npm run dev` works from a fresh clone with no .env:
+//  - portal: defaults to the free public Portal (historical backfill). Leaving this unset would
+//    SILENTLY fall back to stock RPC historical sync — the demo would not use the Portal at all.
+//  - rpc: defaults to a keyless *archive* public RPC (realtime tip + the readContract
+//    vault-metadata calls, which read historical state). Rate-limits under load; set
+//    PONDER_RPC_URL_1 to your own for real work.
+//  - endBlock: defaults to a short window (~91k blocks) so the demo finishes in ~1-2 min. Set
+//    PONDER_END to backfill further, or PONDER_FULL=1 to run the unbounded full history.
+const START = Number(process.env.PONDER_START ?? 20_529_207); // subgraph mainnet startBlock
+const FULL = process.env.PONDER_FULL === '1'; // run the full history (no endBlock bound)
+const END = FULL
+  ? undefined
+  : process.env.PONDER_END
+    ? Number(process.env.PONDER_END)
+    : START + 91_000;
+
 export default createConfig({
   chains: {
     mainnet: {
       id: 1,
-      rpc: process.env.PONDER_RPC_URL_1, // realtime + the readContract vault-metadata calls
-      portal: process.env.PORTAL_URL_1, // ← historical backfill from Portal (drop-in @subsquid/ponder)
+      // realtime tip + the readContract vault-metadata calls. Defaults to a keyless *archive*
+      // public RPC (drpc.org) — the vault reads happen at historical blocks, so a non-archive
+      // node rejects them. Rate-limited under load; set PONDER_RPC_URL_1 to your own for real work.
+      rpc: process.env.PONDER_RPC_URL_1 ?? 'https://eth.drpc.org',
+      // ← historical backfill from the free public Portal (drop-in @subsquid/ponder)
+      portal:
+        process.env.PORTAL_URL_1 ??
+        'https://portal.sqd.dev/datasets/ethereum-mainnet',
     },
   },
   contracts: {
@@ -26,10 +48,8 @@ export default createConfig({
         event: proxyCreated,
         parameter: 'proxy', // child EVault address (subgraph: event.params.proxy)
       }),
-      startBlock: Number(process.env.PONDER_START ?? 20_529_207), // subgraph mainnet startBlock
-      endBlock: process.env.PONDER_END
-        ? Number(process.env.PONDER_END)
-        : undefined,
+      startBlock: START,
+      endBlock: END,
     },
   },
 });
