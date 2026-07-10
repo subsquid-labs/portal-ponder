@@ -86,6 +86,23 @@ surface** (`sync-historical`, `runtime/historical`, `sync-store`, `rpc`, `sync`)
 realtime tests pass unchanged. As with `0.15.17`, that basis is **not** a fresh RPC byte-diff or
 cross-validation — the §3 / §5 byte-diff and A/B evidence remains on `0.16.6`.
 
+**Evidence base version and seam-identity transfer.** The data-correctness evidence in §3 / §5 (the
+paid-matrix byte-diff and the A/B soak) was gathered on the `0.16.6` graft, whereas the published fork
+is `@subsquid/ponder@0.16.8-sqd.1`. That evidence **transfers to the shipped artifact by seam
+identity**: the Portal wiring patch is byte-identical (sha256-equal) across the `0.16.6` / `0.16.7` /
+`0.16.8` grafts, and each upstream delta over that range lands off the Portal graft surface (Layer A
+above). A version bump therefore does **not** invalidate the matrix or the soak, and we deliberately do
+**not** re-run the paid matrix or restart the soak for it. Alongside that transfer, three **direct
+anchors on the shipped `0.16.8-sqd.1` package** tie the evidence to the exact published build:
+1. the examples end-to-end freshness gate ran against the **published** package
+   ([#139](../../pull/139)) — the `euler-subgraph` example reproduced its exact baseline row counts
+   (vaults / deposits / withdraws / borrows / repays), a no-regression check on the shipped tag — **done**;
+2. a fault-injection chaos campaign on a `0.16.8-sqd.1` build (Layer C, §4) — **planned**;
+3. a ≥72 h A/B soak confirmation leg on the `0.16.8-sqd.1` build after the current soak completes its
+   milestone — **planned**.
+The two pending anchors are tracked and not yet claimed as evidence; until they land, the shipped-build
+assurance rests on seam identity plus the published-package examples gate.
+
 ### Layer B — Mutation-verified regression tests
 
 Every fix in this repo ships with a regression test that **fails on the old code** — the test is run
@@ -150,6 +167,20 @@ One row per cell in [`harness/validate/cells.json`](harness/validate/cells.json)
 cannot produce evidence — the `F-*` seeded-window factory cells, §5.5). Repro commands reference only repo files and
 documented environment variables; the paid cells require a Portal tarball and an RPC key supplied by
 the operator (see `harness/validate/README.md`).
+
+**Frozen-artifact policy.** The matrix is an append-only evidence ledger:
+1. **Append-only verdict history** — matrix rows are never deleted; a verdict that changes keeps its
+   prior verdict inline (the `L-base-logs` DIFFER-FAIL → PASS row is the model).
+2. **RETIRED cells stay as rows** — a cell withdrawn because its design cannot produce evidence keeps
+   its row with a reason and a `§`-link, and is marked retired in `cells.json` (the seeded-window `F-*`
+   factory cells, §5.5).
+3. **PASS cells** retain the run-log-with-done-marker (the source of truth), the final results JSON,
+   and a deterministic repro command; the working-store may be deleted — reproduce-from-seed is the
+   durability guarantee, not a kept database.
+4. **FAIL cells** freeze their stores, logs, and queries until the issue is closed by a superseding
+   PASS; the finding is then distilled to a finding-plus-repro entry in §5.
+5. A **re-anchor onto a new base version** is a new row or section — never an overwrite of an existing
+   verdict.
 
 | Cell | App | Chain(s) | Sources | Windows | Status | Repro |
 |------|-----|----------|---------|---------|--------|-------|
@@ -1125,6 +1156,21 @@ same-block child logs, a finality anchor, reorg pruning of factory children, a f
 population of parent transactions on the stream wire. The realtime path continues to be treated as
 **experimental** pending the longer soak; [#33](../../issues/33) (the false-`unknown-parent` fatal it
 hardened against — **not a reorg**) is now **closed** (§5.8).
+
+[#23](../../issues/23) was an RPC-transport realtime availability crash: on a busy block the unfiltered
+full-block `eth_getLogs` response exceeds viem's ~10 MiB body cap (`ResponseBodyTooLargeError`),
+aborting the realtime sync. **Both Portal paths are structurally immune** (they never issue that
+unfiltered call); the crash is RPC-realtime-only. It was fixed by [#144](../../pull/144) (merged
+`f79fda6`): the realtime path catches the body-cap error and falls back to **per-registered-filter**
+`eth_getLogs` requests (bounded, matching the historical backfill's filtered fetch — an
+over-fetch-never-under-fetch superset of the block's real logs), and marks the error **non-retryable**.
+`validateLogsAndBlock` is skipped **only** on the empty-fallback path (mirroring the upstream historical
+`logs.length > 0` guard), so an empty filtered result still ingests the block instead of crashing. The
+fix ships in all four wiring patches (byte-identical hunk) with a mutation-verified regression suite
+(`portal/realtime-getlogs-fallback.test.ts`); [#146](../../pull/146) (merged `fb8f045`) adds
+`portal/realtime-fallback-e2e.test.ts`, which drives `createRealtimeSync` end-to-end so the catch and
+the empty-fallback guard are proven at runtime (mutation-RED when either is removed). The realtime path
+remains **experimental** pending the longer soak (same framing as the rest of §5.2).
 
 ### 5.3 Benign / tolerated diff classes (declared, bounded, removable)
 
