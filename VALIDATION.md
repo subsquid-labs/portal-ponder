@@ -1185,9 +1185,10 @@ persists. Details, evidence, and the exact honesty boundary are in the row below
 merged, the three logs-only gap-chain cells were re-run on a fork build carrying the fix and byte-diffed
 against a stock JSON-RPC backfill over the same seeded windows: **`L-arbitrum-logs` 8 / 8**,
 **`L-avalanche-logs` 8 / 8**, and **`L-base-logs` 16 / 16** windows **PASS** (0 fail; ~14.8k / 19.3k /
-42.5k metered requests respectively). The exact arbitrum window `[358633493, 358635493]` that was
-**2 PASS / 6 FAIL** (`access_list`-only) on the pre-fix build, and the base cell that was **16 / 16 FAIL**
-(§3.5.1), both flip to full PASS — a clean before/after on the same windows and the same differ. The
+42.5k metered requests respectively). The arbitrum cell — including the exact window
+`[358633493, 358635493]` that #32's probe flagged (one of its failing windows) — was **2 PASS / 6 FAIL**
+(`access_list`-only) on the pre-fix build, and the base cell was **16 / 16 FAIL** (§3.5.1); both flip to
+full PASS — a clean before/after on the same windows and the same differ. The
 mechanism is exactly the honesty boundary above: pre-fix the Portal side emitted a fabricated `"[]"`,
 which the [#113](../../pull/113) differ **hard-fails** as a regression sentinel; post-fix it emits SQL
 **NULL**, which the #113 `access_list`-column-gap tolerance **accepts** (the column is genuinely absent
