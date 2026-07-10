@@ -10,7 +10,8 @@
     "serve": "ponder serve",
     "summary": "node scripts/summary.mjs",
     "lint": "eslint .",
-    "typecheck": "tsc"
+    "typecheck": "tsc",
+    "clean": "rm -rf .ponder generated ponder-env.d.ts"
   },
   "dependencies": {
     "abitype": "^0.10.2",
