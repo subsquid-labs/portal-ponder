@@ -67,6 +67,22 @@ That's only half of it. A fast endpoint alone doesn't make a fast indexer — th
 
 A single serial run, not an averaged gate: both legs are fetch-bound, so the ratio reflects the specific Portal dataset and metered RPC endpoint. The sync-store rows are byte-identical across every family ([VALIDATION.md §3.2](VALIDATION.md)) · methodology and caveats: [`BENCHMARKS.md`](harness/bench/BENCHMARKS.md).
 
+## Correctness
+
+The fork changes the **transport** — the SQD Portal instead of per-chain JSON-RPC — not the **data**: the sync-store rows it writes are byte-identical to what stock Ponder writes from RPC. The evidence, consolidated in [`VALIDATION.md`](VALIDATION.md):
+
+- **Byte-diff vs stock RPC.** A paid matrix backfills the same ranges two ways — Portal and genuine `ponder` over metered RPC (ground truth) — and diffs every sync-store row. Logs, transactions, and receipts come out byte-identical across chain families: full Euler history on Ethereum ([VALIDATION.md §3.2](VALIDATION.md)), plus receipts byte-identity on Polygon ([§3.6](VALIDATION.md)) and BSC ([§3.7](VALIDATION.md)).
+- **Whole-store count parity.** The flagship 15-chain store matches the frozen reference exactly — **62/62 aggregate cells, 0 diffs** ([VALIDATION.md §5.7](VALIDATION.md)).
+- **Third-party corroboration.** Discovered vault sets agree with Euler's own public Goldsky subgraphs, and field-level disagreements are broken against independent public archive nodes ([VALIDATION.md §5.7](VALIDATION.md)).
+- **Reorg & finality.** The Portal serves only finalized data for backfill, so historical rows are write-once (reorg-free by construction); realtime reorg reconciliation is mutation-tested ([VALIDATION.md §5.8](VALIDATION.md)).
+- **Crash/durability.** A chaos kill-loop resumes to a store byte-identical to an uninterrupted baseline ([VALIDATION.md §4](VALIDATION.md), Layer C).
+
+The residual Portal-vs-RPC differences are **upstream-dataset column gaps** (e.g. `access_list` missing on some chains, [§5.6](VALIDATION.md); a single non-consensus `block.size` off-by-one, tolerated as benign) — surfaced as honest SQL `NULL`, documented and bounded. They are **not** fork-introduced data loss: the fork's earlier fabricated-`[]` defect was fixed and proven FAIL→PASS ([§5.6](VALIDATION.md), issue [#32](https://github.com/subsquid-labs/portal-ponder/issues/32) closed).
+
+One boundary, stated plainly: the default, validated realtime path runs on your RPC. Portal-native `/stream` realtime is **experimental**, not production-ready ([VALIDATION.md §5.8](VALIDATION.md)).
+
+Full evidence, with repro commands: [`VALIDATION.md`](VALIDATION.md).
+
 ## Compatibility
 
 All of Ponder's source types are supported — logs, factories, transactions, receipts, traces, block intervals, accounts; `readContract` uses your RPC. The Portal serves [130+ EVM networks](https://docs.sqd.dev/en/data/all-networks); per-network capabilities and per-portal availability vary. Check an indexer before migrating:
