@@ -93,7 +93,8 @@ identity**: the Portal wiring patch is byte-identical (sha256-equal) across the 
 `0.16.8` grafts, and each upstream delta over that range lands off the Portal graft surface (Layer A
 above). A version bump therefore does **not** invalidate the matrix or the soak, and we deliberately do
 **not** re-run the paid matrix or restart the soak for it. Alongside that transfer, three **direct
-anchors on the shipped `0.16.8-sqd.1` package** tie the evidence to the exact published build:
+anchors on the shipped `0.16.8-sqd.1` package** — one landed, two planned — tie the evidence to the
+exact published build:
 1. the examples end-to-end freshness gate ran against the **published** package
    ([#139](../../pull/139)) — the `euler-subgraph` example reproduced its exact baseline row counts
    (vaults / deposits / withdraws / borrows / repays), a no-regression check on the shipped tag — **done**;
@@ -1163,7 +1164,8 @@ aborting the realtime sync. **Both Portal paths are structurally immune** (they 
 unfiltered call); the crash is RPC-realtime-only. It was fixed by [#144](../../pull/144) (merged
 `f79fda6`): the realtime path catches the body-cap error and falls back to **per-registered-filter**
 `eth_getLogs` requests (bounded, matching the historical backfill's filtered fetch — an
-over-fetch-never-under-fetch superset of the block's real logs), and marks the error **non-retryable**.
+over-fetch-never-under-fetch superset of the logs the registered filters require, not of every log in
+the block), and marks the error **non-retryable**.
 `validateLogsAndBlock` is skipped **only** on the empty-fallback path (mirroring the upstream historical
 `logs.length > 0` guard), so an empty filtered result still ingests the block instead of crashing. The
 fix ships in all four wiring patches (byte-identical hunk) with a mutation-verified regression suite
