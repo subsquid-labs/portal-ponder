@@ -34,8 +34,10 @@ jobs:
           node-version: 22
           registry-url: "https://registry.npmjs.org"
       - run: corepack enable
-      # npm Trusted Publishing (OIDC) requires npm >= 11.5.1; node 22 ships an older npm.
-      - run: npm install -g npm@latest && npm --version
+      # npm Trusted Publishing (OIDC) requires npm >= 11.5.1; node 22 ships an older one.
+      # Do NOT `npm install -g npm@latest` in place: npm 12.0.0 (latest since 2026-07-08) clobbers
+      # its own bundled deps when installed over the toolcache npm (MODULE_NOT_FOUND: 'sigstore'
+      # at publish). The publish step runs a PINNED npm via npx instead — isolated and proven.
 
       - name: Resolve version (workflow input or v<version> tag)
         id: v
@@ -84,4 +86,4 @@ jobs:
           MAX=$(node -e "const j=require('$GITHUB_WORKSPACE/versions.json');console.log(j.versions.map(r=>r.ponder).sort((a,b)=>a.localeCompare(b,undefined,{numeric:true})).pop())")
           if [ "$V" = "$MAX" ]; then TAG=latest; else TAG="ponder-$V"; fi
           echo "→ npm publish --tag $TAG (newest ponder in versions.json = $MAX)"
-          npm publish --access public --tag "$TAG"
+          npx -y npm@11.18.0 publish --access public --tag "$TAG"
