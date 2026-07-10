@@ -857,6 +857,24 @@ export const createPortalHistoricalSync = (
   // chunkBlocks is finalized). A no-op when there are no factory sources.
   pinDiscoveryFloor();
 
+  // #140: the SINGLE source of truth for the per-chain metrics file. `writeMetrics` overwrites
+  // `${metricsFile}.${chain.id}` on every call (last-write-wins), and reads the live cumulative
+  // `stats` plus the current `chunkBlocks`/`portalHead`, so this closure must be invoked on BOTH
+  // syncBlockData exits — the normal insert path AND the 0-block early return. A chain that streams 0
+  // blocks in its window still ran; emitting a `blocks=0 logs=0 …` file makes it observable and gate-
+  // able (issue #140) instead of leaving the harness with no file to read.
+  const emitMetrics = (): void => {
+    writeMetrics({
+      metricsFile: cfg.metricsFile,
+      chain,
+      stats,
+      chunkBlocks,
+      portalHead,
+      gate,
+      startTime,
+    });
+  };
+
   return {
     async syncBlockRangeData(params) {
       const { interval, syncStore } = params;
@@ -1060,6 +1078,9 @@ export const createPortalHistoricalSync = (
       }
       const blockArr = [...blocks.values()];
       if (blockArr.length === 0) {
+        // #140: a 0-block window still ran — emit the per-chain metrics file (blocks=0 …) so it is
+        // present and gate-able, then take the same early-out (nothing to insert for 0 blocks).
+        emitMetrics();
         maybeComplete(interval);
 
         return s.closest;
@@ -1081,15 +1102,7 @@ export const createPortalHistoricalSync = (
       stats.txs += txs.size;
       stats.receipts += s.receipts.length;
       stats.traces += s.traces.length;
-      writeMetrics({
-        metricsFile: cfg.metricsFile,
-        chain,
-        stats,
-        chunkBlocks,
-        portalHead,
-        gate,
-        startTime,
-      });
+      emitMetrics();
       maybeComplete(interval);
 
       return s.closest;

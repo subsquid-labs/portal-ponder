@@ -1,5 +1,8 @@
+import { existsSync, readFileSync, rmSync } from 'node:fs';
 import http from 'node:http';
 import type { AddressInfo } from 'node:net';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import { afterEach, beforeEach, expect, test } from 'vitest';
 import { createPortalHistoricalSync } from './portal.js';
 
@@ -1708,6 +1711,120 @@ test('regression: a dataset that starts after genesis (TAC starts at block 1) is
     expect(clampedTo).toBe(START); // the retry was clamped to the dataset start, not re-issued from 0
   } finally {
     srv.close();
+  }
+});
+
+test('regression (#140): a chain that streams 0 blocks in its window STILL emits a per-chain metrics file (blocks=0)', async () => {
+  // A window the Portal SERVES (stash entry created, rpc_fallback=0) but which yields NO matching data —
+  // e.g. base/arbitrum in the keyless euler-multichain demo, whose factory-discovered events fall outside
+  // the small default window. syncBlockData reaches `blockArr.length === 0` and early-returns. BEFORE the
+  // fix that early return fired BEFORE writeMetrics, so no `portal-metrics.<chainId>` file was written and
+  // a per-chain-metrics consumer failed with "metrics file not found". AFTER: the 0-block path emits the
+  // file with a schema-identical `inserted.blocks=0 …` payload, so the run is observable and gate-able.
+  // MUTATION: move `emitMetrics()` off the 0-block early-return branch (revert to the old code) and this
+  // test fails — the file is absent, so `existsSync` is false and the read throws.
+  const CHAIN_ID = 8453; // base — the real 0-block chain from the issue
+  const metricsFile = join(
+    tmpdir(),
+    `portal-metrics-empty-window-${process.pid}`,
+  );
+  const perChainFile = `${metricsFile}.${CHAIN_ID}`;
+  rmSync(perChainFile, { force: true });
+  process.env.PORTAL_METRICS_FILE = metricsFile;
+
+  // In-range window [0, 5000] (head 2e9 ≫ window): the Portal serves it, terminating at the range-end
+  // anchor (a header-only cursor record that matches nothing) — so the assembled block set is empty.
+  const srv = http.createServer((req, res) => {
+    let body = '';
+    req.on('data', (c) => {
+      body += c;
+    });
+    req.on('end', () => {
+      if (req.url?.includes('finalized-head')) {
+        res.writeHead(200, { 'content-type': 'application/json' });
+        res.end(JSON.stringify({ number: 2_000_000_000 }));
+
+        return;
+      }
+      const q = body ? JSON.parse(body) : {};
+      anchorRes(res, q.toBlock ?? 1e12); // header-only anchor, no matched data → 0 blocks assembled
+    });
+  });
+  const p: number = await new Promise((r) =>
+    srv.listen(0, () => r((srv.address() as AddressInfo).port)),
+  );
+  try {
+    const inserted = { blocks: [] as any[], logs: [] as any[] };
+    const syncStore: any = {
+      insertLogs: (x: any) => inserted.logs.push(...x.logs),
+      insertBlocks: (x: any) => inserted.blocks.push(...x.blocks),
+      insertTransactions: () => {},
+      insertTransactionReceipts: () => {},
+      insertTraces: () => {},
+    };
+    const filter: any = {
+      type: 'log',
+      chainId: CHAIN_ID,
+      sourceId: 's',
+      address: VAULT,
+      topic0: DEPOSIT_TOPIC0,
+      topic1: null,
+      topic2: null,
+      topic3: null,
+      fromBlock: 0,
+      toBlock: 5000,
+      hasTransactionReceipt: false,
+      include: [],
+    };
+    const sync = createPortalHistoricalSync({
+      common: {
+        logger: { debug() {}, info() {}, warn() {}, error() {}, trace() {} },
+      } as any,
+      chain: {
+        id: CHAIN_ID,
+        name: 'base',
+        portal: `http://localhost:${p}`,
+      } as any,
+      childAddresses: new Map(),
+      eventCallbacks: [{ filter }],
+    } as any);
+
+    const interval: [number, number] = [0, 5000];
+    const logs = await sync.syncBlockRangeData({
+      interval,
+      requiredIntervals: [{ interval, filter }],
+      requiredFactoryIntervals: [],
+      syncStore,
+    });
+    await sync.syncBlockData({ interval, logs, syncStore } as any);
+
+    // Precondition: this window truly streamed 0 blocks (the buggy early-return path).
+    expect(inserted.blocks).toHaveLength(0);
+
+    // THE FIX: the per-chain metrics file is present even though 0 blocks streamed.
+    expect(existsSync(perChainFile)).toBe(true);
+    const parsed = JSON.parse(readFileSync(perChainFile, 'utf8'));
+    // Same FROZEN schema as a normal metrics file, with honest zero counts a consumer can gate on.
+    expect(parsed.chainId).toBe(CHAIN_ID);
+    expect(parsed.chain).toBe('base');
+    expect(parsed.inserted).toEqual({
+      logs: 0,
+      blocks: 0,
+      txs: 0,
+      receipts: 0,
+      traces: 0,
+    });
+    expect(parsed.rpcFallbackIntervals).toBe(0); // Portal-served, not an RPC fallback
+    // The full field shape is present (parsed identically to a non-empty file downstream).
+    expect(parsed).toHaveProperty('wallMs');
+    expect(parsed).toHaveProperty('chunkBlocks');
+    expect(parsed).toHaveProperty('fetch');
+    expect(parsed).toHaveProperty('timing');
+    expect(parsed).toHaveProperty('portalGate');
+  } finally {
+    srv.close();
+    rmSync(perChainFile, { force: true });
+    delete process.env.PORTAL_METRICS_FILE;
   }
 });
 
