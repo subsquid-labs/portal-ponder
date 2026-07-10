@@ -58,6 +58,20 @@ query in `e2e.json`. Check that with:
 node scripts/examples-e2e.mjs euler-subgraph --verify-docs
 ```
 
+## Review checklist
+
+The e2e gate and `biome check` cover the mechanical checks. One behavior CI does not assert needs a
+human pass on any PR that touches the Portal progress path (`portal/portal-metrics.ts`) or an
+example:
+
+- **Cold-start progress still advances.** On a fresh, dense source the first discovery scan can run
+  across many blocks before the first commit lands. The per-chain progress ticker must keep moving
+  through that cold window — `scanned=` climbs even while `blocks_streamed=0` — so a healthy run is
+  never mistaken for a hang. `progressFingerprint` keeps this honest by including
+  `discoveryScannedBlocks` (locked by a regression test in `portal-metrics.test.ts`). Confirm any
+  change to the fingerprint preserves that field, and on an example PR eyeball the ticker output on
+  an empty opening window to see `scanned=` advance.
+
 ## Code Style
 
 Follow [CLAUDE.md](CLAUDE.md) for repository style. In particular: braces on multi-line control
