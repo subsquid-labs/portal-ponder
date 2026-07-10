@@ -30,6 +30,15 @@ E2E_RPC_URL_1=<archive-rpc> node scripts/examples-e2e.mjs euler-subgraph
 The harness never prints RPC URLs. If the env var is unset, the example's public default RPC remains
 in use.
 
+## Definition of done
+
+A user-facing fix is not done when it merges to `main`. The examples run the **published**
+`@subsquid/ponder` package pinned in each `package.json`/`e2e.json`, not the repo working tree, so a
+fix on `main` is neither reproducible by a user nor visible in example behavior until a version
+carrying it is published to npm and the example pins have advanced to that version through the
+release flow (see below). Merged to `main` is not user-safe; a version published and pinned, green
+under the examples e2e gate, is.
+
 ## Pins
 
 Each example pins an exact `@subsquid/ponder` version in both `package.json` and `e2e.json`.
