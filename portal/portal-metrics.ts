@@ -249,9 +249,18 @@ export function createCompletionSummary(args: {
     try {
       const startedAt = startTime() || now();
       const elapsedMs = Math.max(0, now() - startedAt);
+      // Data-plane provenance, driven by the rpcFallback counter (portal.ts: stats.rpcFallback++ runs
+      // once per historical block range the Portal path hands off to the RPC HistoricalSync). So
+      // rpcFallback === 0 ⟺ every historical range was Portal-served with zero JSON-RPC fallback.
+      // This speaks ONLY to the historical sync data plane (blocks/logs/txs/receipts); user-land
+      // readContract state reads still hit the RPC and are out of scope for this line.
+      const provenance =
+        stats.rpcFallback === 0
+          ? 'served entirely by the SQD Portal (0 JSON-RPC for history)'
+          : `${stats.rpcFallback} block range(s) fell back to JSON-RPC`;
       logInfo({
         service: 'portal',
-        msg: `Portal ${chainName} complete: blocks=${stats.blocks} mb_streamed=${formatMb(stats.bytes)} elapsed=${(elapsedMs / 1000).toFixed(1)}s avg_blocks_per_s=${formatRate(stats.blocks, elapsedMs)}`,
+        msg: `Portal ${chainName} complete: blocks=${stats.blocks} logs=${stats.logs} txs=${stats.txs} receipts=${stats.receipts} mb_streamed=${formatMb(stats.bytes)} elapsed=${(elapsedMs / 1000).toFixed(1)}s avg_blocks_per_s=${formatRate(stats.blocks, elapsedMs)} rpc_fallback=${stats.rpcFallback} — ${provenance}`,
       });
     } catch {
       /* completion logging is best-effort */
