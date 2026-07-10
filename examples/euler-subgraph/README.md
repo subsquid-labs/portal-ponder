@@ -41,7 +41,8 @@ Measured output from the default run:
 39 vaults · 504 deposits · 163 withdraws · 185 borrows · 35 repays · 0 liquidations · 900 vault status updates · 887 actions indexed from the SQD Portal
 ```
 
-Or paste this query into `http://localhost:42069/graphql`:
+Or explore the data yourself: open **`http://localhost:42069/graphql`** in your browser (Ponder
+serves a GraphiQL playground there while `npm run dev` is running) and paste this query:
 
 ```graphql
 query DemoCounts {

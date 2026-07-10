@@ -289,14 +289,24 @@ test('default logs: Portal startup and completion are visible without JSON-RPC w
   expect(info[0]).toBe(
     `Portal backfill active for mainnet: http://localhost:${port}`,
   );
-  expect(
-    info.filter((msg) => msg.startsWith('Portal mainnet complete:')),
-  ).toHaveLength(1);
+  const completeLines = info.filter((msg) =>
+    msg.startsWith('Portal mainnet complete:'),
+  );
+  expect(completeLines).toHaveLength(1);
   await sync.syncBlockData({ interval, logs, syncStore } as any);
   expect(
     info.filter((msg) => msg.startsWith('Portal mainnet complete:')),
   ).toHaveLength(1);
-  expect(info.join('\n')).not.toContain('JSON-RPC');
+  // No ambiguous source-plane wording that would imply the HISTORY came from JSON-RPC (the #119
+  // goal — the old "…JSON-RPC data" start line was replaced with the SQD Portal wording).
+  expect(info.join('\n')).not.toContain('JSON-RPC data');
+  expect(info.join('\n')).not.toContain('from JSON-RPC');
+  // This window was fully Portal-served (rpcFallback stayed 0), so the completion line carries the
+  // honest, counter-driven provenance clause — NOT a bare "JSON-RPC" source claim.
+  expect(completeLines[0]).toContain('rpc_fallback=0');
+  expect(completeLines[0]).toContain(
+    'served entirely by the SQD Portal (0 JSON-RPC for history)',
+  );
 });
 
 test('regression (C1): a 2nd log filter sharing a chunk on a LATER call is still fetched — no silent gap', async () => {

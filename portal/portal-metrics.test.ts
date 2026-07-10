@@ -203,10 +203,14 @@ test('progress ticker: disabled interval and logger failures never throw', () =>
   stop();
 });
 
-test('completion summary: fires exactly once with final totals', () => {
+test('completion summary: fires exactly once, reporting event counts and zero-fallback provenance', () => {
   const stats = createStats();
   stats.blocks = 40;
+  stats.logs = 100;
+  stats.txs = 55;
+  stats.receipts = 6;
   stats.bytes = 2 * 1024 * 1024;
+  stats.rpcFallback = 0;
   const logs: string[] = [];
   const complete = createCompletionSummary({
     chainName: 'mainnet',
@@ -218,7 +222,91 @@ test('completion summary: fires exactly once with final totals', () => {
 
   expect(complete()).toBe(true);
   expect(complete()).toBe(false);
-  expect(logs).toEqual([
-    'Portal mainnet complete: blocks=40 mb_streamed=2.00 elapsed=2.0s avg_blocks_per_s=20.0',
-  ]);
+  // The data-plane counts and the fallback counter are on the line. Each of these substrings is new
+  // vs. the pre-change message (blocks=/logs=/txs=/receipts=/rpc_fallback=), so an old-format line
+  // fails every one — the mutation red.
+  expect(logs).toHaveLength(1);
+  expect(logs[0]).toContain('blocks=40');
+  expect(logs[0]).toContain('logs=100');
+  expect(logs[0]).toContain('txs=55');
+  expect(logs[0]).toContain('receipts=6');
+  expect(logs[0]).toContain('mb_streamed=2.00');
+  expect(logs[0]).toContain('elapsed=2.0s');
+  expect(logs[0]).toContain('avg_blocks_per_s=20.0');
+  expect(logs[0]).toContain('rpc_fallback=0');
+  // rpcFallback === 0 ⟺ the whole history came from the Portal. The provenance clause must say so,
+  // and MUST NOT claim any fallback happened.
+  expect(logs[0]).toContain(
+    'served entirely by the SQD Portal (0 JSON-RPC for history)',
+  );
+  expect(logs[0]).not.toContain('fell back');
+});
+
+test('completion summary: with rpcFallback > 0 the provenance flips to the fallback count, no zero-RPC claim', () => {
+  const stats = createStats();
+  stats.blocks = 40;
+  stats.logs = 100;
+  stats.rpcFallback = 3;
+  const logs: string[] = [];
+  const complete = createCompletionSummary({
+    chainName: 'mainnet',
+    stats,
+    startTime: () => 500,
+    now: () => 2500,
+    logInfo: ({ msg }) => logs.push(msg),
+  });
+
+  expect(complete()).toBe(true);
+  expect(logs).toHaveLength(1);
+  expect(logs[0]).toContain('rpc_fallback=3');
+  // The "0 JSON-RPC" provenance MUST NOT appear once any range fell back — the phrasing flips to the
+  // actual count. A build that hard-codes the zero-RPC clause (or omits rpc_fallback) fails here.
+  expect(logs[0]).toContain('3 block range(s) fell back to JSON-RPC');
+  expect(logs[0]).not.toContain('0 JSON-RPC for history');
+});
+
+// The progress fingerprint MUST include discoveryScannedBlocks so the ticker advances during an empty
+// window (a fresh dense source scans the range before the first block streams). This locks that
+// behavior: with blocks/bytes/chunks all frozen at 0, advancing ONLY discovery.through must still fire
+// the ticker. MUTATION: remove `discoveryScannedBlocks(discovery)` from `progressFingerprint` and this
+// test fails (the fingerprint never changes, so `logs` stays empty).
+test('progress ticker: fires on a scanned-only advance (blocks_streamed stays 0)', () => {
+  vi.useFakeTimers();
+  vi.setSystemTime(0);
+
+  const stats = createStats();
+  let through = -1;
+  const logs: string[] = [];
+  const stop = startProgressLog({
+    chainName: 'mainnet',
+    stats,
+    intervalMs: 100,
+    startTime: () => 0,
+    discovery: () => ({ floor: 0, through }),
+    logInfo: ({ msg }) => logs.push(msg),
+  });
+
+  // First tick: nothing has advanced yet.
+  vi.advanceTimersByTime(100);
+  expect(logs).toHaveLength(0);
+
+  // Only the discovery scan advances — no streamed blocks, no bytes, no chunks. The ticker must fire
+  // purely on discoveryScannedBlocks climbing.
+  through = 4999;
+  vi.advanceTimersByTime(100);
+  expect(logs).toHaveLength(1);
+  expect(logs[0]).toContain('blocks_streamed=0');
+  expect(logs[0]).toContain('mb_streamed=0.00');
+  expect(logs[0]).toContain('discChunks=0');
+  expect(logs[0]).toContain('scanned=5000');
+
+  // A further scanned-only advance fires again; a repeat with no advance stays silent.
+  through = 9999;
+  vi.advanceTimersByTime(100);
+  expect(logs).toHaveLength(2);
+
+  vi.advanceTimersByTime(100);
+  expect(logs).toHaveLength(2);
+
+  stop();
 });
