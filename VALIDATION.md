@@ -59,25 +59,32 @@ live in [`portal/INVARIANTS.md`](portal/INVARIANTS.md); the runtime asserts them
 whole-structure O(n) checks used in CI), and the suite proves them with property-based tests
 (`fast-check`, seed-pinned for deterministic runs).
 
-The suite runs **against all three supported upstream Ponder versions** — `0.15.17`, `0.16.6`, and
-`0.16.7` — by grafting the Portal layer onto a pinned Ponder checkout:
+The suite runs **against all four supported upstream Ponder versions** — `0.15.17`, `0.16.6`,
+`0.16.7`, and `0.16.8` — by grafting the Portal layer onto a pinned Ponder checkout:
 
 ```bash
 scripts/sync-upstream.sh 0.15.17 --test
 scripts/sync-upstream.sh 0.16.6  --test
 scripts/sync-upstream.sh 0.16.7  --test
+scripts/sync-upstream.sh 0.16.8  --test
 ```
 
 (config `portal/vite.portal.config.ts`, files `portal/*.test.ts`). The seam
 (`HistoricalSync.syncBlockRangeData` / `syncBlockData`) is verified identical in shape across that
-version range (`versions.json`), and CI's seam matrix (derived from `compat.tested`) runs all three on
-every push. The newest, `0.16.7`, was registered by **[#74](../../pull/74)** (2026-07-06) on a
+version range (`versions.json`), and CI's seam matrix (derived from `compat.tested`) runs all four on
+every push. `0.16.7` was registered by **[#74](../../pull/74)** (2026-07-06) on a
 **seam-identity + full-suite** basis: the `0.16.6` wiring patch applies to the `0.16.7` tree
-byte-identically (zero rejects, all 10 files) and the full Portal suite (**272/272**) passes on the
-graft; the lone upstream delta `0.16.6 → 0.16.7` is a single DB-layer PR (`ponder-sh/ponder#2314`,
-live-query notification batching) with **zero Portal-graft-surface overlap**. As with `0.15.17`, that
-basis is **not** a fresh RPC byte-diff or cross-validation — the §3 / §5 byte-diff and A/B evidence
-remains on `0.16.6`.
+byte-identically (zero rejects, all 10 files) and the full Portal suite (**272/272** at that cut) passes
+on the graft; the lone upstream delta `0.16.6 → 0.16.7` is a single DB-layer PR (`ponder-sh/ponder#2314`,
+live-query notification batching) with **zero Portal-graft-surface overlap**. The newest, `0.16.8`, was
+registered on the **same basis** by **[#129](../../pull/129)** (2026-07-10): the same wiring patch
+applies to the `0.16.8` tree byte-identically (same 10 files) and the full Portal suite (**310/310** at
+that cut) passes on the graft; the lone upstream delta `0.16.7 → 0.16.8` is realtime-only — it adds
+`isAsyncExecutionChain` (in `sync-realtime/index.ts` + `utils/finality.ts`) so async-execution chains
+can surface blocks before `logsBloom` is execution-ready — and **neither file is on the Portal graft
+surface** (`sync-historical`, `runtime/historical`, `sync-store`, `rpc`, `sync`), so the 81 Portal
+realtime tests pass unchanged. As with `0.15.17`, that basis is **not** a fresh RPC byte-diff or
+cross-validation — the §3 / §5 byte-diff and A/B evidence remains on `0.16.6`.
 
 ### Layer B — Mutation-verified regression tests
 
@@ -1509,10 +1516,10 @@ against the running soak — the evidence is the tested logic and the differ, st
 
 **Proven today (with reproducible evidence in this repo):**
 
-- The Portal layer's invariants (INV-1 … INV-18) hold under property-based tests **on all three
-  supported upstream Ponder versions** (`0.15.17`, `0.16.6`, `0.16.7` — the last registered by
-  [#74](../../pull/74) on a seam-identity + full-suite basis, §2), and every fix is backed by a
-  mutation-verified regression test.
+- The Portal layer's invariants (INV-1 … INV-18) hold under property-based tests **on all four
+  supported upstream Ponder versions** (`0.15.17`, `0.16.6`, `0.16.7`, `0.16.8` — the last two
+  registered by [#74](../../pull/74) / [#129](../../pull/129) on a seam-identity + full-suite basis,
+  §2), and every fix is backed by a mutation-verified regression test.
 - **Crash/resume is safe, and resume-from-partial-persisted-state is now proven.** Tier 0 (PGlite,
   §4.1): 203 kills across 41/41 completed backfills, `SIGKILL`-atomic and restart-idempotent,
   byte-identical to an unkilled baseline across all five row families, intervals tiling exactly, zero
@@ -1578,7 +1585,7 @@ All tooling is `bash` + `node` only (no extra dependencies) and lives in this re
 
 | Evidence | Tool | Doc |
 |----------|------|-----|
-| Unit + invariant suite (all three versions) | `scripts/sync-upstream.sh <ver> --test` | `CLAUDE.md`, `portal/INVARIANTS.md` |
+| Unit + invariant suite (all four versions) | `scripts/sync-upstream.sh <ver> --test` | `CLAUDE.md`, `portal/INVARIANTS.md` |
 | Chaos kill-loop + resume (Tier 0, PGlite byte-diff) | `harness/chaos/kill-loop.sh`, `verify-resume.sh`, `proxy.mjs` | `harness/validate/README.md` §Chaos |
 | Chaos resume-from-partial (Tier 1, Postgres logical-digest) | `harness/chaos/chaos-pg-driver.sh`, `build-baseline-pg.sh`, `pg-ctl-chaos.sh`, `verify-resume-pg.sh`, `pg-digest.mjs`, `snapshot-coverage-pg.mjs`, `check-intervals-pg.mjs` | §4.2 (this doc); tool headers |
 | Validation matrix (fork vs stock) | `harness/validate/run-cell.sh`, `ctrl-cell.sh`, `cells.json` | `harness/validate/README.md` |
