@@ -259,11 +259,14 @@ async function assertNoTrackedArtifacts(example) {
     );
   }
 
+  const prefix = `examples/${example}/`;
   const tracked = result.stdout
     .text()
     .split('\0')
     .filter((path) => path.length > 0);
-  const offending = tracked.filter(isRegenerableArtifact);
+  const offending = tracked.filter((path) =>
+    isRegenerableArtifact(path.slice(prefix.length)),
+  );
   if (offending.length > 0) {
     throw new HarnessFailure(
       `${example}: git tracks regenerable artifact(s) that must never be committed: ${offending.join(', ')}; run \`git rm --cached ${offending.join(' ')}\` (they are gitignored regenerables)`,
@@ -271,16 +274,16 @@ async function assertNoTrackedArtifacts(example) {
   }
 }
 
-function isRegenerableArtifact(path) {
-  const segments = path.split('/');
-  if (segments.includes('.ponder')) return true;
+function isRegenerableArtifact(relative) {
+  const segments = relative.split('/');
+  const first = segments[0];
+  if (first === '.ponder') return true;
 
-  if (segments.includes('generated')) return true;
+  if (first === 'generated') return true;
 
-  const name = segments[segments.length - 1];
-  if (name === 'ponder-env.d.ts') return true;
+  if (relative === 'ponder-env.d.ts') return true;
 
-  if (name === 'package-lock.json') return true;
+  if (relative === 'package-lock.json') return true;
 
   return false;
 }
