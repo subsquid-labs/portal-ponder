@@ -52,3 +52,6 @@ const actionTotal =
 console.log(
   `${data.vaults.totalCount} vaults · ${data.deposits.totalCount} deposits · ${data.withdraws.totalCount} withdraws · ${data.borrows.totalCount} borrows · ${data.repays.totalCount} repays · ${data.liquidates.totalCount} liquidations · ${data.vaultStatuss.totalCount} vault status updates · ${actionTotal} actions indexed from the SQD Portal`,
 );
+console.log(
+  `\nExplore the data: open ${endpoint} in your browser to run your own queries.`,
+);
