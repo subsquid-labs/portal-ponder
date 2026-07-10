@@ -1813,9 +1813,11 @@ backend_label_cmd () {
   echo "$label"
 }
 
-case "${1:-campaign}" in
-  selftest) selftest ;;
-  campaign) campaign ;;
-  backend-label) backend_label_cmd ;;
-  *) echo "usage: chaos-pg-driver.sh [campaign|selftest|backend-label]"; exit 2 ;;
-esac
+if [ -z "${CHAOS_LIB_ONLY:-}" ]; then
+  case "${1:-campaign}" in
+    selftest) selftest ;;
+    campaign) campaign ;;
+    backend-label) backend_label_cmd ;;
+    *) echo "usage: chaos-pg-driver.sh [campaign|selftest|backend-label]"; exit 2 ;;
+  esac
+fi
