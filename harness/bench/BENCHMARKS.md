@@ -68,7 +68,47 @@ indexing + chunk amortization), staying stable at **1.6 GB RSS / 0 errors** on 1
 amortize too (7.7 → 6 KB/event). `feature-blocks` is the outlier — 85 s for 2,001 ticks — the block-source
 `includeAllBlocks` scan (optimization #1 below).
 
-## Full-history backfill — F-full flagship cell
+## Flagship — 15 chains, one app (28.4M events, 51m 47s)
+
+The headline production run: **one** Ponder app indexing **every Portal-supported Euler V2 chain (15)**,
+full history from each `eVaultFactory` deploy to a fixed finalized head — **28,405,932 events across
+2,484 vaults** — streamed from the SQD Portal into Postgres. On 2026-07-06 it was **reproduced from
+scratch** by the deterministic zero-RPC bench kit and passed the whole-store parity gate against the
+frozen reference store. Full write-up: [`../euler-multichain/REPORT.md`](../euler-multichain/REPORT.md).
+
+| metric | value |
+|---|---|
+| wall time | **3107 s (51m 47s)**; start→ready 3118.6 s |
+| clean / all-complete | **true / true** |
+| chains complete | **15 / 15** (each `completedBlocks == totalBlocks`) |
+| RPC requests / errors | **90 / 0** — exactly 6/chain × 15, all served by the kit's LOCAL anchor shim from a committed snapshot |
+| store parity vs frozen reference | **pass — 62/62 cells, 0 diffs** |
+| total log rows (both sides) | **28,405,932** |
+| store totals | blocks **4,646,445** / transactions **5,007,056** |
+| envelope | MemoryMax=16G, CPUQuota=200% (2 cores) on a 96-core host; node v22.22.2; `PORTAL_CHECKS=off`; Postgres 16.14 local |
+
+**Zero external RPC.** The 90 RPC requests were all served from a committed anchor snapshot by the kit's
+local shim; the ponder process's only remote endpoint was the SQD Portal — the entire dataset came from
+the Portal. Artifacts are committed under [`results/flagship-2026-07-06/`](results/flagship-2026-07-06/);
+the whole-store 62-cell parity chain of custody is in **VALIDATION.md §5.7** (fresh Portal-only backfill
+vs frozen reference).
+
+**Wall time vs the config-b baseline — honest delta.** 51m 47s (3107 s) is **+15.3 %** over the previously
+published **44m 55s (2695 s)** config-b baseline (2026-07-01), same 16 GB / 2-core envelope. The two runs
+are on **different dates against a live Portal service** *and* the code under test differs — the 2026-07-01
+baseline predates several fixes merged since, plus the PR #71 branch in this build — so the delta is
+**flagged but unattributed**: two data points cannot split it between Portal-throughput variance and code
+changes, and no claim is made either way. What is new: the deterministic kit makes future comparisons
+apples-to-apples (fixed anchor snapshot, zero public-RPC noise). *(For candor: an earlier ad-hoc 2026-07-06
+attempt clocked 65m 55s but was polluted — a public-RPC finality-probe wedge blocked `/ready` for ~17 min,
+`PORTAL_CHECKS=on`, co-resident load — not a valid headline, recorded only for candor.)*
+
+**Config A/B lesson (2026-07-01).** On the identical 28.4M events, a modest **16 GB / 2-core** config
+(44m 55s, 9.2 GB peak, **10,513 ev/s**) beat an over-provisioned **32 GB** config (67m 10s, 19.0 GB,
+7,024 ev/s): **right-size the indexer, tune the database** — don't over-provision. Full table in
+[`../euler-multichain/REPORT.md`](../euler-multichain/REPORT.md).
+
+## Full-history backfill — single-chain 3.6× (F-full flagship cell)
 
 The paid validation cell **F-full** (VALIDATION.md §3.2) also yields the first end-to-end
 **full-history** backfill timing: the entire recorded Euler v2 history on eth mainnet,
