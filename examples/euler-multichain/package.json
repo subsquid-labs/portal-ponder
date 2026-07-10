@@ -5,7 +5,8 @@
   "scripts": {
     "dev": "ponder dev",
     "start": "ponder start",
-    "codegen": "ponder codegen"
+    "codegen": "ponder codegen",
+    "clean": "rm -rf .ponder generated ponder-env.d.ts"
   },
   "dependencies": {
     "abitype": "^0.10.2",
