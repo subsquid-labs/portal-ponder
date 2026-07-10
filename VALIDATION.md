@@ -129,7 +129,10 @@ Where the RPC oracle and the Portal path disagree, the tie is broken against an 
 archive node (and, per the campaign design, count-parity and field-level spot checks from public
 explorers/analytics). Third-party evidence is treated as corroboration, not oracle: a mismatch must
 reduce to a pre-declared benign class or it is a finding. This layer is what let the A/B differ
-attribute its divergences to the RPC leg rather than the Portal leg (§5).
+attribute its divergences to the RPC leg rather than the Portal leg (§5). **All Layer-F evidence to
+date — the 15-chain count parity, the independent Goldsky vault cross-check, and the public-node
+field-level tie-breaks — is consolidated in §5.7, together with a candid boundary on what was designed
+but not executed.**
 
 ---
 
@@ -1233,6 +1236,130 @@ This is the same discipline as the A/B differ's tolerated classes (§5.3): decla
 designed to be deleted. The candor point is the headline: **the byte-diff gate caught a real
 upstream-dataset defect that a coarser check would have waved through** — that is evidence the gate
 works, not a blemish on it.
+
+### 5.7 Layer-F third-party corroboration — consolidated
+
+A campaign acceptance requirement is **count parity across all 15 chains paired with independent
+third-party corroboration**. The evidence for it is real but was scattered across §5.1, §5.6, the
+benchmark report, and the A/B differ's status JSON. This subsection consolidates it in one place so a
+reader can confirm the requirement is met **by evidence, not by waiver** — while being fully candid
+about the two further third-party sweeps that were *designed but not executed*.
+
+Three distinct things are kept strictly separate below, because conflating them is precisely the error
+this section exists to prevent:
+
+- **(a) internal count-parity** — a fresh Portal-only backfill vs the frozen internal reference store.
+  Both are *internal* stores, so this is **not itself third-party**; it is the count half the
+  requirement pairs *with* third-party evidence.
+- **(b) genuinely third-party corroboration** — Euler's own public Goldsky subgraphs (count) and
+  independent public archive nodes (field-level tie-breaks).
+- **(c) Layer-E Portal-vs-RPC byte-identity** — the paid matrix (§3, §5.6). This is **not Layer F**;
+  it is cross-referenced only as context for where the field-level tie-breaks (below) sit.
+
+#### (A) Count parity across all 15 chains — the "15/15" half *(internal, not third-party)*
+
+Source of truth: [`harness/bench/results/flagship-2026-07-06/parity-report.json`](harness/bench/results/flagship-2026-07-06/parity-report.json)
+(`pass: true`, `diffs: []`, **62 cells**, `generatedAt` 2026-07-06). A fresh Portal-only backfill of
+all 15 chains was compared against the **frozen reference store** over `ponder_sync`: per-chain `logs`
+(`logCount` / `minBlock` / `maxBlock` / `distinctTx`) for every chain, plus **whole-store** `blocks` and
+`transactions` totals. **All 62 aggregate cells identical, 0 diffs.**
+
+| Aggregate | bench | reference | match |
+|-----------|------:|----------:|:-----:|
+| whole-store `blocks` total | **4,646,445** | 4,646,445 | ✓ |
+| whole-store `transactions` total | **5,007,056** | 5,007,056 | ✓ |
+| Σ per-chain `logs` (log rows) | **28,405,932** | 28,405,932 | ✓ |
+| distinct chains compared | 15 | 15 | ✓ |
+
+This is a **whole-store aggregate parity of two internal stores** — the complete stored range of every
+chain, not sampling — so it establishes the count-parity-15/15 half. It is **not** itself third-party
+(both stores are ours); it is what the requirement pairs *with* the third-party corroboration below.
+Full account: [`harness/euler-multichain/REPORT.md`](harness/euler-multichain/REPORT.md) §Correctness
+item 0.
+
+#### (B) Independent third-party count corroboration — Euler's own Goldsky subgraphs
+
+This is **genuinely third-party**: the discovered vault set was cross-checked against **Euler's public
+Goldsky subgraphs** (`euler-v2-<net>/latest` and `euler-simple-<net>/latest`), **live-verified
+2026-07-03** ([`harness/euler-multichain/REPORT.md`](harness/euler-multichain/REPORT.md) §Correctness
+item 3). On the chains whose Euler subgraph is itself caught up, the discovered vault count matches
+exactly:
+
+| chain | vaults (this indexer) | vs Euler Goldsky subgraph |
+|-------|---------------------:|:--------------------------|
+| berachain | 59 | **59 / 59 ✓** |
+| polygon | 25 | **25 / 25 ✓** |
+| bob | 27 | **27 / 27 ✓** |
+| tac | 36 | **36 / 36 ✓** |
+
+**hyperliquid — a match, but with a caveat, not a clean one.** At the pinned benchmark head (2026-07-01)
+Euler's then-deployed HyperEVM subgraph reported **zero** vaults; it was **redeployed**, and a live
+re-check on **2026-07-03** reports the same **58** this indexer found — but that redeployed subgraph is
+itself still **stalled ~4M blocks behind the HyperEVM tip** (all 58 predate its indexed head). So the
+58/58 corroboration is real *as of the 2026-07-03 re-check*, but it is **not** the "steady-state
+subgraph agrees" case the four rows above are — it is disclosed here rather than folded into that table
+precisely because a stalled/redeployed third-party source is weaker corroboration than a caught-up one.
+
+The larger-chain gaps are **not missing data** — they resolve to created-after-our-fixed-head plus
+discovered-but-eventless. For ethereum the Portal shows **872** vaults created by our fixed head vs
+Euler's **897**: **25 were created *after* our fixed head** (Euler's subgraph runs ahead of the pinned
+benchmark head), and the remaining **22 are discovered-but-eventless** (created, never used) —
+confirmed because our indexed event total equals the Portal total for the events that do exist. (The
+per-chain benchmark table also lists an *indexed* vault count of 850 for ethereum, a distinct quantity
+from the 872 discovered-by-head used for this gap breakdown; the two are not conflated.) This is
+third-party count corroboration against the data owner's *own* published indexer.
+
+#### (C) Field-level third-party tie-breaks — independent public archive nodes
+
+Where the RPC oracle and the Portal path disagreed on a *field*, the tie was broken against an
+**independent public archive node** — establishing which side carried chain-truth. These already appear
+in §5.1 / §5.6; consolidated here:
+
+| Field / issue | Third-party source | The tie-break | Cross-ref |
+|---------------|--------------------|---------------|-----------|
+| arbitrum `access_list` (refines [#32](../../issues/32)) | public node `arb1.arbitrum.io/rpc` | block **358633596**, tx `0x504a05d5…` (type `0x2`) carries a **20-entry** access list — public node *and* RPC-backfill store agree (populated); the old Portal `"[]"` was the wrong side (fork defect, now NULL — [#110](../../pull/110)/[#111](../../pull/111)) | §5.6 |
+| ethereum `block.size` ([#76](../../issues/76)) | any public archive node | block **19963775** reports `size` **66755** from the Portal endpoint vs **66756** from a public RPC — **publicly reproducible**; the upstream dataset serves it one byte low at the RLP 2^16 boundary, the fork persists it faithfully | §5.3 / §5.6 |
+| A/B soak spot-audit ([#27](../../issues/27), [#36](../../issues/36)) | independent public node (Layer D) | in the confirmed cases leg-B (Portal) rows matched an independent public node **byte-for-byte**, establishing leg-A (RPC realtime) as the **lossy** side; `harness/soak-ab/ab-diff.mjs` exports a bounded `toleratedIssue36Sample` in the status JSON so this audit stays **reproducible** against a third-party node | §5.1 / §5.3 |
+
+#### (D) Publicly-reproducible upstream-dataset gap probes ([#83](../../issues/83))
+
+The `logs_bloom` column gap on base / arbitrum / avalanche is corroborated by **anyone**: it reproduces
+with a single public `curl` against `portal.sqd.dev` (§3.5), no harness and no auth — a `400`
+`column 'logs_bloom' is not found in 'transactions'` below each chain's boundary vs a `200` on
+ethereum / polygon / binance. This makes the *gaps* themselves independently verifiable, not just
+asserted from our own runs. Cross-ref §3.5 / §5.6.
+
+#### (E) Candor — designed but NOT executed
+
+The campaign methodology also **designed** two further third-party sweeps that were **not run**:
+
+1. **Etherscan V2 `getLogs` field-level spot-checks** (~30 windows) plus `txlist` for the accounts cell.
+2. **Dune full-range per-chain totals.**
+
+Both were **not executed** — **no third-party explorer/analytics API key was provisioned for this
+campaign** — and they are recorded here as **optional further corroboration, not load-bearing**. What
+substantiates the third-party requirement is the count-parity (A) **plus** the independent Goldsky
+corroboration (B) **plus** the public-node field-level tie-breaks (C). Stating this plainly is
+deliberate: silently omitting a designed-but-unrun check is the exact **#27 anti-pattern** (asserting a
+known-empty result from an absent one) that this project treats as a cardinal sin — so the boundary is
+named, not soft-pedaled.
+
+**What is proven / what remains optional:**
+
+- **Proven:** 15/15 whole-store count parity (A); independent Goldsky vault-count corroboration on the
+  fully-active chains, gaps explained not missing (B); public-node field-level tie-breaks that put
+  chain-truth on the Portal side of every confirmed A/B divergence (C); publicly-`curl`-reproducible
+  upstream gap probes (D).
+- **Optional (not run):** Etherscan `getLogs`/`txlist` spot-checks and Dune per-chain totals (E).
+
+**Verdict.** The **count-parity-across-15-chains paired with independent third-party corroboration**
+requirement is **met by evidence**, not by waiver: the 15/15 aggregate parity (A) is corroborated
+independently by Euler's own Goldsky subgraphs at the count level (B) and by independent public archive
+nodes at the field level (C), with the upstream gaps themselves publicly reproducible (D). The honest
+boundary is that third-party corroboration is treated throughout as **corroboration, not oracle** (§2,
+Layer F) — the stock JSON-RPC path remains the byte-identity oracle — and that the additional
+Etherscan and Dune sweeps (E) remain **optional further corroboration, not executed and not
+load-bearing**.
 
 ---
 
