@@ -7,6 +7,14 @@
   "seam": "HistoricalSync.syncBlockRangeData / syncBlockData (interval-scoped) — identical in shape across the tested range",
   "versions": [
     {
+      "ponder": "0.16.9",
+      "wiring": "wiring/0.16.9.patch",
+      "rev": 1,
+      "status": "verified",
+      "published": false,
+      "note": "0.16.9-sqd.1 grafts the current Portal layer (invariant-first re-architecture INV-1…INV-18 + the correctness wave: the #47 mid-range-204 fix, the #50 bounded-time-to-first-commit warmup, the #20/#94 needed-field scoping, the #110/#111 access_list honest-NULL fix, and the #23 realtime body-cap filtered fallback) onto ponder@0.16.9. wiring/0.16.9.patch is a verbatim copy of wiring/0.16.8.patch: 0.16.8→0.16.9 is a single-file upstream change — src/indexing-store/cache.ts only (ponder-sh/ponder#2323: fix p.bytes() bytea encoding on the Postgres COPY flush path, emitting \\x<hex> for Buffer values to fix `DelayedInsertError: invalid byte sequence for encoding \"UTF8\": 0x00`) — and every upstream file the wiring patch modifies is byte-identical between 0.16.8 and 0.16.9, so the patch applies with zero rejects. It builds and passes the full current Portal suite (328 tests) on ponder@0.16.9 (scripts/sync-upstream.sh 0.16.9 --test). indexing-store/cache.ts is off the graft surface (sync-historical, runtime/historical, sync-store, rpc, sync, sync-realtime), so the seam is untouched and the fork passively inherits the upstream bytea-COPY correctness fix. No fresh RPC byte-diff on 0.16.9; compat rests on seam-identity + the full suite, as for 0.16.8/0.16.7/0.15.17. As the newest ponder version it will publish with --tag latest when released; publishing is a separate, deliberate, human-reserved step, so this row stays published:false and 0.16.8-sqd.1 remains latest until then."
+    },
+    {
       "ponder": "0.16.8",
       "wiring": "wiring/0.16.8.patch",
       "rev": 1,
@@ -40,8 +48,8 @@
     }
   ],
   "compat": {
-    "tested": ["0.16.8", "0.16.7", "0.16.6", "0.15.17"],
-    "seamStableRange": "0.15.17 - 0.16.8 (verified identical by inspection; CI matrix promotes to 'tested' as patches land)",
+    "tested": ["0.16.9", "0.16.8", "0.16.7", "0.16.6", "0.15.17"],
+    "seamStableRange": "0.15.17 - 0.16.9 (verified identical by inspection; CI matrix promotes to 'tested' as patches land)",
     "howToAdd": "see PUBLISHING.md — scripts/sync-upstream.sh <ver> --test, then add the row here"
   }
 }
