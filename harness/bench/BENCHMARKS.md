@@ -74,7 +74,8 @@ The headline production run: **one** Ponder app indexing **every Portal-supporte
 full history from each `eVaultFactory` deploy to a fixed finalized head — **28,405,932 events across
 2,484 vaults** — streamed from the SQD Portal into Postgres. On 2026-07-06 it was **reproduced from
 scratch** by the deterministic zero-RPC bench kit and passed the whole-store parity gate against the
-frozen reference store. Full write-up: [`../euler-multichain/REPORT.md`](../euler-multichain/REPORT.md).
+frozen reference store. Full write-up — including the fork's tarball hash and source-commit provenance
+for the run under test — [`../euler-multichain/REPORT.md`](../euler-multichain/REPORT.md).
 
 | metric | value |
 |---|---|
@@ -100,8 +101,10 @@ baseline predates several fixes merged since, plus the PR #71 branch in this bui
 **flagged but unattributed**: two data points cannot split it between Portal-throughput variance and code
 changes, and no claim is made either way. What is new: the deterministic kit makes future comparisons
 apples-to-apples (fixed anchor snapshot, zero public-RPC noise). *(For candor: an earlier ad-hoc 2026-07-06
-attempt clocked 65m 55s but was polluted — a public-RPC finality-probe wedge blocked `/ready` for ~17 min,
-`PORTAL_CHECKS=on`, co-resident load — not a valid headline, recorded only for candor.)*
+attempt clocked 65m 55s but its timing was polluted — a public-RPC finality-probe wedge blocked `/ready` for
+~17 min, `PORTAL_CHECKS=on`, co-resident load — so it is not a valid wall-time headline. Its store did
+reproduce the reference exactly, making it the first of the two exact-parity reproductions and this
+deterministic run the second — only the 65m 55s wall-time is discarded, not the run.)*
 
 **Config A/B lesson (2026-07-01).** On the identical 28.4M events, a modest **16 GB / 2-core** config
 (44m 55s, 9.2 GB peak, **10,513 ev/s**) beat an over-provisioned **32 GB** config (67m 10s, 19.0 GB,
