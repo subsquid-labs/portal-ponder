@@ -1363,6 +1363,139 @@ load-bearing**.
 
 ---
 
+### 5.8 Reorg & finality correctness — consolidated
+
+Reorg-correctness evidence exists, but it was scattered — the finalized-only backfill design lives in
+`HOW-IT-WORKS.md`, the realtime reconciliation logic in `portal/portal-realtime.ts` /
+`portal/portal-realtime-wire.ts` with ~30 unit tests, the crash/resume durability in Layer C (§4), and
+the finalized-overlap agreement in Layer D (§2.D, §5.1–§5.3). This subsection consolidates it so a
+reader can confirm what is proven **without conflating three separate things**, and can see the
+deliberate limit stated plainly. The verdict: **reorg-correctness rests on finalized-only backfill
+(reorg-free by construction) plus tested realtime reconciliation, with a reorg below the finalized
+floor a deliberate fail-loud (operator re-syncs) rather than a silent rollback** — the stream path that
+carries the realtime half is **experimental** (§1, §5.2), not certified for unattended production use.
+
+The three things kept strictly separate below are: **(A)** the historical backfill, which never sees a
+reorg by construction; **(B)** the realtime reconciliation, which is **code + unit-test** evidence for
+the *logic* that handles forks; and **(C)** the A/B soak, which is **empirical** evidence that the two
+independent legs agree on the finalized overlap — hourly, within declared tolerances, on an
+experimental path. Conflating "the logic is tested" with "we survived a live deep reorg in production"
+is exactly the error this section exists to prevent.
+
+#### (A) Historical backfill is reorg-free by construction
+
+The Portal serves **only finalized data** for the historical range, so historical rows are **write-once
+and never walked back**: `HOW-IT-WORKS.md` states it directly — *"Backfill is reorg-free. The Portal
+serves only finalized data, so historical rows never need to be walked back"* — and the sync split is
+clean by design: **historical owns `[start, finalized]`; realtime owns `(finalized, tip]`**
+(`HOW-IT-WORKS.md`). There is no reorg path in the backfill because there is no unfinalized data in it.
+
+This is a **design/construction** argument, not a test result, and is labelled as such. It is
+**corroborated** — not proven — by the Layer-C chaos evidence (§4): 203 Tier-0 `SIGKILL`s across 41/41
+completed backfills reached a store **byte-identical** to an unkilled baseline, and Tier 1 added
+attributable resume-from-partial on a crash-durable backend (§4.2–§4.3). **Important boundary: Layer C
+tests crash/resume *durability*, it does NOT inject reorgs.** It shows the backfill commits atomically
+and resumes correctly across kills; it says nothing about reorg handling, and is cited here only as
+corroboration that the write-once store behaves as the reorg-free design claims. The two must not be
+conflated.
+
+#### (B) Realtime reorg reconciliation — code + mutation-verified unit tests
+
+When realtime moves to the Portal `/stream` path (`PORTAL_REALTIME=stream`), reorgs are reconciled from
+the stream's parent-hash chain and surfaced as **Ponder's own `reorg` / `finalize` events**, so
+handlers and checkpointing are unchanged (`HOW-IT-WORKS.md`). The reconciliation core is **pure and
+unit-tested** (`portal/portal-realtime.ts`, the "pure reorg / finalize core"): `reconcile()` classifies
+each newly-streamed block against the local unfinalized chain as `append` / `duplicate` / `reorg` /
+`gap`, and `takeFinalized()` splits the unfinalized chain at a newly-finalized number. A **fork point
+below the finalized floor has no safe recovery, so it is FATAL rather than rewound** — the code comments
+and the wire's floor logic (`portal/portal-realtime-wire.ts`) state this directly. This is **evidence
+for the LOGIC**, backed by ~30 reorg/finality unit tests across `portal/portal-realtime.test.ts` and
+`portal/portal-realtime-wire.test.ts`. The load-bearing behaviours and their exact tests:
+
+| Behaviour (what the logic must do) | Evidencing test (exact name, file) |
+|------------------------------------|------------------------------------|
+| classify append / duplicate / reorg (earlier common ancestor) / deep-fork-to-base / gap | `reconcile: append extends the tip (and the anchored empty chain)` · `reconcile: duplicate tip is idempotent (re-delivery)` · `reconcile: reorg forks off an earlier common ancestor, reorged blocks after it` · `reconcile: deep-fork reorg to the base` · `reconcile: gap when the parent is unknown (beyond our window)` — `portal/portal-realtime.test.ts` |
+| depth-1 fork **at the finality boundary** reorgs off the anchor, not a fatal gap | `reconcile: a depth-1 fork at the finality boundary reorgs off the ANCHOR instead of a fatal gap` · `reconcile: an EMPTY window with an anchor appends ONLY a child of the anchor (else duplicate/gap)` — `portal/portal-realtime.test.ts` |
+| finalized split at a number | `takeFinalized: splits the chain at the finalized number` — `portal/portal-realtime.test.ts` |
+| a re-streamed fork emits a `reorg` to the common ancestor end-to-end | `portalRealtimeEvents: a re-streamed fork emits a reorg to the common ancestor` — `portal/portal-realtime.test.ts` |
+| an unknown-parent **gap is FATAL**, not silently skipped | `portalRealtimeEvents: an unknown-parent gap is FATAL, not silently skipped (finding 7)` — `portal/portal-realtime.test.ts` |
+| a 1-block **orphan at tip heals** via 409 fork negotiation (no gap fatal) | `portalRealtimeEvents: a 1-block orphan at tip heals via 409 fork negotiation — orphan N−1 then canonical N becomes reorg + appends, no gap fatal (issue #33 T1)` · `getPortalRealtimeEventGenerator: a 1-block orphan at tip HEALS via 409 fork negotiation — the wire emits reorg→block→block with hex LightBlocks and the #26 child-prune fires on the reorg (issue #33 T5)` — `portal/portal-realtime.test.ts` / `portal/portal-realtime-wire.test.ts` |
+| 409 fork negotiation **steps the cursor down** and terminates (no-match step-down; oscillation cap; deep step-down to floor; bodyless 409 still drives) | `streamHotBlocks: a 409 whose previousBlocks match NOTHING steps the cursor down one block per retry and fatals at the finalized floor — nothing yielded past the fork (issue #33 T3 step-down)` · `streamHotBlocks: an OSCILLATING 409 loop (server keeps re-409ing a rewind the ring confirms at the SAME height → no cursor progress) fatals at the 10 no-progress cap (issue #33 T3 cap)` · `streamHotBlocks: a no-match step-down descending MORE than 10 heights reaches the FLOOR fatal, NOT the no-progress cap — a deep negotiation runs "until a match or the floor" (issue #33 T3 deep step-down / F2)` · `streamHotBlocks: a BODYLESS 409 (res.body === null) still DRIVES the fork negotiation — it does NOT silently re-poll forever (issue #33 F1)` — `portal/portal-realtime.test.ts` |
+| a fork point **below the finalized floor is FATAL with no rewind** | `streamHotBlocks: a 409 fork point BELOW the finalized floor is FATAL with no rewind (issue #33 T4 below-finality)` — `portal/portal-realtime.test.ts` |
+| a **wrong-fork finalize is FATAL** (canonical hash mismatches the local block) | `portalRealtimeEvents: a finalize whose canonical hash mismatches the local block is FATAL (wrong-fork finalize)` — `portal/portal-realtime.test.ts` |
+| a reorg **prunes reorged-out factory children** from the running map | `getPortalRealtimeEventGenerator: a reorg PRUNES reorged-out children from the running map and narrows the filter` — `portal/portal-realtime-wire.test.ts` |
+| stream-mode finalized boundary **never RAISES** above RPC finalized; **floor never regresses** on restart | `clampFinalizedToPortalHead: Portal at/ahead of RPC finalized → no clamp (never RAISES the boundary)` · `clampFinalizedToPortalHead: a probed head BELOW the persisted floor is clamped UP to the floor — a restart against a lagging replica must not re-stream already-finalized (unrevertable) blocks` · `clampFinalizedToPortalHead: the floor overrides a PORTAL_FINALIZED_HEAD pin below it — a pin below persisted finality must not re-open the double-indexing hole` — `portal/portal-realtime-wire.test.ts` |
+| **foreign-checkpoint restart** maps a foreign checkpoint's timestamp to a local floor (omnichain, [#57](../../issues/57)) | `deriveFinalityFloor: a FOREIGN checkpoint is TIMESTAMP-MAPPED to the local chain’s highest block at/below that timestamp — the floor is a LOCAL block, not the foreign height (issue #57)` · `deriveFinalityFloor → clampFinalizedToPortalHead: the timestamp-mapped floor actually CLAMPS the stream-mode boundary UP — a lagging replica must not re-stream already-finalized blocks after an omnichain restart (issue #57)` — `portal/portal-realtime-wire.test.ts` |
+
+These tests are **mutation-verified** (each fails on the pre-fix code) and gate on **both supported
+upstream Ponder versions** via `scripts/sync-upstream.sh <ver> --test`, in line with this document's
+standing evidence rule (§6: *"every fix is backed by a mutation-verified regression test"*). Much of
+this logic landed as the **stream-realtime correctness wave, PR [#26](../../pull/26)** (§5.2), whose
+follow-up hardening (the 409 step-down / floor / diagnostics) is captured by the `issue #33`-tagged
+tests above.
+
+**On [#33](../../issues/33) — not a reorg.** [#33](../../issues/33) is often mis-remembered as a reorg
+bug; it is not. Its own title records it: *"stream realtime: canonical block fataled with 'unknown
+parent' — parent was the canonical block at N−1 (no reorg involved)"*. It was a **false
+`unknown-parent` fatal on a canonical N−1 block**, with **no chain reorg involved** — hardened by the
+409 delivered-hash-ring / step-down fork negotiation (the `issue #33 T1…T5` tests above) and now
+**CLOSED**. It is listed here so it is not misread as an open reorg defect.
+
+#### (C) A/B soak — finalized-overlap identity (empirical, hourly, experimental path)
+
+The Layer-D A/B soak (§2.D) runs two independently-synced legs — **Leg A** realtime over JSON-RPC and
+**Leg B** realtime over the Portal `/stream` path — and the differ (`harness/soak-ab/ab-diff.mjs`)
+compares them **hourly on their finalized overlap window** `[cutover, min(finalizedA, finalizedB) −
+margin]`. On that window it asserts strict `logs` and `blocks` row-set + field identity
+(`total_difficulty` excluded) and byte-identity of any transaction present on **both** sides, within a
+small set of **pre-declared tolerated classes** (§5.3). This is **empirical** evidence that the two
+independent realtime paths — including their reorg/finalize handling — **converge to the same finalized
+history**: a disagreement localises to one leg, and so far every confirmed divergence has been a
+**leg-A (RPC realtime) defect**, with the Portal leg matching third-party evidence (§5.1, §5.7 (C)).
+Relevant here: the RPC-realtime-mode issues [#27](../../issues/27) (realtime `access_list` stored NULL
+including for txs with a real on-chain list) and [#23](../../issues/23) (deterministic crash when a
+block's full-block `eth_getLogs` exceeds viem's 10 MiB cap) are on the **RPC** path that the Portal
+`/stream` path specifically avoids — the stream leg preserves those access lists and streams through
+those dense blocks — so they are stated accurately as a **Portal-path strength**, not as reorg defects.
+
+**Boundaries — what (C) does and does not show.** The differ is **hourly on the finalized-overlap
+window**, not continuous and not over the unfinalized tip; it establishes that the *finalized results*
+agree, which is where correctness must hold. The stream leg it exercises is **experimental** (§1,
+§5.2). Two currently-open issues on that path are **robustness, not reorg-correctness**, and are named
+so as not to overstate the claim: [#48](../../issues/48) is a stream-wire teardown/undici abort-hang
+race (a shutdown-unwind hardening item), and [#53](../../issues/53) is a `factory_addresses`
+idempotence gap that is app-invisible but breaks store-identity tooling (a sync-store tooling item).
+Neither is a reorg-correctness defect.
+
+#### What this section does NOT claim
+
+Candor is the product; the delta is stated, not hidden (the [#27](../../issues/27) anti-pattern is
+hiding a delta):
+
+- **Stream-realtime is NOT declared production-ready.** It is **experimental** (§1, §5.2) — this
+  document *"does not certify it for unattended production use."* The reorg logic being tested does not
+  change that label.
+- **A reorg deeper than the finalized floor is FATAL by design** — the process fails loud and the
+  operator restarts to re-sync. This is a **deliberate safety choice, not a recovered/healed
+  scenario**: a fork below finality has no safe rollback, so re-syncing from finalized truth is safer
+  than attempting to walk back committed rows. Do not read the `below-finality` FATAL tests as "we
+  recover from deep reorgs" — they prove we **fail loud** on them.
+- **The realtime reorg evidence is UNIT-TEST + short-soak, not a multi-week live-reorg record.** No
+  live deep reorg was **injected against the running soak**; (B) proves the reconciliation *logic* and
+  (C) proves *finalized-overlap agreement* on the soak's naturally-occurring traffic. There is **no
+  claim of empirical live deep-reorg survival** beyond what the tests and the hourly differ show.
+- **Layer C (§4) proves crash-durability, NOT reorg recovery.** The chaos kill-loop injects `SIGKILL`s,
+  not reorgs; it corroborates the write-once backfill store (A) and must not be cited as reorg evidence.
+
+**Verdict.** Reorg-correctness is **met for the historical path by construction** (finalized-only,
+write-once — (A)) and **evidenced for the realtime path by mutation-verified unit tests of the
+reconciliation logic (B) plus hourly finalized-overlap A/B agreement (C)**. The honest boundary is that
+the realtime half runs on an **experimental** path, that a reorg below the finalized floor is a
+**deliberate fail-loud** rather than a healed recovery, and that no **live deep reorg** was injected
+against the running soak — the evidence is the tested logic and the differ, stated as exactly that.
+
+---
+
 ## 6. Current status — what a reader can rely on today
 
 **Proven today (with reproducible evidence in this repo):**
@@ -1407,6 +1540,10 @@ load-bearing**.
 - The A/B dual-implementation soak is **actively cross-validating** the Portal path against the RPC
   path hourly, and every divergence it has found is a **public, tracked issue** (§5) — with the Portal
   leg matching third-party evidence in each confirmed case.
+- **Reorg & finality correctness** rests on a **reorg-free historical backfill by construction**
+  (finalized-only, write-once) plus **mutation-verified unit tests** of the realtime reconciliation
+  logic and **hourly finalized-overlap A/B agreement** — with a reorg below the finalized floor a
+  **deliberate fail-loud**, on the experimental stream path; consolidated in §5.8.
 
 **Pending / not yet claimed:**
 
