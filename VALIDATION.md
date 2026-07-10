@@ -1282,7 +1282,8 @@ item 0.
 This is **genuinely third-party**: the discovered vault set was cross-checked against **Euler's public
 Goldsky subgraphs** (`euler-v2-<net>/latest` and `euler-simple-<net>/latest`), **live-verified
 2026-07-03** ([`harness/euler-multichain/REPORT.md`](harness/euler-multichain/REPORT.md) §Correctness
-item 3). Where a chain is fully active, the discovered vault count matches Euler's own subgraph exactly:
+item 3). On the chains whose Euler subgraph is itself caught up, the discovered vault count matches
+exactly:
 
 | chain | vaults (this indexer) | vs Euler Goldsky subgraph |
 |-------|---------------------:|:--------------------------|
@@ -1290,7 +1291,14 @@ item 3). Where a chain is fully active, the discovered vault count matches Euler
 | polygon | 25 | **25 / 25 ✓** |
 | bob | 27 | **27 / 27 ✓** |
 | tac | 36 | **36 / 36 ✓** |
-| hyperliquid | 58 | **58 / 58 ✓** (subgraph stalled ~4M blocks behind chain tip) |
+
+**hyperliquid — a match, but with a caveat, not a clean one.** At the pinned benchmark head (2026-07-01)
+Euler's then-deployed HyperEVM subgraph reported **zero** vaults; it was **redeployed**, and a live
+re-check on **2026-07-03** reports the same **58** this indexer found — but that redeployed subgraph is
+itself still **stalled ~4M blocks behind the HyperEVM tip** (all 58 predate its indexed head). So the
+58/58 corroboration is real *as of the 2026-07-03 re-check*, but it is **not** the "steady-state
+subgraph agrees" case the four rows above are — it is disclosed here rather than folded into that table
+precisely because a stalled/redeployed third-party source is weaker corroboration than a caught-up one.
 
 The larger-chain gaps are **not missing data** — they resolve to created-after-our-fixed-head plus
 discovered-but-eventless. For ethereum the Portal shows **872** vaults created by our fixed head vs
