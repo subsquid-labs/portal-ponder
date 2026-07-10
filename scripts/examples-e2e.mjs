@@ -161,6 +161,7 @@ async function loadExample(example) {
 
   validateManifest(example, manifest);
   assertCommittedPin(example, manifest, pkg);
+  await assertNoTrackedArtifacts(example);
 
   return { dir, manifest, pkg };
 }
@@ -240,6 +241,51 @@ function ponderDependency(pkg) {
   }
 
   return undefined;
+}
+
+async function assertNoTrackedArtifacts(example) {
+  const result = await runCommand(
+    'git',
+    ['ls-files', '-z', `examples/${example}`],
+    {
+      cwd: ROOT,
+      env: process.env,
+      timeoutMs: 30_000,
+    },
+  );
+  if (result.code !== 0) {
+    throw new HarnessFailure(
+      `${example}: git ls-files failed: ${result.stderr.tail(MAX_TAIL_LINES, redactUrls)}`,
+    );
+  }
+
+  const prefix = `examples/${example}/`;
+  const tracked = result.stdout
+    .text()
+    .split('\0')
+    .filter((path) => path.length > 0);
+  const offending = tracked.filter((path) =>
+    isRegenerableArtifact(path.slice(prefix.length)),
+  );
+  if (offending.length > 0) {
+    throw new HarnessFailure(
+      `${example}: git tracks regenerable artifact(s) that must never be committed: ${offending.join(', ')}; run \`git rm --cached ${offending.join(' ')}\` (they are gitignored regenerables)`,
+    );
+  }
+}
+
+function isRegenerableArtifact(relative) {
+  const segments = relative.split('/');
+  const first = segments[0];
+  if (first === '.ponder') return true;
+
+  if (first === 'generated') return true;
+
+  if (relative === 'ponder-env.d.ts') return true;
+
+  if (relative === 'package-lock.json') return true;
+
+  return false;
 }
 
 function checkLatestPin(example, manifest, pkg, latest) {
