@@ -2,7 +2,10 @@ import assert from 'node:assert/strict';
 import { test } from 'node:test';
 import {
   advanceScenarioCursor,
+  cursorMatchesStep,
   DEFAULT_SCENARIO,
+  encodeLog,
+  eventTopic,
   gatePhaseForBlock,
   hashBlock,
   logsForBlock,
@@ -72,4 +75,79 @@ test('gatePhaseForBlock: gates by killAt block and phase', () => {
 
   assert.equal(gatePhaseForBlock(step, 101), undefined);
   assert.equal(gatePhaseForBlock(step, 102), 'K1-append');
+});
+
+test('eventTopic and encodeLog: derive ABI-correct Euler topics', () => {
+  assert.equal(
+    eventTopic('ProxyCreated'),
+    '0x04e664079117e113faa9684bc14aecb41651cbf098b14eda271248c6d0cda57c',
+  );
+  assert.equal(
+    eventTopic('Deposit'),
+    '0xdcbc1c05240f31ff3ad067ef1ee35ce4997762752e3a095284754544f4c709d7',
+  );
+
+  const proxy = encodeLog(
+    {
+      event: 'ProxyCreated',
+      proxy: '0x1111111111111111111111111111111111111111',
+      transactionHash:
+        '0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',
+    },
+    101,
+  );
+  assert.equal(proxy.topics[0], eventTopic('ProxyCreated'));
+  assert.equal(
+    proxy.topics[1],
+    '0x0000000000000000000000001111111111111111111111111111111111111111',
+  );
+  assert.match(proxy.data, /^0x[0-9a-f]+$/);
+
+  const deposit = encodeLog(
+    {
+      event: 'Deposit',
+      vault: '0x1111111111111111111111111111111111111111',
+      sender: '0x2222222222222222222222222222222222222222',
+      owner: '0x3333333333333333333333333333333333333333',
+      assets: '123456789',
+      shares: '987654321',
+    },
+    102,
+  );
+  assert.equal(deposit.topics[0], eventTopic('Deposit'));
+  assert.equal(deposit.address, '0x1111111111111111111111111111111111111111');
+  assert.equal(deposit.logIndex, 0);
+});
+
+test('cursorMatchesStep: routes redelivery and 409 steps by request cursor', () => {
+  assert.equal(
+    cursorMatchesStep(
+      { type: 'awaitRedelivery', block: 101 },
+      {
+        fromBlock: 101,
+        parentBlockHash: hashBlock(100, 'main'),
+      },
+    ),
+    true,
+  );
+  assert.equal(
+    cursorMatchesStep(
+      { type: 'awaitRedelivery', block: 101 },
+      {
+        fromBlock: 102,
+        parentBlockHash: hashBlock(101, 'main'),
+      },
+    ),
+    false,
+  );
+  assert.equal(
+    cursorMatchesStep(
+      { type: 'status409', block: 105 },
+      {
+        fromBlock: 106,
+        parentBlockHash: hashBlock(105, 'orphan'),
+      },
+    ),
+    true,
+  );
 });

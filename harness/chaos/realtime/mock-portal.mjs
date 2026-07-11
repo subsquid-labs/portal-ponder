@@ -8,7 +8,7 @@ import { appendFileSync, mkdirSync, readFileSync } from 'node:fs';
 import { createServer } from 'node:http';
 import { dirname, resolve } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
-import { keccak256, stringToHex } from 'viem';
+import { encodeAbiParameters, keccak256, stringToHex } from 'viem';
 
 const DEFAULT_PORT = 8701;
 const DEFAULT_HOST = '127.0.0.1';
@@ -16,6 +16,14 @@ const ZERO_HASH = `0x${'00'.repeat(32)}`;
 const ZERO_BLOOM = `0x${'00'.repeat(256)}`;
 const FACTORY =
   process.env.EULER_FACTORY ?? '0x29a56a1b8214D9Cf7c5561811750D5cBDb45CC8e';
+const EVENT_SIGNATURES = {
+  ProxyCreated: 'ProxyCreated(address,bool,address,bytes)',
+  Deposit: 'Deposit(address,address,uint256,uint256)',
+};
+const DEFAULT_CHILD = '0x1111111111111111111111111111111111111111';
+const DEFAULT_SENDER = '0x2222222222222222222222222222222222222222';
+const DEFAULT_OWNER = '0x3333333333333333333333333333333333333333';
+const DEFAULT_IMPLEMENTATION = '0x4444444444444444444444444444444444444444';
 
 export const DEFAULT_SCENARIO = {
   chainId: 1,
@@ -120,6 +128,15 @@ function hexQuantity(number) {
 
 function paddedAddressTopic(address) {
   return `0x${address.toLowerCase().replace(/^0x/, '').padStart(64, '0')}`;
+}
+
+export function eventTopic(name) {
+  const signature = EVENT_SIGNATURES[name];
+  if (signature === undefined) {
+    throw new Error(`unknown mock event: ${name}`);
+  }
+
+  return keccak256(stringToHex(signature));
 }
 
 function deterministicAddress(label) {
@@ -237,15 +254,19 @@ function transactionsForLogs(logs, blockNumber) {
   return out;
 }
 
-function factoryLog(number, child, topic0) {
-  return {
-    address: FACTORY.toLowerCase(),
-    topics: [topic0, paddedAddressTopic(child)],
-    data: '0x',
-    transactionHash: hashBlock(number, `factory-tx:${child}`),
-    transactionIndex: 0,
-    logIndex: 0,
-  };
+function factoryLog(number, child, topic0, opts = {}) {
+  const log = encodeLog(
+    {
+      event: 'ProxyCreated',
+      proxy: child,
+      transactionHash:
+        opts.transactionHash ?? hashBlock(number, `factory-tx:${child}`),
+      logIndex: opts.logIndex ?? 0,
+    },
+    number,
+  );
+
+  return { ...log, topics: [topic0, ...log.topics.slice(1)] };
 }
 
 function matchingFactoryTopic(requests) {
@@ -258,7 +279,7 @@ function matchingFactoryTopic(requests) {
     if (request.topic0?.[0] !== undefined) return request.topic0[0];
   }
 
-  return hashBlock(0, 'ProxyCreated').slice(0, 66);
+  return eventTopic('ProxyCreated');
 }
 
 function logBlockNumber(log) {
@@ -271,6 +292,71 @@ function logBlockNumber(log) {
   return Number(value);
 }
 
+function bigintValue(value, fallback) {
+  if (value === undefined || value === null) return BigInt(fallback);
+  if (typeof value === 'bigint') return value;
+  if (typeof value === 'number') return BigInt(value);
+  return BigInt(value);
+}
+
+function logTransactionHash(log, number) {
+  return (
+    log.transactionHash ??
+    hashBlock(
+      number,
+      `${log.event ?? 'log'}:${log.address ?? ''}:${log.logIndex ?? 0}`,
+    )
+  );
+}
+
+export function encodeLog(log, number) {
+  if (log?.event === undefined) return log;
+
+  const logIndex = Number(log.logIndex ?? 0);
+  const transactionIndex = Number(log.transactionIndex ?? 0);
+  if (log.event === 'ProxyCreated') {
+    const proxy = (log.proxy ?? log.child ?? DEFAULT_CHILD).toLowerCase();
+    return {
+      address: (log.address ?? FACTORY).toLowerCase(),
+      topics: [eventTopic('ProxyCreated'), paddedAddressTopic(proxy)],
+      data: encodeAbiParameters(
+        [{ type: 'bool' }, { type: 'address' }, { type: 'bytes' }],
+        [
+          Boolean(log.upgradeable ?? false),
+          log.implementation ?? DEFAULT_IMPLEMENTATION,
+          log.trailingData ?? '0x',
+        ],
+      ),
+      transactionHash: logTransactionHash(log, number),
+      transactionIndex,
+      logIndex,
+    };
+  }
+  if (log.event === 'Deposit') {
+    const vault = (log.vault ?? log.address ?? DEFAULT_CHILD).toLowerCase();
+    return {
+      address: vault,
+      topics: [
+        eventTopic('Deposit'),
+        paddedAddressTopic(log.sender ?? DEFAULT_SENDER),
+        paddedAddressTopic(log.owner ?? DEFAULT_OWNER),
+      ],
+      data: encodeAbiParameters(
+        [{ type: 'uint256' }, { type: 'uint256' }],
+        [
+          bigintValue(log.assets, 123_456_789n),
+          bigintValue(log.shares, 987_654_321n),
+        ],
+      ),
+      transactionHash: logTransactionHash(log, number),
+      transactionIndex,
+      logIndex,
+    };
+  }
+
+  throw new Error(`unknown mock event: ${log.event}`);
+}
+
 export function logsForBlock(step, number) {
   if (Array.isArray(step?.logs) === false) return [];
 
@@ -280,8 +366,12 @@ export function logsForBlock(step, number) {
       const emitted = { ...log };
       delete emitted.block;
       delete emitted.blockNumber;
-      return emitted;
+      return encodeLog(emitted, number);
     });
+}
+
+function scenarioLogsForBlock(scenario, number) {
+  return scenario.steps.flatMap((step) => logsForBlock(step, number));
 }
 
 export function gatePhaseForBlock(step, number) {
@@ -291,6 +381,59 @@ export function gatePhaseForBlock(step, number) {
   }
 
   return step.killAt.phase;
+}
+
+function phaseForStep(step) {
+  return step?.emitPhase ?? step?.killAt?.phase;
+}
+
+function stepMatchParentHash(step) {
+  const match = step?.match ?? {};
+  if (match.parentBlockHash !== undefined) return match.parentBlockHash;
+  if (step?.parentBlockHash !== undefined) return step.parentBlockHash;
+
+  const parentBlock = match.parentBlock ?? step?.parentBlock;
+  if (parentBlock !== undefined) {
+    return hashBlock(Number(parentBlock), match.parentBranch ?? 'main');
+  }
+  if (step?.type === 'awaitRedelivery') {
+    return hashBlock(Number(step.block) - 1, step.branch ?? 'main');
+  }
+
+  return undefined;
+}
+
+export function cursorMatchesStep(step, body) {
+  if (step === undefined || body === undefined) return false;
+  const cursorTypes = new Set([
+    'awaitRedelivery',
+    'status409',
+    'idle204',
+    'wrongForkFinalize',
+  ]);
+  if (cursorTypes.has(step.type) === false && step.match === undefined) {
+    return false;
+  }
+
+  const match = step.match ?? {};
+  const wantFrom =
+    match.fromBlock ??
+    step.fromBlock ??
+    (step.type === 'awaitRedelivery'
+      ? step.block
+      : step.type === 'status409'
+        ? Number(step.block ?? 0) + 1
+        : undefined);
+  if (wantFrom !== undefined && Number(body.fromBlock) !== Number(wantFrom)) {
+    return false;
+  }
+
+  const wantParent = stepMatchParentHash(step);
+  if (wantParent !== undefined && body.parentBlockHash !== wantParent) {
+    return false;
+  }
+
+  return true;
 }
 
 function blockBatch(number, request, opts = {}) {
@@ -335,6 +478,8 @@ function createRuntime(initialScenario, options = {}) {
     r409: 0,
     phases: {},
     redeliveryReopens: 0,
+    finalizedHeadGates: 0,
+    wrongForkFinalizes: 0,
     requestLog: [],
   };
   const phaseLog = options.phaseLog;
@@ -402,6 +547,8 @@ function createRuntime(initialScenario, options = {}) {
     stats.r409 = 0;
     stats.phases = {};
     stats.redeliveryReopens = 0;
+    stats.finalizedHeadGates = 0;
+    stats.wrongForkFinalizes = 0;
     stats.requestLog = [];
   };
 
@@ -430,6 +577,20 @@ function createRuntime(initialScenario, options = {}) {
       scenario.finalizedHeadSeq[
         Math.min(finalizedIndex, scenario.finalizedHeadSeq.length - 1)
       ] ?? scenario.finalizedHeadSeq[0];
+    const phase = gatePhaseForBlock(scenario, head.number);
+    if (phase !== undefined) {
+      stats.finalizedHeadGates += 1;
+      const open = await gate(
+        phase,
+        {
+          route: 'finalized-head',
+          head,
+          finalizedIndex,
+        },
+        res,
+      );
+      if (open === false) return;
+    }
     if (finalizedIndex < scenario.finalizedHeadSeq.length - 1) {
       finalizedIndex += 1;
     }
@@ -453,19 +614,43 @@ function createRuntime(initialScenario, options = {}) {
 
     res.writeHead(200, { 'content-type': 'application/x-ndjson' });
     for (let number = from; number <= to; number++) {
-      writeNdjson(res, blockBatch(number, body));
+      writeNdjson(
+        res,
+        blockBatch(number, body, {
+          logs: scenarioLogsForBlock(scenario, number),
+        }),
+      );
     }
     stats.r200 += 1;
     res.end();
   };
 
+  const previousBlocksForStep = (step, body) => {
+    if (Array.isArray(step.previousBlocks)) {
+      return step.previousBlocks.map((block) => ({
+        number: Number(block.number),
+        hash: block.hash ?? hashBlock(Number(block.number), 'main'),
+      }));
+    }
+
+    const last = Number(step.block ?? Number(body.fromBlock ?? 1) - 1);
+    const first = Number(step.floor ?? scenario.genesis.number);
+    const out = [];
+    for (let number = last; number >= first; number--) {
+      out.push({ number, hash: hashBlock(number, step.branch ?? 'main') });
+    }
+
+    return out;
+  };
+
   const handleStatus409 = async (step, body, res) => {
-    const phase = step.emitPhase;
+    const phase = phaseForStep(step);
     if (phase !== undefined) {
       const open = await gate(
         phase,
         {
           stepIndex,
+          block: step.block,
           fromBlock: body.fromBlock,
           parentBlockHash: body.parentBlockHash,
         },
@@ -475,16 +660,19 @@ function createRuntime(initialScenario, options = {}) {
     }
     stats.r409 += 1;
     res.writeHead(409, { 'content-type': 'application/json' });
-    res.end(JSON.stringify({ previousBlocks: step.previousBlocks ?? [] }));
+    res.end(
+      JSON.stringify({ previousBlocks: previousBlocksForStep(step, body) }),
+    );
     stepIndex += 1;
   };
 
   const handleIdle204 = async (step, body, res) => {
-    if (step.emitPhase !== undefined) {
+    if (phaseForStep(step) !== undefined) {
       const open = await gate(
-        step.emitPhase,
+        phaseForStep(step),
         {
           stepIndex,
+          block: step.killAt?.block ?? step.block,
           fromBlock: body.fromBlock,
           parentBlockHash: body.parentBlockHash,
         },
@@ -501,6 +689,7 @@ function createRuntime(initialScenario, options = {}) {
   const handleBlocks = async (step, body, res) => {
     const requestFrom = Number(body?.fromBlock ?? streamCursor + 1);
     streamCursor = requestFrom - 1;
+    const firstNumber = streamCursor + 1;
 
     res.writeHead(200, { 'content-type': 'application/x-ndjson' });
     const count = Math.max(0, Number(step.count ?? 0));
@@ -522,9 +711,17 @@ function createRuntime(initialScenario, options = {}) {
         if (open === false) return;
       }
 
+      const branchId = step.branch ?? step.branchId ?? 'main';
+      const parentBranchId =
+        number === firstNumber && step.parentBranch !== undefined
+          ? step.parentBranch
+          : branchId;
       writeNdjson(
         res,
-        blockBatch(number, body, { logs: logsForBlock(step, number) }),
+        blockBatch(number, body, {
+          header: headerFor(number, branchId, parentBranchId),
+          logs: logsForBlock(step, number),
+        }),
       );
       streamCursor = number;
     }
@@ -537,7 +734,7 @@ function createRuntime(initialScenario, options = {}) {
     const number = Number(step.block);
     const child = step.child ?? deterministicAddress(`child:${number}`);
     const topic0 = matchingFactoryTopic(body.logs);
-    const log = factoryLog(number, child, topic0);
+    const log = factoryLog(number, child, topic0, step);
     const header = headerFor(number, 'main');
     streamCursor = number;
     res.writeHead(200, { 'content-type': 'application/x-ndjson' });
@@ -561,9 +758,9 @@ function createRuntime(initialScenario, options = {}) {
       return;
     }
 
-    if (step.emitPhase !== undefined) {
+    if (phaseForStep(step) !== undefined) {
       const open = await gate(
-        step.emitPhase,
+        phaseForStep(step),
         {
           stepIndex,
           fromBlock: body.fromBlock,
@@ -575,7 +772,11 @@ function createRuntime(initialScenario, options = {}) {
       if (open === false) return;
     }
     res.writeHead(200, { 'content-type': 'application/x-ndjson' });
-    writeNdjson(res, blockBatch(block, body));
+    writeNdjson(
+      res,
+      blockBatch(block, body, { logs: logsForBlock(step, block) }),
+    );
+    streamCursor = block;
     stats.r200 += 1;
     stepIndex += 1;
     res.end();
@@ -599,19 +800,36 @@ function createRuntime(initialScenario, options = {}) {
 
   const handleWrongForkFinalize = async (step, body, res) => {
     const number = Number(step.block);
+    stats.wrongForkFinalizes += 1;
+    if (phaseForStep(step) !== undefined) {
+      const open = await gate(
+        phaseForStep(step),
+        {
+          stepIndex,
+          block: number,
+          fromBlock: body.fromBlock,
+          parentBlockHash: body.parentBlockHash,
+        },
+        res,
+      );
+      if (open === false) return;
+    }
     scenario.finalizedHeadSeq.splice(finalizedIndex, 0, {
       number,
-      hash: step.canonicalHash ?? hashBlock(number, 'wrong-fork'),
+      hash: step.hash ?? step.canonicalHash ?? hashBlock(number, 'wrong-fork'),
     });
-    if (step.emitPhase !== undefined) {
-      setPhase(step.emitPhase, false, { stepIndex, block: number });
-    }
     stepIndex += 1;
     await stream(body, res);
   };
 
   const stream = async (body, res) => {
     recordRequest('stream', body);
+    const cursorStepIndex = scenario.steps.findIndex(
+      (step, index) => index >= stepIndex && cursorMatchesStep(step, body),
+    );
+    if (cursorStepIndex >= 0) {
+      stepIndex = cursorStepIndex;
+    }
     const step = scenario.steps[stepIndex];
     if (step === undefined) {
       stats.r204 += 1;
