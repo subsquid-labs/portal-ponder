@@ -5,12 +5,15 @@ import { EVaultAbi } from './abis/EVault';
 const proxyCreated = parseAbiItem(
   'event ProxyCreated(address indexed proxy, bool upgradeable, address implementation, bytes trailingData)',
 );
+const eVaultFactoryAbi = [proxyCreated] as const;
 
 const mockPortal = process.env.PORTAL_URL_1 ?? 'http://127.0.0.1:8701';
 const rpc =
   process.env.PONDER_RPC_URL_1 === 'mock'
     ? `${mockPortal.replace(/\/$/, '')}/rpc`
     : process.env.PONDER_RPC_URL_1;
+const factoryAddress = (process.env.EULER_FACTORY ??
+  '0x29a56a1b8214D9Cf7c5561811750D5cBDb45CC8e') as `0x${string}`;
 
 export default createConfig({
   database:
@@ -32,12 +35,20 @@ export default createConfig({
     },
   },
   contracts: {
+    EVaultFactory: {
+      abi: eVaultFactoryAbi,
+      chain: 'mainnet',
+      address: factoryAddress,
+      startBlock: Number(process.env.PONDER_START ?? 100),
+      endBlock: process.env.PONDER_END
+        ? Number(process.env.PONDER_END)
+        : undefined,
+    },
     EVault: {
       abi: EVaultAbi,
       chain: 'mainnet',
       address: factory({
-        address: (process.env.EULER_FACTORY ??
-          '0x29a56a1b8214D9Cf7c5561811750D5cBDb45CC8e') as `0x${string}`,
+        address: factoryAddress,
         event: proxyCreated,
         parameter: 'proxy',
       }),

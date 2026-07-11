@@ -3,7 +3,9 @@ import { test } from 'node:test';
 import {
   advanceScenarioCursor,
   DEFAULT_SCENARIO,
+  gatePhaseForBlock,
   hashBlock,
+  logsForBlock,
   mergeScenario,
   normalizeScenario,
 } from './mock-portal.mjs';
@@ -51,4 +53,23 @@ test('normalizeScenario: fills deterministic genesis and finalized-head hashes',
   assert.equal(scenario.genesis.hash, hashBlock(12, 'main'));
   assert.equal(scenario.genesis.parentHash, hashBlock(11, 'main'));
   assert.equal(scenario.finalizedHeadSeq[0].hash, hashBlock(12, 'main'));
+});
+
+test('logsForBlock: filters scenario logs and strips fixture-only block fields', () => {
+  const step = {
+    logs: [
+      { block: 101, address: '0x1', logIndex: 0 },
+      { blockNumber: '0x66', address: '0x2', logIndex: 1 },
+      { block: 103, address: '0x3', logIndex: 2 },
+    ],
+  };
+
+  assert.deepEqual(logsForBlock(step, 102), [{ address: '0x2', logIndex: 1 }]);
+});
+
+test('gatePhaseForBlock: gates by killAt block and phase', () => {
+  const step = { killAt: { block: 102, phase: 'K1-append' } };
+
+  assert.equal(gatePhaseForBlock(step, 101), undefined);
+  assert.equal(gatePhaseForBlock(step, 102), 'K1-append');
 });

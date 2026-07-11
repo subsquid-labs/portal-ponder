@@ -119,7 +119,6 @@ wait_complete () {
       return 2
     fi
     if completed "$log_file"; then return 0; fi
-    if completed_live "$log_file"; then return 0; fi
     if ! kill -0 "$pid" 2>/dev/null; then
       log "fatal: app exited before completion; tail follows"
       tail -80 "$log_file" || true
@@ -155,6 +154,8 @@ prepare_app () {
   local app="$WORK/euler-app"
   cp -R "$ROOT/harness/diff/euler-app" "$app"
   cp "$ROOT/harness/diff/euler-app/euler-app.stream.ts" "$app/ponder.config.ts"
+  cp "$ROOT/harness/chaos/realtime/euler-app-stream/ponder.schema.ts" "$app/ponder.schema.ts"
+  cp -R "$ROOT/harness/chaos/realtime/euler-app-stream/src/." "$app/src/"
   APP_DIR="$app" CORE_DIR="$core" node - <<'NODE'
 const fs = require('node:fs');
 const path = require('node:path');
@@ -253,17 +254,18 @@ digest_app () {
   ( cd "$app" && node "$CDIR/app-digest.mjs" "$url" --schema "$APP_SCHEMA" )
 }
 
-run_baseline () {
+run_baseline_once () {
   local app="$1"
-  local db="rg3_phasea_baseline_$$"
+  local label="$2"
+  local db="rg3_phasea_${label}_$$"
   local url="postgres://postgres@127.0.0.1:$PGPORT/$db"
-  local dir="$RUN_ROOT/baseline"
+  local dir="$RUN_ROOT/$label"
   mkdir -p "$dir"
   drop_create_db "$db" || return 1
   start_mock "$dir/phase.log" "$dir/mock.log" || return 1
   start_app "$app" "$url" "$dir/app.log"
   wait_phase "$TARGET_PHASE" || {
-    log "fatal: baseline did not reach $TARGET_PHASE"
+    log "fatal: $label did not reach $TARGET_PHASE"
     return 1
   }
   curl_json POST /__release "{\"phase\":\"$TARGET_PHASE\"}" >/dev/null || return 1
@@ -275,10 +277,34 @@ run_baseline () {
   local store app_digest
   store="$(digest_store "$app" "$url")" || return 1
   app_digest="$(digest_app "$app" "$url")" || return 1
-  printf '%s\n' "$store" > "$BASE_DIR/k1-append.store.digest"
-  printf '%s\n' "$app_digest" > "$BASE_DIR/k1-append.app.digest"
-  log "baseline store digest $store"
-  log "baseline app digest $app_digest"
+  printf '%s\n' "$store" > "$dir/store.digest"
+  printf '%s\n' "$app_digest" > "$dir/app.digest"
+  log "$label store digest $store"
+  log "$label app digest $app_digest"
+}
+
+run_baseline () {
+  local app="$1"
+  run_baseline_once "$app" baseline_a || return 1
+  run_baseline_once "$app" baseline_b || return 1
+
+  local store_a store_b app_a app_b
+  store_a="$(cat "$RUN_ROOT/baseline_a/store.digest")"
+  store_b="$(cat "$RUN_ROOT/baseline_b/store.digest")"
+  app_a="$(cat "$RUN_ROOT/baseline_a/app.digest")"
+  app_b="$(cat "$RUN_ROOT/baseline_b/app.digest")"
+
+  if [ "$store_a" != "$store_b" ] || [ "$app_a" != "$app_b" ]; then
+    log "fatal: unkilled determinism failed"
+    log "baseline_a store=$store_a app=$app_a"
+    log "baseline_b store=$store_b app=$app_b"
+    return 1
+  fi
+
+  printf '%s\n' "$store_a" > "$BASE_DIR/k1-append.store.digest"
+  printf '%s\n' "$app_a" > "$BASE_DIR/k1-append.app.digest"
+  log "unkilled fidelity (idempotence) gate PASS: store=$store_a app=$app_a"
+  log "determinism app digest stable across two unkilled runs: $app_a"
 }
 
 run_kill_resume () {

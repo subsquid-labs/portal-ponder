@@ -24,7 +24,9 @@ export const DEFAULT_SCENARIO = {
     timestamp: 1_700_000_000,
   },
   finalizedHeadSeq: [{ number: 100 }],
-  steps: [{ type: 'blocks', count: 12, emitPhase: 'K1-append' }],
+  steps: [
+    { type: 'blocks', count: 12, killAt: { block: 102, phase: 'K1-append' } },
+  ],
 };
 
 const isPlainObject = (value) =>
@@ -259,6 +261,38 @@ function matchingFactoryTopic(requests) {
   return hashBlock(0, 'ProxyCreated').slice(0, 66);
 }
 
+function logBlockNumber(log) {
+  const value = log.block ?? log.blockNumber;
+  if (value === undefined) return undefined;
+  if (typeof value === 'string' && value.startsWith('0x')) {
+    return Number.parseInt(value, 16);
+  }
+
+  return Number(value);
+}
+
+export function logsForBlock(step, number) {
+  if (Array.isArray(step?.logs) === false) return [];
+
+  return step.logs
+    .filter((log) => logBlockNumber(log) === number)
+    .map((log) => {
+      const emitted = { ...log };
+      delete emitted.block;
+      delete emitted.blockNumber;
+      return emitted;
+    });
+}
+
+export function gatePhaseForBlock(step, number) {
+  if (step?.killAt?.phase === undefined) return undefined;
+  if (logBlockNumber({ block: step.killAt.block }) !== number) {
+    return undefined;
+  }
+
+  return step.killAt.phase;
+}
+
 function blockBatch(number, request, opts = {}) {
   const header = opts.header ?? headerFor(number, opts.branchId ?? 'main');
   const rawLogs = opts.logs ?? [];
@@ -472,16 +506,14 @@ function createRuntime(initialScenario, options = {}) {
     const count = Math.max(0, Number(step.count ?? 0));
     for (let i = 0; i < count; i++) {
       const number = streamCursor + 1;
-      writeNdjson(res, blockBatch(number, body));
-      streamCursor = number;
-
-      if (step.emitPhase !== undefined && i === 0 && i < count - 1) {
+      const phase = gatePhaseForBlock(step, number);
+      if (phase !== undefined) {
         const open = await gate(
-          step.emitPhase,
+          phase,
           {
             stepIndex,
-            afterBlock: number,
-            nextBlock: number + 1,
+            afterBlock: number - 1,
+            nextBlock: number,
             fromBlock: body.fromBlock,
             parentBlockHash: body.parentBlockHash,
           },
@@ -489,6 +521,12 @@ function createRuntime(initialScenario, options = {}) {
         );
         if (open === false) return;
       }
+
+      writeNdjson(
+        res,
+        blockBatch(number, body, { logs: logsForBlock(step, number) }),
+      );
+      streamCursor = number;
     }
     stepIndex += 1;
     stats.r200 += 1;
