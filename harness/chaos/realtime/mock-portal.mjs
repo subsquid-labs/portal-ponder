@@ -463,8 +463,8 @@ function writeNdjson(res, batch) {
   res.write(`${JSON.stringify(batch)}\n`);
 }
 
-function streamTurnDelay() {
-  return new Promise((resolve) => setTimeout(resolve, 10));
+function streamTurnDelay(ms = 10) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
 function createRuntime(initialScenario, options = {}) {
@@ -472,6 +472,7 @@ function createRuntime(initialScenario, options = {}) {
   let stepIndex = 0;
   let streamCursor = scenario.genesis.number;
   let finalizedIndex = 0;
+  let resumeMode = false;
   let seq = 0;
   let currentPhase = {
     name: 'idle',
@@ -539,9 +540,10 @@ function createRuntime(initialScenario, options = {}) {
     for (const resolveGate of waiters) resolveGate();
   };
 
-  const reset = () => {
+  const reset = (opts = {}) => {
     stepIndex = 0;
     streamCursor = scenario.genesis.number;
+    resumeMode = opts.resume === true;
     finalizedIndex = 0;
     for (const name of releaseWaiters.keys()) release(name);
     currentPhase = {
@@ -584,6 +586,13 @@ function createRuntime(initialScenario, options = {}) {
       logs: Array.isArray(body?.logs) ? body.logs.length : undefined,
     });
   };
+
+  const turnDelayForStep = (step) =>
+    Number(
+      resumeMode
+        ? (step.resumeTurnDelayMs ?? step.turnDelayMs ?? 10)
+        : (step.turnDelayMs ?? 10),
+    );
 
   const finalizedHead = async (res) => {
     recordRequest('finalizedHead');
@@ -744,7 +753,7 @@ function createRuntime(initialScenario, options = {}) {
         }),
       );
       streamCursor = number;
-      await streamTurnDelay();
+      await streamTurnDelay(turnDelayForStep(step));
       if (res.destroyed || res.writableEnded) return;
     }
     stepIndex += 1;
@@ -989,7 +998,7 @@ export async function main() {
         return;
       }
       if (req.method === 'POST' && url.pathname === '/__reset') {
-        runtime.reset();
+        runtime.reset({ resume: true });
         json(res, 200, { ok: true });
         return;
       }
