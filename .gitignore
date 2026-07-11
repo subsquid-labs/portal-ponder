@@ -1,6 +1,7 @@
 node_modules/
 harness/results.*.json
 harness/bench/results.md
+harness/chaos/.faultproxy/
 harness/euler/vaults.*.json
 *.log
 .DS_Store

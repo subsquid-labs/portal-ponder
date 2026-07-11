@@ -1,0 +1,4 @@
+{
+  "head": { "mode": "passthrough" },
+  "faults": { "p429": 0.05, "retryAfter": 5 }
+}
