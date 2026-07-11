@@ -477,6 +477,7 @@ for (const klass of classes) {
   const ok = rows.filter((r) => r.status === 'ok');
   const digestMatch = ok.filter((r) => r.verify?.storeMatch && r.verify?.appMatch);
   const dupCount = ok.reduce((n, r) => n + Number(r.verify?.duplicateFinalizedRows ?? 0), 0);
+  const finalizedScannedRows = ok.reduce((n, r) => n + Number(r.verify?.finalizedScannedRows ?? 0), 0);
   const stats = ok.reduce((acc, r) => {
     const s = r.stats ?? {};
     acc.r204 += Number(s.r204 ?? 0);
@@ -494,6 +495,7 @@ for (const klass of classes) {
     cleanResumeCount: ok.length,
     digestMatchCount: digestMatch.length,
     duplicateFinalizedRows: dupCount,
+    finalizedScannedRows,
     fidelity: labels[klass],
     candor: candor[klass],
     handlerStats: stats,
@@ -509,10 +511,13 @@ const totals = Object.values(perClass).reduce((acc, c) => {
   acc.cleanResumeCount += c.cleanResumeCount;
   acc.digestMatchCount += c.digestMatchCount;
   acc.duplicateFinalizedRows += c.duplicateFinalizedRows;
+  acc.finalizedScannedRows += c.finalizedScannedRows;
   return acc;
-}, { killCount: 0, cleanResumeCount: 0, digestMatchCount: 0, duplicateFinalizedRows: 0 });
+}, { killCount: 0, cleanResumeCount: 0, digestMatchCount: 0, duplicateFinalizedRows: 0, finalizedScannedRows: 0 });
 const targetTotal = Number(process.env.TARGET_TOTAL);
 const minPerClass = Number(process.env.MIN_PER_CLASS);
+const isDupCheckExempt = (klass) => /^K[16]/i.test(klass);
+const loadBearingClasses = classes.filter((klass) => !isDupCheckExempt(klass));
 const acceptance = {
   targetTotal,
   minPerClass,
@@ -522,7 +527,14 @@ const acceptance = {
   cleanResumeOk: totals.killCount > 0 && totals.cleanResumeCount === totals.killCount,
   digestMatchOk: totals.killCount > 0 && totals.digestMatchCount === totals.killCount,
   duplicateFinalizedRowsOk: totals.duplicateFinalizedRows === 0,
+  dupCheckLoadBearingOk: loadBearingClasses.every((klass) => perClass[klass].finalizedScannedRows > 0),
 };
+acceptance.accepted = acceptance.totalKillsOk
+  && acceptance.perClassKillsOk
+  && acceptance.cleanResumeOk
+  && acceptance.digestMatchOk
+  && acceptance.duplicateFinalizedRowsOk
+  && acceptance.dupCheckLoadBearingOk;
 const summary = {
   generatedAt: new Date().toISOString(),
   runRoot: process.env.RUN_ROOT,
@@ -543,6 +555,7 @@ md.push(`- kills: ${totals.killCount} / target ${targetTotal}`);
 md.push(`- clean resumes: ${totals.cleanResumeCount} / ${totals.killCount}`);
 md.push(`- digest matches: ${totals.digestMatchCount} / ${totals.killCount}`);
 md.push(`- duplicate FINALIZED rows: ${totals.duplicateFinalizedRows}`);
+md.push(`- dup-check load-bearing (K2-K5 scanned finalized rows): ${acceptance.dupCheckLoadBearingOk}`);
 md.push(`- per-class minimum: ${minPerClass}`);
 md.push('');
 md.push('## Classes');
@@ -557,6 +570,7 @@ for (const klass of classes) {
   md.push(`- clean resumes: ${c.cleanResumeCount}`);
   md.push(`- digest matches: ${c.digestMatchCount}`);
   md.push(`- duplicate FINALIZED rows: ${c.duplicateFinalizedRows}`);
+  md.push(`- finalized rows scanned: ${c.finalizedScannedRows}`);
   md.push(`- handler stats: ${JSON.stringify(c.handlerStats)}`);
   md.push(`- fidelity: ${c.fidelity} — ${c.candor}`);
   if (c.failures.length > 0) md.push(`- failures: ${JSON.stringify(c.failures)}`);

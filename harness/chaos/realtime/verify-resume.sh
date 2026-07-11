@@ -142,10 +142,19 @@ select string_agg(format('%I', table_name), ',')
 )"
 
 dup_rows=""
+finalized_scanned=0
 if [ -n "$dupes" ] && [ -n "$finalized_hi" ] && [ "$finalized_hi" != "-1" ]; then
   echo "  ✓ scanned double-indexed tables: $dupes"
   IFS=',' read -r -a tables <<< "$dupes"
   for table in "${tables[@]}"; do
+    scanned="$(
+      "$PSQL" -Atqc "
+select count(*)
+  from \"$APP_SCHEMA\".$table
+ where block_number <= $finalized_hi;
+" "$CONN" 2>/dev/null
+    )"
+    finalized_scanned=$(( finalized_scanned + ${scanned:-0} ))
     rows="$(
       "$PSQL" -Atqc "
 select '$table', block_number, log_index, count(*)
@@ -164,6 +173,7 @@ else
   echo "  ✗ no double-indexed app tables scanned"
   fail=1
 fi
+echo "  · finalized-region rows scanned for dup: $finalized_scanned"
 
 if [ -n "$dup_rows" ]; then
   dup_count="$(printf '%s\n' "$dup_rows" | sed '/^[[:space:]]*$/d' | wc -l | tr -d ' ')"
@@ -183,6 +193,7 @@ if [ -n "${VERIFY_FACTS:-}" ]; then
   VERIFY_EMPTY_TRIPWIRE_OK="$empty_tripwire_ok" \
   VERIFY_ROWS_OK="$rows_ok" \
   VERIFY_FINALIZED_HI="${finalized_hi:-}" \
+  VERIFY_FINALIZED_SCANNED="$finalized_scanned" \
   VERIFY_DUP_COUNT="$dup_count" \
   VERIFY_STORE_DIGEST="${store_digest:-}" \
   VERIFY_APP_DIGEST="${app_digest:-}" \
@@ -198,6 +209,7 @@ const facts = {
   finalizedHead: process.env.VERIFY_FINALIZED_HI === ''
     ? null
     : Number(process.env.VERIFY_FINALIZED_HI),
+  finalizedScannedRows: Number(process.env.VERIFY_FINALIZED_SCANNED || '0'),
   duplicateFinalizedRows: Number(process.env.VERIFY_DUP_COUNT || '0'),
   storeDigest: process.env.VERIFY_STORE_DIGEST || null,
   appDigest: process.env.VERIFY_APP_DIGEST || null,
