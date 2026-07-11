@@ -684,3 +684,116 @@ test('INV-20 (d): an inheriting child of an ancestor that has an error but NO re
   expect(frames.get('0').error).toBe('execution reverted'); // inherited the ancestor's error
   expect(frames.get('0').revertReason).toBeUndefined(); // and its undefined revertReason, unconditionally
 });
+
+// ── INV-21: root-frame gas parity (byte-identity with the stock-ponder RPC path) ─────────────────────
+//
+// The RPC path stores geth callTracer's top-frame `gas`, which is the transaction's FULL gasLimit. Portal
+// serves Parity-style traces whose ROOT `action.gas` is gasLimit MINUS the EIP-2028 intrinsic (21000 base +
+// 16/nonzero + 4/zero calldata byte, + access-list + creation costs). The diff-harness surfaced exactly
+// this: 133/133 divergences were gas-only, at the root frame (traceAddress []), with gas_used byte-identical
+// and RPC.gas − Portal.gas == the tx's intrinsic — and on every root frame RPC.gas == the tx gasLimit
+// UNCONDITIONALLY (grounded on a real captured Portal-vs-RPC store diff, eth mainnet). So `buildTraces`
+// overrides the root frame's gas with the parent tx's gasLimit to make the Portal store byte-identical to
+// the stock RPC realtime path (intra-deployment determinism — a fork DB is Portal-backfill + stock-RPC-
+// realtime and must be uniformly ponder-shaped). Non-root frames already match and are left untouched.
+//
+// ORACLE: the expected root gas comes from the REAL RPC-store top-frame value (== the tx's real gasLimit)
+// captured for a real eth-mainnet tx (block 19068568, tx index 7 — a Uniswap V2 router swap); the pre-fix
+// Portal `action.gas` (gasLimit − intrinsic) and the real non-root child gas are captured verbatim too. The
+// fixture is a real Portal Parity-flat block, not synthetic.
+const gasFixture = JSON.parse(
+  readFileSync(join(__dirname, '__fixtures__', 'trace-root-gas.json'), 'utf8'),
+);
+
+// a trace filter matching the fixture tx's `to` (the router) so both the root and its child frame are kept.
+const rootGasTraceFilter: any = {
+  type: 'trace',
+  chainId: 1,
+  sourceId: 'g',
+  fromAddress: undefined,
+  toAddress: gasFixture.oracle.toAddr,
+  functionSelector: undefined,
+  callType: undefined,
+  includeReverted: false,
+  fromBlock: 0,
+  toBlock: 1_000_000_000,
+  hasTransactionReceipt: false,
+  include: [],
+};
+
+const assembleGasFixture = (block: any) => {
+  const cd = createChunkData();
+  const bn = Number(block.header.number);
+  cd.traceBlocks.set(bn, {
+    header: block.header,
+    traces: block.traces,
+    txs: block.transactions,
+  });
+  const spec = compileFetchSpec([{ filter: rootGasTraceFilter }], new Map());
+  return assembleRange([cd], [bn, bn], spec, new Map());
+};
+
+// frame at a given traceAddress from an assembled range (matches by the input suffix we carry through).
+const frameGasByAddr = (out: any) => {
+  const m = new Map<string, string>();
+  for (const t of out.traces) {
+    const f = t.trace.trace;
+    m.set(String(f.index), f.gas as string);
+  }
+  return m;
+};
+
+test('INV-21: real diff-root tx — the root frame carries the tx gasLimit (oracle: RPC store), non-root untouched', () => {
+  const { oracle } = gasFixture;
+  // Sanity that the fixture pins the real production signature: the pre-fix Portal action.gas is the
+  // intrinsic-reduced value, and it DIFFERS from the tx gasLimit (else the test proves nothing), while the
+  // RPC store's root gas equals the tx gasLimit and the non-root child already matches.
+  expect(oracle.rootPortalActionGas).not.toBe(oracle.txGasLimit); // Parity action.gas ≠ gasLimit
+  expect(oracle.rootRpcGas).toBe(oracle.txGasLimit); // geth top-frame gas == gasLimit
+  expect(oracle.childPortalGas).toBe(oracle.childRpcGas); // non-root already byte-identical
+
+  const out = assembleGasFixture(gasFixture.block);
+  expect(out.traces).toHaveLength(2); // root + child both matched the router filter
+
+  const gasByIndex = frameGasByAddr(out);
+  // index 0 = the DFS-first (root) frame, index 1 = its child (INV-5 ranking).
+  const rootGas = gasByIndex.get('0');
+  const childGas = gasByIndex.get('1');
+
+  // THE FIX: the stored root gas equals the tx gasLimit (== the RPC store's top-frame gas), NOT Portal's
+  // intrinsic-reduced action.gas.
+  expect(rootGas).toBe(oracle.rootRpcGas);
+  expect(rootGas).toBe(oracle.txGasLimit);
+  expect(rootGas).not.toBe(oracle.rootPortalActionGas); // MUTATION SENTINEL: the OLD `a.gas ?? t.callGas`
+  // mapping (Parity action.gas at root) fails here — revert the buildTraces override and this line breaks.
+
+  // Non-root child is UNTOUCHED — its stored gas is still Portal's action.gas (which already matches RPC).
+  expect(childGas).toBe(oracle.childPortalGas);
+  expect(childGas).toBe(oracle.childRpcGas);
+});
+
+test('INV-21 (a): an already-matching root (Portal action.gas == gasLimit) is unchanged — idempotent', () => {
+  // A root whose Parity action.gas HAPPENS to equal the tx gasLimit (31/164 root frames in the grounded
+  // window): the override sets gas := gasLimit, i.e. the same value — a no-op. Prove it stays byte-equal.
+  const block = structuredClone(gasFixture.block);
+  const gl = gasFixture.oracle.txGasLimit;
+  block.traces = [block.traces[0]]; // root only
+  block.traces[0].action.gas = gl; // Portal already served the full gasLimit
+  const out = assembleGasFixture(block);
+  expect(out.traces).toHaveLength(1);
+  expect(out.traces[0].trace.trace.gas).toBe(gl);
+});
+
+test('INV-21 (b): a rootless trace chunk (only a deep frame, its root not in this chunk) is NOT rewritten', () => {
+  // The override is keyed on traceAddress.length === 0, NOT on the DFS rank — so a chunk holding only a deep
+  // frame (traceAddress [0], which sorts FIRST here and gets DFS index 0) must keep its own action.gas, never
+  // the tx gasLimit. This guards against a rank-based root heuristic silently corrupting a partial tree.
+  const block = structuredClone(gasFixture.block);
+  const child = block.traces[1]; // the traceAddress:[0] frame
+  block.traces = [child]; // root [] absent from this chunk
+  const out = assembleGasFixture(block);
+  expect(out.traces).toHaveLength(1);
+  // gas stays the child's own action.gas; NOT overwritten to the tx gasLimit.
+  expect(out.traces[0].trace.trace.gas).toBe(gasFixture.oracle.childPortalGas);
+  expect(out.traces[0].trace.trace.gas).not.toBe(gasFixture.oracle.txGasLimit);
+});

@@ -78,7 +78,11 @@ type CallFrame = {
   to?: string;
   type: string;
 } & Record<string, unknown>;
-export type RankedTrace = { frame: CallFrame; index: number };
+export type RankedTrace = {
+  frame: CallFrame;
+  index: number;
+  traceAddress: number[];
+};
 
 /**
  * INV-20 (ancestor-error cascade): reproduce stock ponder's derived trace-error normalization so the
@@ -164,7 +168,7 @@ export function rankTraces(traces: RawTrace[]): RankedTrace[] {
       frame.error = cascaded.error;
       frame.revertReason = cascaded.revertReason;
     }
-    out.push({ frame, index: i });
+    out.push({ frame, index: i, traceAddress: t.traceAddress ?? [] });
   });
 
   return out;
@@ -343,7 +347,22 @@ const buildTraces = (
     }
     for (const [txIndex, traces] of byTx) {
       const rawTx = txByIdx.get(txIndex);
-      for (const { frame } of rankTraces(traces)) {
+      for (const { frame, traceAddress } of rankTraces(traces)) {
+        // INV-21 (root-frame gas parity): the RPC path stores geth callTracer's top-frame `gas`, which is
+        // the transaction's FULL gasLimit. Portal serves Parity-style traces whose root `action.gas` is
+        // gasLimit MINUS the EIP-2028 intrinsic (the delta the diff-harness surfaced: gas-only, at the root
+        // frame, gas_used byte-identical). geth puts full tx.gasLimit on the top frame UNCONDITIONALLY (call/
+        // create/any tx type — no intrinsic math), so override the root frame's gas with the parent tx's
+        // gasLimit to make the Portal store byte-identical to the RPC realtime path (intra-deployment
+        // determinism — a fork DB is Portal-backfill + stock-RPC-realtime and must be uniformly ponder-shaped).
+        // Keyed on `traceAddress.length === 0` (the top-level trace), NOT the DFS rank — a chunk can hold only
+        // deep frames. Non-root frames already match the RPC path, so they are left untouched. Skipped when the
+        // parent tx is absent (never poison the store with an undefined gas). Applied HERE, not in
+        // parityToCallFrame, so the shared trace matcher (buildRawTraceMatcher) is unaffected.
+        if (traceAddress.length === 0 && rawTx?.gas !== undefined) {
+          frame.gas = hx(rawTx.gas);
+        }
+
         if (!matchers.traceMatched(frame, bn)) continue;
         if (rawTx) onReceipt?.(rawTx, tb.header); // FIX 4: receipt for the matched trace's tx
         out.push({
