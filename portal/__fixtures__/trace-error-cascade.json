@@ -1,0 +1,386 @@
+{
+  "source": "geth callTracer, eth mainnet block 20351061, tx index 26 (0x...) \u2014 real reverted V3-router swap",
+  "note": "Parity-flat RawTrace shape derived from geth callTracer output; per-frame error/revertReason preserved verbatim (Portal input shape). Ground-truth RPC-store output: whole reverted subtree carries error=execution reverted / revertReason=Too little received.",
+  "traces": [
+    {
+      "transactionIndex": 26,
+      "traceAddress": [],
+      "type": "call",
+      "subtraces": 1,
+      "action": {
+        "from": "0xc24d30475eca133302192b502085a3cc124b0b9b",
+        "to": "0x364e94a1bf09fc6498e979e7715bb13fa6e9f807",
+        "value": "0x0",
+        "gas": "0x13dcc7",
+        "input": "0x3043891e9f00986f265b6e82f121df3d30cfaeb42196abd76cc1f4d6bdaff37b8b28b9bd00000000000000000000000000000000000000000000000000000000000000400000000000000000000000000000000000000000000000000000000000000140cd061d39302e34dc5e4ba4d9f61202dc632cc9e39c1988dc413ea3cbd8398e6e48e3c44dccb879417a16a6c0dd422259c0e0d9e00f93dea6b4133b46ca782d28e051271266f520c74d78a6c0dd422259c0e0dba89782fea6b4133b46ca782d28cdf9df7400696a164d78a6c0dd422259c0e0dba89782fea6b4133b46ca782d29cdfba5510d3f5aa2822b31f9026e7ff57426825adf0ffc8eb72886a1e89211f4218a108aa63177efb4baf11e1d68886072c325259d8ca2e993f9e24ef60d41ea286b9d0e0a85833bae9548dfc5a23725c566cecc96a93e8c1e2a896534f5272691b6f89ed961566321baa6c0b998e326556df54db420dec4b28a7ed10b45ae360af9df7400696a164d78a6c0dd422259c0e0dba89782fea6b4133b46ca782d283ae1f159e2e0ff599de32ce1486c031335228cfdf380e8557d5c0bd6336e7a49",
+        "callType": "call"
+      },
+      "result": {
+        "gasUsed": "0x3cebd",
+        "output": "0x08c379a000000000000000000000000000000000000000000000000000000000000000200000000000000000000000000000000000000000000000000000000000000013546f6f206c6974746c6520726563656976656400000000000000000000000000"
+      },
+      "error": "execution reverted",
+      "revertReason": "Too little received"
+    },
+    {
+      "transactionIndex": 26,
+      "traceAddress": [
+        0
+      ],
+      "type": "call",
+      "subtraces": 3,
+      "action": {
+        "from": "0x364e94a1bf09fc6498e979e7715bb13fa6e9f807",
+        "to": "0x95fe1ebf8d88063ef986ea4208fde554d902e842",
+        "value": "0x0",
+        "gas": "0x1312c0",
+        "input": "0x3043891e9f00986f265b6e82f121df3d30cfaeb42196abd76cc1f4d6bdaff37b8b28b9bd00000000000000000000000000000000000000000000000000000000000000400000000000000000000000000000000000000000000000000000000000000140cd061d39302e34dc5e4ba4d9f61202dc632cc9e39c1988dc413ea3cbd8398e6e48e3c44dccb879417a16a6c0dd422259c0e0d9e00f93dea6b4133b46ca782d28e051271266f520c74d78a6c0dd422259c0e0dba89782fea6b4133b46ca782d28cdf9df7400696a164d78a6c0dd422259c0e0dba89782fea6b4133b46ca782d29cdfba5510d3f5aa2822b31f9026e7ff57426825adf0ffc8eb72886a1e89211f4218a108aa63177efb4baf11e1d68886072c325259d8ca2e993f9e24ef60d41ea286b9d0e0a85833bae9548dfc5a23725c566cecc96a93e8c1e2a896534f5272691b6f89ed961566321baa6c0b998e326556df54db420dec4b28a7ed10b45ae360af9df7400696a164d78a6c0dd422259c0e0dba89782fea6b4133b46ca782d283ae1f159e2e0ff599de32ce1486c031335228cfdf380e8557d5c0bd6336e7a49",
+        "callType": "delegatecall"
+      },
+      "result": {
+        "gasUsed": "0x35204",
+        "output": "0x08c379a000000000000000000000000000000000000000000000000000000000000000200000000000000000000000000000000000000000000000000000000000000013546f6f206c6974746c6520726563656976656400000000000000000000000000"
+      },
+      "error": "execution reverted",
+      "revertReason": "Too little received"
+    },
+    {
+      "transactionIndex": 26,
+      "traceAddress": [
+        0,
+        0
+      ],
+      "type": "call",
+      "subtraces": 0,
+      "action": {
+        "from": "0x364e94a1bf09fc6498e979e7715bb13fa6e9f807",
+        "to": "0x033bbde722ea3cdcec73cffea6581df9f9c257de",
+        "value": "0x0",
+        "gas": "0x128e2d",
+        "input": "0x23b872dd000000000000000000000000c24d30475eca133302192b502085a3cc124b0b9b000000000000000000000000364e94a1bf09fc6498e979e7715bb13fa6e9f8070000000000000000000000000000000000000000000000000000000248981120",
+        "callType": "call"
+      },
+      "result": {
+        "gasUsed": "0x7ea7",
+        "output": "0x0000000000000000000000000000000000000000000000000000000000000001"
+      }
+    },
+    {
+      "transactionIndex": 26,
+      "traceAddress": [
+        0,
+        1
+      ],
+      "type": "call",
+      "subtraces": 3,
+      "action": {
+        "from": "0x364e94a1bf09fc6498e979e7715bb13fa6e9f807",
+        "to": "0x7a250d5630b4cf539739df2c5dacb4c659f2488d",
+        "value": "0x0",
+        "gas": "0x11fcbe",
+        "input": "0x38ed17390000000000000000000000000000000000000000000000000000000248981120000000000000000000000000000000000000000000000000000000000000000100000000000000000000000000000000000000000000000000000000000000a0000000000000000000000000364e94a1bf09fc6498e979e7715bb13fa6e9f80700000000000000000000000000000000000000000000000000000000669c49af0000000000000000000000000000000000000000000000000000000000000002000000000000000000000000033bbde722ea3cdcec73cffea6581df9f9c257de000000000000000000000000c02aaa39b223fe8d0a0e5c4f27ead9083c756cc2",
+        "callType": "call"
+      },
+      "result": {
+        "gasUsed": "0x12fad",
+        "output": "0x00000000000000000000000000000000000000000000000000000000000000200000000000000000000000000000000000000000000000000000000000000002000000000000000000000000000000000000000000000000000000024898112000000000000000000000000000000000000000000000000002c728c4dbe74df1"
+      }
+    },
+    {
+      "transactionIndex": 26,
+      "traceAddress": [
+        0,
+        1,
+        0
+      ],
+      "type": "call",
+      "subtraces": 0,
+      "action": {
+        "from": "0x7a250d5630b4cf539739df2c5dacb4c659f2488d",
+        "to": "0x006e75729351b9ad1d71cfd100051ec079b9d6bc",
+        "value": "0x0",
+        "gas": "0x11a283",
+        "input": "0x0902f1ac",
+        "callType": "staticcall"
+      },
+      "result": {
+        "gasUsed": "0x9c8",
+        "output": "0x0000000000000000000000000000000000000000000000000000006e3a01809e0000000000000000000000000000000000000000000000008945af91f203decd00000000000000000000000000000000000000000000000000000000669c49af"
+      }
+    },
+    {
+      "transactionIndex": 26,
+      "traceAddress": [
+        0,
+        1,
+        1
+      ],
+      "type": "call",
+      "subtraces": 0,
+      "action": {
+        "from": "0x7a250d5630b4cf539739df2c5dacb4c659f2488d",
+        "to": "0x033bbde722ea3cdcec73cffea6581df9f9c257de",
+        "value": "0x0",
+        "gas": "0x118e17",
+        "input": "0x23b872dd000000000000000000000000364e94a1bf09fc6498e979e7715bb13fa6e9f807000000000000000000000000006e75729351b9ad1d71cfd100051ec079b9d6bc0000000000000000000000000000000000000000000000000000000248981120",
+        "callType": "call"
+      },
+      "result": {
+        "gasUsed": "0x291b",
+        "output": "0x0000000000000000000000000000000000000000000000000000000000000001"
+      }
+    },
+    {
+      "transactionIndex": 26,
+      "traceAddress": [
+        0,
+        1,
+        2
+      ],
+      "type": "call",
+      "subtraces": 3,
+      "action": {
+        "from": "0x7a250d5630b4cf539739df2c5dacb4c659f2488d",
+        "to": "0x006e75729351b9ad1d71cfd100051ec079b9d6bc",
+        "value": "0x0",
+        "gas": "0x115d0e",
+        "input": "0x022c0d9f000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000002c728c4dbe74df1000000000000000000000000364e94a1bf09fc6498e979e7715bb13fa6e9f80700000000000000000000000000000000000000000000000000000000000000800000000000000000000000000000000000000000000000000000000000000000",
+        "callType": "call"
+      },
+      "result": {
+        "gasUsed": "0xd4c1",
+        "output": null
+      }
+    },
+    {
+      "transactionIndex": 26,
+      "traceAddress": [
+        0,
+        1,
+        2,
+        0
+      ],
+      "type": "call",
+      "subtraces": 0,
+      "action": {
+        "from": "0x006e75729351b9ad1d71cfd100051ec079b9d6bc",
+        "to": "0xc02aaa39b223fe8d0a0e5c4f27ead9083c756cc2",
+        "value": "0x0",
+        "gas": "0x10e40e",
+        "input": "0xa9059cbb000000000000000000000000364e94a1bf09fc6498e979e7715bb13fa6e9f80700000000000000000000000000000000000000000000000002c728c4dbe74df1",
+        "callType": "call"
+      },
+      "result": {
+        "gasUsed": "0x750a",
+        "output": "0x0000000000000000000000000000000000000000000000000000000000000001"
+      }
+    },
+    {
+      "transactionIndex": 26,
+      "traceAddress": [
+        0,
+        1,
+        2,
+        1
+      ],
+      "type": "call",
+      "subtraces": 0,
+      "action": {
+        "from": "0x006e75729351b9ad1d71cfd100051ec079b9d6bc",
+        "to": "0x033bbde722ea3cdcec73cffea6581df9f9c257de",
+        "value": "0x0",
+        "gas": "0x106e7e",
+        "input": "0x70a08231000000000000000000000000006e75729351b9ad1d71cfd100051ec079b9d6bc",
+        "callType": "staticcall"
+      },
+      "result": {
+        "gasUsed": "0x232",
+        "output": "0x00000000000000000000000000000000000000000000000000000070829991be"
+      }
+    },
+    {
+      "transactionIndex": 26,
+      "traceAddress": [
+        0,
+        1,
+        2,
+        2
+      ],
+      "type": "call",
+      "subtraces": 0,
+      "action": {
+        "from": "0x006e75729351b9ad1d71cfd100051ec079b9d6bc",
+        "to": "0xc02aaa39b223fe8d0a0e5c4f27ead9083c756cc2",
+        "value": "0x0",
+        "gas": "0x106ac0",
+        "input": "0x70a08231000000000000000000000000006e75729351b9ad1d71cfd100051ec079b9d6bc",
+        "callType": "staticcall"
+      },
+      "result": {
+        "gasUsed": "0x216",
+        "output": "0x000000000000000000000000000000000000000000000000867e86cd161c90dc"
+      }
+    },
+    {
+      "transactionIndex": 26,
+      "traceAddress": [
+        0,
+        2
+      ],
+      "type": "call",
+      "subtraces": 1,
+      "action": {
+        "from": "0x364e94a1bf09fc6498e979e7715bb13fa6e9f807",
+        "to": "0xe592427a0aece92de3edee1f18e0157c05861564",
+        "value": "0x0",
+        "gas": "0x10bef5",
+        "input": "0xc04b8d59000000000000000000000000000000000000000000000000000000000000002000000000000000000000000000000000000000000000000000000000000000a0000000000000000000000000767af52d988d1241a346851a1b39ccd11357376e00000000000000000000000000000000000000000000000000000000669c49af00000000000000000000000000000000000000000000000002c728c4dbe74df1000000000000000000000000000000000000000000000000000000002da8f866000000000000000000000000000000000000000000000000000000000000002bc02aaa39b223fe8d0a0e5c4f27ead9083c756cc2000064dac17f958d2ee523a2206206994597c13d831ec7000000000000000000000000000000000000000000",
+        "callType": "call"
+      },
+      "result": {
+        "gasUsed": "0x14213",
+        "output": "0x08c379a000000000000000000000000000000000000000000000000000000000000000200000000000000000000000000000000000000000000000000000000000000013546f6f206c6974746c6520726563656976656400000000000000000000000000"
+      },
+      "error": "execution reverted",
+      "revertReason": "Too little received"
+    },
+    {
+      "transactionIndex": 26,
+      "traceAddress": [
+        0,
+        2,
+        0
+      ],
+      "type": "call",
+      "subtraces": 4,
+      "action": {
+        "from": "0xe592427a0aece92de3edee1f18e0157c05861564",
+        "to": "0xc7bbec68d12a0d1830360f8ec58fa599ba1b0e9b",
+        "value": "0x0",
+        "gas": "0x105f78",
+        "input": "0x128acb08000000000000000000000000767af52d988d1241a346851a1b39ccd11357376e000000000000000000000000000000000000000000000000000000000000000100000000000000000000000000000000000000000000000002c728c4dbe74df100000000000000000000000000000000000000000000000000000001000276a400000000000000000000000000000000000000000000000000000000000000a000000000000000000000000000000000000000000000000000000000000000c000000000000000000000000000000000000000000000000000000000000000200000000000000000000000000000000000000000000000000000000000000040000000000000000000000000364e94a1bf09fc6498e979e7715bb13fa6e9f807000000000000000000000000000000000000000000000000000000000000002bc02aaa39b223fe8d0a0e5c4f27ead9083c756cc2000064dac17f958d2ee523a2206206994597c13d831ec7000000000000000000000000000000000000000000",
+        "callType": "call"
+      },
+      "result": {
+        "gasUsed": "0x1233f",
+        "output": "0x00000000000000000000000000000000000000000000000002c728c4dbe74df1ffffffffffffffffffffffffffffffffffffffffffffffffffffffffd6003cd9"
+      }
+    },
+    {
+      "transactionIndex": 26,
+      "traceAddress": [
+        0,
+        2,
+        0,
+        0
+      ],
+      "type": "call",
+      "subtraces": 0,
+      "action": {
+        "from": "0xc7bbec68d12a0d1830360f8ec58fa599ba1b0e9b",
+        "to": "0xdac17f958d2ee523a2206206994597c13d831ec7",
+        "value": "0x0",
+        "gas": "0xfaf4a",
+        "input": "0xa9059cbb000000000000000000000000767af52d988d1241a346851a1b39ccd11357376e0000000000000000000000000000000000000000000000000000000029ffc327",
+        "callType": "call"
+      },
+      "result": {
+        "gasUsed": "0x5fb5",
+        "output": null
+      }
+    },
+    {
+      "transactionIndex": 26,
+      "traceAddress": [
+        0,
+        2,
+        0,
+        1
+      ],
+      "type": "call",
+      "subtraces": 0,
+      "action": {
+        "from": "0xc7bbec68d12a0d1830360f8ec58fa599ba1b0e9b",
+        "to": "0xc02aaa39b223fe8d0a0e5c4f27ead9083c756cc2",
+        "value": "0x0",
+        "gas": "0xf4e2b",
+        "input": "0x70a08231000000000000000000000000c7bbec68d12a0d1830360f8ec58fa599ba1b0e9b",
+        "callType": "staticcall"
+      },
+      "result": {
+        "gasUsed": "0x9e6",
+        "output": "0x00000000000000000000000000000000000000000000002eb96c0243779dfa8d"
+      }
+    },
+    {
+      "transactionIndex": 26,
+      "traceAddress": [
+        0,
+        2,
+        0,
+        2
+      ],
+      "type": "call",
+      "subtraces": 1,
+      "action": {
+        "from": "0xc7bbec68d12a0d1830360f8ec58fa599ba1b0e9b",
+        "to": "0xe592427a0aece92de3edee1f18e0157c05861564",
+        "value": "0x0",
+        "gas": "0xf4157",
+        "input": "0xfa461e3300000000000000000000000000000000000000000000000002c728c4dbe74df1ffffffffffffffffffffffffffffffffffffffffffffffffffffffffd6003cd9000000000000000000000000000000000000000000000000000000000000006000000000000000000000000000000000000000000000000000000000000000c000000000000000000000000000000000000000000000000000000000000000200000000000000000000000000000000000000000000000000000000000000040000000000000000000000000364e94a1bf09fc6498e979e7715bb13fa6e9f807000000000000000000000000000000000000000000000000000000000000002bc02aaa39b223fe8d0a0e5c4f27ead9083c756cc2000064dac17f958d2ee523a2206206994597c13d831ec7000000000000000000000000000000000000000000",
+        "callType": "call"
+      },
+      "result": {
+        "gasUsed": "0x3009",
+        "output": null
+      }
+    },
+    {
+      "transactionIndex": 26,
+      "traceAddress": [
+        0,
+        2,
+        0,
+        2,
+        0
+      ],
+      "type": "call",
+      "subtraces": 0,
+      "action": {
+        "from": "0xe592427a0aece92de3edee1f18e0157c05861564",
+        "to": "0xc02aaa39b223fe8d0a0e5c4f27ead9083c756cc2",
+        "value": "0x0",
+        "gas": "0xef5e6",
+        "input": "0x23b872dd000000000000000000000000364e94a1bf09fc6498e979e7715bb13fa6e9f807000000000000000000000000c7bbec68d12a0d1830360f8ec58fa599ba1b0e9b00000000000000000000000000000000000000000000000002c728c4dbe74df1",
+        "callType": "call"
+      },
+      "result": {
+        "gasUsed": "0x2021",
+        "output": "0x0000000000000000000000000000000000000000000000000000000000000001"
+      }
+    },
+    {
+      "transactionIndex": 26,
+      "traceAddress": [
+        0,
+        2,
+        0,
+        3
+      ],
+      "type": "call",
+      "subtraces": 0,
+      "action": {
+        "from": "0xc7bbec68d12a0d1830360f8ec58fa599ba1b0e9b",
+        "to": "0xc02aaa39b223fe8d0a0e5c4f27ead9083c756cc2",
+        "value": "0x0",
+        "gas": "0xf0f95",
+        "input": "0x70a08231000000000000000000000000c7bbec68d12a0d1830360f8ec58fa599ba1b0e9b",
+        "callType": "staticcall"
+      },
+      "result": {
+        "gasUsed": "0x216",
+        "output": "0x00000000000000000000000000000000000000000000002ebc332b085385487e"
+      }
+    }
+  ]
+}
