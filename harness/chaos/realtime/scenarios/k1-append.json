@@ -1,0 +1,14 @@
+{
+  "chainId": 1,
+  "genesis": {
+    "number": 100,
+    "timestamp": 1700001200
+  },
+  "finalizedHeadSeq": [
+    { "number": 100 },
+    { "number": 100 },
+    { "number": 100 },
+    { "number": 100 }
+  ],
+  "steps": [{ "type": "blocks", "count": 12, "emitPhase": "K1-append" }]
+}
