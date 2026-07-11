@@ -403,17 +403,27 @@ function stepMatchParentHash(step) {
   return undefined;
 }
 
+function isCursorStep(step) {
+  if (step === undefined) return false;
+  return (
+    new Set([
+      'awaitRedelivery',
+      'status409',
+      'idle204',
+      'wrongForkFinalize',
+    ]).has(step.type) || step.match !== undefined
+  );
+}
+
 export function cursorMatchesStep(step, body) {
   if (step === undefined || body === undefined) return false;
+  if (isCursorStep(step) === false) return false;
   const cursorTypes = new Set([
     'awaitRedelivery',
     'status409',
     'idle204',
     'wrongForkFinalize',
   ]);
-  if (cursorTypes.has(step.type) === false && step.match === undefined) {
-    return false;
-  }
 
   const match = step.match ?? {};
   const wantFrom =
@@ -451,6 +461,10 @@ function blockBatch(number, request, opts = {}) {
 
 function writeNdjson(res, batch) {
   res.write(`${JSON.stringify(batch)}\n`);
+}
+
+function streamTurnDelay() {
+  return new Promise((resolve) => setTimeout(resolve, 10));
 }
 
 function createRuntime(initialScenario, options = {}) {
@@ -601,9 +615,15 @@ function createRuntime(initialScenario, options = {}) {
   const finalizedStream = async (body, res) => {
     recordRequest('finalizedStream', body);
     const from = Number(body?.fromBlock ?? scenario.genesis.number);
-    const head = scenario.finalizedHeadSeq[0] ?? {
-      number: scenario.genesis.number,
-    };
+    const head = scenario.finalizedHeadSeq[
+      Math.max(
+        0,
+        Math.min(finalizedIndex - 1, scenario.finalizedHeadSeq.length - 1),
+      )
+    ] ??
+      scenario.finalizedHeadSeq[0] ?? {
+        number: scenario.genesis.number,
+      };
     const to = Math.min(Number(body?.toBlock ?? head.number), head.number);
     if (from > to) {
       stats.r204 += 1;
@@ -724,6 +744,8 @@ function createRuntime(initialScenario, options = {}) {
         }),
       );
       streamCursor = number;
+      await streamTurnDelay();
+      if (res.destroyed || res.writableEnded) return;
     }
     stepIndex += 1;
     stats.r200 += 1;
@@ -824,14 +846,14 @@ function createRuntime(initialScenario, options = {}) {
 
   const stream = async (body, res) => {
     recordRequest('stream', body);
-    const cursorStepIndex = scenario.steps.findIndex(
-      (step, index) => index >= stepIndex && cursorMatchesStep(step, body),
-    );
-    if (cursorStepIndex >= 0) {
-      stepIndex = cursorStepIndex;
-    }
     const step = scenario.steps[stepIndex];
     if (step === undefined) {
+      stats.r204 += 1;
+      res.writeHead(204);
+      res.end();
+      return;
+    }
+    if (isCursorStep(step) && cursorMatchesStep(step, body) === false) {
       stats.r204 += 1;
       res.writeHead(204);
       res.end();

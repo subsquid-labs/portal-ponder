@@ -12,7 +12,19 @@ const base = (event: any) => ({
   txHash: event.transaction.hash,
 });
 
+const emptyVaultMetadata = () => ({
+  asset: null,
+  name: null,
+  symbol: null,
+  decimals: null,
+  oracle: null,
+  creator: null,
+  evc: null,
+});
+
 async function readVaultMetadata(context: any, id: `0x${string}`) {
+  if (process.env.CHAOS_SKIP_METADATA === '1') return emptyVaultMetadata();
+
   const read = (functionName: string) =>
     context.client
       .readContract({ abi: EVaultAbi, address: id, functionName })

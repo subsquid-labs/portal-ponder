@@ -12,10 +12,15 @@
   ],
   "steps": [
     {
-      "type": "blocks",
-      "count": 8,
-      "branch": "orphan",
-      "parentBranch": "main",
+      "type": "childDiscovery",
+      "block": 101,
+      "child": "0x1111111111111111111111111111111111111111",
+      "transactionHash": "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "logIndex": 0
+    },
+    {
+      "type": "awaitRedelivery",
+      "block": 101,
       "logs": [
         {
           "block": 101,
@@ -26,7 +31,7 @@
           "logIndex": 0
         },
         {
-          "block": 102,
+          "block": 101,
           "event": "Deposit",
           "vault": "0x1111111111111111111111111111111111111111",
           "sender": "0x2222222222222222222222222222222222222222",
@@ -35,9 +40,14 @@
           "shares": "987654321",
           "transactionHash": "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
           "transactionIndex": 0,
-          "logIndex": 0
+          "logIndex": 1
         }
       ]
+    },
+    {
+      "type": "blocks",
+      "count": 7,
+      "branch": "main"
     },
     {
       "type": "wrongForkFinalize",
