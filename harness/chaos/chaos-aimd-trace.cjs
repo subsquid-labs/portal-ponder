@@ -63,7 +63,7 @@ const originalFetch = globalThis.fetch;
 if (typeof originalFetch !== 'function') {
   append({ event: 'aimd-env', error: 'global fetch is unavailable' });
 } else {
-  globalThis.fetch = async function aimdFetch(input, init) {
+  globalThis.fetch = async function aimdFetch(input, _init) {
     const traced = isFinalizedStream(input);
     if (!traced) {
       return originalFetch.apply(this, arguments);

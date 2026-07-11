@@ -315,14 +315,23 @@ const min = Math.min(...values);
 const max = Math.max(...values);
 const final = values[values.length - 1];
 const within = min >= (gate.length ? minBound : 1) && max <= maxBound;
-const sparseGate = gate.length > 0 && sourceRows.length < 3;
+// Fewer than 3 samples cannot demonstrate multiplicative-decrease-then-recovery.
+// Report this honestly as `sparse` and do NOT let it assert `recovered` — a single
+// concurrency reading is not evidence of AIMD recovery (committee finding #3).
+const sparse = sourceRows.length < 3;
 const recovered =
-  final > (gate.length ? minBound : 0) ||
-  max > (gate.length ? minBound : 1) ||
-  sparseGate;
+  !sparse &&
+  (final > (gate.length ? minBound : 0) || max > (gate.length ? minBound : 1));
+// AIMD is SECONDARY evidence: the correctness gate is digest-identity + interval tiling
+// (spec fix #2). Sparse/insufficient AIMD must NOT fail a scenario whose digest+intervals
+// pass — it is simply labelled "sparse — insufficient samples", and never claims
+// "recovered". The one AIMD condition that still fails a scenario is a genuine bounds
+// violation (`within=false`: an observed concurrency outside [min,max]) — a real anomaly,
+// not mere sparseness. `required` only affects the no-samples-at-all branch above.
+const ok = within && (recovered || sparse || !required);
 process.stdout.write(
   JSON.stringify({
-    ok: within && recovered,
+    ok,
     source: gate.length ? 'portalGate' : 'fetch-derived',
     sampleCount: sourceRows.length,
     min,
@@ -330,7 +339,12 @@ process.stdout.write(
     final,
     recovered,
     within,
-    sparseGate,
+    sparse,
+    note: sparse
+      ? 'sparse — insufficient samples to assert AIMD recovery'
+      : recovered
+        ? 'AIMD recovery observed'
+        : 'no AIMD recovery observed',
   }),
 );
 NODE
@@ -409,7 +423,12 @@ agg.runs = Array.isArray(agg.runs)
   : [];
 agg.runs.push(verdict);
 agg.updatedAt = new Date().toISOString();
-agg.status = verdict.pass === false ? 'fail' : agg.status || 'running';
+// A not-applicable verdict (pass:false, notApplicable:true) is vacuous, not a failure —
+// it must not flip the campaign to `fail`. Only a genuine pass:false failure does.
+agg.status =
+  verdict.pass === false && !verdict.notApplicable
+    ? 'fail'
+    : agg.status || 'running';
 fs.writeFileSync(process.env.AGG_FILE, JSON.stringify(agg, null, 2) + '\n');
 NODE
 }
@@ -423,6 +442,10 @@ const fs = require('node:fs');
 const verdict = {
   scenario: process.env.SCENARIO,
   pass: process.env.PASS === 'true',
+  // A not-applicable scenario is neither a pass nor a fail: it is vacuous for this
+  // fixed-range historical harness (committee finding #1/#2). It must not flip the
+  // campaign status to `fail`, nor be counted as a head-tolerance PASS.
+  notApplicable: process.env.OUTCOME === 'not-applicable',
   outcome: process.env.OUTCOME,
   verifyExit:
     process.env.VERIFY_EXIT === '' ? null : Number(process.env.VERIFY_EXIT),
@@ -597,32 +620,57 @@ run_scenario () {
     exit 2
   }
 
+  local fault_json
+  fault_json="$(fault_summary "$run_dir")"
+
+  # committee finding #1/#2 (unanimous): head-regression-100k and head-flap manipulate the head far
+  # ABOVE the pinned endBlock (live head ~21M, regressed/flapped head still > endBlock 20579207), so
+  # the manipulated head never intersects the fixed range [20529207,20579207]. A fixed-range HISTORICAL
+  # backfill is structurally near-immune to a head that stays >= endBlock — it only ever waits for the
+  # head to advance and never rolls back an already-finalized+indexed block. These scenarios therefore
+  # prove nothing the clean baseline did not. Rather than emit a bogus head-tolerance PASS, mark them
+  # NOT-APPLICABLE for this harness. Head-reorg/rollback tolerance is a STREAM-mode property, exercised
+  # by the stream-mode soak, not by this fixed-range historical harness. head-freeze (frozen head BELOW
+  # endBlock) remains the one meaningful in-range head scenario. See RESULT §head-scenarios.
+  case "$scenario" in
+    head-regression-100k|head-flap)
+      local na_aimd na_note na_digest
+      na_aimd="$(aimd_summary "$run_dir/aimd-trace.jsonl" 0)"
+      na_note="not-applicable: manipulated head stays >= endBlock $TO, so it never intersects the fixed range [$FROM,$TO]; a fixed-range historical backfill cannot exercise head-reorg/rollback (a STREAM-mode property covered by the stream-mode soak). Not counted as a head-tolerance PASS."
+      na_digest=""
+      if [ "$done" = 1 ]; then
+        ( cd "$PROBE_DIR" && node ./pg-digest.mjs "$url" ) > "$run_dir/digest" 2>"$run_dir/digest.err" || true
+        na_digest="$(cat "$run_dir/digest" 2>/dev/null || true)"
+      fi
+      write_verdict "$run_dir" "$scenario" "not-applicable" "false" "" "$na_digest" \
+        "$(cat "$ART/baseline.digest" 2>/dev/null || true)" "$fault_json" "$na_aimd" "$loud_line" "$na_note"
+      drop_run_db "$db"
+      rm -f "$meta" "$pidfile" "$pidfile.tmp"
+      log "scenario $scenario NOT-APPLICABLE (head stays >= endBlock; stream-mode property)"
+
+      return 0
+      ;;
+  esac
+
+  # committee finding #4 (elif false-pass): only run head recovery when phase 1 did NOT complete.
+  # head-freeze is the sole in-range head scenario: its frozen head (BELOW endBlock) stalls the Portal
+  # (finalized head behind the requested range) so phase 1 makes little/no progress; recovery then
+  # resumes on the SAME DB with the fault removed. If head_recovery_check FAILS we must propagate that
+  # failure (leave done=0), never retain a stale pass. If phase 1 unexpectedly completes despite the
+  # freeze, no recovery is run and the outcome is a plain completion, NOT byte-identical-recovery.
   local recovery=0
-  if [ "$done" != 1 ] && [ "$loud" != 1 ]; then
-    case "$scenario" in
-      head-freeze|head-flap)
-        recovery=1
-        if head_recovery_check "$scenario" "$url" "$db" "$run_dir"; then
-          done=1
-          loud=0
-          loud_line=""
-        else
-          loud_line="$(loud_failure_line "$run_dir/recovery.log")"
-          [ -n "$loud_line" ] && loud=1
-        fi
-        ;;
-    esac
-  elif [ "$scenario" = "head-freeze" ] || [ "$scenario" = "head-flap" ]; then
+  if [ "$scenario" = "head-freeze" ] && [ "$done" != 1 ] && [ "$loud" != 1 ]; then
     recovery=1
     if head_recovery_check "$scenario" "$url" "$db" "$run_dir"; then
       done=1
       loud=0
       loud_line=""
+    else
+      loud_line="$(loud_failure_line "$run_dir/recovery.log")"
+      [ -n "$loud_line" ] && loud=1
     fi
   fi
 
-  local fault_json
-  fault_json="$(fault_summary "$run_dir")"
   local aimd_required=1
   if [ "$loud" = 1 ] && [ ! -s "$run_dir/dense-trace.jsonl" ]; then aimd_required=0; fi
   local aimd_json
@@ -645,7 +693,16 @@ run_scenario () {
     fi
     if [ "$verify_exit" = 0 ] && node -e "const f=$fault_json,a=$aimd_json; process.exit(f.ok&&a.ok?0:1)"; then
       pass=true
-      [ "$recovery" = 1 ] && outcome="byte-identical-recovery" || outcome="byte-identical-completion"
+      if [ "$recovery" = 1 ]; then
+        outcome="byte-identical-recovery"
+        # committee finding #5 (candor): head-freeze phase 1 stalls (frozen head behind the requested
+        # range) with little/no progress; "recovery" is a clean restart on the SAME DB with the fault
+        # removed, which then completes byte-identical. State honestly what was proven — this is a
+        # stall-without-corruption + clean same-DB restart, NOT a partial-progress resume claim.
+        note="head-freeze stalled without corruption; clean restart on the same DB (fault removed) completed byte-identical"
+      else
+        outcome="byte-identical-completion"
+      fi
     else
       outcome="silent-corruption-or-verifier-failure"
       note="completed but digest/interval/fault/AIMD acceptance failed"
@@ -706,9 +763,13 @@ const rows = order.map((name, i) => {
     : 'head-only';
   return `| ${i + 1} | ${name} | ${r.outcome} | ${expected} | ${c.missedReset ?? 'n/a'} | ${c.missedNdjson ?? 'n/a'} | ${r.digestEqual ? 'yes' : r.digest === 'n/a' ? 'n/a' : 'no'} | ${r.verifyExit === 0 ? 'yes' : 'n/a'} | ${r.aimd?.ok ? 'yes' : 'no'} (${r.aimd?.source ?? 'none'} ${r.aimd?.min ?? 'n/a'}/${r.aimd?.max ?? 'n/a'}/${r.aimd?.final ?? 'n/a'}) | ${r.note || r.loudLine || ''} |`;
 });
-const passed = runs.filter((r) => r.pass).length;
-const failed = runs.filter((r) => r.pass === false).length;
-agg.status = failed > 0 ? 'fail' : runs.length === order.length ? 'pass' : 'incomplete';
+// A not-applicable scenario is vacuous for this fixed-range historical harness — count it
+// separately, never as a pass and never as a fail (committee finding #1/#2).
+const notApplicable = runs.filter((r) => r.notApplicable).length;
+const passed = runs.filter((r) => r.pass && !r.notApplicable).length;
+const failed = runs.filter((r) => r.pass === false && !r.notApplicable).length;
+agg.status =
+  failed > 0 ? 'fail' : runs.length === order.length ? 'pass' : 'incomplete';
 agg.finishedAt = new Date().toISOString();
 fs.writeFileSync(process.env.AGG_FILE, JSON.stringify(agg, null, 2) + '\n');
 const table = [
@@ -734,9 +795,11 @@ Outcome probe decisions:
 - truncated-gzip: ${truncated}
 - malformed-ndjson: ${malformed}
 
-Verdicts: ${passed} pass, ${failed} fail, ${runs.length}/${order.length} scenarios recorded.
+Verdicts: ${passed} pass, ${failed} fail, ${notApplicable} not-applicable, ${runs.length}/${order.length} scenarios recorded.
 
 ${table}
+
+Head-scenario scope: head-freeze (frozen head BELOW endBlock ${agg.params?.to}) is the one meaningful in-range head scenario — its frozen head stalls the Portal, and a clean restart on the same DB with the fault removed completes byte-identical. head-regression-100k and head-flap manipulate the head ABOVE endBlock, so it never intersects the fixed range [${agg.params?.from}, ${agg.params?.to}]; a fixed-range historical backfill never rolls back an already-finalized+indexed block, so these are marked not-applicable (NOT a head-tolerance PASS). Head-reorg/rollback tolerance is a stream-mode property, exercised by the stream-mode soak, not this historical harness.
 
 Artifacts: ${path.dirname(process.env.SUMMARY_FILE)}
 `;

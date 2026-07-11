@@ -1,1 +1,4 @@
-{"head":{"mode":"passthrough"},"faults":{"pStall":0.05,"stallMs":90000}}
+{
+  "head": { "mode": "passthrough" },
+  "faults": { "pStall": 0.05, "stallMs": 90000 }
+}
