@@ -540,7 +540,7 @@ test("INV-2: trace assembly respects the interval's UPPER bound (a trace block a
   expect(Number(BigInt((out.traces[0]!.block as any).number))).toBe(HI);
 });
 
-// ── INV-19: ancestor-error cascade (byte-identity with the stock-ponder RPC path) ────────────────────
+// ── INV-20: ancestor-error cascade (byte-identity with the stock-ponder RPC path) ────────────────────
 //
 // Stock ponder's `debug_traceBlockByNumber` DFS (src/rpc/actions.ts) smears a reverted ancestor's
 // error/revertReason onto every descendant lacking its OWN error, transitively; a frame with its own
@@ -556,7 +556,11 @@ const byAddr = (traces: any[]): Map<string, any> => {
     cmpTraceAddr(x.traceAddress ?? [], y.traceAddress ?? []),
   );
   const ranked = rankTraces(traces);
-  // rankTraces preserves cmpTraceAddr order, so the k-th ranked frame is the k-th sorted raw trace.
+  // rankTraces returns one frame per SURVIVING sorted trace in cmpTraceAddr order (parityToCallFrame can
+  // drop a frame — e.g. a non-call/create/suicide type). Every fixture here is type:'call', so nothing
+  // drops; assert that so the positional zip below stays a valid oracle rather than silently misaligning
+  // if a future fixture introduces a droppable type.
+  expect(ranked.length).toBe(sorted.length);
   sorted.forEach((t, i) => {
     m.set((t.traceAddress ?? []).join(','), ranked[i]!.frame);
   });
@@ -586,7 +590,7 @@ const mkErrTrace = (
   ...(revertReason !== undefined ? { revertReason } : {}),
 });
 
-test('INV-19: real reverted tx — the whole reverted subtree inherits the ancestor error (oracle: RPC store)', () => {
+test('INV-20: real reverted tx — the whole reverted subtree inherits the ancestor error (oracle: RPC store)', () => {
   // Real geth callTracer output for eth mainnet block 20351061, tx index 26 (a reverted swap-router call),
   // reshaped into Portal's Parity-flat RawTrace with each frame's OWN error preserved verbatim (Portal's
   // geth-faithful input shape): frames [], [0], [0,2] carry error; [0,1] and its whole subtree are null.
@@ -614,7 +618,7 @@ test('INV-19: real reverted tx — the whole reverted subtree inherits the ances
   }
 });
 
-test('INV-19 (a): a child with its OWN distinct error SURVIVES (own-error branch wins over the parent)', () => {
+test('INV-20 (a): a child with its OWN distinct error SURVIVES (own-error branch wins over the parent)', () => {
   const frames = byAddr([
     mkErrTrace([], 'execution reverted', 'parent revert'),
     mkErrTrace([0]), // null → inherits parent
@@ -632,7 +636,7 @@ test('INV-19 (a): a child with its OWN distinct error SURVIVES (own-error branch
   expect(frames.get('1,0').revertReason).toBe('own revert');
 });
 
-test('INV-19 (b): ≥3-deep nesting inherits the ancestor error transitively', () => {
+test('INV-20 (b): ≥3-deep nesting inherits the ancestor error transitively', () => {
   const frames = byAddr([
     mkErrTrace([], 'execution reverted', 'deep revert'),
     mkErrTrace([0]),
@@ -647,7 +651,7 @@ test('INV-19 (b): ≥3-deep nesting inherits the ancestor error transitively', (
   }
 });
 
-test('INV-19 (c): a non-reverted tx keeps every frame error/revertReason null', () => {
+test('INV-20 (c): a non-reverted tx keeps every frame error/revertReason null', () => {
   const frames = byAddr([
     mkErrTrace([]),
     mkErrTrace([0]),
@@ -659,4 +663,24 @@ test('INV-19 (c): a non-reverted tx keeps every frame error/revertReason null', 
     expect(f.error).toBeUndefined();
     expect(f.revertReason).toBeUndefined();
   }
+});
+
+test('INV-20 (d): an inheriting child of an ancestor that has an error but NO revertReason gets error set AND revertReason === undefined (unconditional assignment)', () => {
+  // Ancestor reverted with an `error` but no `revertReason` (revertReason omitted → undefined). The child
+  // has neither of its own, so it inherits. Upstream `rpc/actions.ts` assigns BOTH fields unconditionally
+  // (`frame.error = error.error; frame.revertReason = error.revertReason`), so the child ends up with the
+  // ancestor's error AND revertReason === undefined (present-as-undefined).
+  const frames = byAddr([
+    mkErrTrace([], 'execution reverted'), // error set, revertReason omitted (undefined)
+    mkErrTrace([0]), // no own error → inherits [ ]'s error + undefined revertReason
+  ]);
+
+  expect(frames.get('').error).toBe('execution reverted');
+  expect(frames.get('').revertReason).toBeUndefined();
+
+  // This PINS upstream-exact behavior: the cascade assigns revertReason UNCONDITIONALLY. Do NOT add a
+  // guard skipping the undefined-revertReason assignment — that would diverge the Portal store from the
+  // RPC store, whose actions.ts writes revertReason on every inheriting frame regardless of its value.
+  expect(frames.get('0').error).toBe('execution reverted'); // inherited the ancestor's error
+  expect(frames.get('0').revertReason).toBeUndefined(); // and its undefined revertReason, unconditionally
 });

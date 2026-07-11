@@ -81,7 +81,7 @@ type CallFrame = {
 export type RankedTrace = { frame: CallFrame; index: number };
 
 /**
- * INV-19 (ancestor-error cascade): reproduce stock ponder's derived trace-error normalization so the
+ * INV-20 (ancestor-error cascade): reproduce stock ponder's derived trace-error normalization so the
  * Portal-path store is byte-identical to the RPC-path store on `traces.error` / `traces.revert_reason`.
  *
  * Upstream `src/rpc/actions.ts` `debug_traceBlockByNumber`/`debug_traceBlockByHash` DFS (shipped as
@@ -98,7 +98,17 @@ export type RankedTrace = { frame: CallFrame; index: number };
  * resolved before its children are visited. Keyed by traceAddress (not the produced frame) so the
  * parentage chain is intact even if `parityToCallFrame` drops a frame from the output.
  *
- * Upstream issue: <UPSTREAM_ISSUE_URL>  (to be filled by the reviewer).
+ * Non-prefix-closed candor: this keys parentage by traceAddress prefix, so a frame inherits ONLY when its
+ * exact parent path is present in the same tx (parent of [0,1] is [0]). If a Portal tree ever omitted an
+ * intermediate ancestor ([0,1] present, [0] absent), the orphan would inherit NOTHING — a deliberate
+ * conservative choice: we never fabricate a false error smear, and the worst case is the SAME null the
+ * pre-shim path already stored (never worse). This cannot occur for real Portal trees — geth-faithful
+ * callTracer trees are always prefix-closed (every frame's parent frame is emitted) — so the branch is
+ * defensive, not reachable. Unlike upstream's identity-threaded `parentFrame` (which would carry an
+ * orphan's grandparent down), we do not walk up past a missing link; that divergence is unobservable on
+ * prefix-closed input and strictly safer on any malformed tree.
+ *
+ * Upstream divergence documented in VALIDATION.md §5.
  */
 const cascadeTraceErrors = (
   sorted: RawTrace[],
@@ -133,7 +143,7 @@ const cascadeTraceErrors = (
  * INV-5 producer: given ONE transaction's traces (reward/no-tx frames already excluded), sort them into
  * pre-order DFS (cmpTraceAddr) and assign each its rank = position in that sorted full list. The matcher
  * only ever consumes `RankedTrace`s, so a matched trace's `index` is its full-tree position, never a
- * filter-local one. INV-19: the ancestor-error cascade is applied over the same sorted tree, so each
+ * filter-local one. INV-20: the ancestor-error cascade is applied over the same sorted tree, so each
  * frame carries its post-cascade `error`/`revertReason` (byte-identical to the RPC path).
  */
 export function rankTraces(traces: RawTrace[]): RankedTrace[] {
