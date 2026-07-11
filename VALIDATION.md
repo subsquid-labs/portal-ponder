@@ -1651,6 +1651,27 @@ the realtime half runs on an **experimental** path, that a reorg below the final
 **deliberate fail-loud** rather than a healed recovery, and that no **live deep reorg** was injected
 against the running soak — the evidence is the tested logic and the differ, stated as exactly that.
 
+### 5.9 Trace ancestor-error cascade — Portal↔RPC parity (traces.error / revert_reason)
+
+A campaign diff surfaced the Portal historical backfill storing `traces.error = NULL` on a trace frame where the parallel RPC-path store held `error="execution reverted"` and `revert_reason="Too little received"`. The concrete case is Ethereum mainnet block 20351061, transaction index 26 (a DEX-aggregator contract `0x364e94a1…`). The transaction reverts with "Too little received" after attempting a Uniswap-V2 swap at trace path `[0,1]` then a V3 swap at `[0,2]`. The differ matched the V2 router frame `[0,1]`. The same shape appeared on block 20351088, tx 33 (corroborated by the differ record; the independent geth/Portal ground-truth capture below is for block 20351061).
+
+Ground truth from `debug_traceBlockByNumber` with `callTracer` (one paid request, frozen in the operator's evidence archive) attributes the error to paths `[]`, `[0]`, `[0,2]` and reports `[0,1] = null`. The revert originates at `[0,2]` (the V3 swap), NOT at `[0,1]`. A raw Portal `/finalized-stream` capture (full trace fields, match-all, $0) agrees with the geth ground truth on the per-frame error attribution — errored `[]`, `[0]`, `[0,2]`; `[0,1]` null. The fork's pre-fix store faithfully carried this null (the pre-fix FAIL record: fresh fork Portal = null, RPC oracle = "execution reverted", 2/2 DIFFER).
+
+| traceAddress | geth callTracer | Portal raw | pre-#151 fork | RPC baseline store |
+|---|---|---|---|---|
+| `[]` | `execution reverted` | `execution reverted` | `execution reverted` | `execution reverted` |
+| `[0]` | `execution reverted` | `execution reverted` | `execution reverted` | `execution reverted` |
+| `[0,1]` | `NULL` | `NULL` | `NULL` | `execution reverted` |
+| `[0,2]` | `execution reverted` | `execution reverted` | `execution reverted` | `execution reverted` |
+
+The root cause of the divergence is ponder's RPC path, not the Portal path. Ponder's RPC-path trace ingestion cascades a reverted ancestor frame's error onto its succeeded descendant frames. In `rpc/actions.ts` (~lines 186–219), a DFS pre-order error propagation applies an ancestor's error to its descendants. Frame `[0,1]` succeeded, but its ancestor `[0]` reverted, so ponder's RPC store smears `[0]`'s "execution reverted" onto `[0,1]`. This is a deterministic derived post-processing behavior, not raw geth. Strictly on raw geth-literalism, the Portal raw path was the MORE faithful of the two; ponder's RPC store attributes an error where neither geth's own callTracer nor the Portal data does.
+
+The resolution in PR [#151](../../pull/151) (merged `58e3ad9`) makes the Portal historical assemble path port the same ancestor-error cascade (`cascadeTraceErrors`), ensuring the Portal store is a byte-identical match to ponder's RPC store. We deliberately chose RPC-parity (drop-in determinism) over geth-literalism: an indexer must produce the SAME `traces.error` regardless of whether the RPC or Portal backend was used, or intra-deployment determinism breaks. This mirrors the [#110](../../pull/110) `access_list` "match the RPC path" decision. The cascade algorithm is byte-identical to upstream's RPC cascade (own-error-wins, transitive, sibling-isolated, DFS pre-order). This behavior is pinned by invariant **INV-20** (+ INV-20(a)/(b)/(d) oracle tests, mutation-verified). INV-20(d) pins the UNCONDITIONAL `revert_reason` assignment matching upstream — a proposed guard was rejected because it would have DIVERGED the Portal store from the RPC store.
+
+End-to-end verification on merged main confirmed the change. A fresh backfill of window [20350978, 20351278] diffed against the preserved RPC-path store yielded 424 trace rows in both, identical row sets, all 424 matching on `error` + `revert_reason`, 22 non-null-error rows on each side, 0 mismatches, and no over-cascade (full-window diff archived in the operator's evidence set). Pre-#151 the same frames were 2/2 DIFFER; the flip to a full match is caused by #151, not a transient artifact.
+
+**Upstream observation.** Ponder's RPC-path cascade attributes an error at `[0,1]` where geth's own `callTracer` returns null. This is a neutral observation about a derived-attribution difference — not a defect claim; the fork matches the behavior for parity.
+
 ---
 
 ## 6. Current status — what a reader can rely on today
