@@ -1672,6 +1672,27 @@ End-to-end verification on merged main confirmed the change. A fresh backfill of
 
 **Upstream observation.** Ponder's RPC-path cascade attributes an error at `[0,1]` where geth's own `callTracer` returns null. This is a neutral observation about a derived-attribution difference — not a defect claim; the fork matches the behavior for parity.
 
+### 5.10 Trace root-frame gas parity — Portal↔RPC parity (traces.gas)
+
+The same trace campaign surfaced a second, structurally-unrelated divergence class: the Portal historical backfill stored `traces.gas` on the ROOT trace frame (`traceAddress []`, the top-level call) one intrinsic lower than the parallel RPC-path store. Portal serves Parity-style traces whose root `action.gas` is the gas made available to the call AFTER the EIP-2028 intrinsic deduction (base 21000 + 16/nonzero + 4/zero calldata byte, plus access-list and creation costs); the RPC path stores geth `callTracer`, which seeds the top frame's `gas` with the FULL `tx.gasLimit` before any intrinsic deduction. `gas_used` was byte-identical on both paths, and every non-root frame's `gas` already matched — the divergence was exactly the root frame's intrinsic.
+
+The concrete grounding case is Ethereum mainnet block 19068568, transaction index 7 (a Uniswap-V2 swap). Pre-fix, the Portal store held root `action.gas = 0x74700` (= `gasLimit − intrinsic`); the RPC store held `0x7a120` (= the full `gasLimit`). The non-root child frame `[0]` carried `0x3616b` on both paths, already byte-identical.
+
+| frame | Parity action.gas (Portal raw) | geth callTracer (RPC store) | pre-#153 fork | RPC baseline store |
+|---|---|---|---|---|
+| root `[]` | `0x74700` (gasLimit − intrinsic) | `0x7a120` (full gasLimit) | `0x74700` | `0x7a120` |
+| child `[0]` | `0x3616b` | `0x3616b` | `0x3616b` | `0x3616b` |
+
+The root cause is a derived-representation difference between the two trace formats, not a data defect on either side. Parity's `action.gas` and geth `callTracer`'s top-frame `gas` are BOTH self-consistent conventions for "gas at the top call"; they differ only in whether the transaction's intrinsic cost has already been deducted. The RPC-path store persists geth's convention (full `gasLimit`), so the Portal store — serving Parity — wrote the root frame one intrinsic low. `gas_used` (the actually-consumed gas) is convention-independent and matched throughout.
+
+The resolution in PR [#153](../../pull/153) (merged `3bfc074`) makes the Portal historical assemble path override the root frame's `gas` with the parent transaction's `gasLimit` (`frame.gas = hx(rawTx.gas)` when `traceAddress.length === 0`), so the Portal store is a byte-identical match to ponder's RPC store. As with the [#151](../../pull/151) error cascade (§5.9) and the [#110](../../pull/110) `access_list` decision, we chose RPC-parity (drop-in determinism) over format-literalism: a fork deployment mixes Portal backfill with stock-RPC realtime in ONE database, and a path-dependent root-frame gas would leave an invisible seam at the historical→realtime cutover. The override is scoped to the root frame only (non-root gas already matches), carries no intrinsic math (geth's top-frame gas IS the raw `gasLimit`), and lives at the store-write site — the shared trace matcher (`buildRawTraceMatcher`) never reads gas and is untouched. This behavior is pinned by invariant **INV-21** (+ INV-21(a) idempotence / (b) rootless-chunk oracle tests, mutation-verified: reverting the override fails INV-21 with `expected '0x74700' to be '0x7a120'`).
+
+End-to-end verification grounded the fix at scale. Across all 12 preserved Portal-vs-RPC store windows (eth mainnet), **2196 / 2196 root frames** carried `RPC.gas == tx.gasLimit` with zero exceptions — spanning legacy (type `0x0`) and EIP-1559 (type `0x2`) transactions over a wide calldata/intrinsic spread, so the identity is intrinsic-independent, not a single-window calldata coincidence. In every window `gas_used` diffed zero and non-root `gas` diffed zero; the ONLY divergence classes in the entire trace corpus were this root-frame `gas` and the §5.9 ancestor-error cascade — no window showed any other differing trace column. With both closed, the two store paths are byte-identical on `traces` over the grounded eth corpus.
+
+**Scope (candor).** Contract-creation and access-list root frames were ABSENT from the grounded corpus (`creationRoots = 0`, `alRoots = 0` in all 12 windows), so those transaction classes are not directly measured here. They rest on the geth `callTracer` mechanism — `CaptureStart` seeds the top frame's gas with `tx.gas` independently of the call type, before intrinsic deduction — not on an in-corpus measurement. The invariant and the code comment state this explicitly rather than claiming an unconditional, unmeasured result.
+
+**Upstream observation.** None. Unlike §5.9 (where ponder's RPC cascade attributes an error geth's own callTracer does not), the root-frame gas difference is purely a Parity-vs-geth representation convention with no attribution question — geth `callTracer` and the RPC store agree, and the fork matches them for parity.
+
 ---
 
 ## 6. Current status — what a reader can rely on today
