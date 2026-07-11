@@ -93,16 +93,18 @@ identity**: the Portal wiring patch is byte-identical (sha256-equal) across the 
 `0.16.8` grafts, and each upstream delta over that range lands off the Portal graft surface (Layer A
 above). A version bump therefore does **not** invalidate the matrix or the soak, and we deliberately do
 **not** re-run the paid matrix or restart the soak for it. Alongside that transfer, three **direct
-anchors on the shipped `0.16.8-sqd.1` package** — one landed, two planned — tie the evidence to the
+anchors on the shipped `0.16.8-sqd.1` package** — two landed, one planned — tie the evidence to the
 exact published build:
 1. the examples end-to-end freshness gate ran against the **published** package
    ([#139](../../pull/139)) — the `euler-subgraph` example reproduced its exact baseline row counts
    (vaults / deposits / withdraws / borrows / repays), a no-regression check on the shipped tag — **done**;
-2. a fault-injection chaos campaign on a `0.16.8-sqd.1` build (Layer C, §4) — **planned**;
+2. an adversarial network/transport fault-injection campaign on the **published** `0.16.8-sqd.1`
+   package (Layer C, §4.5) — the backfill completed **byte-identical** to a clean baseline under all 8
+   body/transport faults plus a frozen finalized head — **done**;
 3. a ≥72 h A/B soak confirmation leg on the `0.16.8-sqd.1` build after the current soak completes its
    milestone — **planned**.
-The two pending anchors are tracked and not yet claimed as evidence; until they land, the shipped-build
-assurance rests on seam identity plus the published-package examples gate.
+The one pending anchor is tracked and not yet claimed as evidence; until it lands, the shipped-build
+assurance rests on seam identity, the published-package examples gate, and the §4.5 fault campaign.
 
 ### Layer B — Mutation-verified regression tests
 
@@ -862,6 +864,11 @@ property:
   0 scopes out**: it records kills landing at genuine partial durable coverage and completions that
   resumed from partial persisted state.
 
+Both tiers fault the **process** (`SIGKILL`). A separate, complementary campaign (§4.5, ACCEPTED
+2026-07-11) faults the **network** instead — injecting rate-limit/5xx/reset/stall/corruption faults on
+the wire to the Portal while the app keeps running — and proves the backfill still completes
+byte-identical. The two axes are complementary: neither subsumes the other.
+
 ### 4.1 Tier 0 — PGlite byte-identity (ACCEPTED 2026-07-04)
 
 The chaos kill-loop was accepted against the campaign's acceptance criteria. Aggregate result:
@@ -1113,6 +1120,92 @@ To stress the dense-source / factory-child discovery path (many concurrent `data
 **Candor.**
 
 - **This section does NOT assert, and deliberately does not claim, that a fresh dense process's first discovery scan is warmup-bounded.** On attempt 1 of a fresh process, the first `portal-dense-discovery-scan` covers the ENTIRE range in ~8 windows (a grid-aligned `[20528000, 20579207]`, ~51.2k blocks, starting just below the configured floor `20529207` — do not reconcile it against the 50000-block data range) because the concurrent `dataChunk` fan-out supplies a full-range `needTo` when Ponder feeds a large first interval. This is expected (a consequence of `planDiscovery`'s `to = max(needTo, min(endHint, through+quantum))` tracking a large interval, not the watermark) — it is NOT a #50 regression and NOT a fork bug, because a wide discovery scan fetches no data, does not delay first commit, and only front-loads factory-child discovery I/O.
+
+### 4.5 Adversarial network/transport-fault campaign on the shipped `0.16.8-sqd.1` build (ACCEPTED 2026-07-11)
+
+The §4.1–§4.4 campaigns kill the **app process** and prove crash/resume identity. This campaign leaves
+the app running and instead injects **network and transport faults** on the wire between the app and
+the **public** Portal, via an in-path fault proxy (`harness/chaos/proxy.mjs`, unit-tested in
+`proxy.test.mjs`), driven by `harness/chaos/fault-proxy-campaign.sh`. It proves a complementary
+property: under an adversarial network, the Portal backfill still **completes byte-identical to a clean
+baseline** — a fault surfaces as a retry, never as silent data corruption or coverage loss. It ran on
+the **shipped `0.16.8-sqd.1` package** (tarball `subsquid-ponder-0.16.8-sqd.1.tgz`, sha256
+`b5a0daa6f8439a67afd36d715451f040a9addc1e7d55f7043400092ac3869b70`), the fault-proxy code merged in
+[#149](../../pull/149) (`5a2fe88`), so it doubles as the §2 shipped-build anchor #2. Backend is
+`postgres16` (`fsync=on`, recorded `postgres16-fsync-on`), app `euler-app` (factory
+`0x29a56a1b8214D9Cf7c5561811750D5cBDb45CC8e`), chain 1 (ethereum) range `[20529207, 20579207]` (span
+50000), Portal `portal.sqd.dev/datasets/ethereum-mainnet`. The clean baseline logical digest is
+`360af5126a0efffc49b871594b8ac3ea` (baseline wall 300 s). Wall clock: `2026-07-11T00:50:02Z` →
+`2026-07-11T01:10:19Z` (~20 min). Artifacts are in `harness/chaos/.faultproxy/artifacts/`
+(`aggregate.json` → `status: pass`).
+
+Each scenario runs a fresh backfill through the fault-injecting proxy into its **own** throwaway
+Postgres DB, then `harness/chaos/verify-resume-pg.sh` recomputes the logical digest (`pg-digest.mjs`)
+**and** the intervals-tile-exactly check against the clean baseline; the pass gate is fail-closed
+(§4.2). A scenario is a genuine PASS only if the injected fault **actually fired** (proxy counter ≥ 1),
+the resulting store digest **equals** the baseline, and the intervals tile exactly.
+
+**Body/transport-fault scenarios — 8/8 byte-identical, every fault non-vacuously fired:**
+
+| scenario | fault fired (proxy counter) | digest == baseline | AIMD label |
+|---|---|---|---|
+| 429-burst | `r429`×2 | yes | sparse — insufficient samples to assert recovery |
+| 5xx-storm | `r5xx`×6 | yes | recovery observed |
+| retry-after | `r429`×5 | yes | sparse |
+| tcp-reset-mid-ndjson | `reset`×5 | yes | sparse |
+| 90s-stall | `stall`×3 | yes | recovery observed |
+| truncated-gzip | `gzip`×5 | yes | sparse |
+| malformed-ndjson | `ndjson`×2 | yes | recovery observed |
+| spurious-204 | `r204`×4 | yes | sparse |
+
+All eight report `missedReset = 0` and `missedNdjson = 0` (no fault the harness expected to inject went
+undelivered), `verifyExit = 0`, and `digestEqual = true`.
+
+**head-freeze — the one in-range head scenario (PASS, byte-identical recovery):** the finalized head is
+frozen **below** `endBlock` 20579207. The frozen head stalls the Portal **without corrupting the
+durable store**; a clean restart on the same DB with the fault removed completes to a store
+byte-identical to the baseline (`byte-identical-recovery`, digest `360af51…`).
+
+**head-regression-100k and head-flap — NOT-APPLICABLE (not counted as a pass):** both manipulate the
+head so it stays **≥ `endBlock`**, so it never intersects the fixed range `[20529207, 20579207]`. A
+fixed-range historical backfill never rolls back an already-finalized+indexed block, so it cannot
+exercise head-reorg/rollback — a **stream-mode** property, exercised by the stream-mode A/B soak (Layer
+D / §5.2), not this historical harness. Recorded `pass:false, notApplicable:true, digest:"n/a"`.
+
+**Independent re-verification by the orchestrator (load-bearing):** every one of the 9 in-scope
+scenarios' `runs/<scenario>/digest` equals the baseline `360af5126a0efffc49b871594b8ac3ea`; every
+in-scope `verdict.json` carries `verifyExit:0` and `digestEqual:true`; every `proxy-stats.json` shows
+its expected fault counter ≥ 1 with `missedReset:0`/`missedNdjson:0`; the baseline `verify.log` shows
+all seven interval fragments (one factory + six log) tiling `[20529207, 20579208]` exactly with a
+"digest identical" line. The two not-applicable scenarios carry `pass:false, notApplicable:true,
+digest:"n/a"` — so the "8 pass + 1 recovery + 2 n/a" tally is exactly what the on-disk verdicts say,
+not a summarized claim.
+
+**What this proves:**
+
+1. **Adversarial-network byte-identity (PROVEN, 8/8 + head-freeze).** Under rate-limit bursts, 5xx
+   storms, `Retry-After`, mid-NDJSON TCP resets, multi-second stalls, truncated gzip, malformed NDJSON
+   lines, spurious 204s, and a frozen finalized head, the resumed/completed store is byte-identical to
+   an unperturbed baseline. The fault plane cannot inject a silent divergence.
+2. **Honest AIMD labeling (the #149 fix).** Where enough gate transitions were sampled (5xx-storm,
+   90s-stall, malformed-ndjson) the trace shows multiplicative-decrease→additive-increase recovery
+   (`recovered:true`); where too few were sampled the label says exactly that (`sparse — insufficient
+   samples to assert recovery`) instead of overclaiming.
+
+**Candor.**
+
+- **The sparse-AIMD scenarios do NOT assert a full recovery cycle.** For 429-burst, retry-after,
+  tcp-reset-mid-ndjson, truncated-gzip, and spurious-204 the concurrency gate stayed within bounds
+  (`within:true`) but too few transitions were sampled in the short window to assert a
+  decrease→increase recovery, and the verdict labels each `sparse` and `recovered:false`. Byte-identity
+  is fully proven for these; only the *recovery* claim is withheld.
+- **head-regression-100k / head-flap are NOT head-tolerance passes.** They are structurally
+  inapplicable to a fixed-range historical backfill (head stays above `endBlock`). Head-reorg/rollback
+  tolerance is a stream-mode property, covered by the stream-mode soak (Layer D / §5.2), and is not
+  claimed here.
+- **This is a network/transport campaign, not a crash campaign.** It never kills the app process; it is
+  complementary to §4.1–§4.4 (which prove `SIGKILL` atomicity and resume-from-partial). Neither
+  subsumes the other.
 
 ---
 
