@@ -351,15 +351,18 @@ const buildTraces = (
         // INV-21 (root-frame gas parity): the RPC path stores geth callTracer's top-frame `gas`, which is
         // the transaction's FULL gasLimit. Portal serves Parity-style traces whose root `action.gas` is
         // gasLimit MINUS the EIP-2028 intrinsic (the delta the diff-harness surfaced: gas-only, at the root
-        // frame, gas_used byte-identical). geth puts full tx.gasLimit on the top frame UNCONDITIONALLY (call/
-        // create/any tx type — no intrinsic math), so override the root frame's gas with the parent tx's
-        // gasLimit to make the Portal store byte-identical to the RPC realtime path (intra-deployment
-        // determinism — a fork DB is Portal-backfill + stock-RPC-realtime and must be uniformly ponder-shaped).
-        // Keyed on `traceAddress.length === 0` (the top-level trace), NOT the DFS rank — a chunk can hold only
-        // deep frames. Non-root frames already match the RPC path, so they are left untouched. Skipped when the
-        // parent tx is absent (never poison the store with an undefined gas). Applied HERE, not in
-        // parityToCallFrame, so the shared trace matcher (buildRawTraceMatcher) is unaffected.
-        if (traceAddress.length === 0 && rawTx?.gas !== undefined) {
+        // frame, gas_used byte-identical). geth's callTracer seeds the top frame's `gas` with the full
+        // tx.gasLimit (before any intrinsic deduction — no intrinsic math needed here), so override the root
+        // frame's gas with the parent tx's gasLimit to make the Portal store byte-identical to the RPC realtime
+        // path (intra-deployment determinism — a fork DB is Portal-backfill + stock-RPC-realtime and must be
+        // uniformly ponder-shaped). Keyed on `traceAddress.length === 0` (the top-level trace), NOT the DFS
+        // rank — a chunk can hold only deep frames. Non-root frames already match the RPC path, so they are
+        // left untouched. Skipped when the parent tx's gas is absent (never poison the store with a fabricated
+        // gas). Applied HERE, not in parityToCallFrame, so the shared trace matcher (buildRawTraceMatcher) is
+        // unaffected. Grounded on 2196 root frames (legacy + EIP-1559, intrinsic-independent) of a captured
+        // Portal-vs-RPC store diff; contract-creation and access-list roots were absent from that corpus, so
+        // those tx classes rest on the geth callTracer mechanism above, not a direct measurement here.
+        if (traceAddress.length === 0 && rawTx?.gas != null) {
           frame.gas = hx(rawTx.gas);
         }
 

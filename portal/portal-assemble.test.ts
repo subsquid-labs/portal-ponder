@@ -692,7 +692,9 @@ test('INV-20 (d): an inheriting child of an ancestor that has an error but NO re
 // 16/nonzero + 4/zero calldata byte, + access-list + creation costs). The diff-harness surfaced exactly
 // this: 133/133 divergences were gas-only, at the root frame (traceAddress []), with gas_used byte-identical
 // and RPC.gas − Portal.gas == the tx's intrinsic — and on every root frame RPC.gas == the tx gasLimit
-// UNCONDITIONALLY (grounded on a real captured Portal-vs-RPC store diff, eth mainnet). So `buildTraces`
+// (grounded on 2196 root frames of a captured Portal-vs-RPC store diff, eth mainnet — legacy + EIP-1559;
+// contract-creation and access-list roots were absent, so those tx classes are mechanism-inferred from the
+// geth callTracer behavior, not measured in that corpus). So `buildTraces`
 // overrides the root frame's gas with the parent tx's gasLimit to make the Portal store byte-identical to
 // the stock RPC realtime path (intra-deployment determinism — a fork DB is Portal-backfill + stock-RPC-
 // realtime and must be uniformly ponder-shaped). Non-root frames already match and are left untouched.
