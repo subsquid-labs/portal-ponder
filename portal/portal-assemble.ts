@@ -81,22 +81,80 @@ type CallFrame = {
 export type RankedTrace = { frame: CallFrame; index: number };
 
 /**
+ * INV-19 (ancestor-error cascade): reproduce stock ponder's derived trace-error normalization so the
+ * Portal-path store is byte-identical to the RPC-path store on `traces.error` / `traces.revert_reason`.
+ *
+ * Upstream `src/rpc/actions.ts` `debug_traceBlockByNumber`/`debug_traceBlockByHash` DFS (shipped as
+ * @subsquid/ponder dist/esm/rpc/actions.js:100-118): within ONE transaction's trace tree, a reverted
+ * ancestor's error/revertReason is smeared onto every descendant that lacks its OWN error, transitively
+ * (a frame that inherits becomes a source for its own children). A frame with its OWN distinct error
+ * keeps it (own-error branch wins). Portal delivers geth-faithful per-frame errors, so the fork must
+ * apply this same post-processing to match — realtime/fallback already flow through the untouched RPC
+ * cascade, so the fork DB must be uniformly ponder-shaped.
+ *
+ * Upstream keys `failedTraces` by frame identity and threads `parentFrame` down the recursion; here we
+ * key by traceAddress prefix (parent of [a,b,c] is [a,b]) — the frames within a tx are exactly one tree,
+ * `sorted` is DFS pre-order (cmpTraceAddr, parent-before-child), so each parent's effective error is
+ * resolved before its children are visited. Keyed by traceAddress (not the produced frame) so the
+ * parentage chain is intact even if `parityToCallFrame` drops a frame from the output.
+ *
+ * Upstream issue: <UPSTREAM_ISSUE_URL>  (to be filled by the reviewer).
+ */
+const cascadeTraceErrors = (
+  sorted: RawTrace[],
+): Map<string, { error: string; revertReason?: string }> => {
+  const effective = new Map<string, { error: string; revertReason?: string }>();
+  for (const t of sorted) {
+    const addr = t.traceAddress ?? [];
+    const key = addr.join(',');
+    const ownError = (t.error ?? undefined) as string | undefined;
+    if (ownError !== undefined) {
+      effective.set(key, {
+        error: ownError,
+        revertReason: (t.revertReason ?? undefined) as string | undefined,
+      });
+
+      continue;
+    }
+
+    if (addr.length === 0) continue;
+
+    const parentKey = addr.slice(0, -1).join(',');
+    const parentError = effective.get(parentKey);
+    if (parentError === undefined) continue;
+
+    effective.set(key, parentError);
+  }
+
+  return effective;
+};
+
+/**
  * INV-5 producer: given ONE transaction's traces (reward/no-tx frames already excluded), sort them into
  * pre-order DFS (cmpTraceAddr) and assign each its rank = position in that sorted full list. The matcher
  * only ever consumes `RankedTrace`s, so a matched trace's `index` is its full-tree position, never a
- * filter-local one.
+ * filter-local one. INV-19: the ancestor-error cascade is applied over the same sorted tree, so each
+ * frame carries its post-cascade `error`/`revertReason` (byte-identical to the RPC path).
  */
 export function rankTraces(traces: RawTrace[]): RankedTrace[] {
   const sorted = [...traces].sort((x, y) =>
     cmpTraceAddr(x.traceAddress ?? [], y.traceAddress ?? []),
   );
+  const effectiveErrors = cascadeTraceErrors(sorted);
   // Ranks are strictly increasing BY CONSTRUCTION (each rank is the forEach counter of a monotonically
   // walked array) — the same "an assert that could never fire" INV-2 deliberately omits, so none here
   // either (wave 4; the property is proven in portal-assemble.test.ts).
   const out: RankedTrace[] = [];
   sorted.forEach((t, i) => {
     const frame = parityToCallFrame(t, i) as CallFrame | undefined;
-    if (frame) out.push({ frame, index: i });
+    if (!frame) return;
+
+    const cascaded = effectiveErrors.get((t.traceAddress ?? []).join(','));
+    if (cascaded !== undefined) {
+      frame.error = cascaded.error;
+      frame.revertReason = cascaded.revertReason;
+    }
+    out.push({ frame, index: i });
   });
 
   return out;

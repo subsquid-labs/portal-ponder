@@ -1,3 +1,5 @@
+import { readFileSync } from 'node:fs';
+import { join } from 'node:path';
 import fc from 'fast-check';
 import { expect, test } from 'vitest';
 import {
@@ -536,4 +538,125 @@ test("INV-2: trace assembly respects the interval's UPPER bound (a trace block a
   const out = assembleRange([cd], [0, HI], spec, new Map());
   expect(out.traces).toHaveLength(1);
   expect(Number(BigInt((out.traces[0]!.block as any).number))).toBe(HI);
+});
+
+// ── INV-19: ancestor-error cascade (byte-identity with the stock-ponder RPC path) ────────────────────
+//
+// Stock ponder's `debug_traceBlockByNumber` DFS (src/rpc/actions.ts) smears a reverted ancestor's
+// error/revertReason onto every descendant lacking its OWN error, transitively; a frame with its own
+// error keeps it. Portal delivers geth-faithful per-frame errors, so `rankTraces` must reproduce that
+// post-processing for the store to match. These are ORACLE tests: the expected error strings come from
+// the real RPC-store output / from the cascade rule, never hand-derived per frame.
+
+// index a tx's ranked frames by their source traceAddress (encoded into `input` for synthetic cases,
+// or read from the real fixture below).
+const byAddr = (traces: any[]): Map<string, any> => {
+  const m = new Map<string, any>();
+  const sorted = [...traces].sort((x, y) =>
+    cmpTraceAddr(x.traceAddress ?? [], y.traceAddress ?? []),
+  );
+  const ranked = rankTraces(traces);
+  // rankTraces preserves cmpTraceAddr order, so the k-th ranked frame is the k-th sorted raw trace.
+  sorted.forEach((t, i) => {
+    m.set((t.traceAddress ?? []).join(','), ranked[i]!.frame);
+  });
+
+  return m;
+};
+
+const mkErrTrace = (
+  traceAddress: number[],
+  error?: string,
+  revertReason?: string,
+) => ({
+  transactionIndex: 0,
+  traceAddress,
+  type: 'call',
+  subtraces: 0,
+  action: {
+    from: '0xfrom',
+    to: '0xto',
+    value: '0x0',
+    gas: '0x1',
+    input: '0x' + traceAddress.join(','),
+    callType: 'call',
+  },
+  result: { gasUsed: '0x1', output: '0x' },
+  ...(error !== undefined ? { error } : {}),
+  ...(revertReason !== undefined ? { revertReason } : {}),
+});
+
+test('INV-19: real reverted tx — the whole reverted subtree inherits the ancestor error (oracle: RPC store)', () => {
+  // Real geth callTracer output for eth mainnet block 20351061, tx index 26 (a reverted swap-router call),
+  // reshaped into Portal's Parity-flat RawTrace with each frame's OWN error preserved verbatim (Portal's
+  // geth-faithful input shape): frames [], [0], [0,2] carry error; [0,1] and its whole subtree are null.
+  const fixture = JSON.parse(
+    readFileSync(
+      join(__dirname, '__fixtures__', 'trace-error-cascade.json'),
+      'utf8',
+    ),
+  );
+  const frames = byAddr(fixture.traces);
+
+  // The [0,1] frame (to=V2 router 0x7a250d..., input 0x38ed1739) has NO own error in the input, but its
+  // parent [0] is reverted, so the RPC store carries "execution reverted"/"Too little received" on it.
+  const swap = frames.get('0,1');
+  expect(swap.to).toBe('0x7a250d5630b4cf539739df2c5dacb4c659f2488d');
+  expect((swap.input as string).startsWith('0x38ed1739')).toBe(true);
+  expect(swap.error).toBe('execution reverted');
+  expect(swap.revertReason).toBe('Too little received');
+
+  // The root reverted, so EVERY frame in the tx ends up carrying the same error (full-subtree smear),
+  // including the deep descendants of the succeeded-in-geth [0,1] subtree.
+  for (const [, f] of frames) {
+    expect(f.error).toBe('execution reverted');
+    expect(f.revertReason).toBe('Too little received');
+  }
+});
+
+test('INV-19 (a): a child with its OWN distinct error SURVIVES (own-error branch wins over the parent)', () => {
+  const frames = byAddr([
+    mkErrTrace([], 'execution reverted', 'parent revert'),
+    mkErrTrace([0]), // null → inherits parent
+    mkErrTrace([1], 'out of gas', 'own revert'), // own error → keeps it
+    mkErrTrace([1, 0]), // null → inherits [1]'s OWN error, not the root's
+  ]);
+
+  expect(frames.get('').error).toBe('execution reverted');
+  expect(frames.get('0').error).toBe('execution reverted');
+  expect(frames.get('0').revertReason).toBe('parent revert');
+
+  expect(frames.get('1').error).toBe('out of gas'); // survived
+  expect(frames.get('1').revertReason).toBe('own revert');
+  expect(frames.get('1,0').error).toBe('out of gas'); // inherited the OWN error, not the root's
+  expect(frames.get('1,0').revertReason).toBe('own revert');
+});
+
+test('INV-19 (b): ≥3-deep nesting inherits the ancestor error transitively', () => {
+  const frames = byAddr([
+    mkErrTrace([], 'execution reverted', 'deep revert'),
+    mkErrTrace([0]),
+    mkErrTrace([0, 0]),
+    mkErrTrace([0, 0, 0]),
+    mkErrTrace([0, 0, 0, 0]),
+  ]);
+
+  for (const key of ['', '0', '0,0', '0,0,0', '0,0,0,0']) {
+    expect(frames.get(key).error).toBe('execution reverted');
+    expect(frames.get(key).revertReason).toBe('deep revert');
+  }
+});
+
+test('INV-19 (c): a non-reverted tx keeps every frame error/revertReason null', () => {
+  const frames = byAddr([
+    mkErrTrace([]),
+    mkErrTrace([0]),
+    mkErrTrace([0, 0]),
+    mkErrTrace([1]),
+  ]);
+
+  for (const [, f] of frames) {
+    expect(f.error).toBeUndefined();
+    expect(f.revertReason).toBeUndefined();
+  }
 });
