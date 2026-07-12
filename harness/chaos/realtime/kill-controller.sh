@@ -106,8 +106,7 @@ wait_phase () {
 }
 
 completed () { grep -qiE 'Completed indexing across all chains' "$1" 2>/dev/null; }
-completed_live () { grep -qiE 'Completed live indexing' "$1" 2>/dev/null; }
-invariant () { grep -qiE 'InvariantViolation' "$1" 2>/dev/null; }
+invariant () { grep -qiE 'InvariantViolation|restart to re-sync|deterministic, not retried|Cannot finalize safely|Cannot reconcile safely' "$1" 2>/dev/null; }
 
 wait_complete () {
   local pid="$1"

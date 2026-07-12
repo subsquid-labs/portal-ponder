@@ -117,7 +117,7 @@ wait_phase () {
 }
 
 completed () { grep -qiE 'Completed indexing across all chains' "$1" 2>/dev/null; }
-invariant () { grep -qiE 'InvariantViolation|losing fork|gap fatal|unknown parent|Cannot reconcile safely' "$1" 2>/dev/null; }
+invariant () { grep -qiE 'InvariantViolation|restart to re-sync|deterministic, not retried|Cannot finalize safely|Cannot reconcile safely' "$1" 2>/dev/null; }
 
 wait_complete () {
   local pid="$1"
@@ -508,7 +508,7 @@ const candor = {
   K2: 'mid-stream kill; kill block varied across iterations over the interior of the 101..112 stream',
   K3: 'redelivery-of-block only; redelivery watchdog + held-finalize drain NOT exercised (need real Portal / halted-chain sim).',
   K4: 'idle / 204 retry path',
-  K5: "synthetic fork via stale-parentBlockHash 409 (client consumes the canonical replacement chain and resumes byte-identically) PLUS a wrong-fork-finalize handler-REACHABILITY probe. handlerStats.wrongForkFinalizes counts mock-side splices ONLY: the injected wrong finalized head is NOT consumed by the client here (finalize poll cadence ~4s > the post-injection scenario window ~1.8s), so this is not clean-resume wrong-fork evidence. The client-side wrong-fork-finalize FATAL guard (hash-mismatch at finality) is proven deterministically by portal-realtime.test.ts ('a finalize whose canonical hash mismatches the local block is FATAL', finalizePollMs:0). Real L1-reorg wire fidelity NOT exercised.",
+  K5: "synthetic fork via stale-parentBlockHash 409 (client consumes the canonical replacement chain and resumes byte-identically) PLUS a wrong-fork-finalize handler-REACHABILITY probe. handlerStats.wrongForkFinalizes counts mock-side handler entries (reachability) ONLY — the counter increments on handler entry, before the gate, so on a killed run the splice may not even execute; the injected wrong finalized head is NOT consumed by the client here (finalize poll cadence ~4s > the post-injection scenario window ~1.8s), so this is not clean-resume wrong-fork evidence. The client-side wrong-fork-finalize FATAL guard (hash-mismatch at finality) is proven deterministically by portal-realtime.test.ts ('a finalize whose canonical hash mismatches the local block is FATAL', finalizePollMs:0). Real L1-reorg wire fidelity NOT exercised.",
   K6: "kill lands mid backfill→live cutover (>=1 live /stream block served before the kill; see kill.phase.log block + killStats.stream>0), so resume re-drives the cutover. Probe-retry wire fidelity (the 3-attempt loop in clampFinalizedToPortalHead) NOT exercised — mock's /finalized-head succeeds first try; probe-retry fidelity rests on portal-realtime-wire.test.ts.",
 };
 const lines = fs.existsSync(process.env.RECORDS)
@@ -580,13 +580,20 @@ const acceptance = {
   digestMatchOk: totals.killCount > 0 && totals.digestMatchCount === totals.killCount,
   duplicateFinalizedRowsOk: totals.duplicateFinalizedRows === 0,
   dupCheckLoadBearingOk: loadBearingClasses.every((klass) => perClass[klass].finalizedScannedRows > 0),
+  // Self-certify the two non-vacuity properties this harness exists to prove, so a regression to the
+  // original vacuous-K6 bug (kill landing on the /finalized-head startup probe, killStats.stream===0)
+  // or to a fixed-block K2 cannot silently re-produce `accepted:true` on a byte-identical resume.
+  k6CutoverNonVacuousOk: perClass.K6.killCount > 0 && perClass.K6.killsWithLiveStream === perClass.K6.killCount,
+  k2KillSpreadOk: perClass.K2.killBlocks.length >= 3,
 };
 acceptance.accepted = acceptance.totalKillsOk
   && acceptance.perClassKillsOk
   && acceptance.cleanResumeOk
   && acceptance.digestMatchOk
   && acceptance.duplicateFinalizedRowsOk
-  && acceptance.dupCheckLoadBearingOk;
+  && acceptance.dupCheckLoadBearingOk
+  && acceptance.k6CutoverNonVacuousOk
+  && acceptance.k2KillSpreadOk;
 const summary = {
   generatedAt: new Date().toISOString(),
   runRoot: process.env.RUN_ROOT,
@@ -597,7 +604,7 @@ const summary = {
 fs.writeFileSync(process.env.SUMMARY_FILE, `${JSON.stringify(summary, null, 2)}\n`);
 
 const md = [];
-md.push('# RG3 Phase B Realtime Chaos Result');
+md.push('# RG3 Phase A Realtime Chaos Result');
 md.push('');
 md.push(`Run root: \`${process.env.RUN_ROOT}\``);
 md.push('');
@@ -608,6 +615,8 @@ md.push(`- clean resumes: ${totals.cleanResumeCount} / ${totals.killCount}`);
 md.push(`- digest matches: ${totals.digestMatchCount} / ${totals.killCount}`);
 md.push(`- duplicate FINALIZED rows: ${totals.duplicateFinalizedRows}`);
 md.push(`- dup-check load-bearing (K2-K5 scanned finalized rows): ${acceptance.dupCheckLoadBearingOk}`);
+md.push(`- K6 cutover non-vacuous (every K6 kill after >=1 live /stream block): ${acceptance.k6CutoverNonVacuousOk}`);
+md.push(`- K2 kill-block spread (>=3 distinct interior blocks): ${acceptance.k2KillSpreadOk}`);
 md.push(`- per-class minimum: ${minPerClass}`);
 md.push('');
 md.push('## Classes');
