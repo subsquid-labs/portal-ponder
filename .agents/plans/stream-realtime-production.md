@@ -34,7 +34,7 @@ and nowhere else; it is gated on the complete dossier, not on judgment.
 
 | Gate | Name | One-line exit criterion |
 |------|------|------------------------|
-| RG0 | Ground truth ratified | This plan merged; RT-G13 (cutover floor) verified true-bug-or-not with a written verdict |
+| RG0 | Ground truth ratified | This plan merged; RT-G13 (cutover floor) verified true-bug-or-not with a written verdict. **MET** — plan merged ([#157](../../pull/157)); RT-G13 verified **INERT / NOT-A-BUG** (upstream guards isolated adoption — verdict in the RT-G13 register entry below), so RT-2 reclassifies to should-fix (defense / doc-parity). |
 | RG1 | Must-fix code landed | RT-1/RT-2/RT-3 merged: mutation-verified tests, committee review, both-version gates green |
 | RG2 | Fail-loud audit complete | Fatal-injection suite + silent-gap fuzzer green in CI; no enumerated silent path survives |
 | RG3 | Realtime chaos passed | ≥200 kills across ≥6 timing classes, 100 % clean resumes, byte-identical digests. **MET (Phase A, [#158](../../pull/158))** — 238 kills / 7 timing-class sub-runs, 238/238 clean, byte-identical, 0 dup FINALIZED; K6-cutover + K2-spread non-vacuity self-certified. Numbers + candid mock-fidelity caveats in VALIDATION §5.11. |
@@ -177,6 +177,23 @@ gates RG1), **should-fix** (lands during the campaign, doesn't gate the label by
   `floor: hexToNumber(params.syncProgress.finalized.number)` mirroring the multichain site. Even if
   upstream is proven to guard, land the floor anyway as a cheap docstring-parity/defense fix — but
   then classified should-fix and the test asserts the floor is inert.
+- **RG0 verdict — VERIFIED, NOT-A-BUG (isolated adoption is guarded, not unconditional).** Grafted
+  upstream `packages/core/src/runtime/historical.ts` (`getHistoricalEventsIsolated`; raw-upstream
+  0.16.9 lines 827–835, grafted lines shift down where the Portal clamp is inserted above the guard)
+  `break`s *before* the boundary assignment whenever
+  `hexToNumber(finalizedBlock.number) − hexToNumber(params.syncProgress.finalized.number) <= params.chain.finalityBlockCount`,
+  and only otherwise runs `params.syncProgress.finalized = finalizedBlock`. A stale-LOW clamp yields a
+  **negative** delta, which is always `<= finalityBlockCount` (≥ 0), so the `break` fires and the
+  below-floor boundary is **never adopted**. The multichain site's `floor` is load-bearing only because
+  *its* post-catchup assignment is unconditional (`syncProgress.finalized = finalizedBlocks[i]` for
+  every chain once catchup fires); the isolated site has no such unconditional path. Confirmed by two
+  blind reviewers (independent reasoning + a grafted-source read across all pinned versions —
+  0.15.17 / 0.16.6–0.16.9, same guard shape) and re-verified first-hand against raw upstream 0.16.9.
+  **Reclassified must-verify→must-fix ⇒ should-fix (RT-2, defense / doc-parity):** still land the
+  `floor` mirroring the multichain site, but the mutation-verified test **pins the upstream guard**
+  (weaken the `<= finalityBlockCount` comparison ⇒ a stale-low block gets adopted ⇒ the test fails),
+  **not** the floor — removing the floor alone cannot fail the test, since the guard already prevents
+  the regression.
 
 ### RT-G14 (new) — Restart/resume of the realtime region: zero empirical evidence
 - **Analysis**: the design argument is sound — crash recovery reverts unfinalized app rows to the
@@ -209,7 +226,7 @@ gates RG1), **should-fix** (lands during the campaign, doesn't gate the label by
 | RT-G10 | must-fix | RT-1 (progress watchdog) |
 | RT-G11 | must-fix | RT-1 (read idle bound → reconnect) |
 | RT-G12 | must-fix | RT-1 (poll decoupled from delivery) |
-| RT-G13 | must-verify → must-fix | RT-2 (isolated cutover floor) |
+| RT-G13 | verified INERT (RG0) → should-fix | RT-2 (floor for parity; test pins the upstream guard, not the floor) |
 | RT-G14 | evidence | RG3 |
 | RT-G15 | evidence | RG3 K5 + RG2 seam test |
 
