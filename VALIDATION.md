@@ -40,8 +40,10 @@ following are **pending** and must not be read as proven:
 - A **long-duration soak** sign-off. The A/B soak differ runs hourly and its findings are already
   public issues (below), but no multi-day green-soak claim is made in this document yet.
 - **Zero-RPC realtime** without an experimental label. The Portal `/stream` realtime path is under
-  active hardening (see the stream-realtime issues and PR #26); this document does not certify it for
-  unattended production use.
+  active hardening (see the stream-realtime issues and PR #26); the `/stream` **liveness hardening**
+  stack (RT-1/RT-2/RT-3, INV-22…25, §5.12) has landed as **code + unit-test** evidence, but that raises
+  the reliability floor — it does **not** certify the path for unattended production use, which remains
+  explicitly not claimed.
 
 ---
 
@@ -1779,6 +1781,109 @@ realtime stream path resumes **byte-identical** after a `SIGKILL` at each of the
 (the K1–K6 timing classes) spanning its mock-driven ingest/finalize/cutover loop, which is the
 crash-timing half of the recoverability property (§1 of the
 campaign plan) — no more, and stated as no more.
+
+---
+
+### 5.12 Realtime /stream liveness hardening (RT-1 / RT-2 / RT-3 — INV-22…25)
+
+This subsection records the `/stream` **liveness + defense hardening** stack that landed as RT-1
+([#161](../../pull/161)), RT-2 ([#163](../../pull/163)), and RT-3 ([#162](../../pull/162)), adding
+invariants **INV-22, INV-23, INV-24, INV-25** to [`portal/INVARIANTS.md`](portal/INVARIANTS.md). As
+with everything in this document, it states plainly what it does and does **not** prove. The evidence
+**class is the same as §5.8(B)**: *code + mutation-verified **unit** tests* (`portal-realtime.test.ts`,
+`portal-realtime-wire.test.ts`, `portal-cutover-guard.test.ts`) — construction properties pinned by
+tests that go RED on the pre-fix code, **not** paid-matrix byte-identity (§3) and **not** a
+live-protocol reorg/finalize claim (that is RG4/RG5, §5.11). These raise the *reliability floor* of the
+stream path; they do not change its **experimental** label (§1, §6).
+
+**INV-22 — Realtime heartbeat finality cadence (RT-1 SC2).** The finalize poll and the B1 defer
+watchdog run on a wall-clock cadence (≤2× `finalizePollMs`) **regardless of delivery**: `streamHotBlocks`
+emits zero-payload `{kind:'tick'}` heartbeats before its no-data sleeps and `runFinalizeCadence()` runs
+on every tick, so a no-delivery outage — 204s, bodyless 200s, reconnect loops, transient fetch errors,
+or 429/5xx load — **cannot freeze finality** until another block arrives. Pinned by
+`portal-realtime.test.ts` — *"portalRealtimeEvents: heartbeat ticks keep finalize polling on a 204-only
+wall-clock cadence (RT-1 SC2 T2)"* (asserts repeated `finalizedHead` calls under a zero-delivery
+204-only stream), mutation-verified. The cadence itself is a construction property, so there is no
+runtime assert (timing-flaky) — the test is the pin.
+
+**INV-23 — Idle-bounded read + tick-transparent line-wait (RT-1 SC1).** Completes INV-22 for the one
+no-delivery state loop-turn ticks cannot reach: a **silent-OPEN** connection (headers OK, body never
+delivers, no FIN/RST). While the NDJSON read is suspended, `streamHotBlocks` yields a `{kind:'tick'}`
+every `tickSleepMs` of silence **without cutting the connection or dropping/reordering a line** (a single
+pending `it.next()` is held across the heartbeat race and never re-requested until it settles), and after
+`idleMs` of *cumulative* silence recycles the connection (reconnect from `cursor`, **not** fatal). A
+slow-but-alive stream is **never cut** — the idle guard re-arms on every received chunk. Pinned across
+three `portal-realtime.test.ts` cases (silent-open tick clock, idle-bound reconnect-from-cursor,
+never-cut) plus `portal-realtime-wire.test.ts` env-precedence for `resolveStreamIdleMs`
+(`PORTAL_STREAM_IDLE_MS`, default 120_000). Mutation-verified with two **independent** tells — removing
+the tick-transparent wait fails the silent-open test (`SILENT-OPEN-STARVED`); removing the idle bound
+fails the reconnect test (`IDLE-RECONNECT-STARVED`) — each failing on its own and on the pre-SC1 code.
+
+**INV-24 — Delivery-progress watchdog (RT-1 SC3).** When the probed finalized head has climbed
+≥ `deliveryProgressThreshold` (default 16) blocks **beyond the highest DELIVERED block** while **zero**
+blocks were delivered for ≥ `deliveryProgressMaxMs` (default 600_000), `portalRealtimeEvents` fails
+**LOUD** (throws with a diagnostic dump, never an RPC fallback) — turning an otherwise-silent
+"finalize-poll succeeds, nothing reaches the store" stall into a restartable fatal. The baseline is the
+delivered **HEIGHT** — `max(first-observed finalized head, highest delivered block)` — **not** the
+finalized head at last delivery (the RT-G10 fix): because the `/stream` delivers unfinalized tip blocks
+that run far ahead of finality, a **quiet chain** or a **tip-freeze-while-finality-catches-up**
+(finalized ≤ delivered) **never** trips it; only genuinely new blocks the stream is failing to deliver
+do. Pinned by six numbered `portal-realtime.test.ts` cases (T1 genuine stall fatal · T2/T3
+progress-conditioning non-trip · T4 finality-catching-up must-NOT-trip · T5 climb-past-delivered
+still-fatal · T6 the deliver-before-first-poll first-probe `max` fold) plus the E1 fetch-error
+non-delivery seam (`onFetchError` yields a tick and stamps no delivery). Mutation-verified **load-bearing
+in both directions**:
+neutering the finalized-head term (`0 ≥ threshold` never true) starves the genuine-stall tests
+(`PROGRESS-WATCHDOG-STARVED`) while the false-fatal repro stays green, and the symmetric sign-flip
+re-introduces the false-fatal — plus a third mutation dropping the first-probe fold re-introduces the
+deliver-before-first-poll false-fatal (T6).
+
+**INV-25 — Isolated-cutover finality floor (RT-2).** The isolated single-chain historical→realtime
+cutover clamp (`getHistoricalEventsIsolated`) now passes `floor = params.syncProgress.finalized.number`
+to `clampFinalizedToPortalHead`, mirroring the multichain/omnichain cutover sites. **CANDID: this floor
+is INERT defense-in-depth / documentation-parity — it does NOT fix a live bug.** The load-bearing
+protection against adopting a below-boundary finalized block is the **upstream break-before-adopt guard**
+right below the clamp (a stale-LOW probe yields a negative delta ≤ `finalityBlockCount`, so the loop
+**breaks before** the boundary assignment); **RG0 proved the isolated path was already safe without the
+floor** (plan §RG0). Because the floor equals the boundary the guard compares
+against, on the stale-LOW path it **masks a guard-weakening mutation**, which is exactly why the change is
+pinned by grafted-**source** pins rather than a (vacuous) behavioral test through the isolated path:
+`portal-cutover-guard.test.ts` — *"INV-25 / RT-2: isolated-cutover finality floor"* slices the isolated
+body and pins **both protections INDEPENDENTLY** — **Pin A** the shipped `floor:` line, **Pin B** the
+load-bearing break-before-adopt guard. Each is mutation-verified alone: dropping the `floor:` line fails
+Pin A while Pin B stays green (removing the floor has **no** behavioral signal — its inertness made
+concrete); weakening the guard predicate (`<=` → `>=`) fails Pin B while Pin A stays green. RT-2 lands it
+for cross-site parity and as belt-and-braces should the adopt-guard ever be refactored — **not** as a fix.
+
+**RT-3 — RING_CAP 2048→8192 + eviction-fatal proof (RT-G2).** Robustness hardening of the 409
+delivered-hash-ring fork-negotiation that INV-10 / §5.8(B) already cover (issue [#33](../../issues/33)):
+RT-3 raises the module-const `RING_CAP` from 2048 to **8192** and adds the eviction-path proof — it is
+**not** a new invariant. Rationale (from the diff): with the production B1 bound (`finalizeDeferMaxMs`
+600_000 ms), 600000 / 8192 ≈ 73 ms, so any chain with block time ≳75 ms cannot grow the unfinalized
+window past 8192 blocks above the deferred anchor before B1 fires — pushing the F5 availability edge (a
+deep 409 step-down landing on a *size-evicted* ring height) out of reach; the ~8192-entry hash map is
+about a megabyte, negligible. It also corrects the F5 CANDOR note: at a >RING_CAP window the **eviction**
+fatal (*"no delivered-hash ring entry for the resume parent"*) fires FIRST — `pruneRing` evicts the
+LOWEST heights, which sit ABOVE the finalized floor, so a no-match descent crosses the evicted band
+before it can reach the floor; the floor fatal fires only when the whole window fits under RING_CAP
+(nothing evicted). Two mutation-verified `portal-realtime.test.ts` cases reuse the scripted `/stream` 409
+step-down harness: a *~4096-block window FITS under 8192* (no eviction → the descent reaches the FLOOR
+fatal, asserting NOT the eviction message; reverting RING_CAP→2048 evicts the low band and flips it to the
+eviction shape → both asserts fail), and a *>8192 (8200) window* evicts the low heights so the descent
+hits the LOUD eviction fatal (neutering the loop-top missing-ring throw trips a `NEVER-EVICTED` sentinel
+— a loud, fast failure instead of a 15 s Vitest timeout). Either way it is a **loud restart, never wrong
+data** — equivalent to today's restart behavior.
+
+**What this does NOT prove.** These are **liveness + defense** invariants proven **by construction** and
+pinned by **mutation-verified unit tests** — the same class as §5.8(B), on the same axis as §5.2's
+stream-realtime correctness wave. They RAISE the reliability floor of the `/stream` path (a no-delivery
+outage cannot silently freeze finality; a silent-open connection is kept alive and recycled; a genuine
+delivery stall fails loud; the 409 ring's eviction edge is pushed out of the practical envelope and made
+a loud restart). They do **NOT** lift the path's **experimental** label; they do **NOT** establish
+live-protocol reorg survival or finalize-boundary reconciliation (RG4/RG5, §5.11); the paid-matrix
+byte-identity claims (§3) are historical-backfill, not realtime. And **INV-25's floor is explicitly
+inert** — the load-bearing safety on that path is the pre-existing break-before-adopt guard (RG0), not
+this document's newest bullet. The stream path remains experimental (§1, §6).
 
 ---
 
