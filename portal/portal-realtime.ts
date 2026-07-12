@@ -568,6 +568,14 @@ export async function* streamHotBlocks(
     let idleExpired = false;
     try {
       let readerP = it.next();
+      // DO NOT REMOVE — a readerP abandoned before its next re-race (abort/return at the yield, or the
+      // loop-top break on an already-aborted signal) would else unhandled-reject on a signal-aborted body:
+      // the /stream fetch is made with `signal: args.signal`, so on abort the in-flight `reader.read()`
+      // inside this pending `readerP` rejects. This `.catch` is a SEPARATE handler on the same promise — a
+      // promise may carry many independent handlers, so it does NOT consume the rejection observed by
+      // raceHeartbeat's own `readerP.then(...)` on the re-race (idle timeout → onIdleReconnect + reconnect;
+      // stream cut → reconnect); it only guarantees no abandoned readerP unhandled-rejects. (RT-1 SC1 / B1)
+      void readerP.catch(() => {});
       for (;;) {
         if (args.signal?.aborted) break;
 
@@ -586,6 +594,12 @@ export async function* streamHotBlocks(
 
         const line = step.value;
         readerP = it.next(); // this line settled — request the next before processing (order preserved)
+        // DO NOT REMOVE — same B1 guard as the initial readerP above: this prefetched next-read is created
+        // BEFORE we parse/yield the current block, so if the consumer abandons the generator while it is
+        // paused at the yield below (abort / .return() / throw), this readerP gets no further re-race and
+        // would unhandled-reject on the signal-aborted body (or the idle-timeout reject). Separate handler,
+        // does not mask the re-race's observation. (RT-1 SC1 / B1)
+        void readerP.catch(() => {});
         const batch = JSON.parse(line);
         if (batch?.header?.number != null) {
           const num = batch.header.number as number;
@@ -629,6 +643,13 @@ export async function* streamHotBlocks(
       // mid-stream without draining (`for await` did this implicitly; the manual driver must do it too).
       void it.return?.(undefined).catch(() => {});
     }
+    // On abort the inner driver broke out (loop-top guard or the heartbeat-win abort re-check). Return NOW,
+    // before the finalize-cadence tick + backoff below: the outer loop top would only `return` on the same
+    // aborted signal anyway, so emitting one more `{ kind: 'tick' }` (and sleeping) post-teardown is a leak
+    // of a tick past abort. The normal reopen / reconnect / idle-tick paths are untouched — this fires only
+    // when the signal is already aborted. (codex NIT)
+    if (args.signal?.aborted) return;
+
     if (idleExpired) args.onIdleReconnect?.();
     if (!reopen) {
       yield { kind: 'tick' };

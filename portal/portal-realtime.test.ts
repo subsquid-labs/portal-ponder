@@ -2050,3 +2050,128 @@ test('streamHotBlocks: idle bound fires onIdleReconnect and a slow-but-alive str
     await gen.return(undefined);
   }
 });
+
+// ─────────────────────────────── RT-1 SC1 B1: no unhandled rejection from an abandoned readerP ───────────────────────────────
+
+// Capture unhandledRejection for the duration of `fn`. Vitest installs its OWN unhandledRejection listener
+// that fails the whole run — so we SWAP the process listeners for our sentinel-only handler, run, wait one
+// macrotask turn for a pending readerP's abort/idle rejection to surface, then RESTORE the originals. The
+// return is the list of captured reasons; the fix asserts it is EMPTY. On pre-fix code an abandoned readerP
+// (created at `it.next()`, its `reader.read()` rejected when the signal-aborted body errors) has no handler
+// → it lands here non-empty. (RT-1 SC1 / B1)
+async function captureUnhandledRejections(
+  fn: () => Promise<void>,
+): Promise<unknown[]> {
+  const captured: unknown[] = [];
+  const prior = process.listeners('unhandledRejection');
+  for (const l of prior) {
+    process.removeListener('unhandledRejection', l);
+  }
+  const onReject = (reason: unknown): void => {
+    captured.push(reason);
+  };
+  process.on('unhandledRejection', onReject);
+  try {
+    await fn();
+    // A rejection abandoned in a race surfaces on a LATER microtask/macrotask than the abort. Drain both:
+    // a macrotask turn (setTimeout 0) flushes the microtask queue after it, so a `readerP` that rejects on
+    // the aborted body (or a fired idle timer) has settled and dispatched to `unhandledRejection` by here.
+    await new Promise<void>((resolve) => setTimeout(resolve, 50));
+  } finally {
+    process.removeListener('unhandledRejection', onReject);
+    for (const l of prior) {
+      process.on('unhandledRejection', l as (r: unknown) => void);
+    }
+  }
+
+  return captured;
+}
+
+test('streamHotBlocks: B1-A — abort at the first loop-top guard (200 open body) does not unhandled-reject the initial readerP (RT-1 SC1)', async () => {
+  const block100 = {
+    header: { number: 100, hash: 'h100', parentHash: 'h99', timestamp: 100 },
+    logs: [],
+  };
+  // Entry A: the signal is ALREADY aborted when execution reaches the INNER loop-top `if
+  // (args.signal?.aborted) break;` on the FIRST iteration — abort fired during/just after the /stream fetch
+  // resolved 200 with an open body. Crucially the abort must fire AFTER the OUTER loop-top guard (which
+  // would `return` before ever fetching on a pre-aborted signal) — so we abort from INSIDE fetchImpl, right
+  // before handing back the 200 body: the outer guard already passed, the fetch resolves, the initial
+  // `readerP = it.next()` is created (a pending reader.read() on a body wired to error on this signal), and
+  // then the inner loop-top guard breaks BEFORE the first raceHeartbeat — abandoning that readerP with no
+  // re-race handler. On pre-fix code its abort rejection is unhandled; the B1 `.catch` swallows it.
+  const ac = new AbortController();
+  const fetchImpl = (async () => {
+    const r = silentOpenBlock(block100, ac.signal);
+    // Abort now — the outer loop-top guard has already passed (fetch is running), so the generator does NOT
+    // early-return; it opens the body, creates the initial readerP, then breaks at the inner guard. The
+    // body's controller.error fires on this abort, rejecting the pending reader.read() in that readerP.
+    ac.abort();
+
+    return r;
+  }) as any;
+  const captured = await captureUnhandledRejections(async () => {
+    const gen = streamHotBlocks({
+      portalUrl: 'http://portal',
+      headers: {},
+      fromBlock: 100,
+      logs: [],
+      blockFields: BLOCK_FIELDS,
+      fetchImpl,
+      signal: ac.signal,
+      idleMs: 30_000, // large: the abort, not the idle timer, is what settles the read
+      tickSleepMs: 20,
+    });
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const guard = new Promise<IteratorResult<HotItem>>((resolve) => {
+      timer = setTimeout(() => resolve({ done: true, value: undefined }), 2000);
+    });
+    await Promise.race([gen.next(), guard]);
+    if (timer !== undefined) clearTimeout(timer);
+    await gen.return(undefined).catch(() => {});
+  });
+
+  // The abandoned initial readerP must NOT unhandled-reject. Pre-fix: captured carries the body abort error.
+  expect(captured).toEqual([]);
+});
+
+test('streamHotBlocks: B1-B — .return() while paused at the block yield does not unhandled-reject the prefetched readerP (RT-1 SC1)', async () => {
+  const block100 = {
+    header: { number: 100, hash: 'h100', parentHash: 'h99', timestamp: 100 },
+    logs: [],
+  };
+  // Entry B: after yielding block 100 the driver has ALREADY prefetched `readerP = it.next()` (a pending
+  // reader.read() on the still-open body). The consumer then ABANDONS the generator at that yield via
+  // `.return()` — async-generator semantics: `.return()` behind a pending `.next()` does NOT observe that
+  // pending `.next()`'s later rejection, so the prefetched readerP is left without a re-race handler. When
+  // the body then errors on abort, that readerP rejects unobserved. On pre-fix code it lands in `captured`;
+  // the B1 `.catch` on the prefetch swallows it.
+  const ac = new AbortController();
+  const fetchImpl = (async () => silentOpenBlock(block100, ac.signal)) as any;
+  const captured = await captureUnhandledRejections(async () => {
+    const gen = streamHotBlocks({
+      portalUrl: 'http://portal',
+      headers: {},
+      fromBlock: 100,
+      logs: [],
+      blockFields: BLOCK_FIELDS,
+      fetchImpl,
+      signal: ac.signal,
+      idleMs: 30_000, // large: the abort, not the idle timer, settles the prefetched read
+      tickSleepMs: 20,
+    });
+    // Pull until block 100 arrives — at which point the driver is paused at the block yield with the NEXT
+    // read already prefetched into readerP.
+    const first = await nextBlock(gen);
+    expect(first.done).toBe(false);
+    expect(first.value.kind).toBe('block');
+    // Abandon the generator AT the yield. `.return()` runs the driver's finally (it.return → body cancel),
+    // but does not observe the prefetched readerP's pending rejection. Abort errors the body so that
+    // prefetched reader.read() rejects.
+    await gen.return(undefined).catch(() => {});
+    ac.abort();
+  });
+
+  // The abandoned prefetched readerP must NOT unhandled-reject. Pre-fix: captured carries the abort error.
+  expect(captured).toEqual([]);
+});
