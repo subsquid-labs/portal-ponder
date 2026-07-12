@@ -1762,8 +1762,9 @@ hidden:
   **handler-reachability** count, not clean-resume wrong-fork evidence. The real client-side
   wrong-fork-finalize FATAL guard is proven deterministically by the `portal-realtime.test.ts` unit
   test *"a finalize whose canonical hash mismatches the local block is FATAL"* (§5.8(B)), not by K5.
-- **K6 is a MEDIUM–LOW-fidelity mock cutover.** It proves the *fix* — kills now land on a live stream
-  cutover rather than vacuously on startup — but the cutover semantics are **scripted, not organic**.
+- **K6 is a MEDIUM–LOW-fidelity mock cutover.** It proves the *fix* — kills now land on a stream-phase
+  cutover (after a block has actually streamed) rather than vacuously on startup — but the cutover
+  semantics are **scripted, not organic**.
 - **The harness `invariant()` fast-path is a fatal-string tripwire, not the primary death detector.**
   It grep-matches all seven real fatal throws in `portal/portal-realtime.ts` (the gap fatal, the
   below-floor 409 fatal, the 409 no-progress cap, the deterministic-4xx fatal, the unknown-parent
@@ -1774,8 +1775,9 @@ hidden:
 does **not** establish live-protocol reorg survival, live finalize-boundary reconciliation, multichain
 ordering, or long-run availability — those are **RG4** (≥72 h multichain stream soak with live crash
 drills) and **RG5** (the A/B soak evidence, §5.8(C)). Read this subsection as exactly what it is: the
-realtime stream path resumes **byte-identical** after a `SIGKILL` at any point in its mock-driven
-ingest/finalize/cutover loop, which is the crash-timing half of the recoverability property (§1 of the
+realtime stream path resumes **byte-identical** after a `SIGKILL` at each of the exercised crash points
+(the K1–K6 timing classes) spanning its mock-driven ingest/finalize/cutover loop, which is the
+crash-timing half of the recoverability property (§1 of the
 campaign plan) — no more, and stated as no more.
 
 ---
