@@ -11,6 +11,7 @@ import {
   logsForBlock,
   mergeScenario,
   normalizeScenario,
+  retargetKillAtBlock,
 } from './mock-portal.mjs';
 
 test('mergeScenario: deep-merges objects and replaces arrays', () => {
@@ -117,6 +118,48 @@ test('eventTopic and encodeLog: derive ABI-correct Euler topics', () => {
   assert.equal(deposit.topics[0], eventTopic('Deposit'));
   assert.equal(deposit.address, '0x1111111111111111111111111111111111111111');
   assert.equal(deposit.logIndex, 0);
+});
+
+test('retargetKillAtBlock: retargets step-level and scenario-root gate blocks; ignores non-gate killAt and blank input', () => {
+  // K2 shape: a step-level killAt on a blocks step is retargeted (varied mid-stream kill point).
+  const stepScenario = retargetKillAtBlock(
+    {
+      steps: [
+        {
+          type: 'blocks',
+          count: 12,
+          killAt: { block: 107, phase: 'K2-midstream' },
+        },
+      ],
+    },
+    104,
+  );
+  assert.equal(stepScenario.steps[0].killAt.block, 104);
+
+  // K6 shape: a scenario-root killAt with a phase is retargeted too.
+  const rootScenario = retargetKillAtBlock(
+    { killAt: { block: 105, phase: 'K6-cutover' }, steps: [] },
+    109,
+  );
+  assert.equal(rootScenario.killAt.block, 109);
+
+  // A killAt WITHOUT a phase (a plain step cursor field, e.g. childDiscovery) is left untouched.
+  const noPhase = retargetKillAtBlock(
+    { steps: [{ type: 'blocks', killAt: { block: 200 } }] },
+    104,
+  );
+  assert.equal(noPhase.steps[0].killAt.block, 200);
+
+  // Blank / undefined / NaN override is a no-op (empty env ⇒ scenario killAt unchanged).
+  const untouched = retargetKillAtBlock(
+    {
+      steps: [
+        { type: 'blocks', killAt: { block: 107, phase: 'K2-midstream' } },
+      ],
+    },
+    '',
+  );
+  assert.equal(untouched.steps[0].killAt.block, 107);
 });
 
 test('cursorMatchesStep: routes redelivery and 409 steps by request cursor', () => {

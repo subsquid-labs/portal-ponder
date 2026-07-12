@@ -208,7 +208,9 @@ start_mock () {
   local scenario="$1"
   local phase_log="$2"
   local mock_log="$3"
+  local killat_block="${4:-}"
   MOCK_PHASE_LOG="$phase_log" MOCK_SCENARIO="$scenario" MOCK_PORT="$MOCK_PORT" \
+  MOCK_KILLAT_BLOCK="$killat_block" \
     node "$CDIR/mock-portal.mjs" >"$mock_log" 2>&1 &
   MOCK_PID="$!"
   wait_http || {
@@ -310,6 +312,24 @@ variants_for_class () {
   esac
 }
 
+# K2 varies the mid-stream kill point across iterations so the "arbitrary N/M" claim is real
+# rather than one fixed block repeated. The k2-midstream stream is `blocks count:12` from 101
+# (blocks 101..112); interior mid-stream kill points are 103..110 (leave the first two blocks so a
+# vault+deposit row exists pre-kill, and the last block so the kill is strictly mid-stream). Empty
+# output ⇒ the scenario's own killAt.block is used unchanged.
+kill_block_for () {
+  local class="$1"
+  local iteration="$2"
+  case "$class" in
+    K2)
+      local lo=103
+      local span=8
+      echo "$(( lo + ( (iteration - 1) % span ) ))"
+      ;;
+    *) echo "" ;;
+  esac
+}
+
 fidelity_for_class () {
   case "$1" in
     K1) echo "HIGH" ;;
@@ -339,6 +359,27 @@ const readJson = (file) => {
   catch { return null; }
 };
 const dir = process.env.RUN_DIR;
+// Empirically recover the block the kill gate fired on from the kill-side phase log: the last
+// `blocked:true` marker for this run's phase carries the gate details (`nextBlock`/`afterBlock`/
+// `block`). This proves the kill point from the artifact rather than trusting the env override.
+const killBlockFromPhaseLog = (file, phase) => {
+  let text;
+  try { text = fs.readFileSync(file, 'utf8'); }
+  catch { return null; }
+  let block = null;
+  for (const line of text.trim().split(/\n+/).filter(Boolean)) {
+    let entry;
+    try { entry = JSON.parse(line); }
+    catch { continue; }
+    if (entry.name !== phase || entry.blocked !== true) continue;
+
+    const d = entry.details ?? {};
+    const candidate = d.nextBlock ?? d.block ?? (d.afterBlock !== undefined ? Number(d.afterBlock) + 1 : undefined);
+    if (candidate !== undefined) block = Number(candidate);
+  }
+
+  return block;
+};
 const record = {
   class: process.env.RUN_CLASS,
   variant: process.env.RUN_VARIANT,
@@ -347,6 +388,7 @@ const record = {
   scenario: process.env.RUN_SCENARIO,
   phase: process.env.RUN_PHASE,
   fidelity: process.env.RUN_FIDELITY,
+  killAtBlock: killBlockFromPhaseLog(`${dir}/kill.phase.log`, process.env.RUN_PHASE),
   verify: readJson(`${dir}/verify.facts.json`),
   stats: readJson(`${dir}/mock-stats.json`),
   killStats: readJson(`${dir}/kill.mock-stats.json`),
@@ -400,9 +442,11 @@ run_kill_resume () {
   local db="rg3_${class,,}_${variant}_${iteration}_$$"
   local url="postgres://postgres@127.0.0.1:$PGPORT/$db"
   local dir="$RUN_ROOT/classes/$class/$variant-$iteration"
+  local killat_block
+  killat_block="$(kill_block_for "$class" "$iteration")"
   mkdir -p "$dir"
   drop_create_db "$db" || return 1
-  start_mock "$scenario" "$dir/phase.log" "$dir/mock.log" || return 1
+  start_mock "$scenario" "$dir/phase.log" "$dir/mock.log" "$killat_block" || return 1
   start_app "$app" "$url" "$dir/kill.app.log"
   wait_phase "$phase" || {
     log "fatal: $class/$variant#$iteration did not reach $phase"
@@ -461,11 +505,11 @@ const labels = {
 };
 const candor = {
   K1: 'append gate baseline',
-  K2: 'mid-stream kill at arbitrary N/M',
+  K2: 'mid-stream kill; kill block varied across iterations over the interior of the 101..112 stream',
   K3: 'redelivery-of-block only; redelivery watchdog + held-finalize drain NOT exercised (need real Portal / halted-chain sim).',
   K4: 'idle / 204 retry path',
-  K5: 'synthetic fork via stale-parentBlockHash 409 plus wrong-fork-finalize handler probe; real L1-reorg wire fidelity NOT exercised, and hash-mismatch finalize consumption remains fatal-by-design in portal-realtime.test.ts.',
-  K6: "cutover code-path exercised; probe-retry wire fidelity (the 3-attempt loop in clampFinalizedToPortalHead) NOT exercised — mock's /finalized-head succeeds first try; probe-retry fidelity rests on portal-realtime-wire.test.ts.",
+  K5: "synthetic fork via stale-parentBlockHash 409 (client consumes the canonical replacement chain and resumes byte-identically) PLUS a wrong-fork-finalize handler-REACHABILITY probe. handlerStats.wrongForkFinalizes counts mock-side splices ONLY: the injected wrong finalized head is NOT consumed by the client here (finalize poll cadence ~4s > the post-injection scenario window ~1.8s), so this is not clean-resume wrong-fork evidence. The client-side wrong-fork-finalize FATAL guard (hash-mismatch at finality) is proven deterministically by portal-realtime.test.ts ('a finalize whose canonical hash mismatches the local block is FATAL', finalizePollMs:0). Real L1-reorg wire fidelity NOT exercised.",
+  K6: "kill lands mid backfill→live cutover (>=1 live /stream block served before the kill; see kill.phase.log block + killStats.stream>0), so resume re-drives the cutover. Probe-retry wire fidelity (the 3-attempt loop in clampFinalizedToPortalHead) NOT exercised — mock's /finalized-head succeeds first try; probe-retry fidelity rests on portal-realtime-wire.test.ts.",
 };
 const lines = fs.existsSync(process.env.RECORDS)
   ? fs.readFileSync(process.env.RECORDS, 'utf8').trim().split(/\n+/).filter(Boolean)
@@ -488,10 +532,18 @@ for (const klass of classes) {
     acc.wrongForkFinalizes += Number(s.wrongForkFinalizes ?? 0);
     return acc;
   }, { r204: 0, r409: 0, redeliveryReopens: 0, finalizedHead: 0, finalizedHeadGates: 0, wrongForkFinalizes: 0 });
+  // Distinct empirical kill blocks (from each run's kill.phase.log) — proves K2's varied mid-stream
+  // coverage rather than one repeated fixed block.
+  const killBlocks = [...new Set(rows.map((r) => r.killAtBlock).filter((b) => b != null))].sort((a, b) => a - b);
+  // Live-cutover proof: kills where the mock had served >=1 live /stream block before the kill. For K6
+  // this is the load-bearing evidence that the kill lands mid-backfill→live-cutover, not on a startup probe.
+  const killsWithLiveStream = rows.filter((r) => Number(r.killStats?.stream ?? 0) > 0).length;
   perClass[klass] = {
     scenarios: [...new Set(rows.map((r) => r.scenario).filter(Boolean))],
     variantLabels: [...new Set(rows.map((r) => r.variant).filter(Boolean))].join(', '),
     killCount: rows.length,
+    killBlocks,
+    killsWithLiveStream,
     cleanResumeCount: ok.length,
     digestMatchCount: digestMatch.length,
     duplicateFinalizedRows: dupCount,
@@ -571,6 +623,8 @@ for (const klass of classes) {
   md.push(`- digest matches: ${c.digestMatchCount}`);
   md.push(`- duplicate FINALIZED rows: ${c.duplicateFinalizedRows}`);
   md.push(`- finalized rows scanned: ${c.finalizedScannedRows}`);
+  md.push(`- kill blocks (distinct, from kill.phase.log): ${c.killBlocks.length > 0 ? c.killBlocks.join(', ') : 'n/a'}`);
+  md.push(`- kills after >=1 live /stream block: ${c.killsWithLiveStream} / ${c.killCount}`);
   md.push(`- handler stats: ${JSON.stringify(c.handlerStats)}`);
   md.push(`- fidelity: ${c.fidelity} — ${c.candor}`);
   if (c.failures.length > 0) md.push(`- failures: ${JSON.stringify(c.failures)}`);
@@ -604,7 +658,14 @@ main () {
   app="$(prepare_app "$core")" || exit 1
   ensure_pg_resolution "$app" || exit 1
 
+  # CHAOS_CLASSES (space/comma-separated, e.g. "K6" or "K2 K6") restricts the run to a subset of
+  # classes — for targeted proofs/reruns. Default: the full K1..K6 acceptance set. A subset run does NOT
+  # meet the >=200-kill / all-class acceptance bar; it is a probe, not a certification.
   local classes=(K1 K2 K3 K4 K5 K6)
+  if [ -n "${CHAOS_CLASSES:-}" ]; then
+    read -r -a classes <<< "$(printf '%s' "$CHAOS_CLASSES" | tr ',' ' ')"
+    log "CHAOS_CLASSES set: running subset ${classes[*]} (NOT a full acceptance run)"
+  fi
   for class in "${classes[@]}"; do
     local baseline_scenario phase
     baseline_scenario="$(baseline_scenario_for_class "$class")"

@@ -418,12 +418,6 @@ function isCursorStep(step) {
 export function cursorMatchesStep(step, body) {
   if (step === undefined || body === undefined) return false;
   if (isCursorStep(step) === false) return false;
-  const cursorTypes = new Set([
-    'awaitRedelivery',
-    'status409',
-    'idle204',
-    'wrongForkFinalize',
-  ]);
 
   const match = step.match ?? {};
   const wantFrom =
@@ -965,10 +959,35 @@ function createRuntime(initialScenario, options = {}) {
   };
 }
 
+export function retargetKillAtBlock(scenario, block) {
+  if (block === undefined || block === null) return scenario;
+  // Empty/whitespace-only string ⇒ no override (orchestrate passes MOCK_KILLAT_BLOCK="" for classes
+  // that keep the scenario's own killAt.block). Guard before Number(), since Number("") === 0.
+  if (typeof block === 'string' && block.trim() === '') return scenario;
+
+  const number = Number(block);
+  if (Number.isNaN(number)) return scenario;
+
+  if (scenario.killAt?.phase !== undefined) {
+    scenario.killAt.block = number;
+  }
+  for (const step of Array.isArray(scenario.steps) ? scenario.steps : []) {
+    if (step?.killAt?.phase !== undefined) {
+      step.killAt.block = number;
+    }
+  }
+
+  return scenario;
+}
+
 function scenarioFromEnv() {
   if (process.env.MOCK_SCENARIO === undefined) return DEFAULT_SCENARIO;
 
-  return JSON.parse(readFileSync(resolve(process.env.MOCK_SCENARIO), 'utf8'));
+  const scenario = JSON.parse(
+    readFileSync(resolve(process.env.MOCK_SCENARIO), 'utf8'),
+  );
+
+  return retargetKillAtBlock(scenario, process.env.MOCK_KILLAT_BLOCK);
 }
 
 export async function main() {
