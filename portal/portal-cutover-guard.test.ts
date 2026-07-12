@@ -803,3 +803,82 @@ describe('INV-18: wiring pins (grafted runtime/historical.ts)', () => {
     );
   });
 });
+
+// ─────────────────── INV-25 / RT-2: isolated-cutover finality floor (grafted wiring pins) ───────────────────
+//
+// RT-2 lands the `floor` on the isolated single-chain cutover clamp so it mirrors the multichain/omnichain
+// sites (documentation-parity / defense-in-depth). CANDID DESIGN NOTE — the floor is INERT here:
+// `floor = params.syncProgress.finalized.number` is the SAME value the break-before-adopt guard just below
+// compares against, so it can only clamp a stale-LOW probe UP to exactly the previously-adopted boundary —
+// a no-op relative to that boundary. The LOAD-BEARING protection against a below-boundary adoption is the
+// upstream guard (`… <= params.chain.finalityBlockCount ⇒ break;`), which refuses to adopt a non-advancing
+// (stale-LOW ⇒ negative-delta) boundary at all. Because the floor MASKS a guard-weakening mutation (drop
+// the guard and the floor still prevents a below-boundary clamp OUTPUT), a behavioral test through the real
+// isolated path would be VACUOUS — so per RG0 the two protections are pinned INDEPENDENTLY at the source:
+//   Pin A pins the SHIPPED floor (the parity change); Pin B pins the LOAD-BEARING guard.
+// Both read the grafted `runtime/historical.ts` (byte-identical across all pinned versions) and slice the
+// isolated function body [getHistoricalEventsIsolated, refetchHistoricalEvents) so a pin can never match the
+// multichain/omnichain clamp (which use `floor: hexToNumber( params.perChainSync.get(...)…`).
+
+describe('INV-25 / RT-2: isolated-cutover finality floor', () => {
+  const historical = readFileSync(
+    join(__dirname, '..', 'runtime', 'historical.ts'),
+    'utf8',
+  );
+
+  // The function AFTER getHistoricalEventsIsolated is refetchHistoricalEvents (not getLocalSyncGenerator —
+  // two refetch/generator helpers sit between them). Slicing to its start bounds the isolated body exactly.
+  const isolatedStart = historical.indexOf('getHistoricalEventsIsolated');
+  const isolatedEnd = historical.indexOf('refetchHistoricalEvents');
+  const isolated = historical.slice(isolatedStart, isolatedEnd);
+
+  test('the slice bounds are sane (isolated body is non-empty and precedes refetchHistoricalEvents)', () => {
+    expect(isolatedStart).toBeGreaterThan(-1);
+    expect(isolatedEnd).toBeGreaterThan(isolatedStart);
+    // The isolated body must contain its own cutover clamp — the site RT-2 edits.
+    expect(isolated).toContain('clampFinalizedToPortalHead({');
+  });
+
+  // ── Pin A: the SHIPPED parity change. The isolated cutover clamp now carries the finality floor.
+  //    Scoped to `isolated` so it cannot match the multichain/omnichain sites (whose floor reads from
+  //    `params.perChainSync.get(...)`, not `params.syncProgress` — the single-chain isolated form).
+  //    MUTATION RECIPE (M1): delete the `floor: hexToNumber(params.syncProgress.finalized.number),` line
+  //    from the isolated clamp in the wiring patch → this pin FAILS (Pin B still passes — they are
+  //    independent; the floor is inert so no behavioral test could catch its removal).
+  test('Pin A (shipped parity): the isolated cutover clamp carries floor = hexToNumber(params.syncProgress.finalized.number)', () => {
+    expect(isolated).toContain(
+      'floor: hexToNumber(params.syncProgress.finalized.number),',
+    );
+  });
+
+  // ── Pin B: the LOAD-BEARING guard (RG0). The isolated path BREAKS-BEFORE-ADOPT on the finality-delta
+  //    guard; the boundary assignment `params.syncProgress.finalized =` sits AFTER that guarded break, so a
+  //    stale-LOW (non-advancing) probe is never adopted. This — NOT the inert floor above — is what prevents
+  //    a below-boundary adoption. Pinned independently precisely because the floor MASKS a guard mutation.
+  //    MUTATION RECIPE (M2): in the grafted historical.ts, alter the pinned guard text — e.g. rename
+  //    `finalityBlockCount` in that predicate, or remove the `break;` / move the boundary assignment before
+  //    the guard → this pin FAILS. (Editing the pinned source and showing the pin fails IS the accepted
+  //    "pin the guard" verification per the plan — the floor cannot be relied on to catch it.)
+  test('Pin B (load-bearing guard, RG0): the isolated path breaks-before-adopt on the finality-delta guard', () => {
+    // The break-before-adopt guard: a non-advancing (stale-LOW ⇒ negative) delta is `<= finalityBlockCount`,
+    // so the loop breaks WITHOUT adopting the probed boundary.
+    expect(isolated).toContain('params.chain.finalityBlockCount');
+    expect(isolated).toContain('params.syncProgress.finalized.number) <=');
+
+    // The boundary assignment must sit AFTER the guarded break — never before it — so a stale-LOW probe
+    // that trips the guard can never reach the adopt. Anchor on the guard PREDICATE itself (`… .number) <=`),
+    // NOT the first `params.chain.finalityBlockCount` (that occurrence is the probe computation
+    // `latest.number - finalityBlockCount`, not the guard), so the ordering assertion targets what it names.
+    const guardAt = isolated.indexOf(
+      'params.syncProgress.finalized.number) <=',
+    );
+    const breakAt = isolated.indexOf('break;', guardAt);
+    const adoptAt = isolated.indexOf(
+      'params.syncProgress.finalized = finalizedBlock;',
+    );
+
+    expect(guardAt).toBeGreaterThan(-1);
+    expect(breakAt).toBeGreaterThan(guardAt);
+    expect(adoptAt).toBeGreaterThan(breakAt);
+  });
+});

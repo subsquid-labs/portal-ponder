@@ -35,7 +35,7 @@ and nowhere else; it is gated on the complete dossier, not on judgment.
 | Gate | Name | One-line exit criterion |
 |------|------|------------------------|
 | RG0 | Ground truth ratified | This plan merged; RT-G13 (cutover floor) verified true-bug-or-not with a written verdict. **MET** — plan merged ([#157](../../pull/157)); RT-G13 verified **INERT / NOT-A-BUG** (upstream guards isolated adoption — verdict in the RT-G13 register entry below), so RT-2 reclassifies to should-fix (defense / doc-parity). |
-| RG1 | Must-fix code landed | RT-1/RT-2/RT-3 merged: mutation-verified tests, committee review, both-version gates green |
+| RG1 | Must-fix code landed | RT-1/RT-2/RT-3 merged: mutation-verified tests, committee review, both-version gates green. RT-1 ([#161](../../pull/161)) + RT-3 ([#162](../../pull/162)) merged; **RT-2 landed** ([#163](../../pull/163)) — isolated-cutover finality `floor` shipped for parity across all 5 wiring patches (INV-25), test pins the load-bearing break-before-adopt guard INDEPENDENTLY of the inert floor (M1/M2 mutation-verified), both-version `--test` gates green (361 passed each). |
 | RG2 | Fail-loud audit complete | Fatal-injection suite + silent-gap fuzzer green in CI; no enumerated silent path survives |
 | RG3 | Realtime chaos passed | ≥200 kills across ≥6 timing classes, 100 % clean resumes, byte-identical digests. **MET (Phase A, [#158](../../pull/158))** — 238 kills / 7 timing-class sub-runs, 238/238 clean, byte-identical, 0 dup FINALIZED; K6-cutover + K2-spread non-vacuity self-certified. Numbers + candid mock-fidelity caveats in VALIDATION §5.11. |
 | RG4 | Multichain stream soak passed | ≥72 h multi-chain stream soak (incl. one fast chain + omnichain), crash drills clean, parity clean |
@@ -226,7 +226,7 @@ gates RG1), **should-fix** (lands during the campaign, doesn't gate the label by
 | RT-G10 | must-fix | RT-1 (progress watchdog) |
 | RT-G11 | must-fix | RT-1 (read idle bound → reconnect) |
 | RT-G12 | must-fix | RT-1 (poll decoupled from delivery) |
-| RT-G13 | verified INERT (RG0) → should-fix | RT-2 (floor for parity; test pins the upstream guard, not the floor) |
+| RT-G13 | verified INERT (RG0) → should-fix → **LANDED (RT-2, [#163](../../pull/163))** | RT-2 (floor shipped for parity across all 5 wiring patches → INV-25; Pin A pins the floor, Pin B pins the upstream break-before-adopt guard, mutation-verified independent — M1 fails Pin A only, M2 fails Pin B only) |
 | RT-G14 | evidence | RG3 |
 | RT-G15 | evidence | RG3 K5 + RG2 seam test |
 
@@ -280,6 +280,16 @@ mirroring the multichain site.
 cutover the boundary does not regress (fails with the floor removed); if RG0 verification shows
 upstream already guards adoption, the test instead pins the guard and the change is documentation-
 parity. Both-version gates; the patches for all pinned versions updated together.
+**Status — LANDED ([#163](../../pull/163)).** RG0 confirmed the isolated path is already INERT-safe
+(break-before-adopt guard), so RT-2 shipped the `floor` for cross-site parity + defense-in-depth (INV-25)
+across all 5 wiring patches (0.15.17–0.16.9, added `+` block byte-identical). Per RG0 the test does NOT
+assert the boundary through the real path (the floor equals the guard's compare value, so it MASKS a guard
+mutation → a behavioral test would be vacuous); instead `portal-cutover-guard.test.ts`
+"INV-25 / RT-2: isolated-cutover finality floor" pins the two protections INDEPENDENTLY at the grafted
+source — **Pin A** the shipped floor, **Pin B** the load-bearing break-before-adopt guard. Mutation-verified:
+M1 (drop the floor line) fails Pin A only; M2 (weaken the guard `<=`→`>=`) fails Pin B only — the pins are
+independent. Both-version `--test` gates green (0.16.6 + 0.15.17, 361 passed each; cutover-guard 42 tests);
+biome clean.
 
 ### RT-3 — RING_CAP headroom + eviction-path proof (RT-G2)
 
