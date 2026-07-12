@@ -232,6 +232,13 @@ export type PortalRealtimeArgs = {
    * idle reconnect is distinguishable from an ordinary stream cut. Absent ⇒ silent recycle (unit call sites).
    */
   onIdleReconnect?: () => void;
+  /**
+   * Called on each transient `/stream` fetch THROW (the E1 retry site) — the read never opened, so this
+   * round delivers nothing and the loop yields a `{kind:'tick'}` + backs off. A logger-free seam (mirrors
+   * `onIdleReconnect`) letting the shell surface a RATE-LIMITED warn so a silent retry storm is visible at
+   * the wire without this module importing a logger. Absent ⇒ silent (unit call sites). (RT-1 SC3)
+   */
+  onFetchError?: () => void;
   signal?: AbortSignal;
   fetchImpl?: typeof fetch;
 };
@@ -430,6 +437,10 @@ export async function* streamHotBlocks(
         signal: args.signal,
       });
     } catch {
+      // E1: transient fetch throw — the read never opened, so this round delivers NOTHING. Surface it on
+      // the logger-free seam (the shell rate-limits the warn) so a silent retry storm is diagnosable; the
+      // yielded tick is the same non-delivery heartbeat the delivery watchdog already counts. (RT-1 SC3)
+      args.onFetchError?.();
       yield { kind: 'tick' };
       await sleep(errorSleepMs, args.signal);
       continue;
@@ -820,6 +831,34 @@ export async function* portalRealtimeEvents(
      */
     finalizeDeferMaxMs?: number;
     /**
+     * Delivery-progress watchdog (RT-G10, INV-24). Upper bound (ms) on how long the probed finalized head
+     * may advance while ZERO blocks are delivered before the stall is declared fatal. Complements the B1
+     * defer watchdog — B1 bounds a window that DELIVERS but can't hash-verify finality; this bounds the
+     * dual case where NOTHING is delivered at all (204/bodyless-200/reconnect churn or the silent fetch-
+     * error retry loop) yet the chain is demonstrably ALIVE because its finalized head keeps climbing. A
+     * quiet/halted chain (head static) never trips it — it is PROGRESS-conditioned. Injectable for tests;
+     * production default 600_000 (10 min, aligned with the B1 bound). (RT-1 SC3)
+     */
+    deliveryProgressMaxMs?: number;
+    /**
+     * Delivery-progress watchdog head-advance threshold (blocks, RT-G10, INV-24). The watchdog is fatal
+     * only when the probed finalized head has advanced by AT LEAST this many blocks past the head observed
+     * at the last delivery WHILE delivery was zero for the whole bound. A single-block finality lag (head
+     * ticked forward once while a block is momentarily in flight) must NOT trip it, so the default is a
+     * comfortable multiple of one. Injectable for tests; production default 16 (see the resolver comment
+     * for the rationale). (RT-1 SC3)
+     */
+    deliveryProgressThreshold?: number;
+    /**
+     * Non-delivery signal from the producer's fetch-error retry loop (E1 site). streamHotBlocks yields a
+     * `{kind:'tick'}` on a transient fetch throw (the read never opened), which the delivery watchdog
+     * already counts as non-delivery; this callback lets the LOGGER-BEARING shell surface a rate-limited
+     * warn so a silent retry storm is diagnosable at the wire (same seam pattern as `onIdleReconnect`).
+     * Rate-limiting is the shell's responsibility — this fires once per error round. Absent ⇒ silent (unit
+     * call sites). (RT-1 SC3)
+     */
+    onFetchError?: () => void;
+    /**
      * The last FINALIZED block at startup (syncProgress.finalized as a Light) — the reconcile anchor.
      * Advanced to each finalize's tip. REQUIRED (wave 4): startup is always anchored.
      */
@@ -869,6 +908,32 @@ export async function* portalRealtimeEvents(
   const deferMaxMs = args.finalizeDeferMaxMs ?? 600_000;
   let deferStreakStart: number | undefined;
 
+  // Delivery-progress watchdog (RT-G10, INV-24). PROGRESS-CONDITIONED: fatal ONLY when the probed finalized
+  // head has advanced ≥ `deliveryProgressThreshold` blocks past the head observed at the last delivery WHILE
+  // ZERO blocks were delivered for ≥ `deliveryProgressMaxMs`. It bounds the no-delivery case B1 does not:
+  // B1 fires when the window DELIVERS but the finalized head sits above it hash-unverifiably; this fires when
+  // NOTHING is delivered at all (204/bodyless-200/reconnect churn, or the silent E1 fetch-error retry loop)
+  // yet the chain is provably ALIVE because its finalized head keeps climbing. A quiet/halted chain (head
+  // static, or advancing by < threshold) NEVER trips it — that is normal idling, parity with RPC realtime.
+  //   • `lastDeliveryMs` is stamped Date.now() on every delivered block AND INITIALIZED to loop entry (not
+  //     0/epoch): a fresh start that begins INTO an ongoing outage — zero deliveries ever — must arm the
+  //     bound from process start, exactly as the first delivery would have; epoch-0 would make the very first
+  //     poll's `now - lastDeliveryMs` astronomically exceed any bound and false-fatal a healthy startup.
+  //   • `lastDeliveryHead` is the probed head observed AT the last delivery — the baseline the advance is
+  //     measured against. Undefined until the first probe: with no head ever observed there is no advance to
+  //     measure, so the first successful poll ADOPTS its head as the baseline WITHOUT resetting the clock
+  //     (the clock already armed at loop entry, preserving the outage-from-start guarantee).
+  //   • `lastProbedHead` tracks the most recent successful probe so a delivery can stamp its baseline from
+  //     the head the poll cadence already fetched — the block arm never probes (ticks must not touch the
+  //     network or the window; the tick is the clock, wall time is the data).
+  // Fatal = a loud throw with the same diagDump + "restart" tail as the gap/B1 fatals; NEVER an RPC fallback
+  // (ruling Q2: a watchdog fatal-restarts, it never silently switches transport). (RT-1 SC3)
+  const deliveryProgressMaxMs = args.deliveryProgressMaxMs ?? 600_000;
+  const deliveryProgressThreshold = args.deliveryProgressThreshold ?? 16;
+  let lastDeliveryMs = Date.now();
+  let lastDeliveryHead: number | undefined;
+  let lastProbedHead: number | undefined;
+
   // Finalize-poll cadence + B1 defer watchdog, relocated from the inline gate.
   // The hash-unverifiable defer branch returns because this helper is the final step for each turn.
   async function* runFinalizeCadence(): AsyncGenerator<PortalRealtimeEvent> {
@@ -882,6 +947,30 @@ export async function* portalRealtimeEvents(
       // No probe result this poll: the streak of deferrals (if any) is broken — clear it so a later,
       // hash-unverifiable deferral times its OWN run, not a run interleaved with probe outages. (B1)
       if (fhNumber === undefined) deferStreakStart = undefined;
+
+      // Delivery-progress watchdog (RT-G10, INV-24): evaluate on the head THIS poll already probed — no
+      // extra probe, no window touch. A failed probe (fhNumber undefined) carries no head signal, so it can
+      // neither advance the baseline nor trip the watchdog; skip it. Otherwise:
+      //   • record the head this poll saw (a delivery stamps its baseline from it), and
+      //   • if a baseline head was ever observed, fatal when the head has climbed ≥ threshold past it WHILE
+      //     zero blocks were delivered for the whole bound — head advancing + delivery flatlined = the chain
+      //     is alive but the /stream is starving us. Loud restart, never a silent transport switch (Q2).
+      //   • first observed head with no prior baseline: adopt it as the baseline without touching the clock
+      //     (already armed at loop entry), so an outage from process start still times from start.
+      if (fhNumber !== undefined) {
+        lastProbedHead = fhNumber;
+
+        if (lastDeliveryHead === undefined) {
+          lastDeliveryHead = fhNumber;
+        } else if (
+          fhNumber - lastDeliveryHead >= deliveryProgressThreshold &&
+          now - lastDeliveryMs >= deliveryProgressMaxMs
+        ) {
+          throw new Error(
+            `Portal realtime: the finalized head advanced ${fhNumber - lastDeliveryHead} blocks (${lastDeliveryHead}→${fhNumber}) while /stream delivered ZERO blocks for ${now - lastDeliveryMs}ms — the chain is live but the stream is not delivering (endless 204s/reconnects or a transient-error retry loop), so indexing has silently stalled. ${diagDump(diag)} Restart to re-sync from the finalized head.`,
+          );
+        }
+      }
 
       if (fhNumber !== undefined) {
         const { finalizedTip, remaining } = takeFinalized(
@@ -1019,6 +1108,14 @@ export async function* portalRealtimeEvents(
       if (t.hash !== undefined) seenTx.add(t.hash);
       syncTxs.push(toSyncTransaction(t, header));
     }
+    // Delivery-progress watchdog stamp (RT-G10, INV-24): this is the ONE point a real block is delivered
+    // (a skipped `duplicate && !redelivered` returned above; a `gap` threw). Re-baseline the no-delivery
+    // clock to now, and the head-advance baseline to the head the poll cadence last saw (`lastProbedHead`)
+    // — so the NEXT stall measures its head climb against this delivery's head, not a stale one. A delivery
+    // before any poll has run leaves `lastDeliveryHead` at the first poll's adopted value (equivalent). No
+    // probe here — the block arm never touches the network or the window. (RT-1 SC3)
+    lastDeliveryMs = Date.now();
+    lastDeliveryHead = lastProbedHead;
     yield {
       type: 'block',
       block,

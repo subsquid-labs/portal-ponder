@@ -19,6 +19,8 @@ import {
   isPortalRealtime,
   lightToLightBlock,
   portalFinalizedHead,
+  resolveDeliveryProgressMaxMs,
+  resolveDeliveryProgressThreshold,
   resolveRedeliveryTimeoutMs,
   resolveStreamIdleMs,
   type SafeCrashRecoveryBlockLookup,
@@ -1239,6 +1241,41 @@ test('resolveStreamIdleMs: precedence — param wins, then env, then default; ga
   for (const bad of ['abc', '12.5', '0', '-5', '', '  ', 'NaN', 'Infinity']) {
     expect(() => resolveStreamIdleMs(undefined, bad, 120_000)).toThrow(
       /PORTAL_STREAM_IDLE_MS must be a positive integer/i,
+    );
+  }
+});
+
+test('resolveDeliveryProgressMaxMs: precedence — param wins, then env, then default; garbage env fails loud (RT-1 SC3)', () => {
+  // The 600_000ms (10 min) default is the RT-G10 delivery-stall bound, aligned with B1; PORTAL_STREAM_
+  // DELIVERY_MAX_MS makes it a production knob. Validation mirrors resolveStreamIdleMs (positive-integer,
+  // else loud). Pure over its args, so no process.env mutation is needed.
+  expect(resolveDeliveryProgressMaxMs(50, '900000', 600_000)).toBe(50);
+  expect(resolveDeliveryProgressMaxMs(0, '900000', 600_000)).toBe(0); // explicit 0 honored (test injection)
+  expect(resolveDeliveryProgressMaxMs(undefined, '900000', 600_000)).toBe(
+    900_000,
+  );
+  expect(resolveDeliveryProgressMaxMs(undefined, undefined, 600_000)).toBe(
+    600_000,
+  );
+
+  for (const bad of ['abc', '12.5', '0', '-5', '', '  ', 'NaN', 'Infinity']) {
+    expect(() => resolveDeliveryProgressMaxMs(undefined, bad, 600_000)).toThrow(
+      /PORTAL_STREAM_DELIVERY_MAX_MS must be a positive integer/i,
+    );
+  }
+});
+
+test('resolveDeliveryProgressThreshold: precedence — param wins, then env, then default; garbage env fails loud (RT-1 SC3)', () => {
+  // The 16-block default is the RT-G10 head-advance threshold — a single-block finality lag must never trip
+  // the watchdog. PORTAL_STREAM_DELIVERY_THRESHOLD makes it a production knob; validation mirrors the ms
+  // resolvers (positive-integer, else loud). Pure over its args, so no process.env mutation is needed.
+  expect(resolveDeliveryProgressThreshold(4, '32', 16)).toBe(4);
+  expect(resolveDeliveryProgressThreshold(undefined, '32', 16)).toBe(32);
+  expect(resolveDeliveryProgressThreshold(undefined, undefined, 16)).toBe(16);
+
+  for (const bad of ['abc', '12.5', '0', '-5', '', '  ', 'NaN', 'Infinity']) {
+    expect(() => resolveDeliveryProgressThreshold(undefined, bad, 16)).toThrow(
+      /PORTAL_STREAM_DELIVERY_THRESHOLD must be a positive integer/i,
     );
   }
 });
