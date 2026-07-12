@@ -20,6 +20,7 @@ import {
   lightToLightBlock,
   portalFinalizedHead,
   resolveRedeliveryTimeoutMs,
+  resolveStreamIdleMs,
   type SafeCrashRecoveryBlockLookup,
   toRealtimeSyncEvent,
   uniqueFactories,
@@ -1215,6 +1216,29 @@ test('resolveRedeliveryTimeoutMs: precedence — param wins, then env, then defa
   for (const bad of ['abc', '12.5', '0', '-5', '', '  ', 'NaN', 'Infinity']) {
     expect(() => resolveRedeliveryTimeoutMs(undefined, bad, 300_000)).toThrow(
       /PORTAL_STREAM_REDELIVERY_TIMEOUT_MS must be a positive integer/i,
+    );
+  }
+});
+
+test('resolveStreamIdleMs: precedence — param wins, then env, then default; garbage env fails loud (RT-1 SC1)', () => {
+  // The 120_000ms (2 min) default is the RT-G11 idle bound; PORTAL_STREAM_IDLE_MS makes it a production
+  // knob. Validation is IDENTICAL to resolveRedeliveryTimeoutMs (positive-integer, else loud) — the SC1
+  // spec requires mirroring it exactly. Pure over its args, so no process.env mutation is needed.
+
+  // param (tests) wins over both env and default, even a valid env
+  expect(resolveStreamIdleMs(50, '90000', 120_000)).toBe(50);
+  expect(resolveStreamIdleMs(0, '90000', 120_000)).toBe(0); // explicit 0 is honored (test injection)
+
+  // env used when no param — a valid positive integer
+  expect(resolveStreamIdleMs(undefined, '90000', 120_000)).toBe(90_000);
+
+  // unset env → the default
+  expect(resolveStreamIdleMs(undefined, undefined, 120_000)).toBe(120_000);
+
+  // garbage / non-positive env → LOUD, not silently ignored (a silently-dropped knob is an operator trap)
+  for (const bad of ['abc', '12.5', '0', '-5', '', '  ', 'NaN', 'Infinity']) {
+    expect(() => resolveStreamIdleMs(undefined, bad, 120_000)).toThrow(
+      /PORTAL_STREAM_IDLE_MS must be a positive integer/i,
     );
   }
 });

@@ -102,6 +102,32 @@ export function resolveRedeliveryTimeoutMs(
   return n;
 }
 
+/**
+ * Resolve the realtime `/stream` OPEN-body idle bound (ms, RT-G11). Precedence, validation, and loud-on-
+ * garbage behavior are IDENTICAL to `resolveRedeliveryTimeoutMs`: an explicit `override` (tests) wins, then
+ * the `PORTAL_STREAM_IDLE_MS` env var, then the default; the env value must be a positive integer or startup
+ * fails loud (a silently-dropped knob is an operator trap). The 120_000 ms (2 min) default comfortably
+ * exceeds normal inter-block quiet on every supported chain, so a slow-but-alive stream is never recycled;
+ * on expiry the read reconnects from `cursor` (routine, cheap, NOT fatal). Pure over its args — unit-testable
+ * with no process.env mutation. (RT-1 SC1)
+ */
+export function resolveStreamIdleMs(
+  override: number | undefined,
+  envRaw: string | undefined,
+  fallback: number,
+): number {
+  if (override !== undefined) return override;
+  if (envRaw === undefined) return fallback;
+
+  const n = Number(envRaw);
+  if (Number.isInteger(n) === false || n <= 0)
+    throw new Error(
+      `Portal realtime: PORTAL_STREAM_IDLE_MS must be a positive integer (milliseconds), got ${JSON.stringify(envRaw)}.`,
+    );
+
+  return n;
+}
+
 // ─────────────────────────────── Portal finalized head + finality clamp ───────────────────────────────
 
 /** Poll the Portal `/finalized-head`. Delegates to the client's SHARED bounded probe
@@ -463,6 +489,12 @@ export async function* getPortalRealtimeEventGenerator(params: {
    * silently. (recommended: redelivery watchdog; delta review: made configurable)
    */
   redeliveryTimeoutMs?: number;
+  /**
+   * Idle bound (ms) on the OPEN /stream body read (RT-G11). Precedence: this param (tests) → the
+   * `PORTAL_STREAM_IDLE_MS` env var (positive-integer, else startup fails loud) → the 120_000 ms default.
+   * On expiry the read reconnects from `cursor` (routine, NOT fatal) and logs a debug line. (RT-1 SC1)
+   */
+  streamIdleMs?: number;
 }) {
   const { common, chain, eventCallbacks, syncProgress, childAddresses } =
     params;
@@ -520,6 +552,14 @@ export async function* getPortalRealtimeEventGenerator(params: {
     params.redeliveryTimeoutMs,
     process.env.PORTAL_STREAM_REDELIVERY_TIMEOUT_MS,
     300_000,
+  );
+  // Idle bound on the open /stream body read (RT-G11): a wedged connection (headers OK, body silent, no
+  // FIN/RST) reconnects from `cursor` after this bound instead of hanging forever. Resolved once here so a
+  // garbage env fails loud at startup, not deep in the stream loop. (RT-1 SC1)
+  const streamIdleMs = resolveStreamIdleMs(
+    params.streamIdleMs,
+    process.env.PORTAL_STREAM_IDLE_MS,
+    120_000,
   );
   let watchdog: ReturnType<typeof setTimeout> | undefined;
   let watchdogError: Error | undefined;
@@ -588,6 +628,14 @@ export async function* getPortalRealtimeEventGenerator(params: {
         portalFinalizedHead(portalUrl, headers, params.fetchImpl),
       finalizePollMs: params.finalizePollMs,
       finalizeDeferMaxMs: params.finalizeDeferMaxMs,
+      idleMs: streamIdleMs,
+      onIdleReconnect: () =>
+        common.logger.debug({
+          service: 'portal',
+          msg: 'Portal /stream idle bound reached — reconnecting from cursor',
+          chain: chain.name,
+          idle_ms: streamIdleMs,
+        }),
       signal: controller.signal,
       fetchImpl: params.fetchImpl,
     })) {

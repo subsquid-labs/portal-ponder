@@ -1791,3 +1791,262 @@ test('streamHotBlocks: a DROPPABLE BLOCK-field 400 (dataset lacks mix_hash) degr
   await gen.return(undefined);
   ac.abort();
 });
+
+// ─────────────────────────────── RT-1 SC1: idle-bounded read + tick-transparent line-wait ───────────────────────────────
+
+// A /stream body that emits exactly ONE block line then stays OPEN and SILENT — never enqueues another
+// line, never closes (no 204, no FIN/RST). This is the wedged-connection / silent-open state (R1): a plain
+// `for await` over `ndjsonLines` suspends here FOREVER, so no ticks reach the consumer and finalize starves.
+// `signal` (the test's AbortController) errors the body on teardown so a pending `reader.read()` SETTLES —
+// otherwise, under the idle-bound NEUTER where the read never idle-expires, the never-settling read keeps
+// vitest's event loop alive and the process hangs AFTER the assertion (a real hang, not just a slow test).
+// A real fetch aborts its body on the request signal; the mock must model that to be drainable. (RT-1 SC1)
+function silentOpenBlock(
+  block: unknown,
+  signal: AbortSignal,
+): {
+  status: number;
+  ok: boolean;
+  body: ReadableStream<Uint8Array>;
+} {
+  const enc = new TextEncoder();
+  const body = new ReadableStream<Uint8Array>({
+    start(c) {
+      c.enqueue(enc.encode(`${JSON.stringify(block)}\n`));
+      // deliberately NOT closed and NOTHING more enqueued — the read suspends open-but-silent, until abort
+      const onAbort = (): void => {
+        try {
+          c.error(new Error('aborted'));
+        } catch {
+          /* already closed/errored */
+        }
+      };
+      if (signal.aborted) onAbort();
+      else signal.addEventListener('abort', onAbort, { once: true });
+    },
+  });
+
+  return { status: 200, ok: true, body };
+}
+
+test('portalRealtimeEvents: tick-transparent line-wait keeps finalize polling on a SILENT-OPEN connection (RT-1 SC1)', async () => {
+  const block100 = {
+    header: { number: 100, hash: 'h100', parentHash: 'h99', timestamp: 100 },
+    logs: [],
+  };
+  let request = 0;
+  const ac = new AbortController();
+  // Request 1 delivers block 100 then holds the connection OPEN and SILENT (never a second line, never a
+  // close, never a 204). On pre-SC1 code the `for await` suspends on this open body forever → the consumer
+  // gets no ticks → finalize is never re-polled → the sentinel fires. With the tick-transparent line-wait,
+  // heartbeat ticks drive finalize on wall-clock cadence WHILE the connection stays open. `idleMs` is set
+  // large (30s) so the idle-reconnect path does NOT run within the test window — this isolates G2b (the
+  // in-connection line-wait) from G2a (the idle reconnect). Any request ≥ 2 would only occur on a reconnect,
+  // which must NOT happen here.
+  const fetchImpl = (async () => {
+    request += 1;
+    if (request === 1) return silentOpenBlock(block100, ac.signal);
+
+    return { status: 204, ok: false, body: null };
+  }) as any;
+  let headCalls = 0;
+  const iter = portalRealtimeEvents({
+    portalUrl: 'http://portal',
+    headers: {},
+    fromBlock: 100,
+    anchor: L(99, 'h99', 'h98'),
+    logs: [],
+    fetchImpl,
+    signal: ac.signal,
+    idleMs: 30_000, // large: no idle reconnect within the window — proves G2b alone
+    finalizedHead: async () => {
+      headCalls += 1;
+
+      return headCalls === 1
+        ? { number: 99, hash: 'h99' }
+        : { number: 100, hash: 'h100' };
+    },
+    finalizePollMs: 50,
+  });
+  const events: any[] = [];
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const sentinel = new Promise<never>((_, reject) => {
+    timer = setTimeout(
+      () => reject(new Error('SILENT-OPEN-STARVED: finalize never emitted')),
+      2000,
+    );
+  });
+
+  try {
+    const finalize = await Promise.race([
+      (async () => {
+        for await (const e of iter) {
+          events.push(e);
+          if (e.type === 'finalize') return e;
+        }
+
+        throw new Error('SILENT-OPEN-STARVED: generator ended before finalize');
+      })(),
+      sentinel,
+    ]);
+    const blocks = events.filter((e) => e.type === 'block');
+    // Exactly ONE block was delivered; finalize was driven by the tick clock during the silent-open window,
+    // NOT by a second delivery (there is none). This is the R1 proof.
+    expect(blocks).toHaveLength(1);
+    expect(finalize.block.number).toBe(100);
+    // No reconnect happened — the large idleMs means the single open connection served the whole test.
+    expect(request).toBe(1);
+  } finally {
+    if (timer !== undefined) clearTimeout(timer);
+    ac.abort();
+  }
+});
+
+test('streamHotBlocks: idle bound reconnects from cursor on a silent-open stream (RT-1 SC1)', async () => {
+  const block100 = {
+    header: { number: 100, hash: 'h100', parentHash: 'h99', timestamp: 100 },
+    logs: [],
+  };
+  const requestCursors: number[] = [];
+  const ac = new AbortController();
+  // Request 1 delivers block 100 then goes SILENT-OPEN. With a small idleMs the read hits its idle bound and
+  // reconnects from `cursor` (now 101, past block 100). Request 2 records that advanced cursor and 204s. On
+  // neutered code (idleMs not passed / removed) the read suspends forever → request 2 never happens → the
+  // sentinel fires.
+  const fetchImpl = (async (_url: string, init: any) => {
+    const from = JSON.parse(init.body).fromBlock as number;
+    requestCursors.push(from);
+    if (requestCursors.length === 1)
+      return silentOpenBlock(block100, ac.signal);
+
+    return { status: 204, ok: false, body: null };
+  }) as any;
+  const gen = streamHotBlocks({
+    portalUrl: 'http://portal',
+    headers: {},
+    fromBlock: 100,
+    logs: [],
+    blockFields: BLOCK_FIELDS,
+    fetchImpl,
+    signal: ac.signal,
+    idleMs: 150, // small: force the idle bound to fire well within the sentinel window
+    tickSleepMs: 20,
+  });
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const sentinel = new Promise<never>((_, reject) => {
+    timer = setTimeout(
+      () => reject(new Error('IDLE-RECONNECT-STARVED: never reconnected')),
+      2000,
+    );
+  });
+
+  // `stop` lets the detached drive loop below terminate the instant we tear down — without it the loop keeps
+  // pulling ticks every tickSleepMs FOREVER (under the neuter no reconnect ever ends it), keeping vitest's
+  // event loop alive so the process hangs even after the sentinel fails. (cto-spec §4: never an open hang)
+  let stop = false;
+  try {
+    // Drive the generator, pulling ticks/blocks, until the mock has served request 2 (the reconnect) at the
+    // advanced cursor 101, or the sentinel fires.
+    await Promise.race([
+      (async () => {
+        for (;;) {
+          const r = await gen.next();
+          if (r.done || stop) return;
+          if (requestCursors.length >= 2) return;
+        }
+      })(),
+      sentinel,
+    ]);
+    expect(requestCursors[0]).toBe(100); // first connection opened at fromBlock
+    expect(requestCursors[1]).toBe(101); // reconnect resumed from cursor PAST block 100 — no re-fetch/skip
+  } finally {
+    if (timer !== undefined) clearTimeout(timer);
+    stop = true;
+    ac.abort();
+    // Fire-and-forget teardown (cto-spec §4: never an open hang). Under the idle-bound NEUTER the reader
+    // never settles on the silent-open body, so `await gen.return()` would itself block and mask the
+    // sentinel failure — the assertion above has already run, so we do not await the generator's unwind.
+    void gen.return(undefined).catch(() => {});
+  }
+});
+
+test('streamHotBlocks: idle bound fires onIdleReconnect and a slow-but-alive stream is NOT cut (RT-1 SC1)', async () => {
+  const enc = new TextEncoder();
+  let idleCalls = 0;
+  let controller: ReadableStreamDefaultController<Uint8Array> | undefined;
+  const requests: number[] = [];
+  // A single connection that stays open. It delivers block 100 immediately, then — critically — enqueues a
+  // heartbeat-frequency stream of blocks slowly enough to prove the connection is NEVER cut while alive
+  // (each chunk re-arms the idle guard), but the SECOND connection (if a reconnect ever happens) 204s. We
+  // deliver blocks 100..104 spaced ~40ms apart under a 150ms idle bound: 40ms < 150ms, so the guard re-arms
+  // every chunk and the stream is never recycled — onIdleReconnect must stay at 0.
+  const fetchImpl = (async (_url: string, init: any) => {
+    requests.push(JSON.parse(init.body).fromBlock as number);
+    if (requests.length > 1) return { status: 204, ok: false, body: null };
+
+    const body = new ReadableStream<Uint8Array>({
+      start(c) {
+        controller = c;
+        c.enqueue(
+          enc.encode(
+            `${JSON.stringify({ header: { number: 100, hash: 'h100', parentHash: 'h99', timestamp: 100 }, logs: [] })}\n`,
+          ),
+        );
+      },
+    });
+
+    return { status: 200, ok: true, body };
+  }) as any;
+  const ac = new AbortController();
+  const gen = streamHotBlocks({
+    portalUrl: 'http://portal',
+    headers: {},
+    fromBlock: 100,
+    logs: [],
+    blockFields: BLOCK_FIELDS,
+    fetchImpl,
+    signal: ac.signal,
+    idleMs: 150,
+    tickSleepMs: 20,
+    onIdleReconnect: () => {
+      idleCalls += 1;
+    },
+  });
+  // Feed a live-but-slow block every ~40ms (< idleMs 150) so the guard re-arms and never cuts.
+  let n = 101;
+  const feeder = setInterval(() => {
+    if (controller === undefined || n > 104) return;
+
+    controller.enqueue(
+      enc.encode(
+        `${JSON.stringify({ header: { number: n, hash: `h${n}`, parentHash: `h${n - 1}`, timestamp: n }, logs: [] })}\n`,
+      ),
+    );
+    n += 1;
+  }, 40);
+  try {
+    const blocks: number[] = [];
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const done = new Promise<void>((resolve) => {
+      timer = setTimeout(resolve, 400); // drive ~10 heartbeats + 5 slow blocks
+    });
+    const drive = (async () => {
+      for (;;) {
+        const r = await gen.next();
+        if (r.done) return;
+        if (r.value.kind === 'block') blocks.push(r.value.header.number);
+        if (blocks.length >= 5) return;
+      }
+    })();
+    await Promise.race([drive, done]);
+    if (timer !== undefined) clearTimeout(timer);
+    // The stream was alive (blocks kept arriving under the idle bound) → NEVER recycled, NEVER reconnected.
+    expect(idleCalls).toBe(0);
+    expect(requests.length).toBe(1);
+    expect(blocks).toContain(100);
+  } finally {
+    clearInterval(feeder);
+    ac.abort();
+    await gen.return(undefined);
+  }
+});

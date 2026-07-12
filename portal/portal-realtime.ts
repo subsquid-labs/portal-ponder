@@ -215,6 +215,23 @@ export type PortalRealtimeArgs = {
    * may pass a smaller value when finalizePollMs < 2000 to preserve the heartbeat cadence bound.
    */
   errorSleepMs?: number;
+  /**
+   * Idle bound (ms) on the OPEN /stream body read (RT-G11). A wedged connection — headers OK, body never
+   * delivers, no FIN/RST — would otherwise hang the NDJSON read FOREVER: no blocks, no reconnect, no ticks
+   * to drive finalize. `ndjsonLines`' per-chunk idle guard re-arms on every received chunk (a slow-but-alive
+   * stream is never cut) and, after `idleMs` of CUMULATIVE silence, throws — which the loop catches and
+   * reconnects from `cursor` (routine, cheap, NOT fatal). Default 120_000; portalRealtimeEvents/wire resolve
+   * the env-tunable `PORTAL_STREAM_IDLE_MS`. The bound must comfortably exceed normal inter-block quiet.
+   * Independent of the tick-transparent line-wait below: ticks keep finalize alive DURING the idle window;
+   * this only bounds how long a silent-but-open connection is held before it is recycled. (RT-1 SC1)
+   */
+  idleMs?: number;
+  /**
+   * Called once when the OPEN-body read hits its `idleMs` bound and the connection is recycled (RT-G11) — a
+   * seam for the logger-free shell to surface a debug line at the wire (where `common.logger` lives), so an
+   * idle reconnect is distinguishable from an ordinary stream cut. Absent ⇒ silent recycle (unit call sites).
+   */
+  onIdleReconnect?: () => void;
   signal?: AbortSignal;
   fetchImpl?: typeof fetch;
 };
@@ -260,6 +277,7 @@ export async function* streamHotBlocks(
   const fetchImpl = args.fetchImpl ?? fetch;
   const tickSleepMs = args.tickSleepMs ?? 500;
   const errorSleepMs = args.errorSleepMs ?? 1000;
+  const idleMs = args.idleMs ?? 120_000;
   let cursor = args.fromBlock;
   // Delivered-hash ring: height → last-delivered hash at that height. Its semantics is "what is my
   // parentBlockHash if I resume at h+1" — so `ring.get(cursor − 1)` is sent on EVERY /stream request. It
@@ -537,8 +555,37 @@ export async function* streamHotBlocks(
     const openedRev = args.getLogsRevision?.() ?? 0;
     let reopen = false;
     let deliveredThisConn = 0;
+    // Drive the NDJSON reader MANUALLY (not a plain `for await`) so the wait for the next line is
+    // TICK-TRANSPARENT (G2b): while suspended waiting for a line, we yield `{ kind: 'tick' }` every
+    // `tickSleepMs` of silence WITHOUT touching the connection, so finalize/B1 keep polling on a
+    // silent-but-OPEN connection (the one no-delivery state the loop-turn ticks cannot reach). The
+    // `idleMs` guard armed on `ndjsonLines` still re-arms per received chunk (a slow-but-alive stream is
+    // never cut) and, after `idleMs` of CUMULATIVE silence, REJECTS the read → caught below → reconnect.
+    // Correctness: a single pending `readerP` is held across heartbeat races and NEVER re-requested until
+    // it settles, so a heartbeat tick can neither consume nor reorder a line; the heartbeat timer is
+    // always cleared (raceHeartbeat's finally) so no timer accrues across ticks. (RT-1 SC1 / R1)
+    const it = ndjsonLines(res.body, undefined, idleMs);
+    let idleExpired = false;
     try {
-      for await (const line of ndjsonLines(res.body)) {
+      let readerP = it.next();
+      for (;;) {
+        if (args.signal?.aborted) break;
+
+        const r = await raceHeartbeat(readerP, tickSleepMs, args.signal);
+        if (r.tick) {
+          // On abort the heartbeat wins immediately and forever (the read never settles) — break to the
+          // outer loop, whose top `return`s on the aborted signal, rather than spin ticks post-teardown.
+          if (args.signal?.aborted) break;
+
+          yield { kind: 'tick' };
+          continue; // re-race the SAME pending read — no line consumed, no new read requested
+        }
+
+        const step = r.value!;
+        if (step.done) break;
+
+        const line = step.value;
+        readerP = it.next(); // this line settled — request the next before processing (order preserved)
         const batch = JSON.parse(line);
         if (batch?.header?.number != null) {
           const num = batch.header.number as number;
@@ -570,9 +617,19 @@ export async function* streamHotBlocks(
           }
         }
       }
-    } catch {
-      /* stream cut — reconnect from cursor */
+    } catch (err) {
+      // The idle guard rejects with a distinct message after `idleMs` of cumulative silence; anything else
+      // is an ordinary stream cut. Both reconnect from `cursor` (the tick + backoff sleep run below); the
+      // idle case additionally fires the debug seam so an idle recycle is distinguishable at the wire.
+      if (err instanceof Error && err.message.includes('idle timeout')) {
+        idleExpired = true;
+      }
+    } finally {
+      // Cancel the reader's finally on early break/reopen/error — closing the body even when we stopped
+      // mid-stream without draining (`for await` did this implicitly; the manual driver must do it too).
+      void it.return?.(undefined).catch(() => {});
     }
+    if (idleExpired) args.onIdleReconnect?.();
     if (!reopen) {
       yield { kind: 'tick' };
       await sleep(Math.min(200, tickSleepMs), args.signal);
@@ -660,6 +717,50 @@ export const sleep = (ms: number, signal?: AbortSignal) =>
     }, ms);
     signal?.addEventListener('abort', onAbort, { once: true });
   });
+
+/**
+ * Race a PENDING NDJSON read (`readerP`) against a `tickSleepMs` heartbeat and `signal` abort — the engine
+ * of the tick-transparent line-wait (G2b, RT-1 SC1). Returns `{ tick: true }` when the heartbeat (or abort)
+ * wins so the caller yields a `{ kind: 'tick' }` and RE-RACES THE SAME `readerP` (the read is never consumed
+ * nor re-requested on a tick, so no NDJSON line can be dropped or reordered), or `{ tick: false, value }`
+ * carrying the settled read when the reader wins. Leak-safety: exactly one heartbeat timer per race, always
+ * cleared in `finally`; the abort listener is `{ once: true }` and removed on the timer path — so no timer or
+ * listener accrues across the many ticks of a long silent-open window. `readerP` rejecting (the `idleMs`
+ * guard firing, or a stream cut) propagates as a rejection the caller's try/catch handles. (RT-1 SC1)
+ */
+export async function raceHeartbeat<T>(
+  readerP: Promise<T>,
+  tickSleepMs: number,
+  signal?: AbortSignal,
+): Promise<{ tick: true } | { tick: false; value: T }> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  let onAbort: (() => void) | undefined;
+  const read = readerP.then((value) => ({ tick: false as const, value }));
+  // If the heartbeat wins this race, `read` (derived from the pending `readerP`) is left unsettled; should
+  // `readerP` later reject (idle guard / stream cut) its rejection would be UNOBSERVED on this wrapper and
+  // surface as an unhandledRejection. The caller re-races the SAME `readerP`, where the rejection IS
+  // observed (or its try/catch awaits it) — so swallow here on the derived wrapper only, never on readerP.
+  read.catch(() => {});
+  const beat = new Promise<{ tick: true }>((resolve) => {
+    if (signal?.aborted) return resolve({ tick: true });
+
+    onAbort = (): void => {
+      resolve({ tick: true });
+    };
+    timer = setTimeout(() => resolve({ tick: true }), tickSleepMs);
+    signal?.addEventListener('abort', onAbort, { once: true });
+  });
+
+  try {
+    return await Promise.race([read, beat]);
+  } finally {
+    // Clear the heartbeat timer whoever wins — a reader-win must not leave a dangling timer to fire later
+    // (property 2: no timer accrues across a silent-open window). The abort listener is removed here too;
+    // `{ once: true }` covers the fired-abort case, this covers the reader-win / timer-win cases.
+    if (timer !== undefined) clearTimeout(timer);
+    if (onAbort !== undefined) signal?.removeEventListener('abort', onAbort);
+  }
+}
 
 // ─────────────────────────────── event producer ───────────────────────────────
 // Emits ponder RealtimeSyncEvent-shaped objects. `finalizedHead()` polls the Portal finalized head so we
