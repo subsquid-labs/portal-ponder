@@ -532,7 +532,7 @@ index 01b6288..8567db1 100644
      if (Date.now() - lastUnfinalizedRefetch < 30_000) {
        break;
      }
-@@ -826,6 +979,14 @@ export async function* getHistoricalEventsIsolated(params: {
+@@ -826,6 +979,17 @@ export async function* getHistoricalEventsIsolated(params: {
          ],
          context,
        ),
@@ -542,12 +542,15 @@ index 01b6288..8567db1 100644
 +        chain: params.chain,
 +        rpc,
 +        finalizedBlock: fb,
++        // The previously adopted boundary is the in-run finality floor — a stale-LOW probe must not regress
++        // it (RT-2; INERT given the isolated adopt-guard below, defense/parity per RG0).
++        floor: hexToNumber(params.syncProgress.finalized.number),
 +        common: params.common,
 +      }),
      );
  
      const finalizedBlockNumber = hexToNumber(finalizedBlock.number);
-@@ -1216,7 +1377,9 @@ export async function* getLocalSyncGenerator(params: {
+@@ -1216,7 +1380,9 @@ export async function* getLocalSyncGenerator(params: {
        return;
      } else if (params.isCatchup === false) {
        params.common.logger.info({
@@ -558,7 +561,7 @@ index 01b6288..8567db1 100644
          chain: params.chain.name,
          chain_id: params.chain.id,
          cached_block: hexToNumber(params.syncProgress.current.number),
-@@ -1227,14 +1390,18 @@ export async function* getLocalSyncGenerator(params: {
+@@ -1227,14 +1393,18 @@ export async function* getLocalSyncGenerator(params: {
      first = hexToNumber(params.syncProgress.current.number) + 1;
    } else {
      params.common.logger.info({
