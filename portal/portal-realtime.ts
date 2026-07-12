@@ -244,15 +244,25 @@ export type PortalRealtimeArgs = {
 };
 
 /**
- * Max delivered-hash ring entries kept (per height). ~2048 covers far more than any unfinalized window.
+ * Max delivered-hash ring entries kept (per height). 8192 covers far more than any unfinalized window.
  * CANDOR (F5): with an unfinalized window DEEPER than RING_CAP — a fast chain under a max finalize-defer
- * streak, so the anchor (and thus the pruning floor) hasn't advanced while the tip has climbed >2048 blocks
- * above it — a deep 409 step-down could reach an EVICTED ring height and find no confirming entry, ending at
- * the floor fatal. That is an availability edge (a loud restart, never wrong data): the step-down simply
- * fails to confirm a fork point whose ring hash was capped out, exactly as a fresh restart would re-derive
- * the window from the finalized head. The B1 finalize-defer watchdog bounds how long that window can grow.
+ * streak, so the anchor (and thus the pruning floor) hasn't advanced while the tip has climbed >8192 blocks
+ * above it — a deep 409 step-down can reach an EVICTED ring height. Which fatal fires there is NOT the floor
+ * fatal: pruneRing() retains the HIGHEST RING_CAP heights and evicts the lowest, so a no-match descent
+ * lowering the cursor crosses from the retained band into the size-evicted band while that height is still
+ * ABOVE the finalized floor — so the EVICTION fatal at the loop top (`armed && parentBlockHash === undefined`
+ * → "no delivered-hash ring entry for the resume parent") fires FIRST, the moment cursor−1 lands on an
+ * evicted height. The floor fatal ("fork point is at or below the finalized floor") only fires when the
+ * descent reaches the floor WITHOUT first crossing an evicted predecessor — i.e. only when the whole window
+ * fits under RING_CAP so nothing is evicted. Either way it is an availability edge (a loud restart, never
+ * wrong data): the step-down simply fails to confirm a fork point, exactly as a fresh restart would
+ * re-derive the window from the finalized head. Headroom: 8192 entries make the edge unreachable within the
+ * production-default B1 finalize-defer bound (`finalizeDeferMaxMs` 600 s): 600000 ms / 8192 ≈ 73 ms, so any
+ * chain with a block time ≳75 ms cannot grow the window past 8192 blocks above the deferred anchor before B1
+ * fires; a `Map<number,string>` of 8192 ~66-char hash entries is about a megabyte (~1 MB with V8 overhead),
+ * negligible. The B1 finalize-defer watchdog bounds how long that window can grow. (RT-3 / RT-G2)
  */
-export const RING_CAP = 2048;
+export const RING_CAP = 8192;
 /**
  * Max consecutive 409 fork-negotiation rounds WITHOUT cursor progress before failing loud (F2). This is an
  * OSCILLATION guard, NOT a per-409 counter: a legitimate no-match negotiation steps the cursor DOWN one

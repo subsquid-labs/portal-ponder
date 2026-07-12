@@ -908,6 +908,147 @@ test('streamHotBlocks: a no-match step-down descending MORE than 10 heights reac
   );
 });
 
+// ─────────────────────────────── RT-3 / RT-G2: RING_CAP headroom + eviction-fatal proof ───────────────────────────────
+// RING_CAP is a module const (not injectable), so these drive the REAL 8192. pruneRing() retains the
+// HIGHEST RING_CAP heights and evicts the lowest; a no-match 409 descent lowers the cursor one height per
+// round. The two fatals differ by shape: if the window fits under RING_CAP nothing is evicted and the
+// descent reaches the finalized FLOOR (floor fatal); if the window EXCEEDS RING_CAP the descent crosses
+// from the retained band into the size-evicted band while still ABOVE the floor, so the loop-top guard
+// `armed && ring.get(cursor−1) === undefined` throws the EVICTION fatal FIRST. Windows are delivered in a
+// single 200 NDJSON body (cheap even at ~8200 headers); every subsequent request 409s with an at-floor
+// no-match `previousBlocks` ({number:0} at floor 0 — `0 < 0` is false so it never trips belowFloor, and its
+// hash never matches the ring so no rewind), forcing a pure step-down.
+
+// A window that EXACTLY FITS under RING_CAP=8192 (anchor 0 seed + 4096 delivered = 4097 ring entries ≤
+// 8192) → NO eviction → the no-match descent runs all the way to the floor (cursor−1 == floor 0) and throws
+// the FLOOR fatal, never the eviction fatal. This is the RT-3 core: it is GREEN only because RING_CAP is
+// large enough to retain the whole window. MUTATION (revert RING_CAP 8192 → 2048): the 4097-entry window
+// now exceeds 2048, pruneRing evicts the lowest 2049 heights 0..2048 (including the seed anchor at height 0;
+// retains 2049..4096), and the descent hits an evicted predecessor at cursor−1 == 2048 (ABOVE the floor) →
+// the EVICTION fatal fires instead → this test flips red on the different (eviction-not-floor) shape. That
+// mutation is the exact "revert to 2048" the plan names as load-bearing. (RT-3 / RT-G2)
+test('streamHotBlocks: a ~4096-block window FITS under RING_CAP=8192 (no eviction) so a no-match 409 step-down reaches the FLOOR fatal, not the eviction fatal (RT-3 / RT-G2 headroom)', async () => {
+  const bodies: any[] = [];
+  const WINDOW = 4096; // anchor 0 + blocks 1..4096 → 4097 ring entries ≤ 8192 (fits, no eviction)
+  const blocks = Array.from({ length: WINDOW }, (_, i) =>
+    hdr(1 + i, `h${1 + i}`, `h${i}`),
+  );
+  // One 200 delivering the whole window, then a no-match 409 per step-down. The descent is
+  // 4097 → 4096 → … → 1 (cursor−1 reaches the floor 0), so WINDOW+1 = 4097 negotiation rounds are needed;
+  // provision that many. Each 409 names {0, 'xnomatch'}: at the floor, non-matching hash → no rewind, no
+  // belowFloor → pure step-down. Extra conns past the fatal are never consumed.
+  const conns: Conn[] = [
+    { status: 200, blocks },
+    ...Array.from({ length: WINDOW + 1 }, () => ({
+      status: 409 as const,
+      previousBlocks: [{ number: 0, hash: 'xnomatch' }],
+    })),
+  ];
+  const gen = streamHotBlocks({
+    portalUrl: 'http://portal',
+    headers: {},
+    fromBlock: 1,
+    logs: [],
+    seedRing: { number: 0, hash: 'h0' },
+    getFinalizedFloor: () => 0,
+    fetchImpl: mockForkFetch(conns, bodies),
+  });
+  const yielded: any[] = [];
+  let thrown: Error | undefined;
+  try {
+    for await (const b of gen) {
+      if (b.kind === 'block') yielded.push(b.header.number);
+    }
+  } catch (err) {
+    thrown = err as Error;
+  }
+  // ASSERT the FLOOR fatal fired and the EVICTION fatal did NOT — at RING_CAP=8192 nothing was evicted, so
+  // `ring.get(cursor−1)` was defined for every step down to the floor. Both properties on the one throw:
+  // matching the floor message AND NOT matching the eviction message pins the exact fatal shape. The
+  // mutation (RING_CAP → 2048) evicts the low band and flips this to the eviction fatal → both asserts fail.
+  expect(thrown).toBeDefined();
+  expect(thrown!.message).toMatch(
+    /fork point is at or below the finalized floor/i,
+  );
+  expect(thrown!.message).not.toMatch(/no delivered-hash ring entry/i);
+  expect(yielded.length).toBe(WINDOW); // all pre-fork deliveries 1..4096; nothing accepted past the fork
+  // the descent stepped every height from the tip (resume 4097) down to the floor request at 1
+  const stream = bodies.filter((b) => b.fromBlock !== undefined);
+  const negotiations = stream.slice(1); // drop the initial fromBlock=1 delivery request
+  expect(negotiations.map((r) => r.fromBlock)).toEqual(
+    Array.from({ length: WINDOW + 1 }, (_, i) => WINDOW + 1 - i), // 4097,4096,…,1
+  );
+});
+
+// A window that EXCEEDS RING_CAP=8192 (anchor 0 seed + 8200 delivered = 8201 entries > 8192) → pruneRing
+// EVICTS the lowest heights (retains the highest 8192: heights 9..8200), leaving heights 1..8 evicted while
+// they are still ABOVE the finalized floor 0. A no-match 409 step-down descends from the tip and, on
+// reaching cursor−1 == 8 (an evicted height, above the floor), finds `ring.get(cursor−1) === undefined` and
+// throws the LOUD eviction fatal — proving the availability edge is a loud restart, never a silent re-open.
+// MUTATION (neuter/remove the loop-top missing-ring-entry throw, so a missing ring entry sends NO
+// parentBlockHash instead of failing): the descent would silently continue past the evicted height, the
+// eviction fatal never fires, and instead of throwing this test EXHAUSTS every scripted 409 and trips the
+// `NEVER-EVICTED` sentinel below — a loud, fast failure (not a 15 s Vitest timeout). That mutation is
+// load-bearing. (RT-3 / RT-G2)
+test('streamHotBlocks: a >RING_CAP window evicts the lowest heights, so a no-match 409 step-down reaching an EVICTED (above-floor) height throws the LOUD eviction fatal (RT-3 / RT-G2 eviction)', async () => {
+  const bodies: any[] = [];
+  const WINDOW = 8200; // anchor 0 + blocks 1..8200 → 8201 ring entries > 8192 → heights 1..8 evicted
+  const blocks = Array.from({ length: WINDOW }, (_, i) =>
+    hdr(1 + i, `h${1 + i}`, `h${i}`),
+  );
+  // Resume at the tip (8201) and step down. pruneRing retained 9..8200, so the eviction fatal fires at the
+  // loop TOP when cursor == 9 (ring.get(cursor−1 == 8) is undefined) — BEFORE a fetch for fromBlock 9 is
+  // made, so the LAST /stream request that actually went out was fromBlock 10 (the round that stepped the
+  // cursor 10 → 9). Each 409 names an at-floor no-match so nothing rewinds and nothing trips belowFloor.
+  // WINDOW 409s cover the 8192 rounds the eviction fatal needs (fromBlock 8201 → 10) with slack to spare; if
+  // the loop-top eviction throw is neutered the descent runs PAST the evicted band and exhausts every 409,
+  // tripping the sentinel below — a loud, fast failure instead of a 15 s Vitest no-hot-data re-poll timeout.
+  const conns: Conn[] = [
+    { status: 200, blocks },
+    ...Array.from({ length: WINDOW }, () => ({
+      status: 409 as const,
+      previousBlocks: [{ number: 0, hash: 'xnomatch' }],
+    })),
+  ];
+  let onExhausted: (() => void) | undefined;
+  const sentinel = new Promise<never>((_, reject) => {
+    onExhausted = () =>
+      reject(
+        new Error(
+          'NEVER-EVICTED: the >CAP step-down never hit the eviction fatal — it consumed every scripted 409 (regression)',
+        ),
+      );
+  });
+  const gen = streamHotBlocks({
+    portalUrl: 'http://portal',
+    headers: {},
+    fromBlock: 1,
+    logs: [],
+    seedRing: { number: 0, hash: 'h0' },
+    getFinalizedFloor: () => 0,
+    fetchImpl: mockForkFetch(conns, bodies, () => onExhausted?.()),
+  });
+  const yielded: any[] = [];
+  await expect(
+    Promise.race([
+      (async () => {
+        for await (const b of gen) {
+          if (b.kind === 'block') yielded.push(b.header.number);
+        }
+      })(),
+      sentinel,
+    ]),
+  ).rejects.toThrow(/no delivered-hash ring entry/i);
+  expect(yielded.length).toBe(WINDOW); // all pre-fork deliveries 1..8200; nothing accepted past the fork
+  // the descent stepped from the resume tip (8201) down to fromBlock 10 — at cursor 9 the loop top finds
+  // cursor−1 == 8 evicted and throws the eviction fatal BEFORE fetching, so fromBlock 10 is the LAST request
+  // that went out (9 and 8 are never requested)
+  const stream = bodies.filter((b) => b.fromBlock !== undefined);
+  const negotiations = stream.slice(1); // drop the initial fromBlock=1 delivery request
+  expect(negotiations[negotiations.length - 1]!.fromBlock).toBe(10);
+  expect(negotiations.length).toBe(WINDOW - 8); // fromBlock 8201 → 10 inclusive = 8192 rounds
+});
+
 test('streamHotBlocks: a 409 fork point BELOW the finalized floor is FATAL with no rewind (issue #33 T4 below-finality)', async () => {
   const bodies: any[] = [];
   // The server names a canonical replacement whose fork point (500) is BELOW the finalized floor (600).
