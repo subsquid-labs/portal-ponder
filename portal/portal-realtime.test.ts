@@ -3,6 +3,8 @@ import { afterEach, expect, test, vi } from 'vitest';
 import { BLOCK_FIELDS, TX_FIELDS } from './portal-filters.js';
 import {
   diagDump,
+  type HotBatch,
+  type HotItem,
   type Light,
   portalRealtimeEvents,
   reconcile,
@@ -19,6 +21,15 @@ const L = (number: number, hash: string, parentHash: string): Light => ({
   parentHash,
   timestamp: number,
 });
+
+const nextBlock = async (
+  gen: AsyncGenerator<HotItem>,
+): Promise<IteratorResult<HotBatch>> => {
+  for (;;) {
+    const r = await gen.next();
+    if (r.done || r.value.kind !== 'tick') return r as IteratorResult<HotBatch>;
+  }
+};
 
 // The reconcile anchor is REQUIRED since wave 4 (the optional blind-append legacy mode is gone);
 // A9 is the finalized block below these windows' base.
@@ -320,7 +331,7 @@ test('streamHotBlocks: re-opens the /stream with the widened filter the moment t
     signal: ac.signal,
   });
 
-  const first = await gen.next(); // block 100 from connection 1
+  const first = await nextBlock(gen); // block 100 from connection 1
   expect(first.value?.header.number).toBe(100);
   expect(bodies).toHaveLength(1);
   expect(bodies[0].fromBlock).toBe(100);
@@ -333,7 +344,7 @@ test('streamHotBlocks: re-opens the /stream with the widened filter the moment t
   });
   rev = 1;
 
-  const second = await gen.next(); // rev advanced → connection 1 torn down, reopen re-delivers block 100
+  const second = await nextBlock(gen); // rev advanced → connection 1 torn down, reopen re-delivers block 100
   expect(second.value?.header.number).toBe(101);
   expect(bodies).toHaveLength(2);
   // Re-opened FROM block 100, NOT 101: the child discovered in block 100 may have emitted its own logs
@@ -408,14 +419,14 @@ test('streamHotBlocks: caches the /stream body across same-cursor re-opens, rebu
     signal: ac.signal,
   });
 
-  const first = await gen.next(); // conn1 (empty, cursor 100) then conn2 delivers block 100
+  const first = await nextBlock(gen); // conn1 (empty, cursor 100) then conn2 delivers block 100
   expect(first.value?.header.number).toBe(100);
   expect(bodies).toHaveLength(2);
   expect(builds).toBe(1); // ONE serialization for TWO same-cursor requests — the body was REUSED
   expect(bodies[0]).toBe(bodies[1]); // byte-identical
   expect(JSON.parse(bodies[0]!).fromBlock).toBe(100);
 
-  const second = await gen.next(); // conn3 at cursor 101
+  const second = await nextBlock(gen); // conn3 at cursor 101
   expect(second.value?.header.number).toBe(101);
   expect(bodies).toHaveLength(3);
   expect(builds).toBe(2); // the cursor advanced → rebuilt exactly once more (never stale)
@@ -490,17 +501,17 @@ test('streamHotBlocks: the body-cache key pins CURSOR independently — a cursor
     signal: ac.signal,
   });
 
-  const first = await gen.next(); // conn1 (empty, cursor 100) then conn2 delivers 100
+  const first = await nextBlock(gen); // conn1 (empty, cursor 100) then conn2 delivers 100
   expect(first.value?.header.number).toBe(100);
   expect(builds).toBe(1); // conn1 open built; conn2 reused (same cursor 100, same pbh)
 
-  const second = await gen.next(); // conn3: cursor 101, pbh=SAME → rebuilt (cursor advanced)
+  const second = await nextBlock(gen); // conn3: cursor 101, pbh=SAME → rebuilt (cursor advanced)
   expect(second.value?.header.number).toBe(101);
   expect(builds).toBe(2);
   expect(JSON.parse(bodies[2]!).fromBlock).toBe(101);
   expect(JSON.parse(bodies[2]!).parentBlockHash).toBe(SAME);
 
-  const third = await gen.next(); // conn4: cursor 102, pbh=SAME (UNCHANGED from conn3) → MUST rebuild on cursor alone
+  const third = await nextBlock(gen); // conn4: cursor 102, pbh=SAME (UNCHANGED from conn3) → MUST rebuild on cursor alone
   expect(third.value?.header.number).toBe(102);
   // THE PIN: parentBlockHash is byte-identical between conn3 and conn4 (both 'hSAME'); only `cursor`
   // advanced 101→102. With `cursor` in the key this is a fresh build (fromBlock 102); drop `cursor` and it
@@ -650,12 +661,12 @@ test('streamHotBlocks: every /stream request carries parentBlockHash — first =
     fetchImpl: mockForkFetch(conns, bodies, () => ac.abort()),
     signal: ac.signal,
   });
-  const first = await gen.next();
+  const first = await nextBlock(gen);
   expect(first.value?.header.number).toBe(100);
   expect(bodies[0].fromBlock).toBe(100);
   expect(bodies[0].parentBlockHash).toBe('h99'); // FIRST request carries the seeded anchor hash
 
-  const second = await gen.next();
+  const second = await nextBlock(gen);
   expect(second.value?.header.number).toBe(101);
   expect(bodies[1].fromBlock).toBe(101);
   expect(bodies[1].parentBlockHash).toBe('h100'); // post-reconnect carries the LAST delivered hash
@@ -715,12 +726,12 @@ test('streamHotBlocks: the finding-4 redelivery reopen (cursor = number) sends t
     fetchImpl,
     signal: ac.signal,
   });
-  const first = await gen.next();
+  const first = await nextBlock(gen);
   expect(first.value?.header.number).toBe(100);
   expect(bodies[0].parentBlockHash).toBe('h99');
 
   rev = 1; // a child was discovered in block 100 → force the reopen FROM 100
-  const second = await gen.next();
+  const second = await nextBlock(gen);
   expect(second.value?.header.number).toBe(100); // redelivered
   expect(bodies[1].fromBlock).toBe(100); // reopened FROM 100, not 101
   expect(bodies[1].parentBlockHash).toBe('h99'); // the AWAITED block's parentHash (ring[99]), not h100
@@ -761,7 +772,9 @@ test('streamHotBlocks: a 409 whose previousBlocks match NOTHING steps the cursor
   const yielded: any[] = [];
   await expect(
     (async () => {
-      for await (const b of gen) yielded.push(b.header.number);
+      for await (const b of gen) {
+        if (b.kind === 'block') yielded.push(b.header.number);
+      }
     })(),
   ).rejects.toThrow(/fork point is at or below the finalized floor/i);
   expect(yielded).toEqual([101, 102, 103]); // the pre-fork deliveries; nothing accepted past the fork
@@ -824,7 +837,9 @@ test('streamHotBlocks: an OSCILLATING 409 loop (server keeps re-409ing a rewind 
   await expect(
     Promise.race([
       (async () => {
-        for await (const b of gen) yielded.push(b.header.number);
+        for await (const b of gen) {
+          if (b.kind === 'block') yielded.push(b.header.number);
+        }
       })(),
       sentinel,
     ]),
@@ -878,7 +893,9 @@ test('streamHotBlocks: a no-match step-down descending MORE than 10 heights reac
   const yielded: any[] = [];
   await expect(
     (async () => {
-      for await (const b of gen) yielded.push(b.header.number);
+      for await (const b of gen) {
+        if (b.kind === 'block') yielded.push(b.header.number);
+      }
     })(),
   ).rejects.toThrow(/fork point is at or below the finalized floor/i);
   expect(yielded.length).toBe(15); // all pre-fork deliveries 101..115; nothing accepted past the fork
@@ -1299,6 +1316,185 @@ test('portalRealtimeEvents: a hash-carrying finalize ABOVE the local tip is DEFE
   expect(finalizes[0]!.block.hash).toBe('c');
 });
 
+test('portalRealtimeEvents: tick-driven finalize during a 204 stall (RT-1 SC2 T1)', async () => {
+  const enc = new TextEncoder();
+  const block100 = {
+    header: {
+      number: 100,
+      hash: 'h100',
+      parentHash: 'h99',
+      timestamp: 100,
+    },
+    logs: [],
+  };
+  let request = 0;
+  const fetchImpl = (async () => {
+    request += 1;
+    if (request === 1) {
+      const body = new ReadableStream({
+        start(c) {
+          c.enqueue(enc.encode(`${JSON.stringify(block100)}\n`));
+          c.close();
+        },
+      });
+
+      return { status: 200, ok: true, body };
+    }
+
+    return { status: 204, ok: false, body: null };
+  }) as any;
+  let headCalls = 0;
+  const ac = new AbortController();
+  const iter = portalRealtimeEvents({
+    portalUrl: 'http://portal',
+    headers: {},
+    fromBlock: 100,
+    anchor: L(99, 'h99', 'h98'),
+    logs: [],
+    fetchImpl,
+    signal: ac.signal,
+    finalizedHead: async () => {
+      headCalls += 1;
+
+      return headCalls === 1
+        ? { number: 99, hash: 'h99' }
+        : { number: 100, hash: 'h100' };
+    },
+    finalizePollMs: 50,
+  });
+  const events: any[] = [];
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const sentinel = new Promise<never>((_, reject) => {
+    timer = setTimeout(
+      () => reject(new Error('HEARTBEAT-STARVED: finalize never emitted')),
+      2000,
+    );
+  });
+
+  try {
+    const finalize = await Promise.race([
+      (async () => {
+        for await (const e of iter) {
+          events.push(e);
+          if (e.type === 'finalize') return e;
+        }
+
+        throw new Error('HEARTBEAT-STARVED: generator ended before finalize');
+      })(),
+      sentinel,
+    ]);
+    const blocks = events.filter((e) => e.type === 'block');
+    expect(blocks).toHaveLength(1);
+    expect(finalize.block.number).toBe(100);
+  } finally {
+    if (timer !== undefined) clearTimeout(timer);
+    ac.abort();
+  }
+});
+
+test('portalRealtimeEvents: heartbeat ticks keep finalize polling on a 204-only wall-clock cadence (RT-1 SC2 T2)', async () => {
+  const fetchImpl = (async () => ({
+    status: 204,
+    ok: false,
+    body: null,
+  })) as any;
+  const pollTimes: number[] = [];
+  const ac = new AbortController();
+  const events: any[] = [];
+  const iter = portalRealtimeEvents({
+    portalUrl: 'http://portal',
+    headers: {},
+    fromBlock: 100,
+    anchor: L(99, 'h99', 'h98'),
+    logs: [],
+    fetchImpl,
+    signal: ac.signal,
+    finalizedHead: async () => {
+      pollTimes.push(Date.now());
+
+      return { number: 99, hash: 'h99' };
+    },
+    finalizePollMs: 100,
+  });
+  const drain = (async () => {
+    for await (const e of iter) events.push(e);
+  })();
+
+  await sleep(1200);
+  ac.abort();
+  await drain;
+
+  expect(pollTimes.length).toBeGreaterThanOrEqual(5);
+  expect(events).toEqual([]);
+});
+
+test('portalRealtimeEvents: B1 defer fatal fires on wall-clock during no-delivery (RT-1 SC2 T3)', async () => {
+  const enc = new TextEncoder();
+  const block100 = {
+    header: {
+      number: 100,
+      hash: 'h100',
+      parentHash: 'h99',
+      timestamp: 100,
+    },
+    logs: [],
+  };
+  let request = 0;
+  const fetchImpl = (async () => {
+    request += 1;
+    if (request === 1) {
+      const body = new ReadableStream({
+        start(c) {
+          c.enqueue(enc.encode(`${JSON.stringify(block100)}\n`));
+          c.close();
+        },
+      });
+
+      return { status: 200, ok: true, body };
+    }
+
+    return { status: 204, ok: false, body: null };
+  }) as any;
+  const ac = new AbortController();
+  const events: any[] = [];
+  const iter = portalRealtimeEvents({
+    portalUrl: 'http://portal',
+    headers: {},
+    fromBlock: 100,
+    anchor: L(99, 'h99', 'h98'),
+    logs: [],
+    fetchImpl,
+    signal: ac.signal,
+    finalizedHead: async () => ({ number: 105, hash: '0xh105' }),
+    finalizePollMs: 50,
+    finalizeDeferMaxMs: 300,
+  });
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const sentinel = new Promise<never>((_, reject) => {
+    timer = setTimeout(
+      () =>
+        reject(new Error('HEARTBEAT-STARVED: B1 defer watchdog never fired')),
+      2000,
+    );
+  });
+
+  try {
+    await expect(
+      Promise.race([
+        (async () => {
+          for await (const e of iter) events.push(e);
+        })(),
+        sentinel,
+      ]),
+    ).rejects.toThrow(/lagged the hash-carrying finalized head/);
+    const blocks = events.filter((e) => e.type === 'block');
+    expect(blocks).toHaveLength(1);
+  } finally {
+    if (timer !== undefined) clearTimeout(timer);
+    ac.abort();
+  }
+});
+
 // A /stream fetch that lazily yields an UNBOUNDED, strictly-increasing block chain (never 204s), so the
 // window keeps advancing but never catches a finalized head that also keeps climbing above it. Used for the
 // B1 starvation test — the block chain is infinite, so only the watchdog throw terminates the generator.
@@ -1519,7 +1715,7 @@ test('streamHotBlocks: a DROPPABLE tx-field 400 (dataset lacks access_list) degr
     fetchImpl,
     signal: ac.signal,
   });
-  const first = await gen.next(); // NOT a throw — the field is dropped and the retry delivers block 100
+  const first = await nextBlock(gen); // NOT a throw — the field is dropped and the retry delivers block 100
   expect(first.value?.header.number).toBe(100);
   // the first request carried accessList; the retry DROPPED it (kept the other tx fields)
   expect(bodies[0].fields.transaction.accessList).toBe(true);
@@ -1585,7 +1781,7 @@ test('streamHotBlocks: a DROPPABLE BLOCK-field 400 (dataset lacks mix_hash) degr
     fetchImpl,
     signal: ac.signal,
   });
-  const first = await gen.next(); // NOT a throw — the field is dropped and the retry delivers block 100
+  const first = await nextBlock(gen); // NOT a throw — the field is dropped and the retry delivers block 100
   expect(first.value?.header.number).toBe(100);
   // the first request carried mixHash; the retry DROPPED it (kept the required block fields)
   expect(bodies[0].fields.block.mixHash).toBe(true);
@@ -1593,5 +1789,771 @@ test('streamHotBlocks: a DROPPABLE BLOCK-field 400 (dataset lacks mix_hash) degr
   expect(bodies[1].fields.block.number).toBe(true); // the linkage-required fields stay
   expect(bodies[1].fields.block.parentHash).toBe(true);
   await gen.return(undefined);
+  ac.abort();
+});
+
+// ─────────────────────────────── RT-1 SC1: idle-bounded read + tick-transparent line-wait ───────────────────────────────
+
+// A /stream body that emits exactly ONE block line then stays OPEN and SILENT — never enqueues another
+// line, never closes (no 204, no FIN/RST). This is the wedged-connection / silent-open state (R1): a plain
+// `for await` over `ndjsonLines` suspends here FOREVER, so no ticks reach the consumer and finalize starves.
+// `signal` (the test's AbortController) errors the body on teardown so a pending `reader.read()` SETTLES —
+// otherwise, under the idle-bound NEUTER where the read never idle-expires, the never-settling read keeps
+// vitest's event loop alive and the process hangs AFTER the assertion (a real hang, not just a slow test).
+// A real fetch aborts its body on the request signal; the mock must model that to be drainable. (RT-1 SC1)
+function silentOpenBlock(
+  block: unknown,
+  signal: AbortSignal,
+): {
+  status: number;
+  ok: boolean;
+  body: ReadableStream<Uint8Array>;
+} {
+  const enc = new TextEncoder();
+  const body = new ReadableStream<Uint8Array>({
+    start(c) {
+      c.enqueue(enc.encode(`${JSON.stringify(block)}\n`));
+      // deliberately NOT closed and NOTHING more enqueued — the read suspends open-but-silent, until abort
+      const onAbort = (): void => {
+        try {
+          c.error(new Error('aborted'));
+        } catch {
+          /* already closed/errored */
+        }
+      };
+      if (signal.aborted) onAbort();
+      else signal.addEventListener('abort', onAbort, { once: true });
+    },
+  });
+
+  return { status: 200, ok: true, body };
+}
+
+test('portalRealtimeEvents: tick-transparent line-wait keeps finalize polling on a SILENT-OPEN connection (RT-1 SC1)', async () => {
+  const block100 = {
+    header: { number: 100, hash: 'h100', parentHash: 'h99', timestamp: 100 },
+    logs: [],
+  };
+  let request = 0;
+  const ac = new AbortController();
+  // Request 1 delivers block 100 then holds the connection OPEN and SILENT (never a second line, never a
+  // close, never a 204). On pre-SC1 code the `for await` suspends on this open body forever → the consumer
+  // gets no ticks → finalize is never re-polled → the sentinel fires. With the tick-transparent line-wait,
+  // heartbeat ticks drive finalize on wall-clock cadence WHILE the connection stays open. `idleMs` is set
+  // large (30s) so the idle-reconnect path does NOT run within the test window — this isolates G2b (the
+  // in-connection line-wait) from G2a (the idle reconnect). Any request ≥ 2 would only occur on a reconnect,
+  // which must NOT happen here.
+  const fetchImpl = (async () => {
+    request += 1;
+    if (request === 1) return silentOpenBlock(block100, ac.signal);
+
+    return { status: 204, ok: false, body: null };
+  }) as any;
+  let headCalls = 0;
+  const iter = portalRealtimeEvents({
+    portalUrl: 'http://portal',
+    headers: {},
+    fromBlock: 100,
+    anchor: L(99, 'h99', 'h98'),
+    logs: [],
+    fetchImpl,
+    signal: ac.signal,
+    idleMs: 30_000, // large: no idle reconnect within the window — proves G2b alone
+    finalizedHead: async () => {
+      headCalls += 1;
+
+      return headCalls === 1
+        ? { number: 99, hash: 'h99' }
+        : { number: 100, hash: 'h100' };
+    },
+    finalizePollMs: 50,
+  });
+  const events: any[] = [];
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const sentinel = new Promise<never>((_, reject) => {
+    timer = setTimeout(
+      () => reject(new Error('SILENT-OPEN-STARVED: finalize never emitted')),
+      2000,
+    );
+  });
+
+  try {
+    const finalize = await Promise.race([
+      (async () => {
+        for await (const e of iter) {
+          events.push(e);
+          if (e.type === 'finalize') return e;
+        }
+
+        throw new Error('SILENT-OPEN-STARVED: generator ended before finalize');
+      })(),
+      sentinel,
+    ]);
+    const blocks = events.filter((e) => e.type === 'block');
+    // Exactly ONE block was delivered; finalize was driven by the tick clock during the silent-open window,
+    // NOT by a second delivery (there is none). This is the R1 proof.
+    expect(blocks).toHaveLength(1);
+    expect(finalize.block.number).toBe(100);
+    // No reconnect happened — the large idleMs means the single open connection served the whole test.
+    expect(request).toBe(1);
+  } finally {
+    if (timer !== undefined) clearTimeout(timer);
+    ac.abort();
+  }
+});
+
+test('streamHotBlocks: idle bound reconnects from cursor on a silent-open stream (RT-1 SC1)', async () => {
+  const block100 = {
+    header: { number: 100, hash: 'h100', parentHash: 'h99', timestamp: 100 },
+    logs: [],
+  };
+  const requestCursors: number[] = [];
+  const ac = new AbortController();
+  // Request 1 delivers block 100 then goes SILENT-OPEN. With a small idleMs the read hits its idle bound and
+  // reconnects from `cursor` (now 101, past block 100). Request 2 records that advanced cursor and 204s. On
+  // neutered code (idleMs not passed / removed) the read suspends forever → request 2 never happens → the
+  // sentinel fires.
+  const fetchImpl = (async (_url: string, init: any) => {
+    const from = JSON.parse(init.body).fromBlock as number;
+    requestCursors.push(from);
+    if (requestCursors.length === 1)
+      return silentOpenBlock(block100, ac.signal);
+
+    return { status: 204, ok: false, body: null };
+  }) as any;
+  const gen = streamHotBlocks({
+    portalUrl: 'http://portal',
+    headers: {},
+    fromBlock: 100,
+    logs: [],
+    blockFields: BLOCK_FIELDS,
+    fetchImpl,
+    signal: ac.signal,
+    idleMs: 150, // small: force the idle bound to fire well within the sentinel window
+    tickSleepMs: 20,
+  });
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const sentinel = new Promise<never>((_, reject) => {
+    timer = setTimeout(
+      () => reject(new Error('IDLE-RECONNECT-STARVED: never reconnected')),
+      2000,
+    );
+  });
+
+  // `stop` lets the detached drive loop below terminate the instant we tear down — without it the loop keeps
+  // pulling ticks every tickSleepMs FOREVER (under the neuter no reconnect ever ends it), keeping vitest's
+  // event loop alive so the process hangs even after the sentinel fails. (cto-spec §4: never an open hang)
+  let stop = false;
+  try {
+    // Drive the generator, pulling ticks/blocks, until the mock has served request 2 (the reconnect) at the
+    // advanced cursor 101, or the sentinel fires.
+    await Promise.race([
+      (async () => {
+        for (;;) {
+          const r = await gen.next();
+          if (r.done || stop) return;
+          if (requestCursors.length >= 2) return;
+        }
+      })(),
+      sentinel,
+    ]);
+    expect(requestCursors[0]).toBe(100); // first connection opened at fromBlock
+    expect(requestCursors[1]).toBe(101); // reconnect resumed from cursor PAST block 100 — no re-fetch/skip
+  } finally {
+    if (timer !== undefined) clearTimeout(timer);
+    stop = true;
+    ac.abort();
+    // Fire-and-forget teardown (cto-spec §4: never an open hang). Under the idle-bound NEUTER the reader
+    // never settles on the silent-open body, so `await gen.return()` would itself block and mask the
+    // sentinel failure — the assertion above has already run, so we do not await the generator's unwind.
+    void gen.return(undefined).catch(() => {});
+  }
+});
+
+test('streamHotBlocks: idle bound fires onIdleReconnect and a slow-but-alive stream is NOT cut (RT-1 SC1)', async () => {
+  const enc = new TextEncoder();
+  let idleCalls = 0;
+  let controller: ReadableStreamDefaultController<Uint8Array> | undefined;
+  const requests: number[] = [];
+  // A single connection that stays open. It delivers block 100 immediately, then — critically — enqueues a
+  // heartbeat-frequency stream of blocks slowly enough to prove the connection is NEVER cut while alive
+  // (each chunk re-arms the idle guard), but the SECOND connection (if a reconnect ever happens) 204s. We
+  // deliver blocks 100..104 spaced ~40ms apart under a 150ms idle bound: 40ms < 150ms, so the guard re-arms
+  // every chunk and the stream is never recycled — onIdleReconnect must stay at 0.
+  const fetchImpl = (async (_url: string, init: any) => {
+    requests.push(JSON.parse(init.body).fromBlock as number);
+    if (requests.length > 1) return { status: 204, ok: false, body: null };
+
+    const body = new ReadableStream<Uint8Array>({
+      start(c) {
+        controller = c;
+        c.enqueue(
+          enc.encode(
+            `${JSON.stringify({ header: { number: 100, hash: 'h100', parentHash: 'h99', timestamp: 100 }, logs: [] })}\n`,
+          ),
+        );
+      },
+    });
+
+    return { status: 200, ok: true, body };
+  }) as any;
+  const ac = new AbortController();
+  const gen = streamHotBlocks({
+    portalUrl: 'http://portal',
+    headers: {},
+    fromBlock: 100,
+    logs: [],
+    blockFields: BLOCK_FIELDS,
+    fetchImpl,
+    signal: ac.signal,
+    idleMs: 150,
+    tickSleepMs: 20,
+    onIdleReconnect: () => {
+      idleCalls += 1;
+    },
+  });
+  // Feed a live-but-slow block every ~40ms (< idleMs 150) so the guard re-arms and never cuts.
+  let n = 101;
+  const feeder = setInterval(() => {
+    if (controller === undefined || n > 104) return;
+
+    controller.enqueue(
+      enc.encode(
+        `${JSON.stringify({ header: { number: n, hash: `h${n}`, parentHash: `h${n - 1}`, timestamp: n }, logs: [] })}\n`,
+      ),
+    );
+    n += 1;
+  }, 40);
+  try {
+    const blocks: number[] = [];
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const done = new Promise<void>((resolve) => {
+      timer = setTimeout(resolve, 400); // drive ~10 heartbeats + 5 slow blocks
+    });
+    const drive = (async () => {
+      for (;;) {
+        const r = await gen.next();
+        if (r.done) return;
+        if (r.value.kind === 'block') blocks.push(r.value.header.number);
+        if (blocks.length >= 5) return;
+      }
+    })();
+    await Promise.race([drive, done]);
+    if (timer !== undefined) clearTimeout(timer);
+    // The stream was alive (blocks kept arriving under the idle bound) → NEVER recycled, NEVER reconnected.
+    expect(idleCalls).toBe(0);
+    expect(requests.length).toBe(1);
+    expect(blocks).toContain(100);
+  } finally {
+    clearInterval(feeder);
+    ac.abort();
+    await gen.return(undefined);
+  }
+});
+
+// ─────────────────────────────── RT-1 SC1 B1: no unhandled rejection from an abandoned readerP ───────────────────────────────
+
+// Capture unhandledRejection for the duration of `fn`. Vitest installs its OWN unhandledRejection listener
+// that fails the whole run — so we SWAP the process listeners for our sentinel-only handler, run, wait one
+// macrotask turn for a pending readerP's abort/idle rejection to surface, then RESTORE the originals. The
+// return is the list of captured reasons; the fix asserts it is EMPTY. On pre-fix code an abandoned readerP
+// (created at `it.next()`, its `reader.read()` rejected when the signal-aborted body errors) has no handler
+// → it lands here non-empty. (RT-1 SC1 / B1)
+async function captureUnhandledRejections(
+  fn: () => Promise<void>,
+): Promise<unknown[]> {
+  const captured: unknown[] = [];
+  const prior = process.listeners('unhandledRejection');
+  for (const l of prior) {
+    process.removeListener('unhandledRejection', l);
+  }
+  const onReject = (reason: unknown): void => {
+    captured.push(reason);
+  };
+  process.on('unhandledRejection', onReject);
+  try {
+    await fn();
+    // A rejection abandoned in a race surfaces on a LATER microtask/macrotask than the abort. Drain both:
+    // a macrotask turn (setTimeout 0) flushes the microtask queue after it, so a `readerP` that rejects on
+    // the aborted body (or a fired idle timer) has settled and dispatched to `unhandledRejection` by here.
+    await new Promise<void>((resolve) => setTimeout(resolve, 50));
+  } finally {
+    process.removeListener('unhandledRejection', onReject);
+    for (const l of prior) {
+      process.on('unhandledRejection', l as (r: unknown) => void);
+    }
+  }
+
+  return captured;
+}
+
+test('streamHotBlocks: B1-A — abort at the first loop-top guard (200 open body) does not unhandled-reject the initial readerP (RT-1 SC1)', async () => {
+  const block100 = {
+    header: { number: 100, hash: 'h100', parentHash: 'h99', timestamp: 100 },
+    logs: [],
+  };
+  // Entry A: the signal is ALREADY aborted when execution reaches the INNER loop-top `if
+  // (args.signal?.aborted) break;` on the FIRST iteration — abort fired during/just after the /stream fetch
+  // resolved 200 with an open body. Crucially the abort must fire AFTER the OUTER loop-top guard (which
+  // would `return` before ever fetching on a pre-aborted signal) — so we abort from INSIDE fetchImpl, right
+  // before handing back the 200 body: the outer guard already passed, the fetch resolves, the initial
+  // `readerP = it.next()` is created (a pending reader.read() on a body wired to error on this signal), and
+  // then the inner loop-top guard breaks BEFORE the first raceHeartbeat — abandoning that readerP with no
+  // re-race handler. On pre-fix code its abort rejection is unhandled; the B1 `.catch` swallows it.
+  const ac = new AbortController();
+  const fetchImpl = (async () => {
+    const r = silentOpenBlock(block100, ac.signal);
+    // Abort now — the outer loop-top guard has already passed (fetch is running), so the generator does NOT
+    // early-return; it opens the body, creates the initial readerP, then breaks at the inner guard. The
+    // body's controller.error fires on this abort, rejecting the pending reader.read() in that readerP.
+    ac.abort();
+
+    return r;
+  }) as any;
+  const captured = await captureUnhandledRejections(async () => {
+    const gen = streamHotBlocks({
+      portalUrl: 'http://portal',
+      headers: {},
+      fromBlock: 100,
+      logs: [],
+      blockFields: BLOCK_FIELDS,
+      fetchImpl,
+      signal: ac.signal,
+      idleMs: 30_000, // large: the abort, not the idle timer, is what settles the read
+      tickSleepMs: 20,
+    });
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const guard = new Promise<IteratorResult<HotItem>>((resolve) => {
+      timer = setTimeout(() => resolve({ done: true, value: undefined }), 2000);
+    });
+    await Promise.race([gen.next(), guard]);
+    if (timer !== undefined) clearTimeout(timer);
+    await gen.return(undefined).catch(() => {});
+  });
+
+  // The abandoned initial readerP must NOT unhandled-reject. Pre-fix: captured carries the body abort error.
+  expect(captured).toEqual([]);
+});
+
+test('streamHotBlocks: B1-B — .return() while paused at the block yield does not unhandled-reject the prefetched readerP (RT-1 SC1)', async () => {
+  const block100 = {
+    header: { number: 100, hash: 'h100', parentHash: 'h99', timestamp: 100 },
+    logs: [],
+  };
+  // Entry B: after yielding block 100 the driver has ALREADY prefetched `readerP = it.next()` (a pending
+  // reader.read() on the still-open body). The consumer then ABANDONS the generator at that yield via
+  // `.return()` — async-generator semantics: `.return()` behind a pending `.next()` does NOT observe that
+  // pending `.next()`'s later rejection, so the prefetched readerP is left without a re-race handler. When
+  // the body then errors on abort, that readerP rejects unobserved. On pre-fix code it lands in `captured`;
+  // the B1 `.catch` on the prefetch swallows it.
+  const ac = new AbortController();
+  const fetchImpl = (async () => silentOpenBlock(block100, ac.signal)) as any;
+  const captured = await captureUnhandledRejections(async () => {
+    const gen = streamHotBlocks({
+      portalUrl: 'http://portal',
+      headers: {},
+      fromBlock: 100,
+      logs: [],
+      blockFields: BLOCK_FIELDS,
+      fetchImpl,
+      signal: ac.signal,
+      idleMs: 30_000, // large: the abort, not the idle timer, settles the prefetched read
+      tickSleepMs: 20,
+    });
+    // Pull until block 100 arrives — at which point the driver is paused at the block yield with the NEXT
+    // read already prefetched into readerP.
+    const first = await nextBlock(gen);
+    expect(first.done).toBe(false);
+    expect(first.value.kind).toBe('block');
+    // Abandon the generator AT the yield. `.return()` runs the driver's finally (it.return → body cancel),
+    // but does not observe the prefetched readerP's pending rejection. Abort errors the body so that
+    // prefetched reader.read() rejects.
+    await gen.return(undefined).catch(() => {});
+    ac.abort();
+  });
+
+  // The abandoned prefetched readerP must NOT unhandled-reject. Pre-fix: captured carries the abort error.
+  expect(captured).toEqual([]);
+});
+
+// ─────────────────────────────── RT-1 SC3: delivery-progress watchdog (RT-G10 / INV-24) ───────────────────────────────
+
+// A /stream fetch that delivers exactly ONE block on the first request, then 204s FOREVER after — the
+// no-delivery-but-open-loop state the delivery watchdog must bound. NUMBER-ONLY finalized head (no hash) is
+// used deliberately so the B1 hash-unverifiable defer watchdog (which requires a hash) can NEVER fire —
+// isolating SC3 as the sole fatal path. `advanceHead` climbs the returned head per poll to model a chain
+// whose finality keeps advancing while the stream starves us. (RT-1 SC3)
+function oneBlockThen204(block: unknown, onExhausted?: () => void) {
+  let served = false;
+  const enc = new TextEncoder();
+  return (async () => {
+    if (served) {
+      onExhausted?.();
+
+      return { status: 204, ok: false, body: null };
+    }
+    served = true;
+    const body = new ReadableStream({
+      start(c) {
+        c.enqueue(enc.encode(`${JSON.stringify(block)}\n`));
+        c.close();
+      },
+    });
+
+    return { status: 200, ok: true, body };
+  }) as any;
+}
+
+test('portalRealtimeEvents: the finalized head advancing while ZERO blocks are delivered is FATAL — the delivery-progress watchdog fires (RT-1 SC3 T1)', async () => {
+  // One block (100) is delivered and finalized number-only; the head then climbs far above forever while the
+  // stream 204s. Zero further deliveries. With the head advancing ≥ threshold past the head-at-last-delivery
+  // for the whole (tiny) bound, the delivery watchdog must throw its loud fatal — NOT stall silently.
+  //
+  // Deterministic clock: each finalizedHead() poll advances Date.now by 50ms (mirrors the B1 moving-head
+  // test). With a 100ms bound the no-delivery clock crosses it after a couple of polls, at which point the
+  // head has already climbed well past the 5-block threshold → fatal. Without a real wall clock the delta
+  // stays 0 and the loop spins forever, so the clock drive IS the test.
+  let clock = 3_000_000;
+  vi.spyOn(Date, 'now').mockImplementation(() => clock);
+  const block100 = {
+    header: { number: 100, hash: 'h100', parentHash: 'h99', timestamp: 100 },
+    logs: [],
+  };
+  let headNumber = 100; // number-ONLY head: B1's hash-defer path is unreachable, isolating SC3
+  const ac = new AbortController();
+  const iter = portalRealtimeEvents({
+    portalUrl: 'http://portal',
+    headers: {},
+    fromBlock: 100,
+    anchor: L(99, 'h99', 'h98'),
+    logs: [],
+    fetchImpl: oneBlockThen204(block100, () => {}),
+    signal: ac.signal,
+    finalizedHead: async () => {
+      clock += 50; // advance the no-delivery clock once per poll
+      headNumber += 5; // head climbs 5 blocks/poll — crosses the 5-block threshold quickly
+      return { number: headNumber }; // NO hash → number-only finalize, never a B1 defer
+    },
+    finalizePollMs: 0, // poll every turn so the stall is exercised fast
+    deliveryProgressMaxMs: 100, // tiny time bound
+    deliveryProgressThreshold: 5, // small block threshold
+    finalizeDeferMaxMs: 10_000, // large: prove the B1 path is NOT what fires
+  });
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const sentinel = new Promise<never>((_, reject) => {
+    timer = setTimeout(
+      () =>
+        reject(
+          new Error('PROGRESS-WATCHDOG-STARVED: delivery watchdog never fired'),
+        ),
+      2000,
+    );
+  });
+  const events: any[] = [];
+  try {
+    await expect(
+      Promise.race([
+        (async () => {
+          let seen = 0;
+          for await (const e of iter) {
+            events.push(e);
+            seen += 1;
+            if (seen > 5000)
+              throw new Error(
+                'NEVER-THROWN: the stall was not bounded — delivery starved without a fatal (regression)',
+              );
+          }
+        })(),
+        sentinel,
+      ]),
+    ).rejects.toThrow(/delivered ZERO blocks for/i);
+    // exactly the one block was delivered before the stall
+    const blocks = events.filter((e) => e.type === 'block');
+    expect(blocks).toHaveLength(1);
+  } finally {
+    if (timer !== undefined) clearTimeout(timer);
+    ac.abort();
+  }
+});
+
+test('portalRealtimeEvents: a QUIET chain (head STATIC) with zero delivery NEVER trips the watchdog — it is progress-conditioned, not a plain idle timeout (RT-1 SC3 T2)', async () => {
+  // The head-static case is the whole point of PROGRESS-conditioning: an RPC-realtime-parity quiet chain
+  // idles indefinitely without producing blocks, and that must NEVER be a fatal. The clock runs FAR past the
+  // bound but the head never moves, so `fhNumber - deliveryBaseline` stays 0 (< threshold) and the watchdog
+  // holds its fire. A bounded poll count proves it TERMINATES cleanly (drained, no throw), not spins.
+  let clock = 4_000_000;
+  vi.spyOn(Date, 'now').mockImplementation(() => clock);
+  const block100 = {
+    header: { number: 100, hash: 'h100', parentHash: 'h99', timestamp: 100 },
+    logs: [],
+  };
+  let polls = 0;
+  const ac = new AbortController();
+  const iter = portalRealtimeEvents({
+    portalUrl: 'http://portal',
+    headers: {},
+    fromBlock: 100,
+    anchor: L(99, 'h99', 'h98'),
+    logs: [],
+    fetchImpl: oneBlockThen204(block100, () => {}),
+    signal: ac.signal,
+    finalizedHead: async () => {
+      clock += 1000; // clock races FAR past the 100ms bound…
+      polls += 1;
+      if (polls >= 40) ac.abort(); // …but a bounded run ends the test by aborting, not by a throw
+
+      return { number: 100 }; // …while the head stays STATIC → never a threshold cross
+    },
+    finalizePollMs: 0,
+    deliveryProgressMaxMs: 100, // tiny time bound — deliberately crossed many times over
+    deliveryProgressThreshold: 5,
+  });
+  const events: any[] = [];
+  // Must DRAIN to completion (abort) with NO fatal thrown — a static head is not a stall.
+  for await (const e of iter) events.push(e);
+  expect(events.filter((e) => e.type === 'block')).toHaveLength(1);
+  expect(polls).toBeGreaterThanOrEqual(40); // the clock really did run past the bound many times
+});
+
+test('portalRealtimeEvents: a SINGLE-block finality lag (head advances by 1, below the threshold) with zero delivery does NOT trip the watchdog (RT-1 SC3 T3)', async () => {
+  // A benign single-block finality lag: the head ticks forward by ONE while a block is momentarily in flight.
+  // The time bound is crossed, but the head-advance (1) never reaches the threshold (5), so the watchdog must
+  // hold its fire — proving BOTH conditions (time AND block advance) are required, not just the timer.
+  let clock = 5_000_000;
+  vi.spyOn(Date, 'now').mockImplementation(() => clock);
+  const block100 = {
+    header: { number: 100, hash: 'h100', parentHash: 'h99', timestamp: 100 },
+    logs: [],
+  };
+  let polls = 0;
+  const ac = new AbortController();
+  const iter = portalRealtimeEvents({
+    portalUrl: 'http://portal',
+    headers: {},
+    fromBlock: 100,
+    anchor: L(99, 'h99', 'h98'),
+    logs: [],
+    fetchImpl: oneBlockThen204(block100, () => {}),
+    signal: ac.signal,
+    finalizedHead: async () => {
+      clock += 1000; // well past the 100ms bound
+      polls += 1;
+      if (polls >= 40) ac.abort();
+
+      return { number: 101 }; // head is exactly ONE above the delivered block 100 → advance 1 < threshold 5
+    },
+    finalizePollMs: 0,
+    deliveryProgressMaxMs: 100,
+    deliveryProgressThreshold: 5,
+  });
+  const events: any[] = [];
+  for await (const e of iter) events.push(e);
+  expect(events.filter((e) => e.type === 'block')).toHaveLength(1);
+  expect(polls).toBeGreaterThanOrEqual(40);
+});
+
+test('portalRealtimeEvents: FINALITY catching up over ALREADY-DELIVERED blocks (finalized head ≤ highest delivered) must NOT trip the watchdog — the trip baselines on delivered height, not finalized-head-at-delivery (RT-1 SC3 T4 / RT-G10)', async () => {
+  // Steady-state realtime delivers UNFINALIZED tip blocks that run FAR ahead of the finalized head: here the
+  // /stream delivers block 500 while the Portal's finalized head is only 100. The false-fatal this pins: the
+  // chain TIP then pauses (an L2 sequencer freeze — nothing NEW to deliver) for longer than the bound while
+  // FINALITY merely catches up its backlog over blocks 100→120 that were ALREADY delivered. Zero new
+  // deliveries + a finalized head climbing ≥ threshold — but ONLY over blocks we already delivered (finalized
+  // 120 ≪ delivered tip 500). The stream delivered everything the chain has; there is nothing to deliver.
+  //
+  // The correct baseline is the highest DELIVERED block number (500). While `finalizedHead ≤ deliveredTip` the
+  // advance-past-delivered is ≤ 0 (< threshold) → the watchdog must HOLD its fire, even as finality advances
+  // ≥ threshold and the clock races far past the bound. On the OLD code, which baselined on the finalized head
+  // observed AT delivery (~100), 100→120 read as a ≥-threshold advance and FALSE-FATAL'd. Sentinel:
+  // FINALITY-CATCHUP-FALSE-FATAL — if this test throws the PROGRESS-WATCHDOG fatal, the false-fatal is live.
+  let clock = 6_000_000;
+  vi.spyOn(Date, 'now').mockImplementation(() => clock);
+  // Delivered tip (500) is ~400 blocks ABOVE the finalized head (100) — the realtime steady state.
+  const block500 = {
+    header: { number: 500, hash: 'h500', parentHash: 'h499', timestamp: 500 },
+    logs: [],
+  };
+  let headNumber = 100; // finalized head starts FAR BELOW the delivered tip 500…
+  let polls = 0;
+  const ac = new AbortController();
+  const iter = portalRealtimeEvents({
+    portalUrl: 'http://portal',
+    headers: {},
+    fromBlock: 500,
+    anchor: L(499, 'h499', 'h498'), // block 500 appends onto the finalized anchor 499
+    logs: [],
+    fetchImpl: oneBlockThen204(block500, () => {}),
+    signal: ac.signal,
+    finalizedHead: async () => {
+      clock += 1000; // race FAR past the 100ms bound (many times over)
+      polls += 1;
+      // Finality catches up over ALREADY-DELIVERED blocks: 100→120, a ≥5 advance, but every one of those
+      // blocks (≤ 120) sits well below the delivered tip 500 — nothing NEW is unshipped.
+      if (headNumber < 120) headNumber += 5;
+      if (polls >= 40) ac.abort(); // a bounded, throw-FREE run ends the test by aborting
+
+      return { number: headNumber }; // number-only head → B1 hash-defer path unreachable, isolates SC3
+    },
+    finalizePollMs: 0,
+    deliveryProgressMaxMs: 100, // tiny bound — deliberately crossed dozens of times
+    deliveryProgressThreshold: 5, // finality climbs 100→120 = 20 ≥ 5: a ≥-threshold FINALITY advance…
+    finalizeDeferMaxMs: 10_000, // large: prove B1 is not what fires
+  });
+  const events: any[] = [];
+  // Must DRAIN to completion (abort) with NO fatal — finality catching up over delivered blocks is not a stall.
+  for await (const e of iter) events.push(e);
+  expect(events.filter((e) => e.type === 'block')).toHaveLength(1); // block 500 delivered, then 204 forever
+  expect(polls).toBeGreaterThanOrEqual(40); // the clock + finality really did run past the bound many times
+  expect(headNumber).toBeGreaterThanOrEqual(120); // finality advanced ≥ threshold — yet no false-fatal
+});
+
+test('portalRealtimeEvents: a GENUINE post-delivery stall — finalized head climbs ≥ threshold BEYOND the highest delivered block while ZERO blocks are delivered — STILL fatals (RT-1 SC3 T5 / RT-G10)', async () => {
+  // The must-still-fire half: after delivering block 500, the chain keeps FINALIZING blocks ABOVE 500 (516,
+  // 520, …) that /stream never hands us — genuinely new blocks the chain has and we are not delivering. The
+  // finalized head advances ≥ threshold PAST the highest delivered block (500) while zero deliveries occur for
+  // the whole bound → the watchdog MUST throw its loud fatal. This is the corrected trip: baselined on the
+  // delivered height (500), the advance-past-delivered reaches the threshold only once finality overtakes 500.
+  let clock = 7_000_000;
+  vi.spyOn(Date, 'now').mockImplementation(() => clock);
+  const block500 = {
+    header: { number: 500, hash: 'h500', parentHash: 'h499', timestamp: 500 },
+    logs: [],
+  };
+  let headNumber = 500; // finality starts AT the delivered tip, then climbs strictly above it
+  const ac = new AbortController();
+  const iter = portalRealtimeEvents({
+    portalUrl: 'http://portal',
+    headers: {},
+    fromBlock: 500,
+    anchor: L(499, 'h499', 'h498'),
+    logs: [],
+    fetchImpl: oneBlockThen204(block500, () => {}),
+    signal: ac.signal,
+    finalizedHead: async () => {
+      clock += 50; // advance the no-delivery clock per poll
+      headNumber += 5; // finality climbs PAST the delivered tip 500 → crosses the threshold beyond delivered
+      return { number: headNumber }; // number-only head → never a B1 defer
+    },
+    finalizePollMs: 0,
+    deliveryProgressMaxMs: 100,
+    deliveryProgressThreshold: 5,
+    finalizeDeferMaxMs: 10_000, // large: prove B1 is not what fires
+  });
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const sentinel = new Promise<never>((_, reject) => {
+    timer = setTimeout(
+      () =>
+        reject(
+          new Error('PROGRESS-WATCHDOG-STARVED: delivery watchdog never fired'),
+        ),
+      2000,
+    );
+  });
+  const events: any[] = [];
+  try {
+    await expect(
+      Promise.race([
+        (async () => {
+          let seen = 0;
+          for await (const e of iter) {
+            events.push(e);
+            seen += 1;
+            if (seen > 5000)
+              throw new Error(
+                'NEVER-THROWN: a genuine post-delivery stall was not bounded (regression)',
+              );
+          }
+        })(),
+        sentinel,
+      ]),
+    ).rejects.toThrow(/delivered ZERO blocks for/i);
+    expect(events.filter((e) => e.type === 'block')).toHaveLength(1);
+  } finally {
+    if (timer !== undefined) clearTimeout(timer);
+    ac.abort();
+  }
+});
+
+test('portalRealtimeEvents: a RESUME that delivers its anchor BEFORE the first finalize poll, then sees a STATIC finalized head far above it, must NOT false-fatal — the first probe folds into the baseline (RT-1 SC3 T6 / RT-G10 / glm Finding 1)', async () => {
+  // The delivery-before-first-poll resume (INV-24's `max(first-observed finalized head, highest delivered
+  // block number)`). On a resume the /stream delivers the anchor block (100) BEFORE the finalize cadence has
+  // run once — so the block arm stamps `deliveryBaseline = 100` (the delivered height) before ANY probe. The
+  // FIRST finalize poll then returns a finalized head FAR above the anchor (500) that is already there —
+  // pre-existing, static, nothing NEW being unshipped. INV-24 documents the baseline as `max(500, 100) = 500`,
+  // so a resume that then goes fully silent with STATIC finality at 500 must NOT trip: `500 - 500 = 0 <
+  // threshold`. The design intent (INV-24, comment ~938-943) is to GRANT the resume grace to backfill the
+  // pre-existing deficit for the whole bound without a false fatal.
+  //
+  // Deterministic clock: each finalizedHead() poll advances Date.now by 1000ms — the 100ms bound is crossed
+  // on the very first poll, dozens of times over across the run. The head is STATIC at 500 the whole time. A
+  // bounded, throw-FREE run (abort after 40 polls) is the pass; a PROGRESS-WATCHDOG fatal is the false-fatal.
+  let clock = 8_000_000;
+  vi.spyOn(Date, 'now').mockImplementation(() => clock);
+  // Anchor block 100 is delivered FIRST (before the finalize cadence runs) → baseline stamped to 100.
+  const block100 = {
+    header: { number: 100, hash: 'h100', parentHash: 'h99', timestamp: 100 },
+    logs: [],
+  };
+  let polls = 0;
+  const ac = new AbortController();
+  const iter = portalRealtimeEvents({
+    portalUrl: 'http://portal',
+    headers: {},
+    fromBlock: 100,
+    anchor: L(99, 'h99', 'h98'),
+    logs: [],
+    fetchImpl: oneBlockThen204(block100, () => {}),
+    signal: ac.signal,
+    finalizedHead: async () => {
+      clock += 1000; // race FAR past the 100ms bound (many times over)
+      polls += 1;
+      if (polls >= 40) ac.abort(); // a bounded, throw-FREE run ends the test by aborting
+
+      // The finalized head sits FAR above the delivered anchor 100 and is STATIC — pre-existing finality the
+      // resume must be allowed to backfill against, not a stream that is starving us of NEW blocks.
+      return { number: 500 }; // number-only head → B1 hash-defer path unreachable, isolates SC3
+    },
+    finalizePollMs: 0, // poll every turn
+    deliveryProgressMaxMs: 100, // tiny bound — deliberately crossed dozens of times
+    deliveryProgressThreshold: 5, // 500 − 100 = 400 ≥ 5 on the OLD baseline → false-fatal; ≥ max(500,100) fix holds
+    finalizeDeferMaxMs: 10_000, // large: prove B1 is not what fires
+  });
+  const events: any[] = [];
+  // Must DRAIN to completion (abort) with NO fatal — a static pre-existing finality deficit is not a stall.
+  for await (const e of iter) events.push(e);
+  expect(events.filter((e) => e.type === 'block')).toHaveLength(1); // anchor 100 delivered, then 204 forever
+  expect(polls).toBeGreaterThanOrEqual(40); // the clock really did run past the bound many times over
+});
+
+test('streamHotBlocks: a transient /stream fetch throw invokes onFetchError (the E1 non-delivery seam) and yields a tick, not a block (RT-1 SC3)', async () => {
+  // The E1 site: `fetchImpl` THROWS (the read never opens). The producer must (a) surface it on the
+  // onFetchError seam so the shell can rate-limit a warn, and (b) yield a `{kind:'tick'}` (non-delivery) —
+  // never a block. The delivery watchdog counts this tick as non-delivery; this test pins the seam + shape.
+  let calls = 0;
+  const fetchImpl = (async () => {
+    calls += 1;
+    throw new Error('ECONNRESET');
+  }) as any;
+  let fetchErrors = 0;
+  const ac = new AbortController();
+  const gen = streamHotBlocks({
+    portalUrl: 'http://portal',
+    headers: {},
+    fromBlock: 100,
+    logs: [],
+    blockFields: BLOCK_FIELDS,
+    fetchImpl,
+    signal: ac.signal,
+    onFetchError: () => {
+      fetchErrors += 1;
+    },
+    errorSleepMs: 1,
+    tickSleepMs: 1,
+  });
+  const first = await gen.next();
+  expect(first.done).toBe(false);
+  expect(first.value.kind).toBe('tick'); // non-delivery: a tick, never a block
+  expect(calls).toBe(1);
+  expect(fetchErrors).toBe(1); // the E1 seam fired exactly once for the one throw
+  await gen.return(undefined).catch(() => {});
   ac.abort();
 });

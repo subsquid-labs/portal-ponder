@@ -19,7 +19,10 @@ import {
   isPortalRealtime,
   lightToLightBlock,
   portalFinalizedHead,
+  resolveDeliveryProgressMaxMs,
+  resolveDeliveryProgressThreshold,
   resolveRedeliveryTimeoutMs,
+  resolveStreamIdleMs,
   type SafeCrashRecoveryBlockLookup,
   toRealtimeSyncEvent,
   uniqueFactories,
@@ -1101,6 +1104,185 @@ test('getPortalRealtimeEventGenerator: a redelivery that never lands is bounded 
   await expect(run).rejects.toThrow(/never re-delivered it within/i);
 });
 
+// A /stream fetch that delivers `conn1` on the FIRST /stream request, then on the reopen serves a body whose
+// `read()` NEVER settles AND that IGNORES the abort signal — modelling the documented undici race
+// (nodejs/undici#4089) where an abort landing during gzip body consumption leaves the pending read unsettled
+// FOREVER. This is the exact shape issue #48 warns about: if the wire's watchdog/teardown unwind DEPENDS on
+// the aborted read settling, the loud fatal degrades into a silent stall. The /finalized-head probe is
+// bounded independently (own timeout), so it always resolves. (RT-1 SC4)
+function mockPortalReopenNeverSettles(conn1: any[], finalizedHead: number) {
+  let streamReq = 0;
+  return (async (url: string) => {
+    if (url.endsWith('/finalized-head'))
+      return { json: async () => ({ number: finalizedHead }) };
+    streamReq += 1;
+    if (streamReq === 1) {
+      const lines = conn1.map((b) => JSON.stringify(b) + '\n').join('');
+      const body = new ReadableStream({
+        start(c) {
+          c.enqueue(new TextEncoder().encode(lines));
+          c.close();
+        },
+      });
+
+      return { status: 200, ok: true, body };
+    }
+    // The reopen: an OPEN body that enqueues one line's worth of nothing and then STALLS its read forever,
+    // deliberately NOT wired to the abort signal — a real `reader.read()` here never settles after abort().
+    const body = new ReadableStream({
+      start() {
+        // never enqueue, never close, never error — the pending read() hangs unconditionally
+      },
+    });
+
+    return { status: 200, ok: true, body };
+  }) as any;
+}
+
+test('getPortalRealtimeEventGenerator: the redelivery watchdog surfaces its loud fatal even when the aborted /stream read NEVER settles — the unwind does not depend on the abort settling (RT-1 SC4 / issue #48)', async () => {
+  // Block 100 discovers a child → suppressed, redelivery awaited; the reopened /stream then STALLS its read
+  // forever and ignores the abort (the undici #4089 race). The redelivery watchdog fires at redeliveryTimeout
+  // Ms, records its loud fatal, and aborts — and the wire MUST rethrow that fatal within a hard deadline
+  // rather than hang on the never-settling read. A sentinel converts a regression (the pre-SC4 hang) into a
+  // NAMED failure (ABORT-UNWIND-STARVED), never an open hang.
+  process.env.PORTAL_REALTIME = 'stream';
+  const factory = eulerFactory();
+  const child = '0x6666666666666666666666666666666666666666';
+  const conn1 = [
+    {
+      header: { number: 100, hash: 'h100', parentHash: 'h99', timestamp: 1000 },
+      logs: [proxyLog(child, { blockNumber: 100 })],
+    },
+  ];
+  const run = (async () => {
+    for await (const _ of getPortalRealtimeEventGenerator({
+      common: {
+        logger: { info() {}, debug() {}, warn() {}, trace() {} },
+      } as any,
+      chain: { id: 1, name: 'mainnet', portal: 'http://portal' } as any,
+      rpc: {} as any,
+      eventCallbacks: [
+        { filter: logFilter({ address: factory as any }) } as any,
+      ],
+      syncProgress: {
+        finalized: {
+          number: '0x63',
+          hash: 'h99',
+          parentHash: 'h98',
+          timestamp: '0x1',
+        } as any,
+        end: { number: '0x66' } as any,
+      },
+      childAddresses: new Map<string, Map<Address, number>>([
+        ['euler-factory', new Map()],
+      ]),
+      fetchImpl: mockPortalReopenNeverSettles(conn1, 0),
+      redeliveryTimeoutMs: 50, // the redelivery never lands → watchdog fires fast
+    })) {
+      /* drain */
+    }
+  })();
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const sentinel = new Promise<never>((_, reject) => {
+    timer = setTimeout(
+      () =>
+        reject(
+          new Error(
+            'ABORT-UNWIND-STARVED: the watchdog fatal never surfaced — the unwind hung on the never-settling read',
+          ),
+        ),
+      2000,
+    );
+  });
+  try {
+    await expect(Promise.race([run, sentinel])).rejects.toThrow(
+      /never re-delivered it within/i,
+    );
+  } finally {
+    if (timer !== undefined) clearTimeout(timer);
+  }
+});
+
+// A /stream fetch that delivers ONE block, then on every subsequent request STALLS its body read forever and
+// ignores abort (the undici #4089 race) — used to prove the TEARDOWN abort site (issue #48's second site)
+// also unwinds independent of the read settling. (RT-1 SC4)
+function mockPortalOneBlockThenNeverSettles(block: any, finalizedHead: number) {
+  let streamReq = 0;
+  return (async (url: string) => {
+    if (url.endsWith('/finalized-head'))
+      return { json: async () => ({ number: finalizedHead }) };
+    streamReq += 1;
+    if (streamReq === 1) {
+      const body = new ReadableStream({
+        start(c) {
+          c.enqueue(new TextEncoder().encode(JSON.stringify(block) + '\n'));
+          c.close();
+        },
+      });
+
+      return { status: 200, ok: true, body };
+    }
+    const body = new ReadableStream({
+      start() {
+        // never enqueue, never close, never error — the read hangs unconditionally, ignoring abort
+      },
+    });
+
+    return { status: 200, ok: true, body };
+  }) as any;
+}
+
+test('getPortalRealtimeEventGenerator: the TEARDOWN abort unwinds promptly when the consumer abandons the generator over a never-settling /stream read — .return() does not hang (RT-1 SC4 / issue #48 teardown site)', async () => {
+  // The second abort site (#48): the wire's `finally { controller.abort() }`. Here the consumer pulls one
+  // block then ABANDONS the generator via `.return()` while the reopened /stream read is pending and never
+  // settles. The teardown must complete within a hard deadline, not hang on the aborted read.
+  process.env.PORTAL_REALTIME = 'stream';
+  const block100 = {
+    header: { number: 100, hash: 'h100', parentHash: 'h99', timestamp: 1000 },
+    logs: [],
+  };
+  const gen = getPortalRealtimeEventGenerator({
+    common: {
+      logger: { info() {}, debug() {}, warn() {}, trace() {} },
+    } as any,
+    chain: { id: 1, name: 'mainnet', portal: 'http://portal' } as any,
+    rpc: {} as any,
+    eventCallbacks: [{ filter: logFilter() } as any],
+    syncProgress: {
+      finalized: {
+        number: '0x63',
+        hash: 'h99',
+        parentHash: 'h98',
+        timestamp: '0x1',
+      } as any,
+    },
+    childAddresses: new Map<string, Map<Address, number>>(),
+    fetchImpl: mockPortalOneBlockThenNeverSettles(block100, 0),
+    streamIdleMs: 1_000_000, // huge: the idle timer cannot be what rescues the read within the deadline
+  });
+  // Pull the first block, then abandon at the yield while the reopened read is pending + never-settling.
+  const first = await gen.next();
+  expect(first.done).toBe(false);
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const sentinel = new Promise<never>((_, reject) => {
+    timer = setTimeout(
+      () =>
+        reject(
+          new Error(
+            'TEARDOWN-UNWIND-STARVED: .return() hung on the aborted read',
+          ),
+        ),
+      2000,
+    );
+  });
+  try {
+    // .return() runs the wire's finally (controller.abort()); it must settle promptly, not hang.
+    await Promise.race([gen.return(undefined as any), sentinel]);
+  } finally {
+    if (timer !== undefined) clearTimeout(timer);
+  }
+});
+
 // like mockPortalConns but the /finalized-head carries the canonical HASH (arms the wrong-fork guard and
 // lets a finalize land at the exact height) — used for the held-finalize-during-redelivery case.
 function mockPortalConnsWithHead(
@@ -1215,6 +1397,64 @@ test('resolveRedeliveryTimeoutMs: precedence — param wins, then env, then defa
   for (const bad of ['abc', '12.5', '0', '-5', '', '  ', 'NaN', 'Infinity']) {
     expect(() => resolveRedeliveryTimeoutMs(undefined, bad, 300_000)).toThrow(
       /PORTAL_STREAM_REDELIVERY_TIMEOUT_MS must be a positive integer/i,
+    );
+  }
+});
+
+test('resolveStreamIdleMs: precedence — param wins, then env, then default; garbage env fails loud (RT-1 SC1)', () => {
+  // The 120_000ms (2 min) default is the RT-G11 idle bound; PORTAL_STREAM_IDLE_MS makes it a production
+  // knob. Validation is IDENTICAL to resolveRedeliveryTimeoutMs (positive-integer, else loud) — the SC1
+  // spec requires mirroring it exactly. Pure over its args, so no process.env mutation is needed.
+
+  // param (tests) wins over both env and default, even a valid env
+  expect(resolveStreamIdleMs(50, '90000', 120_000)).toBe(50);
+  expect(resolveStreamIdleMs(0, '90000', 120_000)).toBe(0); // explicit 0 is honored (test injection)
+
+  // env used when no param — a valid positive integer
+  expect(resolveStreamIdleMs(undefined, '90000', 120_000)).toBe(90_000);
+
+  // unset env → the default
+  expect(resolveStreamIdleMs(undefined, undefined, 120_000)).toBe(120_000);
+
+  // garbage / non-positive env → LOUD, not silently ignored (a silently-dropped knob is an operator trap)
+  for (const bad of ['abc', '12.5', '0', '-5', '', '  ', 'NaN', 'Infinity']) {
+    expect(() => resolveStreamIdleMs(undefined, bad, 120_000)).toThrow(
+      /PORTAL_STREAM_IDLE_MS must be a positive integer/i,
+    );
+  }
+});
+
+test('resolveDeliveryProgressMaxMs: precedence — param wins, then env, then default; garbage env fails loud (RT-1 SC3)', () => {
+  // The 600_000ms (10 min) default is the RT-G10 delivery-stall bound, aligned with B1; PORTAL_STREAM_
+  // DELIVERY_MAX_MS makes it a production knob. Validation mirrors resolveStreamIdleMs (positive-integer,
+  // else loud). Pure over its args, so no process.env mutation is needed.
+  expect(resolveDeliveryProgressMaxMs(50, '900000', 600_000)).toBe(50);
+  expect(resolveDeliveryProgressMaxMs(0, '900000', 600_000)).toBe(0); // explicit 0 honored (test injection)
+  expect(resolveDeliveryProgressMaxMs(undefined, '900000', 600_000)).toBe(
+    900_000,
+  );
+  expect(resolveDeliveryProgressMaxMs(undefined, undefined, 600_000)).toBe(
+    600_000,
+  );
+
+  for (const bad of ['abc', '12.5', '0', '-5', '', '  ', 'NaN', 'Infinity']) {
+    expect(() => resolveDeliveryProgressMaxMs(undefined, bad, 600_000)).toThrow(
+      /PORTAL_STREAM_DELIVERY_MAX_MS must be a positive integer/i,
+    );
+  }
+});
+
+test('resolveDeliveryProgressThreshold: precedence — param wins, then env, then default; garbage env fails loud (RT-1 SC3)', () => {
+  // The 16-block default is the RT-G10 head-advance threshold — a single-block finality lag must never trip
+  // the watchdog. PORTAL_STREAM_DELIVERY_THRESHOLD makes it a production knob; validation mirrors the ms
+  // resolvers (positive-integer, else loud). Pure over its args, so no process.env mutation is needed.
+  expect(resolveDeliveryProgressThreshold(4, '32', 16)).toBe(4);
+  expect(resolveDeliveryProgressThreshold(undefined, '32', 16)).toBe(32);
+  expect(resolveDeliveryProgressThreshold(undefined, undefined, 16)).toBe(16);
+
+  for (const bad of ['abc', '12.5', '0', '-5', '', '  ', 'NaN', 'Infinity']) {
+    expect(() => resolveDeliveryProgressThreshold(undefined, bad, 16)).toThrow(
+      /PORTAL_STREAM_DELIVERY_THRESHOLD must be a positive integer/i,
     );
   }
 });

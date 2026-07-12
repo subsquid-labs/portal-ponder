@@ -208,6 +208,37 @@ export type PortalRealtimeArgs = {
    * (issue #33)
    */
   diag?: StreamDiag;
+  /** No-data repoll sleep and tick spacing (204 / bodyless-200). Default 500 (legacy timing). */
+  tickSleepMs?: number;
+  /**
+   * Transient-error retry sleep (fetch throw, 429/5xx). Default 1000 (legacy timing); portalRealtimeEvents
+   * may pass a smaller value when finalizePollMs < 2000 to preserve the heartbeat cadence bound.
+   */
+  errorSleepMs?: number;
+  /**
+   * Idle bound (ms) on the OPEN /stream body read (RT-G11). A wedged connection — headers OK, body never
+   * delivers, no FIN/RST — would otherwise hang the NDJSON read FOREVER: no blocks, no reconnect, no ticks
+   * to drive finalize. `ndjsonLines`' per-chunk idle guard re-arms on every received chunk (a slow-but-alive
+   * stream is never cut) and, after `idleMs` of CUMULATIVE silence, throws — which the loop catches and
+   * reconnects from `cursor` (routine, cheap, NOT fatal). Default 120_000; portalRealtimeEvents/wire resolve
+   * the env-tunable `PORTAL_STREAM_IDLE_MS`. The bound must comfortably exceed normal inter-block quiet.
+   * Independent of the tick-transparent line-wait below: ticks keep finalize alive DURING the idle window;
+   * this only bounds how long a silent-but-open connection is held before it is recycled. (RT-1 SC1)
+   */
+  idleMs?: number;
+  /**
+   * Called once when the OPEN-body read hits its `idleMs` bound and the connection is recycled (RT-G11) — a
+   * seam for the logger-free shell to surface a debug line at the wire (where `common.logger` lives), so an
+   * idle reconnect is distinguishable from an ordinary stream cut. Absent ⇒ silent recycle (unit call sites).
+   */
+  onIdleReconnect?: () => void;
+  /**
+   * Called on each transient `/stream` fetch THROW (the E1 retry site) — the read never opened, so this
+   * round delivers nothing and the loop yields a `{kind:'tick'}` + backs off. A logger-free seam (mirrors
+   * `onIdleReconnect`) letting the shell surface a RATE-LIMITED warn so a silent retry storm is visible at
+   * the wire without this module importing a logger. Absent ⇒ silent (unit call sites). (RT-1 SC3)
+   */
+  onFetchError?: () => void;
   signal?: AbortSignal;
   fetchImpl?: typeof fetch;
 };
@@ -232,6 +263,15 @@ export const RING_CAP = 2048;
  */
 export const MAX_CONSECUTIVE_409 = 10;
 
+export type HotBatch = {
+  kind: 'block';
+  header: RawHeader;
+  logs: RawLog[];
+  transactions: RawTx[];
+};
+export type HotTick = { kind: 'tick' };
+export type HotItem = HotBatch | HotTick;
+
 /**
  * Stream fork-aware hot-blocks with `includeAllBlocks` (every header + filtered logs + the matched logs'
  * parent transactions when `txFields` is set). Yields raw Portal batch objects `{ header, logs,
@@ -240,12 +280,11 @@ export const MAX_CONSECUTIVE_409 = 10;
  */
 export async function* streamHotBlocks(
   args: PortalRealtimeArgs,
-): AsyncGenerator<{
-  header: RawHeader;
-  logs: RawLog[];
-  transactions: RawTx[];
-}> {
+): AsyncGenerator<HotItem> {
   const fetchImpl = args.fetchImpl ?? fetch;
+  const tickSleepMs = args.tickSleepMs ?? 500;
+  const errorSleepMs = args.errorSleepMs ?? 1000;
+  const idleMs = args.idleMs ?? 120_000;
   let cursor = args.fromBlock;
   // Delivered-hash ring: height → last-delivered hash at that height. Its semantics is "what is my
   // parentBlockHash if I resume at h+1" — so `ring.get(cursor − 1)` is sent on EVERY /stream request. It
@@ -398,11 +437,17 @@ export async function* streamHotBlocks(
         signal: args.signal,
       });
     } catch {
-      await sleep(1000, args.signal);
+      // E1: transient fetch throw — the read never opened, so this round delivers NOTHING. Surface it on
+      // the logger-free seam (the shell rate-limits the warn) so a silent retry storm is diagnosable; the
+      // yielded tick is the same non-delivery heartbeat the delivery watchdog already counts. (RT-1 SC3)
+      args.onFetchError?.();
+      yield { kind: 'tick' };
+      await sleep(errorSleepMs, args.signal);
       continue;
     }
     if (res.status === 204) {
-      await sleep(500, args.signal);
+      yield { kind: 'tick' };
+      await sleep(tickSleepMs, args.signal);
       continue;
     } // no hot data yet; re-poll
     // NB: only a 204 short-circuits to a re-poll here. The old guard ALSO re-polled on `!res.body` BEFORE
@@ -501,7 +546,8 @@ export async function* streamHotBlocks(
       }
       // 429/5xx: load — cancel the body so the socket doesn't leak, then retry with backoff.
       void res.body?.cancel().catch(() => {});
-      await sleep(1000, args.signal);
+      yield { kind: 'tick' };
+      await sleep(errorSleepMs, args.signal);
       continue;
     }
     // A 200 means the fork negotiation (if any) resolved — the chain from `cursor` links to our ring. Clear
@@ -510,7 +556,8 @@ export async function* streamHotBlocks(
     // A bodyless 200 (empty OK — "no hot data yet") re-polls, preserving the old `!res.body` semantics but
     // now ONLY on the OK path, after the 409/4xx branches have had their turn. (F1)
     if (!res.body) {
-      await sleep(500, args.signal);
+      yield { kind: 'tick' };
+      await sleep(tickSleepMs, args.signal);
       continue;
     }
     // Snapshot the filter revision at open; if it advances while streaming (a child was discovered), break
@@ -519,8 +566,51 @@ export async function* streamHotBlocks(
     const openedRev = args.getLogsRevision?.() ?? 0;
     let reopen = false;
     let deliveredThisConn = 0;
+    // Drive the NDJSON reader MANUALLY (not a plain `for await`) so the wait for the next line is
+    // TICK-TRANSPARENT (G2b): while suspended waiting for a line, we yield `{ kind: 'tick' }` every
+    // `tickSleepMs` of silence WITHOUT touching the connection, so finalize/B1 keep polling on a
+    // silent-but-OPEN connection (the one no-delivery state the loop-turn ticks cannot reach). The
+    // `idleMs` guard armed on `ndjsonLines` still re-arms per received chunk (a slow-but-alive stream is
+    // never cut) and, after `idleMs` of CUMULATIVE silence, REJECTS the read → caught below → reconnect.
+    // Correctness: a single pending `readerP` is held across heartbeat races and NEVER re-requested until
+    // it settles, so a heartbeat tick can neither consume nor reorder a line; the heartbeat timer is
+    // always cleared (raceHeartbeat's finally) so no timer accrues across ticks. (RT-1 SC1 / R1)
+    const it = ndjsonLines(res.body, undefined, idleMs);
+    let idleExpired = false;
     try {
-      for await (const line of ndjsonLines(res.body)) {
+      let readerP = it.next();
+      // DO NOT REMOVE — a readerP abandoned before its next re-race (abort/return at the yield, or the
+      // loop-top break on an already-aborted signal) would else unhandled-reject on a signal-aborted body:
+      // the /stream fetch is made with `signal: args.signal`, so on abort the in-flight `reader.read()`
+      // inside this pending `readerP` rejects. This `.catch` is a SEPARATE handler on the same promise — a
+      // promise may carry many independent handlers, so it does NOT consume the rejection observed by
+      // raceHeartbeat's own `readerP.then(...)` on the re-race (idle timeout → onIdleReconnect + reconnect;
+      // stream cut → reconnect); it only guarantees no abandoned readerP unhandled-rejects. (RT-1 SC1 / B1)
+      void readerP.catch(() => {});
+      for (;;) {
+        if (args.signal?.aborted) break;
+
+        const r = await raceHeartbeat(readerP, tickSleepMs, args.signal);
+        if (r.tick) {
+          // On abort the heartbeat wins immediately and forever (the read never settles) — break to the
+          // outer loop, whose top `return`s on the aborted signal, rather than spin ticks post-teardown.
+          if (args.signal?.aborted) break;
+
+          yield { kind: 'tick' };
+          continue; // re-race the SAME pending read — no line consumed, no new read requested
+        }
+
+        const step = r.value!;
+        if (step.done) break;
+
+        const line = step.value;
+        readerP = it.next(); // this line settled — request the next before processing (order preserved)
+        // DO NOT REMOVE — same B1 guard as the initial readerP above: this prefetched next-read is created
+        // BEFORE we parse/yield the current block, so if the consumer abandons the generator while it is
+        // paused at the yield below (abort / .return() / throw), this readerP gets no further re-race and
+        // would unhandled-reject on the signal-aborted body (or the idle-timeout reject). Separate handler,
+        // does not mask the re-race's observation. (RT-1 SC1 / B1)
+        void readerP.catch(() => {});
         const batch = JSON.parse(line);
         if (batch?.header?.number != null) {
           const num = batch.header.number as number;
@@ -532,6 +622,7 @@ export async function* streamHotBlocks(
           cursor = num + 1; // resume past this block on reconnect
           syncDiag(parentBlockHash, deliveredThisConn);
           yield {
+            kind: 'block',
             header: batch.header,
             logs: batch.logs ?? [],
             transactions: batch.transactions ?? [],
@@ -551,10 +642,30 @@ export async function* streamHotBlocks(
           }
         }
       }
-    } catch {
-      /* stream cut — reconnect from cursor */
+    } catch (err) {
+      // The idle guard rejects with a distinct message after `idleMs` of cumulative silence; anything else
+      // is an ordinary stream cut. Both reconnect from `cursor` (the tick + backoff sleep run below); the
+      // idle case additionally fires the debug seam so an idle recycle is distinguishable at the wire.
+      if (err instanceof Error && err.message.includes('idle timeout')) {
+        idleExpired = true;
+      }
+    } finally {
+      // Cancel the reader's finally on early break/reopen/error — closing the body even when we stopped
+      // mid-stream without draining (`for await` did this implicitly; the manual driver must do it too).
+      void it.return?.(undefined).catch(() => {});
     }
-    if (!reopen) await sleep(200, args.signal); // filter changed ⇒ re-open immediately, no backoff
+    // On abort the inner driver broke out (loop-top guard or the heartbeat-win abort re-check). Return NOW,
+    // before the finalize-cadence tick + backoff below: the outer loop top would only `return` on the same
+    // aborted signal anyway, so emitting one more `{ kind: 'tick' }` (and sleeping) post-teardown is a leak
+    // of a tick past abort. The normal reopen / reconnect / idle-tick paths are untouched — this fires only
+    // when the signal is already aborted. (codex NIT)
+    if (args.signal?.aborted) return;
+
+    if (idleExpired) args.onIdleReconnect?.();
+    if (!reopen) {
+      yield { kind: 'tick' };
+      await sleep(Math.min(200, tickSleepMs), args.signal);
+    } // filter changed ⇒ re-open immediately, no backoff
   }
 }
 
@@ -639,6 +750,50 @@ export const sleep = (ms: number, signal?: AbortSignal) =>
     signal?.addEventListener('abort', onAbort, { once: true });
   });
 
+/**
+ * Race a PENDING NDJSON read (`readerP`) against a `tickSleepMs` heartbeat and `signal` abort — the engine
+ * of the tick-transparent line-wait (G2b, RT-1 SC1). Returns `{ tick: true }` when the heartbeat (or abort)
+ * wins so the caller yields a `{ kind: 'tick' }` and RE-RACES THE SAME `readerP` (the read is never consumed
+ * nor re-requested on a tick, so no NDJSON line can be dropped or reordered), or `{ tick: false, value }`
+ * carrying the settled read when the reader wins. Leak-safety: exactly one heartbeat timer per race, always
+ * cleared in `finally`; the abort listener is `{ once: true }` and removed on the timer path — so no timer or
+ * listener accrues across the many ticks of a long silent-open window. `readerP` rejecting (the `idleMs`
+ * guard firing, or a stream cut) propagates as a rejection the caller's try/catch handles. (RT-1 SC1)
+ */
+export async function raceHeartbeat<T>(
+  readerP: Promise<T>,
+  tickSleepMs: number,
+  signal?: AbortSignal,
+): Promise<{ tick: true } | { tick: false; value: T }> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  let onAbort: (() => void) | undefined;
+  const read = readerP.then((value) => ({ tick: false as const, value }));
+  // If the heartbeat wins this race, `read` (derived from the pending `readerP`) is left unsettled; should
+  // `readerP` later reject (idle guard / stream cut) its rejection would be UNOBSERVED on this wrapper and
+  // surface as an unhandledRejection. The caller re-races the SAME `readerP`, where the rejection IS
+  // observed (or its try/catch awaits it) — so swallow here on the derived wrapper only, never on readerP.
+  read.catch(() => {});
+  const beat = new Promise<{ tick: true }>((resolve) => {
+    if (signal?.aborted) return resolve({ tick: true });
+
+    onAbort = (): void => {
+      resolve({ tick: true });
+    };
+    timer = setTimeout(() => resolve({ tick: true }), tickSleepMs);
+    signal?.addEventListener('abort', onAbort, { once: true });
+  });
+
+  try {
+    return await Promise.race([read, beat]);
+  } finally {
+    // Clear the heartbeat timer whoever wins — a reader-win must not leave a dangling timer to fire later
+    // (property 2: no timer accrues across a silent-open window). The abort listener is removed here too;
+    // `{ once: true }` covers the fired-abort case, this covers the reader-win / timer-win cases.
+    if (timer !== undefined) clearTimeout(timer);
+    if (onAbort !== undefined) signal?.removeEventListener('abort', onAbort);
+  }
+}
+
 // ─────────────────────────────── event producer ───────────────────────────────
 // Emits ponder RealtimeSyncEvent-shaped objects. `finalizedHead()` polls the Portal finalized head so we
 // can emit `finalize` events (the RPC RealtimeSync derives finality from confirmations; the Portal tells
@@ -676,6 +831,35 @@ export async function* portalRealtimeEvents(
      */
     finalizeDeferMaxMs?: number;
     /**
+     * Delivery-progress watchdog (RT-G10, INV-24). Upper bound (ms) on how long the probed finalized head
+     * may advance while ZERO blocks are delivered before the stall is declared fatal. Complements the B1
+     * defer watchdog — B1 bounds a window that DELIVERS but can't hash-verify finality; this bounds the
+     * dual case where NOTHING is delivered at all (204/bodyless-200/reconnect churn or the silent fetch-
+     * error retry loop) yet the chain is demonstrably ALIVE because its finalized head keeps climbing. A
+     * quiet/halted chain (head static) never trips it — it is PROGRESS-conditioned. Injectable for tests;
+     * production default 600_000 (10 min, aligned with the B1 bound). (RT-1 SC3)
+     */
+    deliveryProgressMaxMs?: number;
+    /**
+     * Delivery-progress watchdog head-advance threshold (blocks, RT-G10, INV-24). The watchdog is fatal
+     * only when the probed finalized head has advanced by AT LEAST this many blocks past the delivery
+     * baseline (highest delivered block number, floored at the first observed finalized head — RT-G10)
+     * WHILE delivery was zero for the whole bound. A single-block finality lag (head
+     * ticked forward once while a block is momentarily in flight) must NOT trip it, so the default is a
+     * comfortable multiple of one. Injectable for tests; production default 16 (see the resolver comment
+     * for the rationale). (RT-1 SC3)
+     */
+    deliveryProgressThreshold?: number;
+    /**
+     * Non-delivery signal from the producer's fetch-error retry loop (E1 site). streamHotBlocks yields a
+     * `{kind:'tick'}` on a transient fetch throw (the read never opened), which the delivery watchdog
+     * already counts as non-delivery; this callback lets the LOGGER-BEARING shell surface a rate-limited
+     * warn so a silent retry storm is diagnosable at the wire (same seam pattern as `onIdleReconnect`).
+     * Rate-limiting is the shell's responsibility — this fires once per error round. Absent ⇒ silent (unit
+     * call sites). (RT-1 SC3)
+     */
+    onFetchError?: () => void;
+    /**
      * The last FINALIZED block at startup (syncProgress.finalized as a Light) — the reconcile anchor.
      * Advanced to each finalize's tip. REQUIRED (wave 4): startup is always anchored.
      */
@@ -693,6 +877,7 @@ export async function* portalRealtimeEvents(
   let anchor = args.anchor;
   let lastFinalizePoll = 0;
   const pollMs = args.finalizePollMs ?? 4000;
+  const half = Math.max(1, Math.floor(pollMs / 2));
   // Wire the /stream fork-negotiation state (issue #33): SEED the delivered-hash ring with the startup
   // anchor so the first request carries its hash, and expose the FINALIZED FLOOR (the anchor's number,
   // advanced on each finalize) so the ring prunes and the 409 rewind bounds correctly. `diag` mirrors the
@@ -713,6 +898,8 @@ export async function* portalRealtimeEvents(
         : args.seedRing,
     getFinalizedFloor: () => anchor?.number ?? args.fromBlock - 1,
     diag,
+    tickSleepMs: Math.min(500, half),
+    errorSleepMs: Math.min(1000, half),
   };
   // B1 defer-streak watchdog: `deferStreakStart` is the Date.now() of the FIRST poll in an unbroken run of
   // hash-unverifiable-finalize deferrals (undefined ⇒ not armed). Set when a poll defers and the streak is
@@ -722,9 +909,164 @@ export async function* portalRealtimeEvents(
   const deferMaxMs = args.finalizeDeferMaxMs ?? 600_000;
   let deferStreakStart: number | undefined;
 
-  for await (const { header, logs, transactions } of streamHotBlocks(
-    streamArgs,
-  )) {
+  // Delivery-progress watchdog (RT-G10, INV-24). PROGRESS-CONDITIONED: fatal ONLY when the probed finalized
+  // head has advanced ≥ `deliveryProgressThreshold` blocks past the HIGHEST DELIVERED block number WHILE
+  // ZERO blocks were delivered for ≥ `deliveryProgressMaxMs`. It bounds the no-delivery case B1 does not:
+  // B1 fires when the window DELIVERS but the finalized head sits above it hash-unverifiably; this fires when
+  // NOTHING is delivered at all (204/bodyless-200/reconnect churn, or the silent E1 fetch-error retry loop)
+  // yet the chain is provably ALIVE because it has FINALIZED blocks ABOVE everything we delivered. A
+  // quiet/halted chain (finality static, or ≤ threshold past the delivered tip) NEVER trips it — normal
+  // idling, parity with RPC realtime.
+  //   • WHY DELIVERED HEIGHT, NOT FINALIZED-HEAD-AT-DELIVERY (RT-G10 correctness fix): the /stream delivers
+  //     UNFINALIZED tip blocks that run FAR AHEAD of the finalized head (steady state: delivered tip 500,
+  //     finalized head 100). The old baseline was the finalized head observed AT the last delivery, so a
+  //     chain-TIP freeze (an L2 sequencer pause — nothing NEW to deliver) while FINALITY merely caught up
+  //     its backlog over blocks 100→116 that were ALREADY delivered read as a ≥-threshold advance with zero
+  //     deliveries and FALSE-FATAL'd — it used FINALITY progress as a proxy for NEW-BLOCK production, and the
+  //     two diverge on a tip-freeze. Baselining on the highest DELIVERED block makes `finalized ≤ delivered ⇒
+  //     no trip` hold BY CONSTRUCTION (finality catching up over delivered blocks can never trip), while a
+  //     genuine post-delivery stall — finality climbing ≥ threshold BEYOND the highest delivered block,
+  //     provably new blocks we are not delivering — still fatals.
+  //   • `lastDeliveryMs` is stamped Date.now() on every delivered block AND INITIALIZED to loop entry (not
+  //     0/epoch): a fresh start that begins INTO an ongoing outage — zero deliveries ever — must arm the
+  //     bound from process start, exactly as the first delivery would have; epoch-0 would make the very first
+  //     poll's `now - lastDeliveryMs` astronomically exceed any bound and false-fatal a healthy startup.
+  //   • `deliveryBaseline` is `max(first-observed finalized head, highest delivered block number)` — the
+  //     block height the advance is measured against. Undefined until the first probe: with no height ever
+  //     observed there is nothing to measure against, so the first successful poll ADOPTS its finalized head
+  //     as the baseline WITHOUT resetting the clock (already armed at loop entry — preserving the
+  //     outage-from-start guarantee). Adopting the FIRST PROBED HEAD (not the resume anchor) is deliberate: a
+  //     process that RESUMES after downtime sees a finalized head already far above its anchor and must be
+  //     allowed to backfill that pre-existing deficit for the whole bound without a false fatal — the anchor
+  //     as baseline would fatal a legitimately-catching-up resume. Every delivery then RAISES the baseline to
+  //     its own block number, never LOWERS it (a resume that adopts a high head then delivers lower catch-up
+  //     blocks must not regress the baseline below the head), so the trip only ever measures finality's climb
+  //     PAST the furthest thing we have delivered or provably know finalized. The block arm never probes
+  //     (ticks must not touch the network or the window; the tick is the clock, wall time is the data).
+  // Fatal = a loud throw with the same diagDump + "restart" tail as the gap/B1 fatals; NEVER an RPC fallback
+  // (ruling Q2: a watchdog fatal-restarts, it never silently switches transport). (RT-1 SC3)
+  const deliveryProgressMaxMs = args.deliveryProgressMaxMs ?? 600_000;
+  const deliveryProgressThreshold = args.deliveryProgressThreshold ?? 16;
+  let lastDeliveryMs = Date.now();
+  let deliveryBaseline: number | undefined;
+  // Whether the first successful finalize probe has folded its head into `deliveryBaseline` yet. Tracked
+  // INDEPENDENTLY of `deliveryBaseline === undefined` because a delivery can set the baseline (to the
+  // delivered height) BEFORE any poll runs — on a resume the /stream hands us the anchor before the finalize
+  // cadence ticks once. INV-24's baseline is `max(first-observed finalized head, highest delivered block)`, so
+  // the first probe must ALWAYS fold its head in via `max`, even when a delivery already seeded the baseline;
+  // keying that fold on `undefined` alone silently drops the first-probed head on the deliver-before-poll
+  // ordering, leaving a resume to false-fatal on a static pre-existing finality deficit (RT-G10, glm Finding 1).
+  let firstProbeAdopted = false;
+
+  // Finalize-poll cadence + B1 defer watchdog, relocated from the inline gate.
+  // The hash-unverifiable defer branch returns because this helper is the final step for each turn.
+  async function* runFinalizeCadence(): AsyncGenerator<PortalRealtimeEvent> {
+    // finalize on a cadence (cheap head probe), not every block
+    const now = Date.now();
+    if (now - lastFinalizePoll >= pollMs) {
+      lastFinalizePoll = now;
+      const fh = await args.finalizedHead().catch(() => undefined);
+      const fhNumber = fh?.number;
+      const fhHash = fh?.hash;
+      // No probe result this poll: the streak of deferrals (if any) is broken — clear it so a later,
+      // hash-unverifiable deferral times its OWN run, not a run interleaved with probe outages. (B1)
+      if (fhNumber === undefined) deferStreakStart = undefined;
+
+      // Delivery-progress watchdog (RT-G10, INV-24): evaluate on the head THIS poll already probed — no
+      // extra probe, no window touch. A failed probe (fhNumber undefined) carries no head signal, so it can
+      // neither advance the baseline nor trip the watchdog; skip it. Otherwise:
+      //   • if a baseline was ever established, fatal when the finalized head has climbed ≥ threshold PAST the
+      //     highest DELIVERED block (the baseline) WHILE zero blocks were delivered for the whole bound —
+      //     finality provably above everything we delivered + delivery flatlined = the chain has NEW blocks
+      //     the /stream is starving us of. Loud restart, never a silent transport switch (Q2). Finality
+      //     merely catching up OVER already-delivered blocks (finalized ≤ delivered) can never trip.
+      //   • FIRST successful probe: fold its head into the baseline via `max` — WITHOUT touching the clock
+      //     (already armed at loop entry, so an outage from process start still times from start). The `max`
+      //     (not a bare adopt) is what implements INV-24's `max(first-observed finalized head, highest
+      //     delivered block)` even when a delivery already seeded the baseline to the delivered height before
+      //     this poll ran (the deliver-before-first-poll resume): the first-probed head must never be dropped,
+      //     yet a delivered height ABOVE that head (a resume already ahead of finality) must not be lowered
+      //     either. Gated on `firstProbeAdopted`, NOT `deliveryBaseline === undefined`, precisely so the
+      //     delivery-seeded case still folds the first head in (RT-G10, glm Finding 1).
+      if (fhNumber !== undefined) {
+        if (!firstProbeAdopted) {
+          firstProbeAdopted = true;
+          deliveryBaseline = Math.max(deliveryBaseline ?? fhNumber, fhNumber);
+        } else if (
+          fhNumber - deliveryBaseline! >= deliveryProgressThreshold &&
+          now - lastDeliveryMs >= deliveryProgressMaxMs
+        ) {
+          throw new Error(
+            `Portal realtime: the finalized head advanced to ${fhNumber}, ${fhNumber - deliveryBaseline!} blocks PAST the highest delivered block ${deliveryBaseline}, while /stream delivered ZERO blocks for ${now - lastDeliveryMs}ms — the chain has finalized blocks the stream never delivered (endless 204s/reconnects or a transient-error retry loop), so indexing has silently stalled. ${diagDump(diag)} Restart to re-sync from the finalized head.`,
+          );
+        }
+      }
+
+      if (fhNumber !== undefined) {
+        const { finalizedTip, remaining } = takeFinalized(
+          unfinalized,
+          fhNumber,
+        );
+        // No block at/below the finalized height yet — nothing to finalize, and not a hash-unverifiable
+        // deferral either. This poll did NOT defer, so clear the streak. (B1)
+        if (!finalizedTip) deferStreakStart = undefined;
+
+        if (finalizedTip) {
+          // Wrong-fork finalize guard: `takeFinalized` splits by NUMBER, so the finalizedTip is only
+          // hash-VERIFIABLE against the probe when it sits at the probe's exact height. Two cases when the
+          // probe carries the canonical hash:
+          //   • finalizedTip.number === fhNumber — our local block at that height must equal the canonical
+          //     hash, else the window is on a fork that lost to a finalized competitor; persisting it as
+          //     finalized would commit wrong-fork data with no rollback event. Fail loud (review B1 keeps
+          //     this).
+          //   • finalizedTip.number  <  fhNumber — the probe references a block ABOVE our local tip, so we
+          //     have NO canonical hash for finalizedTip's height and cannot confirm it descends from the
+          //     canonical finalized block. Finalizing it by number alone would persist a possibly-losing
+          //     fork below finality (the exact hole this guard closes). DEFER: skip this poll and let the
+          //     window catch up to a hash-verifiable boundary (finality is monotonic and live chains reach
+          //     fhNumber within a poll or two, at which point the === case verifies or fatals). (review B1)
+          if (fhHash !== undefined && finalizedTip.number === fhNumber) {
+            if (finalizedTip.hash !== fhHash)
+              throw new Error(
+                `Portal realtime: local block ${finalizedTip.number} (${finalizedTip.hash}) diverges from the canonical finalized block (${fhHash}) — the unfinalized window is on a losing fork at/below finality. Cannot finalize safely; restart to re-sync from the finalized head.`,
+              );
+          } else if (fhHash !== undefined && finalizedTip.number < fhNumber) {
+            // Hash-unverifiable finalize: the canonical head sits ABOVE our window tip, so we cannot
+            // confirm the local finalizedTip descends from it. Deferring is correct for a window that is
+            // merely catching up — but a persistent Portal brownout (delivery below the chain rate) keeps
+            // the head ABOVE the window forever, so EVERY poll defers, the anchor never advances, and
+            // `unfinalized` grows without bound while ponder's finalized checkpoint silently freezes. Bound
+            // the streak: arm it on the first deferral, and if it has run for the whole bound, fail loud —
+            // number-only fallback would reopen the wrong-fork hole this branch exists to close. A restart
+            // re-syncs from the finalized head. (delta review B1)
+            if (deferStreakStart === undefined) deferStreakStart = now;
+            else if (now - deferStreakStart >= deferMaxMs)
+              throw new Error(
+                `Portal realtime: the unfinalized window has lagged the hash-carrying finalized head (${fhNumber}, ${fhHash}) for ${now - deferStreakStart}ms (local tip ${finalizedTip.number}) — /stream delivery is below the chain's finalization rate, so finality cannot be hash-verified and the finalized checkpoint has stopped advancing. Cannot finalize safely; restart to re-sync from the finalized head.`,
+              );
+
+            return; // hash-unverifiable finalize deferred until the window reaches fhNumber
+          }
+          // This poll finalizes (or applies a number-only head) — it did NOT defer, so the streak is
+          // broken; clear it. (B1)
+          deferStreakStart = undefined;
+
+          anchor = finalizedTip; // the reconcile anchor advances with finality
+          unfinalized.length = 0;
+          unfinalized.push(...remaining);
+          yield { type: 'finalize', block: finalizedTip };
+        }
+      }
+    }
+  }
+
+  for await (const item of streamHotBlocks(streamArgs)) {
+    if (item.kind === 'tick') {
+      yield* runFinalizeCadence();
+      continue;
+    }
+
+    const { header, logs, transactions } = item;
     const light = toLight(header);
     const r = reconcile(unfinalized, light, anchor);
     const redelivered =
@@ -796,6 +1138,19 @@ export async function* portalRealtimeEvents(
       if (t.hash !== undefined) seenTx.add(t.hash);
       syncTxs.push(toSyncTransaction(t, header));
     }
+    // Delivery-progress watchdog stamp (RT-G10, INV-24): this is the ONE point a real block is delivered
+    // (a skipped `duplicate && !redelivered` returned above; a `gap` threw). Re-baseline the no-delivery
+    // clock to now, and RAISE the delivered-height baseline to THIS block's number — so the NEXT stall
+    // measures finality's climb against the furthest block we have actually delivered, never below it. Use a
+    // max (never lower): a resume that adopted a high first-probed finalized head then delivers lower
+    // catch-up blocks must not regress the baseline beneath that head. A delivery before any poll has run
+    // seeds `deliveryBaseline` to `light.number` here; the FIRST finalize probe then folds ITS head in via
+    // `max` regardless (gated on `firstProbeAdopted`, not `undefined`), so the deliver-before-poll ordering
+    // still honours INV-24's `max(first-observed finalized head, highest delivered block)` and never
+    // false-fatals a static pre-existing deficit (RT-G10, glm Finding 1). No probe — the block arm never
+    // touches the network or the window. (RT-1 SC3)
+    lastDeliveryMs = Date.now();
+    deliveryBaseline = Math.max(deliveryBaseline ?? light.number, light.number);
     yield {
       type: 'block',
       block,
@@ -803,73 +1158,6 @@ export async function* portalRealtimeEvents(
       transactions: syncTxs,
       hasMatchedFilter: syncLogs.length > 0,
     };
-
-    // finalize on a cadence (cheap head probe), not every block
-    const now = Date.now();
-    if (now - lastFinalizePoll >= pollMs) {
-      lastFinalizePoll = now;
-      const fh = await args.finalizedHead().catch(() => undefined);
-      const fhNumber = fh?.number;
-      const fhHash = fh?.hash;
-      // No probe result this poll: the streak of deferrals (if any) is broken — clear it so a later,
-      // hash-unverifiable deferral times its OWN run, not a run interleaved with probe outages. (B1)
-      if (fhNumber === undefined) deferStreakStart = undefined;
-
-      if (fhNumber !== undefined) {
-        const { finalizedTip, remaining } = takeFinalized(
-          unfinalized,
-          fhNumber,
-        );
-        // No block at/below the finalized height yet — nothing to finalize, and not a hash-unverifiable
-        // deferral either. This poll did NOT defer, so clear the streak. (B1)
-        if (!finalizedTip) deferStreakStart = undefined;
-
-        if (finalizedTip) {
-          // Wrong-fork finalize guard: `takeFinalized` splits by NUMBER, so the finalizedTip is only
-          // hash-VERIFIABLE against the probe when it sits at the probe's exact height. Two cases when the
-          // probe carries the canonical hash:
-          //   • finalizedTip.number === fhNumber — our local block at that height must equal the canonical
-          //     hash, else the window is on a fork that lost to a finalized competitor; persisting it as
-          //     finalized would commit wrong-fork data with no rollback event. Fail loud (review B1 keeps
-          //     this).
-          //   • finalizedTip.number  <  fhNumber — the probe references a block ABOVE our local tip, so we
-          //     have NO canonical hash for finalizedTip's height and cannot confirm it descends from the
-          //     canonical finalized block. Finalizing it by number alone would persist a possibly-losing
-          //     fork below finality (the exact hole this guard closes). DEFER: skip this poll and let the
-          //     window catch up to a hash-verifiable boundary (finality is monotonic and live chains reach
-          //     fhNumber within a poll or two, at which point the === case verifies or fatals). (review B1)
-          if (fhHash !== undefined && finalizedTip.number === fhNumber) {
-            if (finalizedTip.hash !== fhHash)
-              throw new Error(
-                `Portal realtime: local block ${finalizedTip.number} (${finalizedTip.hash}) diverges from the canonical finalized block (${fhHash}) — the unfinalized window is on a losing fork at/below finality. Cannot finalize safely; restart to re-sync from the finalized head.`,
-              );
-          } else if (fhHash !== undefined && finalizedTip.number < fhNumber) {
-            // Hash-unverifiable finalize: the canonical head sits ABOVE our window tip, so we cannot
-            // confirm the local finalizedTip descends from it. Deferring is correct for a window that is
-            // merely catching up — but a persistent Portal brownout (delivery below the chain rate) keeps
-            // the head ABOVE the window forever, so EVERY poll defers, the anchor never advances, and
-            // `unfinalized` grows without bound while ponder's finalized checkpoint silently freezes. Bound
-            // the streak: arm it on the first deferral, and if it has run for the whole bound, fail loud —
-            // number-only fallback would reopen the wrong-fork hole this branch exists to close. A restart
-            // re-syncs from the finalized head. (delta review B1)
-            if (deferStreakStart === undefined) deferStreakStart = now;
-            else if (now - deferStreakStart >= deferMaxMs)
-              throw new Error(
-                `Portal realtime: the unfinalized window has lagged the hash-carrying finalized head (${fhNumber}, ${fhHash}) for ${now - deferStreakStart}ms (local tip ${finalizedTip.number}) — /stream delivery is below the chain's finalization rate, so finality cannot be hash-verified and the finalized checkpoint has stopped advancing. Cannot finalize safely; restart to re-sync from the finalized head.`,
-              );
-
-            continue; // hash-unverifiable finalize deferred until the window reaches fhNumber
-          }
-          // This poll finalizes (or applies a number-only head) — it did NOT defer, so the streak is
-          // broken; clear it. (B1)
-          deferStreakStart = undefined;
-
-          anchor = finalizedTip; // the reconcile anchor advances with finality
-          unfinalized.length = 0;
-          unfinalized.push(...remaining);
-          yield { type: 'finalize', block: finalizedTip };
-        }
-      }
-    }
+    yield* runFinalizeCadence();
   }
 }

@@ -102,6 +102,85 @@ export function resolveRedeliveryTimeoutMs(
   return n;
 }
 
+/**
+ * Resolve the realtime `/stream` OPEN-body idle bound (ms, RT-G11). Precedence, validation, and loud-on-
+ * garbage behavior are IDENTICAL to `resolveRedeliveryTimeoutMs`: an explicit `override` (tests) wins, then
+ * the `PORTAL_STREAM_IDLE_MS` env var, then the default; the env value must be a positive integer or startup
+ * fails loud (a silently-dropped knob is an operator trap). The 120_000 ms (2 min) default comfortably
+ * exceeds normal inter-block quiet on every supported chain, so a slow-but-alive stream is never recycled;
+ * on expiry the read reconnects from `cursor` (routine, cheap, NOT fatal). Pure over its args — unit-testable
+ * with no process.env mutation. (RT-1 SC1)
+ */
+export function resolveStreamIdleMs(
+  override: number | undefined,
+  envRaw: string | undefined,
+  fallback: number,
+): number {
+  if (override !== undefined) return override;
+  if (envRaw === undefined) return fallback;
+
+  const n = Number(envRaw);
+  if (Number.isInteger(n) === false || n <= 0)
+    throw new Error(
+      `Portal realtime: PORTAL_STREAM_IDLE_MS must be a positive integer (milliseconds), got ${JSON.stringify(envRaw)}.`,
+    );
+
+  return n;
+}
+
+/**
+ * Resolve the delivery-progress watchdog bound (ms, RT-G10 / INV-24). Precedence, validation, and loud-on-
+ * garbage behavior are IDENTICAL to `resolveStreamIdleMs`: an explicit `override` (tests) wins, then the
+ * `PORTAL_STREAM_DELIVERY_MAX_MS` env var, then the default; the env value must be a positive integer or
+ * startup fails loud. The 600_000 ms (10 min) default is ALIGNED with the B1 defer bound — the two
+ * watchdogs bound complementary no-progress cases (B1: window delivers but can't hash-verify finality;
+ * this: nothing delivered while the head climbs), so a single operator-visible timescale governs both.
+ * Pure over its args — unit-testable with no process.env mutation. (RT-1 SC3)
+ */
+export function resolveDeliveryProgressMaxMs(
+  override: number | undefined,
+  envRaw: string | undefined,
+  fallback: number,
+): number {
+  if (override !== undefined) return override;
+  if (envRaw === undefined) return fallback;
+
+  const n = Number(envRaw);
+  if (Number.isInteger(n) === false || n <= 0)
+    throw new Error(
+      `Portal realtime: PORTAL_STREAM_DELIVERY_MAX_MS must be a positive integer (milliseconds), got ${JSON.stringify(envRaw)}.`,
+    );
+
+  return n;
+}
+
+/**
+ * Resolve the delivery-progress watchdog head-advance threshold (blocks, RT-G10 / INV-24). Precedence and
+ * loud-on-garbage behavior mirror `resolveDeliveryProgressMaxMs`. Default 16 blocks: the watchdog must not
+ * fire on a benign single-block finality lag (the head ticks forward once while a block is momentarily in
+ * flight), so the threshold is a comfortable multiple of one — yet 16 blocks is a handful of seconds of head
+ * advance on even the slowest supported chain, far under the 10-minute time bound, so a genuine stall (head
+ * climbing for 10 min with zero delivery) clears it with enormous margin. A watchdog needs BOTH the block
+ * threshold AND the time bound crossed, so 16 only shapes the false-positive floor, not the trip latency.
+ * Pure over its args — unit-testable with no process.env mutation. (RT-1 SC3)
+ */
+export function resolveDeliveryProgressThreshold(
+  override: number | undefined,
+  envRaw: string | undefined,
+  fallback: number,
+): number {
+  if (override !== undefined) return override;
+  if (envRaw === undefined) return fallback;
+
+  const n = Number(envRaw);
+  if (Number.isInteger(n) === false || n <= 0)
+    throw new Error(
+      `Portal realtime: PORTAL_STREAM_DELIVERY_THRESHOLD must be a positive integer (blocks), got ${JSON.stringify(envRaw)}.`,
+    );
+
+  return n;
+}
+
 // ─────────────────────────────── Portal finalized head + finality clamp ───────────────────────────────
 
 /** Poll the Portal `/finalized-head`. Delegates to the client's SHARED bounded probe
@@ -463,6 +542,25 @@ export async function* getPortalRealtimeEventGenerator(params: {
    * silently. (recommended: redelivery watchdog; delta review: made configurable)
    */
   redeliveryTimeoutMs?: number;
+  /**
+   * Idle bound (ms) on the OPEN /stream body read (RT-G11). Precedence: this param (tests) → the
+   * `PORTAL_STREAM_IDLE_MS` env var (positive-integer, else startup fails loud) → the 120_000 ms default.
+   * On expiry the read reconnects from `cursor` (routine, NOT fatal) and logs a debug line. (RT-1 SC1)
+   */
+  streamIdleMs?: number;
+  /**
+   * Delivery-progress watchdog bound (ms, RT-G10 / INV-24). Precedence: this param (tests) → the
+   * `PORTAL_STREAM_DELIVERY_MAX_MS` env var (positive-integer, else startup fails loud) → the 600_000 ms
+   * default. Fatal only when the probed head climbs ≥ `deliveryProgressThreshold` blocks while ZERO blocks
+   * are delivered for this whole bound — a live chain the stream is starving us on. (RT-1 SC3)
+   */
+  deliveryProgressMaxMs?: number;
+  /**
+   * Delivery-progress watchdog head-advance threshold (blocks, RT-G10 / INV-24). Precedence: this param
+   * (tests) → the `PORTAL_STREAM_DELIVERY_THRESHOLD` env var (positive-integer, else startup fails loud) →
+   * the 16-block default. A single-block finality lag must never trip the watchdog. (RT-1 SC3)
+   */
+  deliveryProgressThreshold?: number;
 }) {
   const { common, chain, eventCallbacks, syncProgress, childAddresses } =
     params;
@@ -521,6 +619,42 @@ export async function* getPortalRealtimeEventGenerator(params: {
     process.env.PORTAL_STREAM_REDELIVERY_TIMEOUT_MS,
     300_000,
   );
+  // Idle bound on the open /stream body read (RT-G11): a wedged connection (headers OK, body silent, no
+  // FIN/RST) reconnects from `cursor` after this bound instead of hanging forever. Resolved once here so a
+  // garbage env fails loud at startup, not deep in the stream loop. (RT-1 SC1)
+  const streamIdleMs = resolveStreamIdleMs(
+    params.streamIdleMs,
+    process.env.PORTAL_STREAM_IDLE_MS,
+    120_000,
+  );
+  // Delivery-progress watchdog bounds (RT-G10 / INV-24): resolve both once at startup so garbage env fails
+  // loud here, not mid-stream. The head-advance threshold + the time bound are BOTH required to trip. (SC3)
+  const deliveryProgressMaxMs = resolveDeliveryProgressMaxMs(
+    params.deliveryProgressMaxMs,
+    process.env.PORTAL_STREAM_DELIVERY_MAX_MS,
+    600_000,
+  );
+  const deliveryProgressThreshold = resolveDeliveryProgressThreshold(
+    params.deliveryProgressThreshold,
+    process.env.PORTAL_STREAM_DELIVERY_THRESHOLD,
+    16,
+  );
+  // Rate-limited fetch-error warn (RT-G10 / INV-24, E1 seam): the producer's transient-fetch-throw retry
+  // loop is SILENT — it just yields a tick and backs off, which the delivery watchdog counts as non-
+  // delivery. Surface it at the wire (where the logger lives) so a retry storm is visible, but throttle to
+  // at most one line per window so it can't spam the log; the delivery watchdog remains the loud backstop.
+  let lastFetchErrorWarnMs = 0;
+  const onFetchError = (): void => {
+    const now = Date.now();
+    if (now - lastFetchErrorWarnMs < 30_000) return;
+
+    lastFetchErrorWarnMs = now;
+    common.logger.warn({
+      service: 'portal',
+      msg: 'Portal /stream fetch failed — retrying (rate-limited; the delivery-progress watchdog bounds a persistent stall)',
+      chain: chain.name,
+    });
+  };
   let watchdog: ReturnType<typeof setTimeout> | undefined;
   let watchdogError: Error | undefined;
   const setAwaiting = (
@@ -536,6 +670,16 @@ export async function* getPortalRealtimeEventGenerator(params: {
         watchdogError = new Error(
           `Portal realtime: block ${v.number} (${v.hash}) was suppressed for its same-block child redelivery but the /stream never re-delivered it within ${redeliveryTimeoutMs}ms — the chain may be halted or the Portal is not re-serving it. Restart to re-sync from the finalized head.`,
         );
+        // TERMINAL ABORT SITE #1 (RT-G8 / issue #48). This abort must unwind the generator chain so the
+        // `for await` below exits and rethrows `watchdogError` — and that unwind is INDEPENDENT of the
+        // aborted `/stream` read settling (the undici #4089 race can leave a mid-read `read()` unsettled
+        // forever). Independence holds BY CONSTRUCTION of RT-1 SC1: streamHotBlocks never `await`s a bare
+        // read — every read is raced against `raceHeartbeat`, whose beat resolves ON the abort event, so the
+        // producer breaks + returns without the read settling (the SC1 "race the read against our own timer"
+        // form the #48 hardening called for). PINNED by portal-realtime-wire.test.ts "the redelivery
+        // watchdog surfaces its loud fatal even when the aborted /stream read NEVER settles (RT-1 SC4)":
+        // mutation-verified — neutering `raceHeartbeat`'s beat fails it with ABORT-UNWIND-STARVED. Do NOT
+        // reintroduce a bare `await` on a body read anywhere on this teardown path.
         controller.abort();
       }, redeliveryTimeoutMs);
       watchdog.unref?.();
@@ -588,6 +732,17 @@ export async function* getPortalRealtimeEventGenerator(params: {
         portalFinalizedHead(portalUrl, headers, params.fetchImpl),
       finalizePollMs: params.finalizePollMs,
       finalizeDeferMaxMs: params.finalizeDeferMaxMs,
+      deliveryProgressMaxMs,
+      deliveryProgressThreshold,
+      onFetchError,
+      idleMs: streamIdleMs,
+      onIdleReconnect: () =>
+        common.logger.debug({
+          service: 'portal',
+          msg: 'Portal /stream idle bound reached — reconnecting from cursor',
+          chain: chain.name,
+          idle_ms: streamIdleMs,
+        }),
       signal: controller.signal,
       fetchImpl: params.fetchImpl,
     })) {
@@ -698,6 +853,13 @@ export async function* getPortalRealtimeEventGenerator(params: {
     if (watchdogError !== undefined) throw watchdogError;
   } finally {
     if (watchdog !== undefined) clearTimeout(watchdog);
+    // TERMINAL ABORT SITE #2 (RT-G8 / issue #48): teardown on ANY exit (endBlock reached, a thrown fatal,
+    // or the consumer abandoning this generator via `.return()`). Like site #1, this abort's unwind is
+    // independent of the aborted `/stream` read settling: a consumer `.return()` injects a return completion
+    // that forcibly resumes streamHotBlocks' suspended read-race (async-generator semantics), and the SC1
+    // heartbeat race means no step ever awaits a bare body read. PINNED by portal-realtime-wire.test.ts "the
+    // TEARDOWN abort unwinds promptly when the consumer abandons the generator over a never-settling /stream
+    // read (RT-1 SC4)". Keep this path free of any awaited body read.
     controller.abort();
   }
 }
