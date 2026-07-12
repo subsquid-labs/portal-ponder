@@ -2473,6 +2473,57 @@ test('portalRealtimeEvents: a GENUINE post-delivery stall — finalized head cli
   }
 });
 
+test('portalRealtimeEvents: a RESUME that delivers its anchor BEFORE the first finalize poll, then sees a STATIC finalized head far above it, must NOT false-fatal — the first probe folds into the baseline (RT-1 SC3 T6 / RT-G10 / glm Finding 1)', async () => {
+  // The delivery-before-first-poll resume (INV-24's `max(first-observed finalized head, highest delivered
+  // block number)`). On a resume the /stream delivers the anchor block (100) BEFORE the finalize cadence has
+  // run once — so the block arm stamps `deliveryBaseline = 100` (the delivered height) before ANY probe. The
+  // FIRST finalize poll then returns a finalized head FAR above the anchor (500) that is already there —
+  // pre-existing, static, nothing NEW being unshipped. INV-24 documents the baseline as `max(500, 100) = 500`,
+  // so a resume that then goes fully silent with STATIC finality at 500 must NOT trip: `500 - 500 = 0 <
+  // threshold`. The design intent (INV-24, comment ~938-943) is to GRANT the resume grace to backfill the
+  // pre-existing deficit for the whole bound without a false fatal.
+  //
+  // Deterministic clock: each finalizedHead() poll advances Date.now by 1000ms — the 100ms bound is crossed
+  // on the very first poll, dozens of times over across the run. The head is STATIC at 500 the whole time. A
+  // bounded, throw-FREE run (abort after 40 polls) is the pass; a PROGRESS-WATCHDOG fatal is the false-fatal.
+  let clock = 8_000_000;
+  vi.spyOn(Date, 'now').mockImplementation(() => clock);
+  // Anchor block 100 is delivered FIRST (before the finalize cadence runs) → baseline stamped to 100.
+  const block100 = {
+    header: { number: 100, hash: 'h100', parentHash: 'h99', timestamp: 100 },
+    logs: [],
+  };
+  let polls = 0;
+  const ac = new AbortController();
+  const iter = portalRealtimeEvents({
+    portalUrl: 'http://portal',
+    headers: {},
+    fromBlock: 100,
+    anchor: L(99, 'h99', 'h98'),
+    logs: [],
+    fetchImpl: oneBlockThen204(block100, () => {}),
+    signal: ac.signal,
+    finalizedHead: async () => {
+      clock += 1000; // race FAR past the 100ms bound (many times over)
+      polls += 1;
+      if (polls >= 40) ac.abort(); // a bounded, throw-FREE run ends the test by aborting
+
+      // The finalized head sits FAR above the delivered anchor 100 and is STATIC — pre-existing finality the
+      // resume must be allowed to backfill against, not a stream that is starving us of NEW blocks.
+      return { number: 500 }; // number-only head → B1 hash-defer path unreachable, isolates SC3
+    },
+    finalizePollMs: 0, // poll every turn
+    deliveryProgressMaxMs: 100, // tiny bound — deliberately crossed dozens of times
+    deliveryProgressThreshold: 5, // 500 − 100 = 400 ≥ 5 on the OLD baseline → false-fatal; ≥ max(500,100) fix holds
+    finalizeDeferMaxMs: 10_000, // large: prove B1 is not what fires
+  });
+  const events: any[] = [];
+  // Must DRAIN to completion (abort) with NO fatal — a static pre-existing finality deficit is not a stall.
+  for await (const e of iter) events.push(e);
+  expect(events.filter((e) => e.type === 'block')).toHaveLength(1); // anchor 100 delivered, then 204 forever
+  expect(polls).toBeGreaterThanOrEqual(40); // the clock really did run past the bound many times over
+});
+
 test('streamHotBlocks: a transient /stream fetch throw invokes onFetchError (the E1 non-delivery seam) and yields a tick, not a block (RT-1 SC3)', async () => {
   // The E1 site: `fetchImpl` THROWS (the read never opens). The producer must (a) surface it on the
   // onFetchError seam so the shell can rate-limit a warn, and (b) yield a `{kind:'tick'}` (non-delivery) —

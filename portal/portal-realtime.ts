@@ -949,6 +949,14 @@ export async function* portalRealtimeEvents(
   const deliveryProgressThreshold = args.deliveryProgressThreshold ?? 16;
   let lastDeliveryMs = Date.now();
   let deliveryBaseline: number | undefined;
+  // Whether the first successful finalize probe has folded its head into `deliveryBaseline` yet. Tracked
+  // INDEPENDENTLY of `deliveryBaseline === undefined` because a delivery can set the baseline (to the
+  // delivered height) BEFORE any poll runs — on a resume the /stream hands us the anchor before the finalize
+  // cadence ticks once. INV-24's baseline is `max(first-observed finalized head, highest delivered block)`, so
+  // the first probe must ALWAYS fold its head in via `max`, even when a delivery already seeded the baseline;
+  // keying that fold on `undefined` alone silently drops the first-probed head on the deliver-before-poll
+  // ordering, leaving a resume to false-fatal on a static pre-existing finality deficit (RT-G10, glm Finding 1).
+  let firstProbeAdopted = false;
 
   // Finalize-poll cadence + B1 defer watchdog, relocated from the inline gate.
   // The hash-unverifiable defer branch returns because this helper is the final step for each turn.
@@ -972,17 +980,24 @@ export async function* portalRealtimeEvents(
       //     finality provably above everything we delivered + delivery flatlined = the chain has NEW blocks
       //     the /stream is starving us of. Loud restart, never a silent transport switch (Q2). Finality
       //     merely catching up OVER already-delivered blocks (finalized ≤ delivered) can never trip.
-      //   • first observed head with no prior baseline: adopt it as the baseline without touching the clock
-      //     (already armed at loop entry), so an outage from process start still times from start.
+      //   • FIRST successful probe: fold its head into the baseline via `max` — WITHOUT touching the clock
+      //     (already armed at loop entry, so an outage from process start still times from start). The `max`
+      //     (not a bare adopt) is what implements INV-24's `max(first-observed finalized head, highest
+      //     delivered block)` even when a delivery already seeded the baseline to the delivered height before
+      //     this poll ran (the deliver-before-first-poll resume): the first-probed head must never be dropped,
+      //     yet a delivered height ABOVE that head (a resume already ahead of finality) must not be lowered
+      //     either. Gated on `firstProbeAdopted`, NOT `deliveryBaseline === undefined`, precisely so the
+      //     delivery-seeded case still folds the first head in (RT-G10, glm Finding 1).
       if (fhNumber !== undefined) {
-        if (deliveryBaseline === undefined) {
-          deliveryBaseline = fhNumber;
+        if (!firstProbeAdopted) {
+          firstProbeAdopted = true;
+          deliveryBaseline = Math.max(deliveryBaseline ?? fhNumber, fhNumber);
         } else if (
-          fhNumber - deliveryBaseline >= deliveryProgressThreshold &&
+          fhNumber - deliveryBaseline! >= deliveryProgressThreshold &&
           now - lastDeliveryMs >= deliveryProgressMaxMs
         ) {
           throw new Error(
-            `Portal realtime: the finalized head advanced to ${fhNumber}, ${fhNumber - deliveryBaseline} blocks PAST the highest delivered block ${deliveryBaseline}, while /stream delivered ZERO blocks for ${now - lastDeliveryMs}ms — the chain has finalized blocks the stream never delivered (endless 204s/reconnects or a transient-error retry loop), so indexing has silently stalled. ${diagDump(diag)} Restart to re-sync from the finalized head.`,
+            `Portal realtime: the finalized head advanced to ${fhNumber}, ${fhNumber - deliveryBaseline!} blocks PAST the highest delivered block ${deliveryBaseline}, while /stream delivered ZERO blocks for ${now - lastDeliveryMs}ms — the chain has finalized blocks the stream never delivered (endless 204s/reconnects or a transient-error retry loop), so indexing has silently stalled. ${diagDump(diag)} Restart to re-sync from the finalized head.`,
           );
         }
       }
@@ -1129,8 +1144,11 @@ export async function* portalRealtimeEvents(
     // measures finality's climb against the furthest block we have actually delivered, never below it. Use a
     // max (never lower): a resume that adopted a high first-probed finalized head then delivers lower
     // catch-up blocks must not regress the baseline beneath that head. A delivery before any poll has run
-    // leaves `deliveryBaseline` undefined here and adopts `light.number` directly. No probe — the block arm
-    // never touches the network or the window. (RT-1 SC3)
+    // seeds `deliveryBaseline` to `light.number` here; the FIRST finalize probe then folds ITS head in via
+    // `max` regardless (gated on `firstProbeAdopted`, not `undefined`), so the deliver-before-poll ordering
+    // still honours INV-24's `max(first-observed finalized head, highest delivered block)` and never
+    // false-fatals a static pre-existing deficit (RT-G10, glm Finding 1). No probe — the block arm never
+    // touches the network or the window. (RT-1 SC3)
     lastDeliveryMs = Date.now();
     deliveryBaseline = Math.max(deliveryBaseline ?? light.number, light.number);
     yield {
