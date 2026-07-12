@@ -670,6 +670,16 @@ export async function* getPortalRealtimeEventGenerator(params: {
         watchdogError = new Error(
           `Portal realtime: block ${v.number} (${v.hash}) was suppressed for its same-block child redelivery but the /stream never re-delivered it within ${redeliveryTimeoutMs}ms — the chain may be halted or the Portal is not re-serving it. Restart to re-sync from the finalized head.`,
         );
+        // TERMINAL ABORT SITE #1 (RT-G8 / issue #48). This abort must unwind the generator chain so the
+        // `for await` below exits and rethrows `watchdogError` — and that unwind is INDEPENDENT of the
+        // aborted `/stream` read settling (the undici #4089 race can leave a mid-read `read()` unsettled
+        // forever). Independence holds BY CONSTRUCTION of RT-1 SC1: streamHotBlocks never `await`s a bare
+        // read — every read is raced against `raceHeartbeat`, whose beat resolves ON the abort event, so the
+        // producer breaks + returns without the read settling (the SC1 "race the read against our own timer"
+        // form the #48 hardening called for). PINNED by portal-realtime-wire.test.ts "the redelivery
+        // watchdog surfaces its loud fatal even when the aborted /stream read NEVER settles (RT-1 SC4)":
+        // mutation-verified — neutering `raceHeartbeat`'s beat fails it with ABORT-UNWIND-STARVED. Do NOT
+        // reintroduce a bare `await` on a body read anywhere on this teardown path.
         controller.abort();
       }, redeliveryTimeoutMs);
       watchdog.unref?.();
@@ -843,6 +853,13 @@ export async function* getPortalRealtimeEventGenerator(params: {
     if (watchdogError !== undefined) throw watchdogError;
   } finally {
     if (watchdog !== undefined) clearTimeout(watchdog);
+    // TERMINAL ABORT SITE #2 (RT-G8 / issue #48): teardown on ANY exit (endBlock reached, a thrown fatal,
+    // or the consumer abandoning this generator via `.return()`). Like site #1, this abort's unwind is
+    // independent of the aborted `/stream` read settling: a consumer `.return()` injects a return completion
+    // that forcibly resumes streamHotBlocks' suspended read-race (async-generator semantics), and the SC1
+    // heartbeat race means no step ever awaits a bare body read. PINNED by portal-realtime-wire.test.ts "the
+    // TEARDOWN abort unwinds promptly when the consumer abandons the generator over a never-settling /stream
+    // read (RT-1 SC4)". Keep this path free of any awaited body read.
     controller.abort();
   }
 }
