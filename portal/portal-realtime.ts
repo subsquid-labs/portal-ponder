@@ -842,8 +842,9 @@ export async function* portalRealtimeEvents(
     deliveryProgressMaxMs?: number;
     /**
      * Delivery-progress watchdog head-advance threshold (blocks, RT-G10, INV-24). The watchdog is fatal
-     * only when the probed finalized head has advanced by AT LEAST this many blocks past the head observed
-     * at the last delivery WHILE delivery was zero for the whole bound. A single-block finality lag (head
+     * only when the probed finalized head has advanced by AT LEAST this many blocks past the delivery
+     * baseline (highest delivered block number, floored at the first observed finalized head — RT-G10)
+     * WHILE delivery was zero for the whole bound. A single-block finality lag (head
      * ticked forward once while a block is momentarily in flight) must NOT trip it, so the default is a
      * comfortable multiple of one. Injectable for tests; production default 16 (see the resolver comment
      * for the rationale). (RT-1 SC3)
