@@ -1,0 +1,57 @@
+{
+  "chainId": 1,
+  "genesis": {
+    "number": 100,
+    "timestamp": 1700001200
+  },
+  "finalizedHeadSeq": [
+    { "number": 100 },
+    { "number": 100 },
+    { "number": 103 },
+    { "number": 103 }
+  ],
+  "steps": [
+    {
+      "type": "idle204",
+      "killAt": { "block": 105, "phase": "K4-idle" }
+    },
+    {
+      "type": "childDiscovery",
+      "block": 101,
+      "child": "0x1111111111111111111111111111111111111111",
+      "transactionHash": "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "logIndex": 0
+    },
+    {
+      "type": "awaitRedelivery",
+      "block": 101,
+      "logs": [
+        {
+          "block": 101,
+          "event": "ProxyCreated",
+          "proxy": "0x1111111111111111111111111111111111111111",
+          "transactionHash": "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "transactionIndex": 0,
+          "logIndex": 0
+        },
+        {
+          "block": 101,
+          "event": "Deposit",
+          "vault": "0x1111111111111111111111111111111111111111",
+          "sender": "0x2222222222222222222222222222222222222222",
+          "owner": "0x3333333333333333333333333333333333333333",
+          "assets": "123456789",
+          "shares": "987654321",
+          "transactionHash": "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+          "transactionIndex": 0,
+          "logIndex": 1
+        }
+      ]
+    },
+    {
+      "type": "blocks",
+      "count": 11,
+      "turnDelayMs": 450
+    }
+  ]
+}

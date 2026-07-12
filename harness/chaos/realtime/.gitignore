@@ -1,0 +1,6 @@
+.chaos-pg/
+run/
+work/
+RESULT.md
+orchestrate.summary.json
+baselines/k[1-6]*.digest
