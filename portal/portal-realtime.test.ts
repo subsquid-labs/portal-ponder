@@ -3,6 +3,8 @@ import { afterEach, expect, test, vi } from 'vitest';
 import { BLOCK_FIELDS, TX_FIELDS } from './portal-filters.js';
 import {
   diagDump,
+  type HotBatch,
+  type HotItem,
   type Light,
   portalRealtimeEvents,
   reconcile,
@@ -19,6 +21,15 @@ const L = (number: number, hash: string, parentHash: string): Light => ({
   parentHash,
   timestamp: number,
 });
+
+const nextBlock = async (
+  gen: AsyncGenerator<HotItem>,
+): Promise<IteratorResult<HotBatch>> => {
+  for (;;) {
+    const r = await gen.next();
+    if (r.done || r.value.kind !== 'tick') return r as IteratorResult<HotBatch>;
+  }
+};
 
 // The reconcile anchor is REQUIRED since wave 4 (the optional blind-append legacy mode is gone);
 // A9 is the finalized block below these windows' base.
@@ -320,7 +331,7 @@ test('streamHotBlocks: re-opens the /stream with the widened filter the moment t
     signal: ac.signal,
   });
 
-  const first = await gen.next(); // block 100 from connection 1
+  const first = await nextBlock(gen); // block 100 from connection 1
   expect(first.value?.header.number).toBe(100);
   expect(bodies).toHaveLength(1);
   expect(bodies[0].fromBlock).toBe(100);
@@ -333,7 +344,7 @@ test('streamHotBlocks: re-opens the /stream with the widened filter the moment t
   });
   rev = 1;
 
-  const second = await gen.next(); // rev advanced → connection 1 torn down, reopen re-delivers block 100
+  const second = await nextBlock(gen); // rev advanced → connection 1 torn down, reopen re-delivers block 100
   expect(second.value?.header.number).toBe(101);
   expect(bodies).toHaveLength(2);
   // Re-opened FROM block 100, NOT 101: the child discovered in block 100 may have emitted its own logs
@@ -408,14 +419,14 @@ test('streamHotBlocks: caches the /stream body across same-cursor re-opens, rebu
     signal: ac.signal,
   });
 
-  const first = await gen.next(); // conn1 (empty, cursor 100) then conn2 delivers block 100
+  const first = await nextBlock(gen); // conn1 (empty, cursor 100) then conn2 delivers block 100
   expect(first.value?.header.number).toBe(100);
   expect(bodies).toHaveLength(2);
   expect(builds).toBe(1); // ONE serialization for TWO same-cursor requests — the body was REUSED
   expect(bodies[0]).toBe(bodies[1]); // byte-identical
   expect(JSON.parse(bodies[0]!).fromBlock).toBe(100);
 
-  const second = await gen.next(); // conn3 at cursor 101
+  const second = await nextBlock(gen); // conn3 at cursor 101
   expect(second.value?.header.number).toBe(101);
   expect(bodies).toHaveLength(3);
   expect(builds).toBe(2); // the cursor advanced → rebuilt exactly once more (never stale)
@@ -490,17 +501,17 @@ test('streamHotBlocks: the body-cache key pins CURSOR independently — a cursor
     signal: ac.signal,
   });
 
-  const first = await gen.next(); // conn1 (empty, cursor 100) then conn2 delivers 100
+  const first = await nextBlock(gen); // conn1 (empty, cursor 100) then conn2 delivers 100
   expect(first.value?.header.number).toBe(100);
   expect(builds).toBe(1); // conn1 open built; conn2 reused (same cursor 100, same pbh)
 
-  const second = await gen.next(); // conn3: cursor 101, pbh=SAME → rebuilt (cursor advanced)
+  const second = await nextBlock(gen); // conn3: cursor 101, pbh=SAME → rebuilt (cursor advanced)
   expect(second.value?.header.number).toBe(101);
   expect(builds).toBe(2);
   expect(JSON.parse(bodies[2]!).fromBlock).toBe(101);
   expect(JSON.parse(bodies[2]!).parentBlockHash).toBe(SAME);
 
-  const third = await gen.next(); // conn4: cursor 102, pbh=SAME (UNCHANGED from conn3) → MUST rebuild on cursor alone
+  const third = await nextBlock(gen); // conn4: cursor 102, pbh=SAME (UNCHANGED from conn3) → MUST rebuild on cursor alone
   expect(third.value?.header.number).toBe(102);
   // THE PIN: parentBlockHash is byte-identical between conn3 and conn4 (both 'hSAME'); only `cursor`
   // advanced 101→102. With `cursor` in the key this is a fresh build (fromBlock 102); drop `cursor` and it
@@ -650,12 +661,12 @@ test('streamHotBlocks: every /stream request carries parentBlockHash — first =
     fetchImpl: mockForkFetch(conns, bodies, () => ac.abort()),
     signal: ac.signal,
   });
-  const first = await gen.next();
+  const first = await nextBlock(gen);
   expect(first.value?.header.number).toBe(100);
   expect(bodies[0].fromBlock).toBe(100);
   expect(bodies[0].parentBlockHash).toBe('h99'); // FIRST request carries the seeded anchor hash
 
-  const second = await gen.next();
+  const second = await nextBlock(gen);
   expect(second.value?.header.number).toBe(101);
   expect(bodies[1].fromBlock).toBe(101);
   expect(bodies[1].parentBlockHash).toBe('h100'); // post-reconnect carries the LAST delivered hash
@@ -715,12 +726,12 @@ test('streamHotBlocks: the finding-4 redelivery reopen (cursor = number) sends t
     fetchImpl,
     signal: ac.signal,
   });
-  const first = await gen.next();
+  const first = await nextBlock(gen);
   expect(first.value?.header.number).toBe(100);
   expect(bodies[0].parentBlockHash).toBe('h99');
 
   rev = 1; // a child was discovered in block 100 → force the reopen FROM 100
-  const second = await gen.next();
+  const second = await nextBlock(gen);
   expect(second.value?.header.number).toBe(100); // redelivered
   expect(bodies[1].fromBlock).toBe(100); // reopened FROM 100, not 101
   expect(bodies[1].parentBlockHash).toBe('h99'); // the AWAITED block's parentHash (ring[99]), not h100
@@ -761,7 +772,9 @@ test('streamHotBlocks: a 409 whose previousBlocks match NOTHING steps the cursor
   const yielded: any[] = [];
   await expect(
     (async () => {
-      for await (const b of gen) yielded.push(b.header.number);
+      for await (const b of gen) {
+        if (b.kind === 'block') yielded.push(b.header.number);
+      }
     })(),
   ).rejects.toThrow(/fork point is at or below the finalized floor/i);
   expect(yielded).toEqual([101, 102, 103]); // the pre-fork deliveries; nothing accepted past the fork
@@ -824,7 +837,9 @@ test('streamHotBlocks: an OSCILLATING 409 loop (server keeps re-409ing a rewind 
   await expect(
     Promise.race([
       (async () => {
-        for await (const b of gen) yielded.push(b.header.number);
+        for await (const b of gen) {
+          if (b.kind === 'block') yielded.push(b.header.number);
+        }
       })(),
       sentinel,
     ]),
@@ -878,7 +893,9 @@ test('streamHotBlocks: a no-match step-down descending MORE than 10 heights reac
   const yielded: any[] = [];
   await expect(
     (async () => {
-      for await (const b of gen) yielded.push(b.header.number);
+      for await (const b of gen) {
+        if (b.kind === 'block') yielded.push(b.header.number);
+      }
     })(),
   ).rejects.toThrow(/fork point is at or below the finalized floor/i);
   expect(yielded.length).toBe(15); // all pre-fork deliveries 101..115; nothing accepted past the fork
@@ -1299,6 +1316,185 @@ test('portalRealtimeEvents: a hash-carrying finalize ABOVE the local tip is DEFE
   expect(finalizes[0]!.block.hash).toBe('c');
 });
 
+test('portalRealtimeEvents: tick-driven finalize during a 204 stall (RT-1 SC2 T1)', async () => {
+  const enc = new TextEncoder();
+  const block100 = {
+    header: {
+      number: 100,
+      hash: 'h100',
+      parentHash: 'h99',
+      timestamp: 100,
+    },
+    logs: [],
+  };
+  let request = 0;
+  const fetchImpl = (async () => {
+    request += 1;
+    if (request === 1) {
+      const body = new ReadableStream({
+        start(c) {
+          c.enqueue(enc.encode(`${JSON.stringify(block100)}\n`));
+          c.close();
+        },
+      });
+
+      return { status: 200, ok: true, body };
+    }
+
+    return { status: 204, ok: false, body: null };
+  }) as any;
+  let headCalls = 0;
+  const ac = new AbortController();
+  const iter = portalRealtimeEvents({
+    portalUrl: 'http://portal',
+    headers: {},
+    fromBlock: 100,
+    anchor: L(99, 'h99', 'h98'),
+    logs: [],
+    fetchImpl,
+    signal: ac.signal,
+    finalizedHead: async () => {
+      headCalls += 1;
+
+      return headCalls === 1
+        ? { number: 99, hash: 'h99' }
+        : { number: 100, hash: 'h100' };
+    },
+    finalizePollMs: 50,
+  });
+  const events: any[] = [];
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const sentinel = new Promise<never>((_, reject) => {
+    timer = setTimeout(
+      () => reject(new Error('HEARTBEAT-STARVED: finalize never emitted')),
+      2000,
+    );
+  });
+
+  try {
+    const finalize = await Promise.race([
+      (async () => {
+        for await (const e of iter) {
+          events.push(e);
+          if (e.type === 'finalize') return e;
+        }
+
+        throw new Error('HEARTBEAT-STARVED: generator ended before finalize');
+      })(),
+      sentinel,
+    ]);
+    const blocks = events.filter((e) => e.type === 'block');
+    expect(blocks).toHaveLength(1);
+    expect(finalize.block.number).toBe(100);
+  } finally {
+    if (timer !== undefined) clearTimeout(timer);
+    ac.abort();
+  }
+});
+
+test('portalRealtimeEvents: heartbeat ticks keep finalize polling on a 204-only wall-clock cadence (RT-1 SC2 T2)', async () => {
+  const fetchImpl = (async () => ({
+    status: 204,
+    ok: false,
+    body: null,
+  })) as any;
+  const pollTimes: number[] = [];
+  const ac = new AbortController();
+  const events: any[] = [];
+  const iter = portalRealtimeEvents({
+    portalUrl: 'http://portal',
+    headers: {},
+    fromBlock: 100,
+    anchor: L(99, 'h99', 'h98'),
+    logs: [],
+    fetchImpl,
+    signal: ac.signal,
+    finalizedHead: async () => {
+      pollTimes.push(Date.now());
+
+      return { number: 99, hash: 'h99' };
+    },
+    finalizePollMs: 100,
+  });
+  const drain = (async () => {
+    for await (const e of iter) events.push(e);
+  })();
+
+  await sleep(1200);
+  ac.abort();
+  await drain;
+
+  expect(pollTimes.length).toBeGreaterThanOrEqual(5);
+  expect(events).toEqual([]);
+});
+
+test('portalRealtimeEvents: B1 defer fatal fires on wall-clock during no-delivery (RT-1 SC2 T3)', async () => {
+  const enc = new TextEncoder();
+  const block100 = {
+    header: {
+      number: 100,
+      hash: 'h100',
+      parentHash: 'h99',
+      timestamp: 100,
+    },
+    logs: [],
+  };
+  let request = 0;
+  const fetchImpl = (async () => {
+    request += 1;
+    if (request === 1) {
+      const body = new ReadableStream({
+        start(c) {
+          c.enqueue(enc.encode(`${JSON.stringify(block100)}\n`));
+          c.close();
+        },
+      });
+
+      return { status: 200, ok: true, body };
+    }
+
+    return { status: 204, ok: false, body: null };
+  }) as any;
+  const ac = new AbortController();
+  const events: any[] = [];
+  const iter = portalRealtimeEvents({
+    portalUrl: 'http://portal',
+    headers: {},
+    fromBlock: 100,
+    anchor: L(99, 'h99', 'h98'),
+    logs: [],
+    fetchImpl,
+    signal: ac.signal,
+    finalizedHead: async () => ({ number: 105, hash: '0xh105' }),
+    finalizePollMs: 50,
+    finalizeDeferMaxMs: 300,
+  });
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const sentinel = new Promise<never>((_, reject) => {
+    timer = setTimeout(
+      () =>
+        reject(new Error('HEARTBEAT-STARVED: B1 defer watchdog never fired')),
+      2000,
+    );
+  });
+
+  try {
+    await expect(
+      Promise.race([
+        (async () => {
+          for await (const e of iter) events.push(e);
+        })(),
+        sentinel,
+      ]),
+    ).rejects.toThrow(/lagged the hash-carrying finalized head/);
+    const blocks = events.filter((e) => e.type === 'block');
+    expect(blocks).toHaveLength(1);
+  } finally {
+    if (timer !== undefined) clearTimeout(timer);
+    ac.abort();
+  }
+});
+
 // A /stream fetch that lazily yields an UNBOUNDED, strictly-increasing block chain (never 204s), so the
 // window keeps advancing but never catches a finalized head that also keeps climbing above it. Used for the
 // B1 starvation test — the block chain is infinite, so only the watchdog throw terminates the generator.
@@ -1519,7 +1715,7 @@ test('streamHotBlocks: a DROPPABLE tx-field 400 (dataset lacks access_list) degr
     fetchImpl,
     signal: ac.signal,
   });
-  const first = await gen.next(); // NOT a throw — the field is dropped and the retry delivers block 100
+  const first = await nextBlock(gen); // NOT a throw — the field is dropped and the retry delivers block 100
   expect(first.value?.header.number).toBe(100);
   // the first request carried accessList; the retry DROPPED it (kept the other tx fields)
   expect(bodies[0].fields.transaction.accessList).toBe(true);
@@ -1585,7 +1781,7 @@ test('streamHotBlocks: a DROPPABLE BLOCK-field 400 (dataset lacks mix_hash) degr
     fetchImpl,
     signal: ac.signal,
   });
-  const first = await gen.next(); // NOT a throw — the field is dropped and the retry delivers block 100
+  const first = await nextBlock(gen); // NOT a throw — the field is dropped and the retry delivers block 100
   expect(first.value?.header.number).toBe(100);
   // the first request carried mixHash; the retry DROPPED it (kept the required block fields)
   expect(bodies[0].fields.block.mixHash).toBe(true);

@@ -208,6 +208,13 @@ export type PortalRealtimeArgs = {
    * (issue #33)
    */
   diag?: StreamDiag;
+  /** No-data repoll sleep and tick spacing (204 / bodyless-200). Default 500 (legacy timing). */
+  tickSleepMs?: number;
+  /**
+   * Transient-error retry sleep (fetch throw, 429/5xx). Default 1000 (legacy timing); portalRealtimeEvents
+   * may pass a smaller value when finalizePollMs < 2000 to preserve the heartbeat cadence bound.
+   */
+  errorSleepMs?: number;
   signal?: AbortSignal;
   fetchImpl?: typeof fetch;
 };
@@ -232,6 +239,15 @@ export const RING_CAP = 2048;
  */
 export const MAX_CONSECUTIVE_409 = 10;
 
+export type HotBatch = {
+  kind: 'block';
+  header: RawHeader;
+  logs: RawLog[];
+  transactions: RawTx[];
+};
+export type HotTick = { kind: 'tick' };
+export type HotItem = HotBatch | HotTick;
+
 /**
  * Stream fork-aware hot-blocks with `includeAllBlocks` (every header + filtered logs + the matched logs'
  * parent transactions when `txFields` is set). Yields raw Portal batch objects `{ header, logs,
@@ -240,12 +256,10 @@ export const MAX_CONSECUTIVE_409 = 10;
  */
 export async function* streamHotBlocks(
   args: PortalRealtimeArgs,
-): AsyncGenerator<{
-  header: RawHeader;
-  logs: RawLog[];
-  transactions: RawTx[];
-}> {
+): AsyncGenerator<HotItem> {
   const fetchImpl = args.fetchImpl ?? fetch;
+  const tickSleepMs = args.tickSleepMs ?? 500;
+  const errorSleepMs = args.errorSleepMs ?? 1000;
   let cursor = args.fromBlock;
   // Delivered-hash ring: height → last-delivered hash at that height. Its semantics is "what is my
   // parentBlockHash if I resume at h+1" — so `ring.get(cursor − 1)` is sent on EVERY /stream request. It
@@ -398,11 +412,13 @@ export async function* streamHotBlocks(
         signal: args.signal,
       });
     } catch {
-      await sleep(1000, args.signal);
+      yield { kind: 'tick' };
+      await sleep(errorSleepMs, args.signal);
       continue;
     }
     if (res.status === 204) {
-      await sleep(500, args.signal);
+      yield { kind: 'tick' };
+      await sleep(tickSleepMs, args.signal);
       continue;
     } // no hot data yet; re-poll
     // NB: only a 204 short-circuits to a re-poll here. The old guard ALSO re-polled on `!res.body` BEFORE
@@ -501,7 +517,8 @@ export async function* streamHotBlocks(
       }
       // 429/5xx: load — cancel the body so the socket doesn't leak, then retry with backoff.
       void res.body?.cancel().catch(() => {});
-      await sleep(1000, args.signal);
+      yield { kind: 'tick' };
+      await sleep(errorSleepMs, args.signal);
       continue;
     }
     // A 200 means the fork negotiation (if any) resolved — the chain from `cursor` links to our ring. Clear
@@ -510,7 +527,8 @@ export async function* streamHotBlocks(
     // A bodyless 200 (empty OK — "no hot data yet") re-polls, preserving the old `!res.body` semantics but
     // now ONLY on the OK path, after the 409/4xx branches have had their turn. (F1)
     if (!res.body) {
-      await sleep(500, args.signal);
+      yield { kind: 'tick' };
+      await sleep(tickSleepMs, args.signal);
       continue;
     }
     // Snapshot the filter revision at open; if it advances while streaming (a child was discovered), break
@@ -532,6 +550,7 @@ export async function* streamHotBlocks(
           cursor = num + 1; // resume past this block on reconnect
           syncDiag(parentBlockHash, deliveredThisConn);
           yield {
+            kind: 'block',
             header: batch.header,
             logs: batch.logs ?? [],
             transactions: batch.transactions ?? [],
@@ -554,7 +573,10 @@ export async function* streamHotBlocks(
     } catch {
       /* stream cut — reconnect from cursor */
     }
-    if (!reopen) await sleep(200, args.signal); // filter changed ⇒ re-open immediately, no backoff
+    if (!reopen) {
+      yield { kind: 'tick' };
+      await sleep(Math.min(200, tickSleepMs), args.signal);
+    } // filter changed ⇒ re-open immediately, no backoff
   }
 }
 
@@ -693,6 +715,7 @@ export async function* portalRealtimeEvents(
   let anchor = args.anchor;
   let lastFinalizePoll = 0;
   const pollMs = args.finalizePollMs ?? 4000;
+  const half = Math.max(1, Math.floor(pollMs / 2));
   // Wire the /stream fork-negotiation state (issue #33): SEED the delivered-hash ring with the startup
   // anchor so the first request carries its hash, and expose the FINALIZED FLOOR (the anchor's number,
   // advanced on each finalize) so the ring prunes and the 409 rewind bounds correctly. `diag` mirrors the
@@ -713,6 +736,8 @@ export async function* portalRealtimeEvents(
         : args.seedRing,
     getFinalizedFloor: () => anchor?.number ?? args.fromBlock - 1,
     diag,
+    tickSleepMs: Math.min(500, half),
+    errorSleepMs: Math.min(1000, half),
   };
   // B1 defer-streak watchdog: `deferStreakStart` is the Date.now() of the FIRST poll in an unbroken run of
   // hash-unverifiable-finalize deferrals (undefined ⇒ not armed). Set when a poll defers and the streak is
@@ -722,9 +747,85 @@ export async function* portalRealtimeEvents(
   const deferMaxMs = args.finalizeDeferMaxMs ?? 600_000;
   let deferStreakStart: number | undefined;
 
-  for await (const { header, logs, transactions } of streamHotBlocks(
-    streamArgs,
-  )) {
+  // Finalize-poll cadence + B1 defer watchdog, relocated from the inline gate.
+  // The hash-unverifiable defer branch returns because this helper is the final step for each turn.
+  async function* runFinalizeCadence(): AsyncGenerator<PortalRealtimeEvent> {
+    // finalize on a cadence (cheap head probe), not every block
+    const now = Date.now();
+    if (now - lastFinalizePoll >= pollMs) {
+      lastFinalizePoll = now;
+      const fh = await args.finalizedHead().catch(() => undefined);
+      const fhNumber = fh?.number;
+      const fhHash = fh?.hash;
+      // No probe result this poll: the streak of deferrals (if any) is broken — clear it so a later,
+      // hash-unverifiable deferral times its OWN run, not a run interleaved with probe outages. (B1)
+      if (fhNumber === undefined) deferStreakStart = undefined;
+
+      if (fhNumber !== undefined) {
+        const { finalizedTip, remaining } = takeFinalized(
+          unfinalized,
+          fhNumber,
+        );
+        // No block at/below the finalized height yet — nothing to finalize, and not a hash-unverifiable
+        // deferral either. This poll did NOT defer, so clear the streak. (B1)
+        if (!finalizedTip) deferStreakStart = undefined;
+
+        if (finalizedTip) {
+          // Wrong-fork finalize guard: `takeFinalized` splits by NUMBER, so the finalizedTip is only
+          // hash-VERIFIABLE against the probe when it sits at the probe's exact height. Two cases when the
+          // probe carries the canonical hash:
+          //   • finalizedTip.number === fhNumber — our local block at that height must equal the canonical
+          //     hash, else the window is on a fork that lost to a finalized competitor; persisting it as
+          //     finalized would commit wrong-fork data with no rollback event. Fail loud (review B1 keeps
+          //     this).
+          //   • finalizedTip.number  <  fhNumber — the probe references a block ABOVE our local tip, so we
+          //     have NO canonical hash for finalizedTip's height and cannot confirm it descends from the
+          //     canonical finalized block. Finalizing it by number alone would persist a possibly-losing
+          //     fork below finality (the exact hole this guard closes). DEFER: skip this poll and let the
+          //     window catch up to a hash-verifiable boundary (finality is monotonic and live chains reach
+          //     fhNumber within a poll or two, at which point the === case verifies or fatals). (review B1)
+          if (fhHash !== undefined && finalizedTip.number === fhNumber) {
+            if (finalizedTip.hash !== fhHash)
+              throw new Error(
+                `Portal realtime: local block ${finalizedTip.number} (${finalizedTip.hash}) diverges from the canonical finalized block (${fhHash}) — the unfinalized window is on a losing fork at/below finality. Cannot finalize safely; restart to re-sync from the finalized head.`,
+              );
+          } else if (fhHash !== undefined && finalizedTip.number < fhNumber) {
+            // Hash-unverifiable finalize: the canonical head sits ABOVE our window tip, so we cannot
+            // confirm the local finalizedTip descends from it. Deferring is correct for a window that is
+            // merely catching up — but a persistent Portal brownout (delivery below the chain rate) keeps
+            // the head ABOVE the window forever, so EVERY poll defers, the anchor never advances, and
+            // `unfinalized` grows without bound while ponder's finalized checkpoint silently freezes. Bound
+            // the streak: arm it on the first deferral, and if it has run for the whole bound, fail loud —
+            // number-only fallback would reopen the wrong-fork hole this branch exists to close. A restart
+            // re-syncs from the finalized head. (delta review B1)
+            if (deferStreakStart === undefined) deferStreakStart = now;
+            else if (now - deferStreakStart >= deferMaxMs)
+              throw new Error(
+                `Portal realtime: the unfinalized window has lagged the hash-carrying finalized head (${fhNumber}, ${fhHash}) for ${now - deferStreakStart}ms (local tip ${finalizedTip.number}) — /stream delivery is below the chain's finalization rate, so finality cannot be hash-verified and the finalized checkpoint has stopped advancing. Cannot finalize safely; restart to re-sync from the finalized head.`,
+              );
+
+            return; // hash-unverifiable finalize deferred until the window reaches fhNumber
+          }
+          // This poll finalizes (or applies a number-only head) — it did NOT defer, so the streak is
+          // broken; clear it. (B1)
+          deferStreakStart = undefined;
+
+          anchor = finalizedTip; // the reconcile anchor advances with finality
+          unfinalized.length = 0;
+          unfinalized.push(...remaining);
+          yield { type: 'finalize', block: finalizedTip };
+        }
+      }
+    }
+  }
+
+  for await (const item of streamHotBlocks(streamArgs)) {
+    if (item.kind === 'tick') {
+      yield* runFinalizeCadence();
+      continue;
+    }
+
+    const { header, logs, transactions } = item;
     const light = toLight(header);
     const r = reconcile(unfinalized, light, anchor);
     const redelivered =
@@ -803,73 +904,6 @@ export async function* portalRealtimeEvents(
       transactions: syncTxs,
       hasMatchedFilter: syncLogs.length > 0,
     };
-
-    // finalize on a cadence (cheap head probe), not every block
-    const now = Date.now();
-    if (now - lastFinalizePoll >= pollMs) {
-      lastFinalizePoll = now;
-      const fh = await args.finalizedHead().catch(() => undefined);
-      const fhNumber = fh?.number;
-      const fhHash = fh?.hash;
-      // No probe result this poll: the streak of deferrals (if any) is broken — clear it so a later,
-      // hash-unverifiable deferral times its OWN run, not a run interleaved with probe outages. (B1)
-      if (fhNumber === undefined) deferStreakStart = undefined;
-
-      if (fhNumber !== undefined) {
-        const { finalizedTip, remaining } = takeFinalized(
-          unfinalized,
-          fhNumber,
-        );
-        // No block at/below the finalized height yet — nothing to finalize, and not a hash-unverifiable
-        // deferral either. This poll did NOT defer, so clear the streak. (B1)
-        if (!finalizedTip) deferStreakStart = undefined;
-
-        if (finalizedTip) {
-          // Wrong-fork finalize guard: `takeFinalized` splits by NUMBER, so the finalizedTip is only
-          // hash-VERIFIABLE against the probe when it sits at the probe's exact height. Two cases when the
-          // probe carries the canonical hash:
-          //   • finalizedTip.number === fhNumber — our local block at that height must equal the canonical
-          //     hash, else the window is on a fork that lost to a finalized competitor; persisting it as
-          //     finalized would commit wrong-fork data with no rollback event. Fail loud (review B1 keeps
-          //     this).
-          //   • finalizedTip.number  <  fhNumber — the probe references a block ABOVE our local tip, so we
-          //     have NO canonical hash for finalizedTip's height and cannot confirm it descends from the
-          //     canonical finalized block. Finalizing it by number alone would persist a possibly-losing
-          //     fork below finality (the exact hole this guard closes). DEFER: skip this poll and let the
-          //     window catch up to a hash-verifiable boundary (finality is monotonic and live chains reach
-          //     fhNumber within a poll or two, at which point the === case verifies or fatals). (review B1)
-          if (fhHash !== undefined && finalizedTip.number === fhNumber) {
-            if (finalizedTip.hash !== fhHash)
-              throw new Error(
-                `Portal realtime: local block ${finalizedTip.number} (${finalizedTip.hash}) diverges from the canonical finalized block (${fhHash}) — the unfinalized window is on a losing fork at/below finality. Cannot finalize safely; restart to re-sync from the finalized head.`,
-              );
-          } else if (fhHash !== undefined && finalizedTip.number < fhNumber) {
-            // Hash-unverifiable finalize: the canonical head sits ABOVE our window tip, so we cannot
-            // confirm the local finalizedTip descends from it. Deferring is correct for a window that is
-            // merely catching up — but a persistent Portal brownout (delivery below the chain rate) keeps
-            // the head ABOVE the window forever, so EVERY poll defers, the anchor never advances, and
-            // `unfinalized` grows without bound while ponder's finalized checkpoint silently freezes. Bound
-            // the streak: arm it on the first deferral, and if it has run for the whole bound, fail loud —
-            // number-only fallback would reopen the wrong-fork hole this branch exists to close. A restart
-            // re-syncs from the finalized head. (delta review B1)
-            if (deferStreakStart === undefined) deferStreakStart = now;
-            else if (now - deferStreakStart >= deferMaxMs)
-              throw new Error(
-                `Portal realtime: the unfinalized window has lagged the hash-carrying finalized head (${fhNumber}, ${fhHash}) for ${now - deferStreakStart}ms (local tip ${finalizedTip.number}) — /stream delivery is below the chain's finalization rate, so finality cannot be hash-verified and the finalized checkpoint has stopped advancing. Cannot finalize safely; restart to re-sync from the finalized head.`,
-              );
-
-            continue; // hash-unverifiable finalize deferred until the window reaches fhNumber
-          }
-          // This poll finalizes (or applies a number-only head) — it did NOT defer, so the streak is
-          // broken; clear it. (B1)
-          deferStreakStart = undefined;
-
-          anchor = finalizedTip; // the reconcile anchor advances with finality
-          unfinalized.length = 0;
-          unfinalized.push(...remaining);
-          yield { type: 'finalize', block: finalizedTip };
-        }
-      }
-    }
+    yield* runFinalizeCadence();
   }
 }
