@@ -909,30 +909,45 @@ export async function* portalRealtimeEvents(
   let deferStreakStart: number | undefined;
 
   // Delivery-progress watchdog (RT-G10, INV-24). PROGRESS-CONDITIONED: fatal ONLY when the probed finalized
-  // head has advanced ≥ `deliveryProgressThreshold` blocks past the head observed at the last delivery WHILE
+  // head has advanced ≥ `deliveryProgressThreshold` blocks past the HIGHEST DELIVERED block number WHILE
   // ZERO blocks were delivered for ≥ `deliveryProgressMaxMs`. It bounds the no-delivery case B1 does not:
   // B1 fires when the window DELIVERS but the finalized head sits above it hash-unverifiably; this fires when
   // NOTHING is delivered at all (204/bodyless-200/reconnect churn, or the silent E1 fetch-error retry loop)
-  // yet the chain is provably ALIVE because its finalized head keeps climbing. A quiet/halted chain (head
-  // static, or advancing by < threshold) NEVER trips it — that is normal idling, parity with RPC realtime.
+  // yet the chain is provably ALIVE because it has FINALIZED blocks ABOVE everything we delivered. A
+  // quiet/halted chain (finality static, or ≤ threshold past the delivered tip) NEVER trips it — normal
+  // idling, parity with RPC realtime.
+  //   • WHY DELIVERED HEIGHT, NOT FINALIZED-HEAD-AT-DELIVERY (RT-G10 correctness fix): the /stream delivers
+  //     UNFINALIZED tip blocks that run FAR AHEAD of the finalized head (steady state: delivered tip 500,
+  //     finalized head 100). The old baseline was the finalized head observed AT the last delivery, so a
+  //     chain-TIP freeze (an L2 sequencer pause — nothing NEW to deliver) while FINALITY merely caught up
+  //     its backlog over blocks 100→116 that were ALREADY delivered read as a ≥-threshold advance with zero
+  //     deliveries and FALSE-FATAL'd — it used FINALITY progress as a proxy for NEW-BLOCK production, and the
+  //     two diverge on a tip-freeze. Baselining on the highest DELIVERED block makes `finalized ≤ delivered ⇒
+  //     no trip` hold BY CONSTRUCTION (finality catching up over delivered blocks can never trip), while a
+  //     genuine post-delivery stall — finality climbing ≥ threshold BEYOND the highest delivered block,
+  //     provably new blocks we are not delivering — still fatals.
   //   • `lastDeliveryMs` is stamped Date.now() on every delivered block AND INITIALIZED to loop entry (not
   //     0/epoch): a fresh start that begins INTO an ongoing outage — zero deliveries ever — must arm the
   //     bound from process start, exactly as the first delivery would have; epoch-0 would make the very first
   //     poll's `now - lastDeliveryMs` astronomically exceed any bound and false-fatal a healthy startup.
-  //   • `lastDeliveryHead` is the probed head observed AT the last delivery — the baseline the advance is
-  //     measured against. Undefined until the first probe: with no head ever observed there is no advance to
-  //     measure, so the first successful poll ADOPTS its head as the baseline WITHOUT resetting the clock
-  //     (the clock already armed at loop entry, preserving the outage-from-start guarantee).
-  //   • `lastProbedHead` tracks the most recent successful probe so a delivery can stamp its baseline from
-  //     the head the poll cadence already fetched — the block arm never probes (ticks must not touch the
-  //     network or the window; the tick is the clock, wall time is the data).
+  //   • `deliveryBaseline` is `max(first-observed finalized head, highest delivered block number)` — the
+  //     block height the advance is measured against. Undefined until the first probe: with no height ever
+  //     observed there is nothing to measure against, so the first successful poll ADOPTS its finalized head
+  //     as the baseline WITHOUT resetting the clock (already armed at loop entry — preserving the
+  //     outage-from-start guarantee). Adopting the FIRST PROBED HEAD (not the resume anchor) is deliberate: a
+  //     process that RESUMES after downtime sees a finalized head already far above its anchor and must be
+  //     allowed to backfill that pre-existing deficit for the whole bound without a false fatal — the anchor
+  //     as baseline would fatal a legitimately-catching-up resume. Every delivery then RAISES the baseline to
+  //     its own block number, never LOWERS it (a resume that adopts a high head then delivers lower catch-up
+  //     blocks must not regress the baseline below the head), so the trip only ever measures finality's climb
+  //     PAST the furthest thing we have delivered or provably know finalized. The block arm never probes
+  //     (ticks must not touch the network or the window; the tick is the clock, wall time is the data).
   // Fatal = a loud throw with the same diagDump + "restart" tail as the gap/B1 fatals; NEVER an RPC fallback
   // (ruling Q2: a watchdog fatal-restarts, it never silently switches transport). (RT-1 SC3)
   const deliveryProgressMaxMs = args.deliveryProgressMaxMs ?? 600_000;
   const deliveryProgressThreshold = args.deliveryProgressThreshold ?? 16;
   let lastDeliveryMs = Date.now();
-  let lastDeliveryHead: number | undefined;
-  let lastProbedHead: number | undefined;
+  let deliveryBaseline: number | undefined;
 
   // Finalize-poll cadence + B1 defer watchdog, relocated from the inline gate.
   // The hash-unverifiable defer branch returns because this helper is the final step for each turn.
@@ -951,23 +966,22 @@ export async function* portalRealtimeEvents(
       // Delivery-progress watchdog (RT-G10, INV-24): evaluate on the head THIS poll already probed — no
       // extra probe, no window touch. A failed probe (fhNumber undefined) carries no head signal, so it can
       // neither advance the baseline nor trip the watchdog; skip it. Otherwise:
-      //   • record the head this poll saw (a delivery stamps its baseline from it), and
-      //   • if a baseline head was ever observed, fatal when the head has climbed ≥ threshold past it WHILE
-      //     zero blocks were delivered for the whole bound — head advancing + delivery flatlined = the chain
-      //     is alive but the /stream is starving us. Loud restart, never a silent transport switch (Q2).
+      //   • if a baseline was ever established, fatal when the finalized head has climbed ≥ threshold PAST the
+      //     highest DELIVERED block (the baseline) WHILE zero blocks were delivered for the whole bound —
+      //     finality provably above everything we delivered + delivery flatlined = the chain has NEW blocks
+      //     the /stream is starving us of. Loud restart, never a silent transport switch (Q2). Finality
+      //     merely catching up OVER already-delivered blocks (finalized ≤ delivered) can never trip.
       //   • first observed head with no prior baseline: adopt it as the baseline without touching the clock
       //     (already armed at loop entry), so an outage from process start still times from start.
       if (fhNumber !== undefined) {
-        lastProbedHead = fhNumber;
-
-        if (lastDeliveryHead === undefined) {
-          lastDeliveryHead = fhNumber;
+        if (deliveryBaseline === undefined) {
+          deliveryBaseline = fhNumber;
         } else if (
-          fhNumber - lastDeliveryHead >= deliveryProgressThreshold &&
+          fhNumber - deliveryBaseline >= deliveryProgressThreshold &&
           now - lastDeliveryMs >= deliveryProgressMaxMs
         ) {
           throw new Error(
-            `Portal realtime: the finalized head advanced ${fhNumber - lastDeliveryHead} blocks (${lastDeliveryHead}→${fhNumber}) while /stream delivered ZERO blocks for ${now - lastDeliveryMs}ms — the chain is live but the stream is not delivering (endless 204s/reconnects or a transient-error retry loop), so indexing has silently stalled. ${diagDump(diag)} Restart to re-sync from the finalized head.`,
+            `Portal realtime: the finalized head advanced to ${fhNumber}, ${fhNumber - deliveryBaseline} blocks PAST the highest delivered block ${deliveryBaseline}, while /stream delivered ZERO blocks for ${now - lastDeliveryMs}ms — the chain has finalized blocks the stream never delivered (endless 204s/reconnects or a transient-error retry loop), so indexing has silently stalled. ${diagDump(diag)} Restart to re-sync from the finalized head.`,
           );
         }
       }
@@ -1110,12 +1124,14 @@ export async function* portalRealtimeEvents(
     }
     // Delivery-progress watchdog stamp (RT-G10, INV-24): this is the ONE point a real block is delivered
     // (a skipped `duplicate && !redelivered` returned above; a `gap` threw). Re-baseline the no-delivery
-    // clock to now, and the head-advance baseline to the head the poll cadence last saw (`lastProbedHead`)
-    // — so the NEXT stall measures its head climb against this delivery's head, not a stale one. A delivery
-    // before any poll has run leaves `lastDeliveryHead` at the first poll's adopted value (equivalent). No
-    // probe here — the block arm never touches the network or the window. (RT-1 SC3)
+    // clock to now, and RAISE the delivered-height baseline to THIS block's number — so the NEXT stall
+    // measures finality's climb against the furthest block we have actually delivered, never below it. Use a
+    // max (never lower): a resume that adopted a high first-probed finalized head then delivers lower
+    // catch-up blocks must not regress the baseline beneath that head. A delivery before any poll has run
+    // leaves `deliveryBaseline` undefined here and adopts `light.number` directly. No probe — the block arm
+    // never touches the network or the window. (RT-1 SC3)
     lastDeliveryMs = Date.now();
-    lastDeliveryHead = lastProbedHead;
+    deliveryBaseline = Math.max(deliveryBaseline ?? light.number, light.number);
     yield {
       type: 'block',
       block,

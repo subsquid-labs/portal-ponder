@@ -2279,7 +2279,7 @@ test('portalRealtimeEvents: the finalized head advancing while ZERO blocks are d
 test('portalRealtimeEvents: a QUIET chain (head STATIC) with zero delivery NEVER trips the watchdog — it is progress-conditioned, not a plain idle timeout (RT-1 SC3 T2)', async () => {
   // The head-static case is the whole point of PROGRESS-conditioning: an RPC-realtime-parity quiet chain
   // idles indefinitely without producing blocks, and that must NEVER be a fatal. The clock runs FAR past the
-  // bound but the head never moves, so `fhNumber - lastDeliveryHead` stays 0 (< threshold) and the watchdog
+  // bound but the head never moves, so `fhNumber - deliveryBaseline` stays 0 (< threshold) and the watchdog
   // holds its fire. A bounded poll count proves it TERMINATES cleanly (drained, no throw), not spins.
   let clock = 4_000_000;
   vi.spyOn(Date, 'now').mockImplementation(() => clock);
@@ -2350,6 +2350,127 @@ test('portalRealtimeEvents: a SINGLE-block finality lag (head advances by 1, bel
   for await (const e of iter) events.push(e);
   expect(events.filter((e) => e.type === 'block')).toHaveLength(1);
   expect(polls).toBeGreaterThanOrEqual(40);
+});
+
+test('portalRealtimeEvents: FINALITY catching up over ALREADY-DELIVERED blocks (finalized head ≤ highest delivered) must NOT trip the watchdog — the trip baselines on delivered height, not finalized-head-at-delivery (RT-1 SC3 T4 / RT-G10)', async () => {
+  // Steady-state realtime delivers UNFINALIZED tip blocks that run FAR ahead of the finalized head: here the
+  // /stream delivers block 500 while the Portal's finalized head is only 100. The false-fatal this pins: the
+  // chain TIP then pauses (an L2 sequencer freeze — nothing NEW to deliver) for longer than the bound while
+  // FINALITY merely catches up its backlog over blocks 100→120 that were ALREADY delivered. Zero new
+  // deliveries + a finalized head climbing ≥ threshold — but ONLY over blocks we already delivered (finalized
+  // 120 ≪ delivered tip 500). The stream delivered everything the chain has; there is nothing to deliver.
+  //
+  // The correct baseline is the highest DELIVERED block number (500). While `finalizedHead ≤ deliveredTip` the
+  // advance-past-delivered is ≤ 0 (< threshold) → the watchdog must HOLD its fire, even as finality advances
+  // ≥ threshold and the clock races far past the bound. On the OLD code, which baselined on the finalized head
+  // observed AT delivery (~100), 100→120 read as a ≥-threshold advance and FALSE-FATAL'd. Sentinel:
+  // FINALITY-CATCHUP-FALSE-FATAL — if this test throws the PROGRESS-WATCHDOG fatal, the false-fatal is live.
+  let clock = 6_000_000;
+  vi.spyOn(Date, 'now').mockImplementation(() => clock);
+  // Delivered tip (500) is ~400 blocks ABOVE the finalized head (100) — the realtime steady state.
+  const block500 = {
+    header: { number: 500, hash: 'h500', parentHash: 'h499', timestamp: 500 },
+    logs: [],
+  };
+  let headNumber = 100; // finalized head starts FAR BELOW the delivered tip 500…
+  let polls = 0;
+  const ac = new AbortController();
+  const iter = portalRealtimeEvents({
+    portalUrl: 'http://portal',
+    headers: {},
+    fromBlock: 500,
+    anchor: L(499, 'h499', 'h498'), // block 500 appends onto the finalized anchor 499
+    logs: [],
+    fetchImpl: oneBlockThen204(block500, () => {}),
+    signal: ac.signal,
+    finalizedHead: async () => {
+      clock += 1000; // race FAR past the 100ms bound (many times over)
+      polls += 1;
+      // Finality catches up over ALREADY-DELIVERED blocks: 100→120, a ≥5 advance, but every one of those
+      // blocks (≤ 120) sits well below the delivered tip 500 — nothing NEW is unshipped.
+      if (headNumber < 120) headNumber += 5;
+      if (polls >= 40) ac.abort(); // a bounded, throw-FREE run ends the test by aborting
+
+      return { number: headNumber }; // number-only head → B1 hash-defer path unreachable, isolates SC3
+    },
+    finalizePollMs: 0,
+    deliveryProgressMaxMs: 100, // tiny bound — deliberately crossed dozens of times
+    deliveryProgressThreshold: 5, // finality climbs 100→120 = 20 ≥ 5: a ≥-threshold FINALITY advance…
+    finalizeDeferMaxMs: 10_000, // large: prove B1 is not what fires
+  });
+  const events: any[] = [];
+  // Must DRAIN to completion (abort) with NO fatal — finality catching up over delivered blocks is not a stall.
+  for await (const e of iter) events.push(e);
+  expect(events.filter((e) => e.type === 'block')).toHaveLength(1); // block 500 delivered, then 204 forever
+  expect(polls).toBeGreaterThanOrEqual(40); // the clock + finality really did run past the bound many times
+  expect(headNumber).toBeGreaterThanOrEqual(120); // finality advanced ≥ threshold — yet no false-fatal
+});
+
+test('portalRealtimeEvents: a GENUINE post-delivery stall — finalized head climbs ≥ threshold BEYOND the highest delivered block while ZERO blocks are delivered — STILL fatals (RT-1 SC3 T5 / RT-G10)', async () => {
+  // The must-still-fire half: after delivering block 500, the chain keeps FINALIZING blocks ABOVE 500 (516,
+  // 520, …) that /stream never hands us — genuinely new blocks the chain has and we are not delivering. The
+  // finalized head advances ≥ threshold PAST the highest delivered block (500) while zero deliveries occur for
+  // the whole bound → the watchdog MUST throw its loud fatal. This is the corrected trip: baselined on the
+  // delivered height (500), the advance-past-delivered reaches the threshold only once finality overtakes 500.
+  let clock = 7_000_000;
+  vi.spyOn(Date, 'now').mockImplementation(() => clock);
+  const block500 = {
+    header: { number: 500, hash: 'h500', parentHash: 'h499', timestamp: 500 },
+    logs: [],
+  };
+  let headNumber = 500; // finality starts AT the delivered tip, then climbs strictly above it
+  const ac = new AbortController();
+  const iter = portalRealtimeEvents({
+    portalUrl: 'http://portal',
+    headers: {},
+    fromBlock: 500,
+    anchor: L(499, 'h499', 'h498'),
+    logs: [],
+    fetchImpl: oneBlockThen204(block500, () => {}),
+    signal: ac.signal,
+    finalizedHead: async () => {
+      clock += 50; // advance the no-delivery clock per poll
+      headNumber += 5; // finality climbs PAST the delivered tip 500 → crosses the threshold beyond delivered
+      return { number: headNumber }; // number-only head → never a B1 defer
+    },
+    finalizePollMs: 0,
+    deliveryProgressMaxMs: 100,
+    deliveryProgressThreshold: 5,
+    finalizeDeferMaxMs: 10_000, // large: prove B1 is not what fires
+  });
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const sentinel = new Promise<never>((_, reject) => {
+    timer = setTimeout(
+      () =>
+        reject(
+          new Error('PROGRESS-WATCHDOG-STARVED: delivery watchdog never fired'),
+        ),
+      2000,
+    );
+  });
+  const events: any[] = [];
+  try {
+    await expect(
+      Promise.race([
+        (async () => {
+          let seen = 0;
+          for await (const e of iter) {
+            events.push(e);
+            seen += 1;
+            if (seen > 5000)
+              throw new Error(
+                'NEVER-THROWN: a genuine post-delivery stall was not bounded (regression)',
+              );
+          }
+        })(),
+        sentinel,
+      ]),
+    ).rejects.toThrow(/delivered ZERO blocks for/i);
+    expect(events.filter((e) => e.type === 'block')).toHaveLength(1);
+  } finally {
+    if (timer !== undefined) clearTimeout(timer);
+    ac.abort();
+  }
 });
 
 test('streamHotBlocks: a transient /stream fetch throw invokes onFetchError (the E1 non-delivery seam) and yields a tick, not a block (RT-1 SC3)', async () => {
