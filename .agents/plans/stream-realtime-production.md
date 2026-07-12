@@ -37,7 +37,7 @@ and nowhere else; it is gated on the complete dossier, not on judgment.
 | RG0 | Ground truth ratified | This plan merged; RT-G13 (cutover floor) verified true-bug-or-not with a written verdict |
 | RG1 | Must-fix code landed | RT-1/RT-2/RT-3 merged: mutation-verified tests, committee review, both-version gates green |
 | RG2 | Fail-loud audit complete | Fatal-injection suite + silent-gap fuzzer green in CI; no enumerated silent path survives |
-| RG3 | Realtime chaos passed | ≥200 kills across ≥6 timing classes, 100 % clean resumes, byte-identical digests |
+| RG3 | Realtime chaos passed | ≥200 kills across ≥6 timing classes, 100 % clean resumes, byte-identical digests. **MET (Phase A, [#158](../../pull/158))** — 238 kills / 7 timing-class sub-runs, 238/238 clean, byte-identical, 0 dup FINALIZED; K6-cutover + K2-spread non-vacuity self-certified. Numbers + candid mock-fidelity caveats in VALIDATION §5.11. |
 | RG4 | Multichain stream soak passed | ≥72 h multi-chain stream soak (incl. one fast chain + omnichain), crash drills clean, parity clean |
 | RG5 | A/B soak evidence complete | 7-day single-chain A/B soak done + ≥72 h re-soak on the patched build, zero unexplained diffs |
 | RG6 | Dossier & label flip | VALIDATION §5.8 rewritten, INVARIANTS rows landed, README label flipped in the dossier PR |

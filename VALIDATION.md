@@ -1693,6 +1693,93 @@ End-to-end verification grounded the fix at scale. Across all 12 preserved Porta
 
 **Upstream observation.** None. Unlike §5.9 (where ponder's RPC cascade attributes an error geth's own callTracer does not), the root-frame gas difference is purely a Parity-vs-geth representation convention with no attribution question — geth `callTracer` and the RPC store agree, and the fork matches them for parity.
 
+### 5.11 Realtime chaos — crash-timing safety (RG3 Phase A, mock-driven)
+
+The stream-realtime campaign (its plan lives alongside this document under `.agents/plans/`) gates a
+`PORTAL_REALTIME=stream` production label on a six-gate dossier; **RG3** is its realtime chaos gate:
+*≥200 kills across ≥6 timing classes, 100 % clean resumes, byte-identical digests*. This subsection
+records the **RG3 Phase-A** result and — as with every claim in this document — states plainly what it
+does and does **not** prove. It is deliberately scoped and self-contained: the full §5.8 rewrite that
+folds RG3–RG5 into a single reorg/finality dossier is a later (RG6) task, not this one.
+
+**What RG3 Phase A is.** A `SIGKILL` crash-timing suite (harness [#158](../../pull/158), under
+`harness/chaos/realtime/`) that drives the *actual* stream-mode indexer (`portal/portal-realtime.ts`
+via a Ponder app) against a **deterministic mock Portal**: scripted `/stream` NDJSON with forks, 409
+fork-negotiations, 204 idle phases, redelivery re-serves, and a `/finalized-head` script. A
+**phase-aware kill controller** reads "phase reached" markers the mock exposes, so kills land
+deterministically in the intended state rather than by sleep-guessing. After each kill the process is
+restarted and the resumed store is digested and compared, whole-cluster, against the digest of an
+**unkilled baseline** for that class. This exercises the Portal fork's own realtime code end-to-end
+against **scripted Portal semantics** — it is evidence for **crash-timing safety**, on the same
+`SIGKILL`-atomicity axis as Layer C (§4) but on the realtime path, and must not be conflated with
+live-protocol reorg/finalize fidelity (see the boundary below).
+
+**The six timing classes.** K1 mid-append (normal 200 flow) · K2 mid-stream at a varying interior
+block · K3 during the redelivery await · K4 during a finalize-defer streak · K5 at a fork/409
+cutover-handler entry (a 409 variant + a wrong-fork variant) · K6 at the historical→realtime cutover.
+Per-class mock fidelity is recorded candidly in the harness and reproduced here — HIGH for K1/K2/K4
+(direct 200/reorg/defer flows), MEDIUM for K3/K5 (redelivery / fork-handler reachability), and
+**MEDIUM–LOW for K6** (a scripted, not organic, cutover).
+
+**Result (Phase A, from the operator's evidence archive — verbatim).**
+
+| Metric | Value |
+|--------|-------|
+| Kills, total | **238** (7 sub-runs × 34: K1/main, K2/main, K3/main, K4/main, K5/409, K5/wrongfork, K6/cutover) |
+| Timing classes | **7** sub-runs across the 6 classes (≥6 required) |
+| Clean resumes | **238 / 238** (0 non-ok status) |
+| Store↔app digest match | **238 / 238** byte-identical (0 mismatch) |
+| Duplicate FINALIZED rows | **0** (204 finalized rows scanned across K2–K5 — the dup check is load-bearing, not vacuous) |
+
+All three RG3 numeric thresholds are met: **238 ≥ 200** kills across **7 ≥ 6** timing classes,
+**100 %** clean resumes, and every resumed cluster **byte-identical** to its unkilled baseline with
+**zero** double-indexed finalized rows.
+
+**The K6 cutover fix is proven non-vacuous.** An adversarial review of the harness caught that the
+original K6 "cutover" kill landed on the **first `/finalized-head` startup probe**, before any live
+`/stream` block was served — so it re-exercised startup, not a cutover, and was vacuous. After the fix
+(the `killAt` gate moved into the served-block step), all **34** K6 kills recorded
+`killStats.stream == 1` (min 1, only value 1): each kill lands after block ≥106 has streamed, i.e. on a
+**real** backfill→live cutover, not a startup restart. **K2 non-vacuity** is likewise recorded: the
+kill-at-block varied across **8 distinct interior blocks** {103,104,105,106,107,108,109,110},
+recovered empirically from the kill phase log rather than trusted from the environment. Both properties
+are now **self-certified in the harness**: the `accepted` conjunction includes `k6CutoverNonVacuousOk`
+(every K6 kill after ≥1 live/stream block) and `k2KillSpreadOk` (≥3 distinct interior kill blocks),
+each mutation-verified load-bearing — a regression that makes K6 vacuous again or pins K2 to a single
+block flips `accepted:false` rather than silently passing on a byte-identical resume.
+
+**Mock-fidelity caveats (candor is the product).** These bound the claim precisely and are stated, not
+hidden:
+
+- **The harness is mock-driven against *scripted* Portal semantics.** It proves crash-**timing**
+  safety — a `SIGKILL` at any point in the ingest / finalize / cutover loop resumes byte-identical —
+  **NOT** live-protocol reorg/finalize semantics. Those are **RG4/RG5's** job (live Portal + a
+  multichain stream soak), not RG3's.
+- **K5 exercises mock-side *reachability* of the cutover-handler entries** — a 409 variant and a
+  wrong-fork/"losing fork" variant — **not** a real client fork-choice splice. The wrong-fork
+  finalized head the mock injects is not consumed by the client within the scenario window (the
+  finalize-poll cadence is longer than the post-injection window), so the wrong-fork counter is a
+  **handler-reachability** count, not clean-resume wrong-fork evidence. The real client-side
+  wrong-fork-finalize FATAL guard is proven deterministically by the `portal-realtime.test.ts` unit
+  test *"a finalize whose canonical hash mismatches the local block is FATAL"* (§5.8(B)), not by K5.
+- **K6 is a MEDIUM–LOW-fidelity mock cutover.** It proves the *fix* — kills now land on a stream-phase
+  cutover (after a block has actually streamed) rather than vacuously on startup — but the cutover
+  semantics are **scripted, not organic**.
+- **The harness `invariant()` fast-path is a fatal-string tripwire, not the primary death detector.**
+  It grep-matches all seven real fatal throws in `portal/portal-realtime.ts` (the gap fatal, the
+  below-floor 409 fatal, the 409 no-progress cap, the deterministic-4xx fatal, the unknown-parent
+  reconcile fatal, and the two finalize fatals), but a real client **process death** fails the run
+  regardless of the tripwire — the tripwire is an early-exit convenience, not the safety net.
+
+**What this does NOT prove → RG4/RG5.** RG3 Phase A is crash-timing safety against a scripted mock. It
+does **not** establish live-protocol reorg survival, live finalize-boundary reconciliation, multichain
+ordering, or long-run availability — those are **RG4** (≥72 h multichain stream soak with live crash
+drills) and **RG5** (the A/B soak evidence, §5.8(C)). Read this subsection as exactly what it is: the
+realtime stream path resumes **byte-identical** after a `SIGKILL` at each of the exercised crash points
+(the K1–K6 timing classes) spanning its mock-driven ingest/finalize/cutover loop, which is the
+crash-timing half of the recoverability property (§1 of the
+campaign plan) — no more, and stated as no more.
+
 ---
 
 ## 6. Current status — what a reader can rely on today
