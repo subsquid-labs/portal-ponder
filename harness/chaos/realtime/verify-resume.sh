@@ -150,7 +150,7 @@ if [ -n "$dupes" ] && [ -n "$finalized_hi" ] && [ "$finalized_hi" != "-1" ]; the
     scanned="$(
       "$PSQL" -Atqc "
 select count(*)
-  from \"$APP_SCHEMA\".$table
+  from \"$APP_SCHEMA\".\"$table\"
  where block_number <= $finalized_hi;
 " "$CONN" 2>/dev/null
     )"
@@ -158,7 +158,7 @@ select count(*)
     rows="$(
       "$PSQL" -Atqc "
 select '$table', block_number, log_index, count(*)
-  from \"$APP_SCHEMA\".$table
+  from \"$APP_SCHEMA\".\"$table\"
  where block_number <= $finalized_hi
  group by block_number, log_index
 having count(*) > 1;

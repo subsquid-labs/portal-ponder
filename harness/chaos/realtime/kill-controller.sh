@@ -105,7 +105,7 @@ wait_phase () {
   return 1
 }
 
-completed () { grep -qiE 'Completed indexing across' "$1" 2>/dev/null; }
+completed () { grep -qiE 'Completed indexing across all chains' "$1" 2>/dev/null; }
 completed_live () { grep -qiE 'Completed live indexing' "$1" 2>/dev/null; }
 invariant () { grep -qiE 'InvariantViolation' "$1" 2>/dev/null; }
 

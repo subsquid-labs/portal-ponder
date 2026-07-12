@@ -117,7 +117,7 @@ wait_phase () {
 }
 
 completed () { grep -qiE 'Completed indexing across all chains' "$1" 2>/dev/null; }
-invariant () { grep -qiE 'InvariantViolation|wrong-fork|wrong fork|gap fatal|unknown parent|Cannot reconcile safely' "$1" 2>/dev/null; }
+invariant () { grep -qiE 'InvariantViolation|losing fork|gap fatal|unknown parent|Cannot reconcile safely' "$1" 2>/dev/null; }
 
 wait_complete () {
   local pid="$1"
