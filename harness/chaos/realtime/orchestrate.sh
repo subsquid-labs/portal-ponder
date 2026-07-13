@@ -511,7 +511,7 @@ const candor = {
   K4: 'idle / 204 retry path',
   K5: "synthetic fork via stale-parentBlockHash 409 (client consumes the canonical replacement chain and resumes byte-identically) PLUS a wrong-fork-finalize handler-REACHABILITY probe. handlerStats.wrongForkFinalizes counts mock-side handler entries (reachability) ONLY — the counter increments on handler entry, before the gate, so on a killed run the splice may not even execute; the injected wrong finalized head is NOT consumed by the client here (finalize poll cadence ~4s > the post-injection scenario window ~1.8s), so this is not clean-resume wrong-fork evidence. The client-side wrong-fork-finalize FATAL guard (hash-mismatch at finality) is proven deterministically by portal-realtime.test.ts ('a finalize whose canonical hash mismatches the local block is FATAL', finalizePollMs:0). Real L1-reorg wire fidelity NOT exercised.",
   K6: "kill lands at the backfill→live chunk boundary (cutoverGate fires on the client's natural fromBlock=106 request, not a fixed block), so resume re-drives an organic cutover within the mock's deterministic capability. Probe-retry wire fidelity (the 3-attempt loop in clampFinalizedToPortalHead) NOT exercised — mock's /finalized-head succeeds first try; probe-retry fidelity rests on portal-realtime-wire.test.ts.",
-  K7: 'K7: kill lands mid rollback-apply (client sees parent mismatch at block 104 and must roll back to 103 before applying the rollback branch). Mock-driven: the rollback is scripted, not a live L1 reorg. Live reorg-during-rollback fidelity is RG4/RG5.',
+  K7: "kill lands mid rollback-apply: after 101..106 on main, the client resumes at fromBlock=107/parent=106:main, the mock serves a reorg branch forking at block 104 (104:rollback carries parent 103:main, in-window above the <=102 finalized anchor), so reconcile -> {kind:'reorg'} rolls back 104..106:main and re-applies the rollback branch 104..112 (extended to PONDER_END so the app completes); the SIGKILL fires at block 105, AFTER the rollback event and the first apply, mid re-apply. The fork point is strictly ABOVE the finalized anchor (<=102) so this is an ACCEPTED reorg, never the below-floor gap fatal. reorgApplied counts the mock actually serving the cross-branch fork block, so a scenario that degraded to a plain append cannot self-report a K7 pass. Mock-driven crash-timing coverage of INV-10's rollback arm (same product code path from portal-realtime.ts:1105 as K5-409's accepted reorg). What is NOT proven here: live-protocol fork-choice fidelity — a real Portal 409/reorg with competing finalized sources and real parentHash chains — remains RG4/RG5.",
 };
 const lines = fs.existsSync(process.env.RECORDS)
   ? fs.readFileSync(process.env.RECORDS, 'utf8').trim().split(/\n+/).filter(Boolean)
@@ -534,6 +534,7 @@ for (const klass of classes) {
     acc.wrongForkFinalizes += Number(s.wrongForkFinalizes ?? 0);
     acc.wrongForkFinalizeConsumed += Number(s.wrongForkFinalizeConsumed ?? 0);
     acc.wrongForkFinalizeRejected += Number(s.wrongForkFinalizeRejected ?? 0);
+    acc.reorgApplied += Number(s.reorgApplied ?? 0);
     return acc;
   }, {
     r204: 0,
@@ -544,6 +545,7 @@ for (const klass of classes) {
     wrongForkFinalizes: 0,
     wrongForkFinalizeConsumed: 0,
     wrongForkFinalizeRejected: 0,
+    reorgApplied: 0,
   });
   // Distinct empirical kill blocks (from each run's kill.phase.log) — proves K2's varied mid-stream
   // coverage rather than one repeated fixed block. `killBlocksRecorded` keeps every row's non-null
@@ -556,6 +558,11 @@ for (const klass of classes) {
   const killsWithLiveStream = rows.filter((r) => Number(r.killStats?.stream ?? 0) > 0).length;
   const wrongForkRows = ok.filter((r) => r.variant === 'wrongfork');
   const wrongForkConsumedRuns = wrongForkRows.filter((r) => Number(r.stats?.wrongForkFinalizeConsumed ?? 0) > 0).length;
+  // K7 non-vacuity: count ok runs whose FINAL mock stats recorded the reorg branch actually served
+  // (reorgApplied > 0) on the resumed run. A scenario that silently degraded to a plain append (fork
+  // point drifting to the tip) never increments the mock-side counter, so a vacuous K7 pass cannot
+  // self-report reorgAppliedRuns === killCount.
+  const reorgAppliedRuns = ok.filter((r) => Number(r.stats?.reorgApplied ?? 0) > 0).length;
   perClass[klass] = {
     scenarios: [...new Set(rows.map((r) => r.scenario).filter(Boolean))],
     variantLabels: [...new Set(rows.map((r) => r.variant).filter(Boolean))].join(', '),
@@ -565,6 +572,7 @@ for (const klass of classes) {
     killsWithLiveStream,
     wrongForkRunCount: wrongForkRows.length,
     wrongForkConsumedRuns,
+    reorgAppliedRuns,
     cleanResumeCount: ok.length,
     digestMatchCount: digestMatch.length,
     duplicateFinalizedRows: dupCount,
@@ -615,12 +623,23 @@ const acceptance = {
     && perClass.K6.killsWithLiveStream === perClass.K6.killCount),
   k2KillSpreadOk: !hasClass('K2') || perClass.K2.killBlocks.length >= 3,
   // Left `undefined` (not `true`) when K7 is absent so the guards below skip it entirely — a class
-  // that never ran must not self-report a vacuous "non-vacuous: true" pass in RESULT.md.
+  // that never ran must not self-report a vacuous "non-vacuous: true" pass in RESULT.md. When present,
+  // mirror k6CutoverOrganicOk's non-vacuity self-cert so a scenario that silently degraded to a plain
+  // append (fork point drifting to the tip, so the kill never lands mid-rollback-apply) cannot report
+  // a byte-identical pass: every K7 kill must have seen a live /stream request before the kill
+  // (killsWithLiveStream), the empirical kill-block set must be exactly {105} (the mid-apply block),
+  // and every ok run's FINAL mock stats must record the reorg branch actually served
+  // (reorgAppliedRuns === killCount) — the mock-side reachability floor for the load-bearing splice.
   k7RollbackNonVacuousOk: !hasClass('K7')
     ? undefined
     : (perClass.K7.killCount > 0
       && perClass.K7.cleanResumeCount === perClass.K7.killCount
-      && perClass.K7.digestMatchCount === perClass.K7.killCount),
+      && perClass.K7.digestMatchCount === perClass.K7.killCount
+      && perClass.K7.killsWithLiveStream === perClass.K7.killCount
+      && perClass.K7.killBlocksRecordedCount === perClass.K7.killCount
+      && perClass.K7.killBlocks.length === 1
+      && perClass.K7.killBlocks[0] === 105
+      && perClass.K7.reorgAppliedRuns === perClass.K7.killCount),
 };
 acceptance.accepted = acceptance.totalKillsOk
   && acceptance.perClassKillsOk
@@ -679,6 +698,7 @@ for (const klass of classes) {
   md.push(`- kill blocks (distinct, from kill.phase.log): ${c.killBlocks.length > 0 ? c.killBlocks.join(', ') : 'n/a'}`);
   md.push(`- kills after >=1 live /stream request: ${c.killsWithLiveStream} / ${c.killCount}`);
   if (klass === 'K5') md.push(`- wrong-fork consumed runs: ${c.wrongForkConsumedRuns} / ${c.wrongForkRunCount}`);
+  if (klass === 'K7') md.push(`- reorg-applied runs (mock served the rollback branch): ${c.reorgAppliedRuns} / ${c.killCount}`);
   md.push(`- handler stats: ${JSON.stringify(c.handlerStats)}`);
   md.push(`- fidelity: ${c.fidelity} — ${c.candor}`);
   if (c.failures.length > 0) md.push(`- failures: ${JSON.stringify(c.failures)}`);

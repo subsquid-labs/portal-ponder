@@ -501,6 +501,7 @@ function createRuntime(initialScenario, options = {}) {
     wrongForkFinalizes: 0,
     wrongForkFinalizeConsumed: 0,
     wrongForkFinalizeRejected: 0,
+    reorgApplied: 0,
     requestLog: [],
   };
   const phaseLog = options.phaseLog;
@@ -573,6 +574,7 @@ function createRuntime(initialScenario, options = {}) {
     stats.wrongForkFinalizes = 0;
     stats.wrongForkFinalizeConsumed = 0;
     stats.wrongForkFinalizeRejected = 0;
+    stats.reorgApplied = 0;
     stats.requestLog = [];
     pendingWrongForkHead = undefined;
     skipWrongForkRejection = false;
@@ -893,6 +895,17 @@ function createRuntime(initialScenario, options = {}) {
   };
 
   const handleRollbackApply = async (step, body, res) => {
+    // Cursor discipline (parity with handleStatus409): only serve the reorg branch on the client's
+    // natural resume cursor. `stream()` already 204s a mis-cursored request via isCursorStep, but a
+    // defensive re-check here makes a stray request 204 rather than mis-deliver the rollback branch.
+    if (step.match !== undefined && cursorMatchesStep(step, body) === false) {
+      stats.r204 += 1;
+      res.writeHead(204);
+      res.end();
+
+      return;
+    }
+
     const reorgBlock = Number(step.reorgBlock ?? streamCursor - 1);
     const count = Math.max(0, Number(step.count ?? 1));
     const branchId = step.branch ?? step.branchId ?? 'rollback';
@@ -900,6 +913,15 @@ function createRuntime(initialScenario, options = {}) {
     res.writeHead(200, { 'content-type': 'application/x-ndjson' });
     for (let i = 0; i < count; i++) {
       const number = reorgBlock + i;
+      // Count the reorg branch actually being served: the fork block (i === 0) carries a CROSS-branch
+      // parentHash (parent on `parentBranchId`, self on `branchId`), which is what drives the product's
+      // reconcile -> {kind:'reorg'} rollback-apply. A scenario that silently degraded to a plain
+      // tip-append (fork point == branch) has parentBranchId === branchId and never increments this,
+      // so a vacuous "append masquerading as rollback" cannot self-report a K7 pass.
+      if (i === 0 && parentBranchId !== branchId) {
+        stats.reorgApplied += 1;
+      }
+
       const phase = gatePhaseForBlock(step, number);
       if (phase !== undefined) {
         const open = await gate(

@@ -227,3 +227,40 @@ test('cursorMatchesStep: routes redelivery and 409 steps by request cursor', () 
     false,
   );
 });
+
+test('cursorMatchesStep: rollbackApply fires only on the natural post-window resume cursor', () => {
+  // K7: after streaming 101..106 on `main`, the client's natural next request is
+  // fromBlock=107 with parentBlockHash = hashBlock(106, 'main'). The rollbackApply step's
+  // `match` must fire there — and NOT on the earlier in-window cursors — so the reorg branch
+  // is served on the resume request rather than mis-delivered mid-stream.
+  const step = {
+    type: 'rollbackApply',
+    reorgBlock: 104,
+    count: 3,
+    branch: 'rollback',
+    parentBranch: 'main',
+    match: { fromBlock: 107, parentBlock: 106, parentBranch: 'main' },
+  };
+
+  assert.equal(
+    cursorMatchesStep(step, {
+      fromBlock: 107,
+      parentBlockHash: hashBlock(106, 'main'),
+    }),
+    true,
+  );
+  assert.equal(
+    cursorMatchesStep(step, {
+      fromBlock: 106,
+      parentBlockHash: hashBlock(105, 'main'),
+    }),
+    false,
+  );
+  assert.equal(
+    cursorMatchesStep(step, {
+      fromBlock: 107,
+      parentBlockHash: hashBlock(106, 'rollback'),
+    }),
+    false,
+  );
+});

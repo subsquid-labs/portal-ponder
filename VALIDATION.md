@@ -1722,8 +1722,14 @@ cutover-handler entry (a 409 variant + a wrong-fork variant) · K6 at the histor
 Per-class mock fidelity is recorded candidly in the harness and reproduced here — HIGH for K1/K2/K4
 (direct 200/reorg/defer flows), MEDIUM for K3/K5 (redelivery / fork-handler reachability), and
 **MEDIUM for K6** after Phase B (an organic mock cutover at the client's natural chunk-boundary
-request). K7 is **not included** in RG3 Phase B: the pre-flight hit the product unknown-parent fatal
-before a kill, so kill-during-rollback remains RG4/RG5.
+request). K7 (kill-during-rollback-apply) is added against the mock: the pre-flight fatal was a
+scenario-design bug (a fork point *below* the finalized anchor, which correctly fatals as an unknown-
+parent/deep-reorg gap), not a mock or product limit. With the fork point corrected to sit strictly
+*above* the anchor, the same product code path (`reconcile → {kind:'reorg'}` then rollback-apply,
+`portal-realtime.ts:1105`) that K5-409 already exercises drives an accepted rollback, and the SIGKILL
+lands mid-apply — so the **crash-timing** half of K7 is now mock-covered. What remains RG4/RG5 is only
+the **live-protocol fork-choice fidelity** (a real Portal 409/reorg with competing finalized sources),
+not kill-during-rollback as a class.
 
 **Result (Phase A, from the operator's evidence archive — verbatim).**
 
@@ -1749,7 +1755,7 @@ All three RG3 numeric thresholds are met: **238 ≥ 200** kills across **7 ≥ 6
 | Duplicate FINALIZED rows | **0** |
 | K6 organic cutover | **10 / 10** (every kill on block 106, the chunk boundary) |
 | K5 wrong-fork consumed in-window | **deferred** — default clean run consumed **0 / 1**; a stretched post-injection window makes the product correctly raise the wrong-fork finalize fatal |
-| K7 kill-during-rollback | **deferred** — pre-flight baseline fataled on unknown-parent/deep-reorg before any kill |
+| K7 kill-during-rollback-apply | **mock-covered (crash-timing)** — fork point corrected to sit ABOVE the finalized anchor (≤102), so `reconcile → {kind:'reorg'}` rolls back 104..106:main and re-applies the rollback branch; the SIGKILL lands mid-apply at block 105 and resumes byte-identical. `k7RollbackNonVacuousOk` self-certs kill-block=={105}, live /stream before every kill, and the mock served the cross-branch fork (`reorgApplied>0`). **Live-protocol fork fidelity remains RG4/RG5.** |
 
 The full K1–K6 moderate rerun was attempted with
 `CHAOS_KILLS_PER_CLASS=10 CHAOS_MIN_PER_CLASS=10 CHAOS_TOTAL_KILLS=70`, but it stopped before Phase-B
@@ -1793,10 +1799,24 @@ hidden:
   `fromBlock=106` with the canonical parent hash). The cutover is **organic within the mock's
   deterministic capability** — it is still not a live Portal cutover with competing finalized sources;
   that remains RG4/RG5.
-- **K7 kill-during-rollback is deferred.** The pre-flight scenario attempted to stream block 104 on a
-  rollback branch with parent block 103 while the finalized anchor was 105. The client treated that as
-  the existing unknown-parent/deep-reorg fatal (`Cannot reconcile safely`) before any kill could be
-  taken. The invariant was not weakened; K7 remains RG4/RG5.
+- **K7 kill-during-rollback-apply — crash-timing is mock-covered; live fork fidelity remains RG4/RG5.**
+  The pre-flight scenario that fataled attempted to stream block 104 on a rollback branch with parent
+  block 103 while the finalized anchor was 105 — a fork point *below* finality, which correctly fatals
+  (`Cannot reconcile safely`; a fork below the finalized floor has no safe rollback). That was a
+  **scenario-design bug**, not a mock or product limit: the mock already carries the
+  `handleRollbackApply` handler and the product carries a real accepted rollback-apply path
+  (`portal-realtime.ts:1105-1117`), exercised today by K5-409. K7 now moves the fork point strictly
+  *above* the anchor (window 101..106 on `main`, anchor ≤102, reorg forking at block 104), so
+  `reconcile` returns `{kind:'reorg'}` (not `gap`), the losing 104..106:main suffix is rolled back and
+  the `rollback` branch re-applied. The SIGKILL fires at block 105 — after the rollback event and the
+  first apply, mid re-apply — and the resume is byte-identical. `k7RollbackNonVacuousOk` self-certifies
+  non-vacuity exactly as `k6CutoverOrganicOk` does: the empirical kill-block set is `{105}`, every kill
+  followed ≥1 live `/stream` request, and the mock-side `reorgApplied` counter (>0 per run) proves the
+  cross-branch fork was actually served rather than degrading to a plain append. This is crash-timing
+  coverage of **INV-10**'s rollback arm — no new invariant. What genuinely **remains RG4/RG5** is only
+  the *live-protocol fork-choice fidelity*: a real Portal 409/reorg with competing finalized sources
+  and real parentHash chains. The mock proves the rollback-apply *code path* is crash-timing safe; it
+  does not prove the Portal emits such branches — that is RG4/RG5.
 - **The harness `invariant()` fast-path is a fatal-string tripwire, not the primary death detector.**
   It grep-matches all eight real fatal throws in `portal/portal-realtime.ts` (the gap fatal, the
   below-floor 409 fatal, the 409 no-progress cap, the deterministic-4xx fatal, the delivery-progress
