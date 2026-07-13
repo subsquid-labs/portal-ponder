@@ -40,7 +40,12 @@ export const DEFAULT_SCENARIO = {
 const TRACE_FILE = process.env.MOCK_TRACE;
 let TRACE_CONN = 0;
 const trace = (msg, extra) => {
-  if (TRACE_FILE === undefined) return;
+  // Treat unset AND empty-string as "tracing off". orchestrate.sh forwards MOCK_TRACE via
+  // `${MOCK_TRACE:-}`, so an unset caller (e.g. the acceptance capstone) reaches node as an empty
+  // string, not undefined. A bare `=== undefined` guard let that empty value through to
+  // appendFileSync(''), which throws ENOENT — surfacing as a 500 on the very first /finalized-head
+  // probe and a spurious "cannot establish finality boundary" fatal for every non-tracing run.
+  if (!TRACE_FILE) return;
 
   const line = `${new Date().toISOString()} ${msg}${
     extra === undefined ? '' : ` ${JSON.stringify(extra)}`
