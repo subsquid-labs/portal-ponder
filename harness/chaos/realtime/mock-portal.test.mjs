@@ -57,6 +57,39 @@ async function reorgAppliedFor(step, body) {
   return runtime.stats().reorgApplied;
 }
 
+// Parse the block numbers a /stream connection emitted, in order, from the ndjson chunks a fakeRes
+// captured. Each block-producing chunk is a JSON batch `{ header: { number, ... }, ... }`; the
+// writeHead(200) call is not a chunk, so every captured chunk is one streamed block.
+function streamedNumbers(res) {
+  const numbers = [];
+  for (const chunk of res.chunks) {
+    const trimmed = chunk.trim();
+    if (trimmed.length === 0) continue;
+
+    const batch = JSON.parse(trimmed);
+    numbers.push(batch.header.number);
+  }
+
+  return numbers;
+}
+
+// Assert a streamed sequence is strictly contiguous: [n, n+1, n+2, …] with no skip. This is the
+// exact property the shared-cursor race violated (100→101→103, skipping 102). Reported with the
+// full observed sequence so a failure shows the actual skip.
+function assertContiguous(numbers, label) {
+  for (let i = 1; i < numbers.length; i++) {
+    assert.equal(
+      numbers[i],
+      numbers[i - 1] + 1,
+      `${label}: streamed block ${numbers[i]} is not contiguous with ${
+        numbers[i - 1]
+      } (expected ${numbers[i - 1] + 1}); full sequence ${JSON.stringify(
+        numbers,
+      )}`,
+    );
+  }
+}
+
 test('mergeScenario: deep-merges objects and replaces arrays', () => {
   const merged = mergeScenario(DEFAULT_SCENARIO, {
     genesis: { number: 500 },
@@ -356,4 +389,104 @@ test('handleRollbackApply: an APPEND-shaped rollbackApply does NOT increment reo
     { fromBlock: 107, parentBlockHash: hashBlock(106, 'main') },
   );
   assert.equal(sameBranch, 0);
+});
+
+test('handleBlocks: two overlapping /stream connections each emit a contiguous sequence off their own fromBlock (K2 shared-cursor race guard)', async () => {
+  // Regression for the K2 baseline (turnDelayMs:450) shared-cursor skip that PR #169 fixed. A slow
+  // block step lets the client open an overlapping /stream (a legitimate reconnect on a
+  // finalized-head advance). handleBlocks streams one block, then awaits streamTurnDelay — a real
+  // await that yields the event loop, so two concurrent handleBlocks turns interleave through the
+  // setTimeout queue. Under the OLD module-level `streamCursor`, the second connection wakes, reads
+  // the first connection's advanced cursor, and skips a block (e.g. 101 → 103, dropping 102), which
+  // the product rightly fatals on ("unknown parent"). The fix drives each turn off a per-connection
+  // `localCursor` seeded from the request's fromBlock, so each connection is independent.
+  //
+  // Two connections from well-separated windows (101.. and 201..): under the shared cursor the
+  // second stream's writes stomp the first's cursor across the delay, so at least one connection
+  // becomes non-contiguous. Both windows must be strictly contiguous off their own fromBlock.
+  const runtime = createRuntime({
+    chainId: 1,
+    genesis: { number: 100 },
+    finalizedHeadSeq: [{ number: 100 }],
+    // Two block steps so each concurrent /stream turn routes to handleBlocks. `blocks` is not a
+    // cursor step, so both requests are served regardless of their fromBlock. turnDelayMs keeps the
+    // per-block await long enough for the two turns to interleave on the shared timer queue.
+    steps: [
+      { type: 'blocks', count: 4, turnDelayMs: 20 },
+      { type: 'blocks', count: 4, turnDelayMs: 20 },
+    ],
+  });
+
+  const resA = fakeRes();
+  const resB = fakeRes();
+
+  // Kick both streams off concurrently and let their turns interleave through streamTurnDelay.
+  await Promise.all([
+    runtime.stream(
+      { fromBlock: 101, parentBlockHash: hashBlock(100, 'main') },
+      resA,
+    ),
+    runtime.stream(
+      { fromBlock: 201, parentBlockHash: hashBlock(200, 'main') },
+      resB,
+    ),
+  ]);
+
+  const seqA = streamedNumbers(resA);
+  const seqB = streamedNumbers(resB);
+
+  // Sanity: both connections actually streamed their full window (guards against a vacuous pass
+  // where a connection emitted nothing and "contiguity" held trivially).
+  assert.deepEqual(seqA, [101, 102, 103, 104]);
+  assert.deepEqual(seqB, [201, 202, 203, 204]);
+
+  // The load-bearing property: each connection is strictly contiguous off its OWN fromBlock,
+  // independent of how the two interleaved. This is what the shared cursor broke.
+  assertContiguous(seqA, 'connection A (fromBlock=101)');
+  assertContiguous(seqB, 'connection B (fromBlock=201)');
+});
+
+test('handleBlocks: a /stream reopened at a fresh fromBlock mid-flight starts at that fromBlock, not the shared cursor (K2 reconnect guard)', async () => {
+  // The narrower K2 shape: a single in-flight stream is joined by a reconnect that requests a
+  // DIFFERENT window while the first is still delivering. Under the shared cursor the reconnect
+  // ignores its own fromBlock (it reads whatever the in-flight turn left in `streamCursor`), so its
+  // first emitted block is wrong; the per-connection cursor makes it honor its fromBlock exactly.
+  const runtime = createRuntime({
+    chainId: 1,
+    genesis: { number: 100 },
+    finalizedHeadSeq: [{ number: 100 }],
+    steps: [
+      { type: 'blocks', count: 3, turnDelayMs: 20 },
+      { type: 'blocks', count: 3, turnDelayMs: 20 },
+    ],
+  });
+
+  const resInFlight = fakeRes();
+  const inFlight = runtime.stream(
+    { fromBlock: 110, parentBlockHash: hashBlock(109, 'main') },
+    resInFlight,
+  );
+
+  // Let the in-flight stream write its first block and advance the shared cursor before the
+  // reconnect arrives, so the shared-cursor bug (if present) would seed the reconnect off it.
+  await new Promise((resolve) => setTimeout(resolve, 5));
+
+  const resReconnect = fakeRes();
+  const reconnect = runtime.stream(
+    { fromBlock: 300, parentBlockHash: hashBlock(299, 'main') },
+    resReconnect,
+  );
+
+  await Promise.all([inFlight, reconnect]);
+
+  const reconnectSeq = streamedNumbers(resReconnect);
+
+  // Sanity: the reconnect streamed its full window off its OWN fromBlock (guards against a vacuous
+  // pass where it emitted nothing/too few and "contiguity" held trivially). Under the shared cursor
+  // it would inherit the in-flight stream's position instead of honoring fromBlock 300.
+  assert.deepEqual(reconnectSeq, [300, 301, 302]);
+
+  // The load-bearing property: the reconnect begins at its own fromBlock and stays contiguous —
+  // never inherits the in-flight stream's cursor position.
+  assertContiguous(reconnectSeq, 'reconnect (fromBlock=300)');
 });
