@@ -37,6 +37,17 @@ export const DEFAULT_SCENARIO = {
   ],
 };
 
+const TRACE_FILE = process.env.MOCK_TRACE;
+let TRACE_CONN = 0;
+const trace = (msg, extra) => {
+  if (TRACE_FILE === undefined) return;
+
+  const line = `${new Date().toISOString()} ${msg}${
+    extra === undefined ? '' : ` ${JSON.stringify(extra)}`
+  }\n`;
+  appendFileSync(TRACE_FILE, line);
+};
+
 const isPlainObject = (value) =>
   value !== null && typeof value === 'object' && Array.isArray(value) === false;
 
@@ -646,6 +657,12 @@ export function createRuntime(initialScenario, options = {}) {
       scenario.finalizedHeadSeq[
         Math.min(finalizedIndex, scenario.finalizedHeadSeq.length - 1)
       ] ?? scenario.finalizedHeadSeq[0];
+    trace('finalizedHead:request', {
+      finalizedIndex,
+      headNumber: head?.number,
+      streamCursor,
+      stepIndex,
+    });
     const phase = gatePhaseForBlock(scenario, head.number);
     if (phase !== undefined) {
       stats.finalizedHeadGates += 1;
@@ -670,6 +687,13 @@ export function createRuntime(initialScenario, options = {}) {
 
   const finalizedStream = async (body, res) => {
     recordRequest('finalizedStream', body);
+    trace('finalizedStream:request', {
+      fromBlock: body?.fromBlock,
+      toBlock: body?.toBlock,
+      finalizedIndex,
+      streamCursor,
+      stepIndex,
+    });
     const from = Number(body?.fromBlock ?? scenario.genesis.number);
     const head = scenario.finalizedHeadSeq[
       Math.max(
@@ -797,14 +821,39 @@ export function createRuntime(initialScenario, options = {}) {
   };
 
   const handleBlocks = async (step, body, res) => {
+    TRACE_CONN += 1;
+    const conn = TRACE_CONN;
     const requestFrom = Number(body?.fromBlock ?? streamCursor + 1);
-    streamCursor = requestFrom - 1;
-    const firstNumber = streamCursor + 1;
+    trace('handleBlocks:enter', {
+      conn,
+      fromBlock: body?.fromBlock,
+      requestFrom,
+      streamCursorBefore: streamCursor,
+      stepIndex,
+      finalizedIndex,
+    });
+    // Per-connection cursor. The block-number arithmetic MUST NOT read the shared module-level
+    // `streamCursor`: a slow step (turnDelayMs) lets the client open an overlapping /stream (e.g. on a
+    // finalized-head advance), and two concurrent handleBlocks turns reading+writing one shared cursor
+    // interleave into a skipped block number (100→101→103) that the product rightly fatals on. A real
+    // Portal serves each /stream connection independently from its own fromBlock, so seed a LOCAL cursor
+    // here and only mirror it back to the shared one (best-effort, for the fromBlock-less default of the
+    // NEXT request) after each write.
+    let localCursor = requestFrom - 1;
+    streamCursor = localCursor;
+    const firstNumber = localCursor + 1;
 
     res.writeHead(200, { 'content-type': 'application/x-ndjson' });
     const count = Math.max(0, Number(step.count ?? 0));
     for (let i = 0; i < count; i++) {
-      const number = streamCursor + 1;
+      const number = localCursor + 1;
+      trace('handleBlocks:writeStart', {
+        conn,
+        number,
+        localCursor,
+        streamCursor,
+        finalizedIndex,
+      });
       const phase = gatePhaseForBlock(step, number);
       if (phase !== undefined) {
         const open = await gate(
@@ -833,8 +882,16 @@ export function createRuntime(initialScenario, options = {}) {
           logs: logsForBlock(step, number),
         }),
       );
+      localCursor = number;
       streamCursor = number;
+      trace('handleBlocks:wrote', { conn, number, localCursor, streamCursor });
       await streamTurnDelay(turnDelayForStep(step));
+      trace('handleBlocks:afterDelay', {
+        conn,
+        wroteNumber: number,
+        localCursor,
+        streamCursorNow: streamCursor,
+      });
       if (res.destroyed || res.writableEnded) return;
     }
     stepIndex += 1;
@@ -1016,6 +1073,13 @@ export function createRuntime(initialScenario, options = {}) {
 
   const stream = async (body, res) => {
     recordRequest('stream', body);
+    trace('stream:request', {
+      fromBlock: body?.fromBlock,
+      parentBlockHash: body?.parentBlockHash,
+      streamCursor,
+      stepIndex,
+      finalizedIndex,
+    });
     observeWrongForkStreamRequest(body);
     const step = scenario.steps[stepIndex];
     if (step === undefined) {

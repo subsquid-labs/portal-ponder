@@ -203,7 +203,7 @@ start_mock () {
   local mock_log="$3"
   local killat_block="${4:-}"
   MOCK_PHASE_LOG="$phase_log" MOCK_SCENARIO="$scenario" MOCK_PORT="$MOCK_PORT" \
-  MOCK_KILLAT_BLOCK="$killat_block" \
+  MOCK_KILLAT_BLOCK="$killat_block" MOCK_TRACE="${MOCK_TRACE:-}" \
     node "$CDIR/mock-portal.mjs" >"$mock_log" 2>&1 &
   MOCK_PID="$!"
   wait_http || {
