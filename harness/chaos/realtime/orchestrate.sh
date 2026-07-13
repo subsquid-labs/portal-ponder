@@ -34,15 +34,8 @@ RESULT_FILE="$CDIR/RESULT.md"
 RECORDS="$RUN_ROOT/run-records.ndjson"
 
 MIN_PER_CLASS="${CHAOS_MIN_PER_CLASS:-25}"
-TOTAL_TARGET="${CHAOS_TOTAL_KILLS:-200}"
-if [ -n "${CHAOS_KILLS_PER_CLASS:-}" ]; then
-  KILLS_PER_CLASS="$CHAOS_KILLS_PER_CLASS"
-else
-  KILLS_PER_CLASS="$(( (TOTAL_TARGET + 5) / 6 ))"
-  if [ "$KILLS_PER_CLASS" -lt "$MIN_PER_CLASS" ]; then
-    KILLS_PER_CLASS="$MIN_PER_CLASS"
-  fi
-fi
+TOTAL_TARGET="${CHAOS_TOTAL_KILLS:-}"
+KILLS_PER_CLASS="${CHAOS_KILLS_PER_CLASS:-}"
 
 mkdir -p "$CDIR/work"
 WORK="$(mktemp -d "$CDIR/work/orchestrate.XXXXXX")"
@@ -276,6 +269,7 @@ scenario_for_class () {
     K4) echo "$CDIR/scenarios/k4-idle.json" ;;
     K5) echo "$CDIR/scenarios/k5-409.json" ;;
     K6) echo "$CDIR/scenarios/k6-cutover.json" ;;
+    K7) echo "$CDIR/scenarios/k7-rollback.json" ;;
   esac
 }
 
@@ -294,6 +288,7 @@ phase_for_class () {
     K4) echo "K4-idle" ;;
     K5) echo "K5-409" ;;
     K6) echo "K6-cutover" ;;
+    K7) echo "K7-rollback" ;;
   esac
 }
 
@@ -337,7 +332,8 @@ fidelity_for_class () {
     K3) echo "MEDIUM" ;;
     K4) echo "HIGH" ;;
     K5) echo "MEDIUM" ;;
-    K6) echo "MEDIUM-LOW" ;;
+    K6) echo "MEDIUM" ;;
+    K7) echo "MEDIUM" ;;
   esac
 }
 
@@ -479,6 +475,7 @@ run_kill_resume () {
 
   ROOT="$ROOT" PROBE_DIR="$app" STORE_SCHEMA="$STORE_SCHEMA" APP_SCHEMA="$APP_SCHEMA" \
     VERIFY_FACTS="$dir/verify.facts.json" \
+    VERIFY_TARGET_PHASE="$phase" \
     "$VERIFY" "$url" "$BASE_DIR/${class,,}.store.digest" "$BASE_DIR/${class,,}.app.digest" \
       "$dir/kill.phase.log" "$phase" >"$dir/verify.log" 2>&1 || {
         log "fatal: verify failed for $class/$variant#$iteration"
@@ -492,16 +489,20 @@ run_kill_resume () {
 write_summary () {
   SUMMARY_FILE="$SUMMARY_FILE" RESULT_FILE="$RESULT_FILE" RECORDS="$RECORDS" \
   TARGET_TOTAL="$TOTAL_TARGET" MIN_PER_CLASS="$MIN_PER_CLASS" KILLS_PER_CLASS="$KILLS_PER_CLASS" \
-  RUN_ROOT="$RUN_ROOT" node - <<'NODE'
+  RUN_CLASSES="$ACTIVE_CLASSES" RUN_ROOT="$RUN_ROOT" node - <<'NODE'
 const fs = require('node:fs');
-const classes = ['K1', 'K2', 'K3', 'K4', 'K5', 'K6'];
+const classes = (process.env.RUN_CLASSES || 'K1 K2 K3 K4 K5 K6')
+  .trim()
+  .split(/\s+/)
+  .filter(Boolean);
 const labels = {
   K1: 'HIGH',
   K2: 'HIGH',
   K3: 'MEDIUM',
   K4: 'HIGH',
   K5: 'MEDIUM',
-  K6: 'MEDIUM-LOW',
+  K6: 'MEDIUM',
+  K7: 'MEDIUM',
 };
 const candor = {
   K1: 'append gate baseline',
@@ -509,7 +510,8 @@ const candor = {
   K3: 'redelivery-of-block only; redelivery watchdog + held-finalize drain NOT exercised (need real Portal / halted-chain sim).',
   K4: 'idle / 204 retry path',
   K5: "synthetic fork via stale-parentBlockHash 409 (client consumes the canonical replacement chain and resumes byte-identically) PLUS a wrong-fork-finalize handler-REACHABILITY probe. handlerStats.wrongForkFinalizes counts mock-side handler entries (reachability) ONLY — the counter increments on handler entry, before the gate, so on a killed run the splice may not even execute; the injected wrong finalized head is NOT consumed by the client here (finalize poll cadence ~4s > the post-injection scenario window ~1.8s), so this is not clean-resume wrong-fork evidence. The client-side wrong-fork-finalize FATAL guard (hash-mismatch at finality) is proven deterministically by portal-realtime.test.ts ('a finalize whose canonical hash mismatches the local block is FATAL', finalizePollMs:0). Real L1-reorg wire fidelity NOT exercised.",
-  K6: "kill lands mid backfill→live cutover (>=1 live /stream block served before the kill; see kill.phase.log block + killStats.stream>0), so resume re-drives the cutover. Probe-retry wire fidelity (the 3-attempt loop in clampFinalizedToPortalHead) NOT exercised — mock's /finalized-head succeeds first try; probe-retry fidelity rests on portal-realtime-wire.test.ts.",
+  K6: "kill lands at the backfill→live chunk boundary (cutoverGate fires on the client's natural fromBlock=106 request, not a fixed block), so resume re-drives an organic cutover within the mock's deterministic capability. Probe-retry wire fidelity (the 3-attempt loop in clampFinalizedToPortalHead) NOT exercised — mock's /finalized-head succeeds first try; probe-retry fidelity rests on portal-realtime-wire.test.ts.",
+  K7: 'K7: kill lands mid rollback-apply (client sees parent mismatch at block 104 and must roll back to 103 before applying the rollback branch). Mock-driven: the rollback is scripted, not a live L1 reorg. Live reorg-during-rollback fidelity is RG4/RG5.',
 };
 const lines = fs.existsSync(process.env.RECORDS)
   ? fs.readFileSync(process.env.RECORDS, 'utf8').trim().split(/\n+/).filter(Boolean)
@@ -530,20 +532,35 @@ for (const klass of classes) {
     acc.finalizedHead += Number(s.finalizedHead ?? 0);
     acc.finalizedHeadGates += Number(s.finalizedHeadGates ?? 0);
     acc.wrongForkFinalizes += Number(s.wrongForkFinalizes ?? 0);
+    acc.wrongForkFinalizeConsumed += Number(s.wrongForkFinalizeConsumed ?? 0);
+    acc.wrongForkFinalizeRejected += Number(s.wrongForkFinalizeRejected ?? 0);
     return acc;
-  }, { r204: 0, r409: 0, redeliveryReopens: 0, finalizedHead: 0, finalizedHeadGates: 0, wrongForkFinalizes: 0 });
+  }, {
+    r204: 0,
+    r409: 0,
+    redeliveryReopens: 0,
+    finalizedHead: 0,
+    finalizedHeadGates: 0,
+    wrongForkFinalizes: 0,
+    wrongForkFinalizeConsumed: 0,
+    wrongForkFinalizeRejected: 0,
+  });
   // Distinct empirical kill blocks (from each run's kill.phase.log) — proves K2's varied mid-stream
   // coverage rather than one repeated fixed block.
   const killBlocks = [...new Set(rows.map((r) => r.killAtBlock).filter((b) => b != null))].sort((a, b) => a - b);
-  // Live-cutover proof: kills where the mock had served >=1 live /stream block before the kill. For K6
-  // this is the load-bearing evidence that the kill lands mid-backfill→live-cutover, not on a startup probe.
+  // Live-cutover proof: kills where the mock had seen >=1 live /stream request before the kill. For K6
+  // this is the load-bearing evidence that the kill lands at the backfill→live cutover request, not on a startup probe.
   const killsWithLiveStream = rows.filter((r) => Number(r.killStats?.stream ?? 0) > 0).length;
+  const wrongForkRows = ok.filter((r) => r.variant === 'wrongfork');
+  const wrongForkConsumedRuns = wrongForkRows.filter((r) => Number(r.stats?.wrongForkFinalizeConsumed ?? 0) > 0).length;
   perClass[klass] = {
     scenarios: [...new Set(rows.map((r) => r.scenario).filter(Boolean))],
     variantLabels: [...new Set(rows.map((r) => r.variant).filter(Boolean))].join(', '),
     killCount: rows.length,
     killBlocks,
     killsWithLiveStream,
+    wrongForkRunCount: wrongForkRows.length,
+    wrongForkConsumedRuns,
     cleanResumeCount: ok.length,
     digestMatchCount: digestMatch.length,
     duplicateFinalizedRows: dupCount,
@@ -570,6 +587,7 @@ const targetTotal = Number(process.env.TARGET_TOTAL);
 const minPerClass = Number(process.env.MIN_PER_CLASS);
 const isDupCheckExempt = (klass) => /^K[16]/i.test(klass);
 const loadBearingClasses = classes.filter((klass) => !isDupCheckExempt(klass));
+const hasClass = (klass) => perClass[klass] !== undefined;
 const acceptance = {
   targetTotal,
   minPerClass,
@@ -583,8 +601,18 @@ const acceptance = {
   // Self-certify the two non-vacuity properties this harness exists to prove, so a regression to the
   // original vacuous-K6 bug (kill landing on the /finalized-head startup probe, killStats.stream===0)
   // or to a fixed-block K2 cannot silently re-produce `accepted:true` on a byte-identical resume.
-  k6CutoverNonVacuousOk: perClass.K6.killCount > 0 && perClass.K6.killsWithLiveStream === perClass.K6.killCount,
-  k2KillSpreadOk: perClass.K2.killBlocks.length >= 3,
+  k6CutoverNonVacuousOk: !hasClass('K6')
+    || (perClass.K6.killCount > 0 && perClass.K6.killsWithLiveStream === perClass.K6.killCount),
+  k6CutoverOrganicOk: !hasClass('K6')
+    || (perClass.K6.killCount > 0
+    && perClass.K6.killBlocks.length === 1
+    && perClass.K6.killBlocks[0] === 106
+    && perClass.K6.killsWithLiveStream === perClass.K6.killCount),
+  k2KillSpreadOk: !hasClass('K2') || perClass.K2.killBlocks.length >= 3,
+  k7RollbackNonVacuousOk: !hasClass('K7')
+    || (perClass.K7.killCount > 0
+      && perClass.K7.cleanResumeCount === perClass.K7.killCount
+      && perClass.K7.digestMatchCount === perClass.K7.killCount),
 };
 acceptance.accepted = acceptance.totalKillsOk
   && acceptance.perClassKillsOk
@@ -593,7 +621,11 @@ acceptance.accepted = acceptance.totalKillsOk
   && acceptance.duplicateFinalizedRowsOk
   && acceptance.dupCheckLoadBearingOk
   && acceptance.k6CutoverNonVacuousOk
+  && acceptance.k6CutoverOrganicOk
   && acceptance.k2KillSpreadOk;
+if (acceptance.k7RollbackNonVacuousOk !== undefined) {
+  acceptance.accepted = acceptance.accepted && acceptance.k7RollbackNonVacuousOk;
+}
 const summary = {
   generatedAt: new Date().toISOString(),
   runRoot: process.env.RUN_ROOT,
@@ -604,7 +636,7 @@ const summary = {
 fs.writeFileSync(process.env.SUMMARY_FILE, `${JSON.stringify(summary, null, 2)}\n`);
 
 const md = [];
-md.push('# RG3 Phase A Realtime Chaos Result');
+md.push('# RG3 Phase B Realtime Chaos Result');
 md.push('');
 md.push(`Run root: \`${process.env.RUN_ROOT}\``);
 md.push('');
@@ -614,9 +646,13 @@ md.push(`- kills: ${totals.killCount} / target ${targetTotal}`);
 md.push(`- clean resumes: ${totals.cleanResumeCount} / ${totals.killCount}`);
 md.push(`- digest matches: ${totals.digestMatchCount} / ${totals.killCount}`);
 md.push(`- duplicate FINALIZED rows: ${totals.duplicateFinalizedRows}`);
-md.push(`- dup-check load-bearing (K2-K5 scanned finalized rows): ${acceptance.dupCheckLoadBearingOk}`);
-md.push(`- K6 cutover non-vacuous (every K6 kill after >=1 live /stream block): ${acceptance.k6CutoverNonVacuousOk}`);
+md.push(`- dup-check load-bearing: ${acceptance.dupCheckLoadBearingOk}`);
+md.push(`- K6 cutover non-vacuous (every K6 kill after >=1 live /stream request): ${acceptance.k6CutoverNonVacuousOk}`);
+md.push(`- K6 organic cutover (every K6 kill on block 106): ${acceptance.k6CutoverOrganicOk}`);
 md.push(`- K2 kill-block spread (>=3 distinct interior blocks): ${acceptance.k2KillSpreadOk}`);
+if (acceptance.k7RollbackNonVacuousOk !== undefined) {
+  md.push(`- K7 rollback non-vacuous: ${acceptance.k7RollbackNonVacuousOk}`);
+}
 md.push(`- per-class minimum: ${minPerClass}`);
 md.push('');
 md.push('## Classes');
@@ -633,7 +669,8 @@ for (const klass of classes) {
   md.push(`- duplicate FINALIZED rows: ${c.duplicateFinalizedRows}`);
   md.push(`- finalized rows scanned: ${c.finalizedScannedRows}`);
   md.push(`- kill blocks (distinct, from kill.phase.log): ${c.killBlocks.length > 0 ? c.killBlocks.join(', ') : 'n/a'}`);
-  md.push(`- kills after >=1 live /stream block: ${c.killsWithLiveStream} / ${c.killCount}`);
+  md.push(`- kills after >=1 live /stream request: ${c.killsWithLiveStream} / ${c.killCount}`);
+  if (klass === 'K5') md.push(`- wrong-fork consumed runs: ${c.wrongForkConsumedRuns} / ${c.wrongForkRunCount}`);
   md.push(`- handler stats: ${JSON.stringify(c.handlerStats)}`);
   md.push(`- fidelity: ${c.fidelity} — ${c.candor}`);
   if (c.failures.length > 0) md.push(`- failures: ${JSON.stringify(c.failures)}`);
@@ -671,9 +708,30 @@ main () {
   # classes — for targeted proofs/reruns. Default: the full K1..K6 acceptance set. A subset run does NOT
   # meet the >=200-kill / all-class acceptance bar; it is a probe, not a certification.
   local classes=(K1 K2 K3 K4 K5 K6)
+  if [ -f "$CDIR/scenarios/k7-rollback.json" ]; then
+    classes+=(K7)
+    log "K7 scenario present: including kill-during-rollback-apply class"
+  else
+    log "K7 scenario absent: deferring kill-during-rollback-apply to RG4/RG5"
+  fi
   if [ -n "${CHAOS_CLASSES:-}" ]; then
     read -r -a classes <<< "$(printf '%s' "$CHAOS_CLASSES" | tr ',' ' ')"
     log "CHAOS_CLASSES set: running subset ${classes[*]} (NOT a full acceptance run)"
+  fi
+  ACTIVE_CLASSES="${classes[*]}"
+  if [ -z "$TOTAL_TARGET" ]; then
+    if [[ " ${classes[*]} " == *" K7 "* ]]; then
+      TOTAL_TARGET=238
+    else
+      TOTAL_TARGET=200
+    fi
+  fi
+  if [ -z "$KILLS_PER_CLASS" ]; then
+    local nclasses="${#classes[@]}"
+    KILLS_PER_CLASS="$(( (TOTAL_TARGET + nclasses - 1) / nclasses ))"
+    if [ "$KILLS_PER_CLASS" -lt "$MIN_PER_CLASS" ]; then
+      KILLS_PER_CLASS="$MIN_PER_CLASS"
+    fi
   fi
   for class in "${classes[@]}"; do
     local baseline_scenario phase

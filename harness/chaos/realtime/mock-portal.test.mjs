@@ -40,6 +40,11 @@ test('hashBlock: deterministic 32-byte hex and branch-sensitive', () => {
 test('advanceScenarioCursor: advances only block-producing steps', () => {
   assert.equal(advanceScenarioCursor(100, { type: 'blocks', count: 3 }), 103);
   assert.equal(advanceScenarioCursor(100, { type: 'fork', count: 2 }), 102);
+  assert.equal(advanceScenarioCursor(100, { type: 'cutoverGate' }), 100);
+  assert.equal(
+    advanceScenarioCursor(100, { type: 'rollbackApply', count: 4 }),
+    104,
+  );
   assert.equal(advanceScenarioCursor(100, { type: 'idle204', count: 5 }), 100);
   assert.equal(
     advanceScenarioCursor(100, { type: 'childDiscovery', block: 160 }),
@@ -192,5 +197,33 @@ test('cursorMatchesStep: routes redelivery and 409 steps by request cursor', () 
       },
     ),
     true,
+  );
+  assert.equal(
+    cursorMatchesStep(
+      {
+        type: 'cutoverGate',
+        fromBlock: 106,
+        parentBlockHash: hashBlock(105, 'main'),
+      },
+      {
+        fromBlock: 106,
+        parentBlockHash: hashBlock(105, 'main'),
+      },
+    ),
+    true,
+  );
+  assert.equal(
+    cursorMatchesStep(
+      {
+        type: 'cutoverGate',
+        fromBlock: 106,
+        parentBlockHash: hashBlock(105, 'main'),
+      },
+      {
+        fromBlock: 108,
+        parentBlockHash: hashBlock(107, 'main'),
+      },
+    ),
+    false,
   );
 });

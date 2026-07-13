@@ -1695,12 +1695,12 @@ End-to-end verification grounded the fix at scale. Across all 12 preserved Porta
 
 **Upstream observation.** None. Unlike §5.9 (where ponder's RPC cascade attributes an error geth's own callTracer does not), the root-frame gas difference is purely a Parity-vs-geth representation convention with no attribution question — geth `callTracer` and the RPC store agree, and the fork matches them for parity.
 
-### 5.11 Realtime chaos — crash-timing safety (RG3 Phase A, mock-driven)
+### 5.11 Realtime chaos — crash-timing safety (RG3 Phase B, mock-driven)
 
 The stream-realtime campaign (its plan lives alongside this document under `.agents/plans/`) gates a
 `PORTAL_REALTIME=stream` production label on a six-gate dossier; **RG3** is its realtime chaos gate:
 *≥200 kills across ≥6 timing classes, 100 % clean resumes, byte-identical digests*. This subsection
-records the **RG3 Phase-A** result and — as with every claim in this document — states plainly what it
+records the **RG3 Phase-A** result plus the **Phase-B** delta and — as with every claim in this document — states plainly what it
 does and does **not** prove. It is deliberately scoped and self-contained: the full §5.8 rewrite that
 folds RG3–RG5 into a single reorg/finality dossier is a later (RG6) task, not this one.
 
@@ -1721,7 +1721,9 @@ block · K3 during the redelivery await · K4 during a finalize-defer streak · 
 cutover-handler entry (a 409 variant + a wrong-fork variant) · K6 at the historical→realtime cutover.
 Per-class mock fidelity is recorded candidly in the harness and reproduced here — HIGH for K1/K2/K4
 (direct 200/reorg/defer flows), MEDIUM for K3/K5 (redelivery / fork-handler reachability), and
-**MEDIUM–LOW for K6** (a scripted, not organic, cutover).
+**MEDIUM for K6** after Phase B (an organic mock cutover at the client's natural chunk-boundary
+request). K7 is **not included** in RG3 Phase B: the pre-flight hit the product unknown-parent fatal
+before a kill, so kill-during-rollback remains RG4/RG5.
 
 **Result (Phase A, from the operator's evidence archive — verbatim).**
 
@@ -1737,18 +1739,36 @@ All three RG3 numeric thresholds are met: **238 ≥ 200** kills across **7 ≥ 6
 **100 %** clean resumes, and every resumed cluster **byte-identical** to its unkilled baseline with
 **zero** double-indexed finalized rows.
 
-**The K6 cutover fix is proven non-vacuous.** An adversarial review of the harness caught that the
+**Phase B delta (this worktree run).**
+
+| Metric | Value |
+|--------|-------|
+| K6 organic-cutover kills | **10** (`CHAOS_CLASSES=K6 CHAOS_KILLS_PER_CLASS=10`) |
+| Clean resumes | **10 / 10** |
+| Store↔app digest match | **10 / 10** byte-identical |
+| Duplicate FINALIZED rows | **0** |
+| K6 organic cutover | **10 / 10** (every kill on block 106, the chunk boundary) |
+| K5 wrong-fork consumed in-window | **deferred** — default clean run consumed **0 / 1**; a stretched post-injection window makes the product correctly raise the wrong-fork finalize fatal |
+| K7 kill-during-rollback | **deferred** — pre-flight baseline fataled on unknown-parent/deep-reorg before any kill |
+
+The full K1–K6 moderate rerun was attempted with
+`CHAOS_KILLS_PER_CLASS=10 CHAOS_MIN_PER_CLASS=10 CHAOS_TOTAL_KILLS=70`, but it stopped before Phase-B
+classes because the current K2 baseline did not reach `K2-midstream`: the app raised the product
+unknown-parent fatal after child discovery at block 101 left block 102 absent from the unfinalized
+window and block 103 arrived. A timing-only K2 probe (`turnDelayMs` 450 → 900) did not change that
+outcome, so Phase B does not claim a new full-suite acceptance number here.
+
+**The K6 cutover fix is now proven organic within the mock.** An adversarial review of the harness caught that the
 original K6 "cutover" kill landed on the **first `/finalized-head` startup probe**, before any live
 `/stream` block was served — so it re-exercised startup, not a cutover, and was vacuous. After the fix
-(the `killAt` gate moved into the served-block step), all **34** K6 kills recorded
-`killStats.stream == 1` (min 1, only value 1): each kill lands after block ≥106 has streamed, i.e. on a
-**real** backfill→live cutover, not a startup restart. **K2 non-vacuity** is likewise recorded: the
-kill-at-block varied across **8 distinct interior blocks** {103,104,105,106,107,108,109,110},
-recovered empirically from the kill phase log rather than trusted from the environment. Both properties
-are now **self-certified in the harness**: the `accepted` conjunction includes `k6CutoverNonVacuousOk`
-(every K6 kill after ≥1 live/stream block) and `k2KillSpreadOk` (≥3 distinct interior kill blocks),
-each mutation-verified load-bearing — a regression that makes K6 vacuous again or pins K2 to a single
-block flips `accepted:false` rather than silently passing on a byte-identical resume.
+(the `cutoverGate` cursor step), all **10** Phase-B K6 kills recorded
+`killStats.stream > 0` and the empirical kill block set was exactly `{106}`: the kill lands on the
+client's natural `fromBlock=106` request with the canonical parent hash for block 105, not a fixed
+served-block gate. The new `k6CutoverOrganicOk` self-cert is mutation-verified load-bearing:
+temporarily reverting K6 to a fixed-block `blocks` step with `killAt.block=107` produced a clean
+resume but flipped `k6CutoverOrganicOk:false` and `accepted:false`; restoring `cutoverGate` flipped it
+back to `true`. The existing `k6CutoverNonVacuousOk` and Phase-A `k2KillSpreadOk` self-certs remain in
+the harness.
 
 **Mock-fidelity caveats (candor is the product).** These bound the claim precisely and are stated, not
 hidden:
@@ -1758,15 +1778,25 @@ hidden:
   **NOT** live-protocol reorg/finalize semantics. Those are **RG4/RG5's** job (live Portal + a
   multichain stream soak), not RG3's.
 - **K5 exercises mock-side *reachability* of the cutover-handler entries** — a 409 variant and a
-  wrong-fork/"losing fork" variant — **not** a real client fork-choice splice. The wrong-fork
-  finalized head the mock injects is not consumed by the client within the scenario window (the
-  finalize-poll cadence is longer than the post-injection window), so the wrong-fork counter is a
-  **handler-reachability** count, not clean-resume wrong-fork evidence. The real client-side
-  wrong-fork-finalize FATAL guard is proven deterministically by the `portal-realtime.test.ts` unit
-  test *"a finalize whose canonical hash mismatches the local block is FATAL"* (§5.8(B)), not by K5.
-- **K6 is a MEDIUM–LOW-fidelity mock cutover.** It proves the *fix* — kills now land on a stream-phase
-  cutover (after a block has actually streamed) rather than vacuously on startup — but the cutover
-  semantics are **scripted, not organic**.
+  wrong-fork/"losing fork" variant — **not** a real client fork-choice splice. Phase B attempted to
+  close the wrong-fork-vacuity caveat, but the real chaos app has no harness-accessible
+  `finalizePollMs` knob (the production default remains the injected `finalizePollMs` field in
+  `portal-realtime.ts`). With default timing, the clean K5 probe recorded `wrongForkFinalizeConsumed=0`.
+  Lengthening the mock's post-injection window made the client consume the wrong finalized head, but
+  the product correctly raised the wrong-fork finalize fatal at block 108. Therefore K5 remains
+  **handler-reachability** evidence in RG3 Phase B; no `k5WrongForkConsumedOk` self-cert is claimed.
+  The real client-side wrong-fork-finalize FATAL guard is proven deterministically by the
+  `portal-realtime.test.ts` unit test *"a finalize whose canonical hash mismatches the local block is
+  FATAL"* (§5.8(B)), not by K5.
+- **K6 is a MEDIUM-fidelity mock cutover** (raised from MEDIUM–LOW in Phase A). The kill target is no
+  longer a fixed block but the client's natural chunk-boundary request (`cutoverGate` fires on
+  `fromBlock=106` with the canonical parent hash). The cutover is **organic within the mock's
+  deterministic capability** — it is still not a live Portal cutover with competing finalized sources;
+  that remains RG4/RG5.
+- **K7 kill-during-rollback is deferred.** The pre-flight scenario attempted to stream block 104 on a
+  rollback branch with parent block 103 while the finalized anchor was 105. The client treated that as
+  the existing unknown-parent/deep-reorg fatal (`Cannot reconcile safely`) before any kill could be
+  taken. The invariant was not weakened; K7 remains RG4/RG5.
 - **The harness `invariant()` fast-path is a fatal-string tripwire, not the primary death detector.**
   It grep-matches all seven real fatal throws in `portal/portal-realtime.ts` (the gap fatal, the
   below-floor 409 fatal, the 409 no-progress cap, the deterministic-4xx fatal, the unknown-parent
