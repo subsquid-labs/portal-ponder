@@ -2,6 +2,7 @@ import assert from 'node:assert/strict';
 import { test } from 'node:test';
 import {
   advanceScenarioCursor,
+  createRuntime,
   cursorMatchesStep,
   DEFAULT_SCENARIO,
   encodeLog,
@@ -13,6 +14,48 @@ import {
   normalizeScenario,
   retargetKillAtBlock,
 } from './mock-portal.mjs';
+
+// Minimal in-process response double: captures the ndjson stream and satisfies the surface
+// handleRollbackApply touches (writeHead/write/end + the `once('close')` gate hook + the
+// writableEnded/destroyed guards). Good enough to drive a gate-free rollbackApply to completion.
+function fakeRes() {
+  return {
+    statusCode: undefined,
+    chunks: [],
+    writableEnded: false,
+    destroyed: false,
+    writeHead(code) {
+      this.statusCode = code;
+      return this;
+    },
+    write(chunk) {
+      this.chunks.push(String(chunk));
+      return true;
+    },
+    end(chunk) {
+      if (chunk !== undefined) this.chunks.push(String(chunk));
+      this.writableEnded = true;
+    },
+    once() {
+      return this;
+    },
+  };
+}
+
+// Drive a single scenario step (no killAt gate) through the runtime's /stream handler and return
+// the mock's reorgApplied counter after it completes.
+async function reorgAppliedFor(step, body) {
+  const runtime = createRuntime({
+    chainId: 1,
+    genesis: { number: 100 },
+    finalizedHeadSeq: [{ number: 100 }],
+    steps: [step],
+  });
+  const res = fakeRes();
+  await runtime.stream(body, res);
+
+  return runtime.stats().reorgApplied;
+}
 
 test('mergeScenario: deep-merges objects and replaces arrays', () => {
   const merged = mergeScenario(DEFAULT_SCENARIO, {
@@ -226,4 +269,91 @@ test('cursorMatchesStep: routes redelivery and 409 steps by request cursor', () 
     ),
     false,
   );
+});
+
+test('cursorMatchesStep: rollbackApply fires only on the natural post-window resume cursor', () => {
+  // K7: after streaming 101..106 on `main`, the client's natural next request is
+  // fromBlock=107 with parentBlockHash = hashBlock(106, 'main'). The rollbackApply step's
+  // `match` must fire there — and NOT on the earlier in-window cursors — so the reorg branch
+  // is served on the resume request rather than mis-delivered mid-stream.
+  const step = {
+    type: 'rollbackApply',
+    reorgBlock: 104,
+    count: 3,
+    branch: 'rollback',
+    parentBranch: 'main',
+    match: { fromBlock: 107, parentBlock: 106, parentBranch: 'main' },
+  };
+
+  assert.equal(
+    cursorMatchesStep(step, {
+      fromBlock: 107,
+      parentBlockHash: hashBlock(106, 'main'),
+    }),
+    true,
+  );
+  assert.equal(
+    cursorMatchesStep(step, {
+      fromBlock: 106,
+      parentBlockHash: hashBlock(105, 'main'),
+    }),
+    false,
+  );
+  assert.equal(
+    cursorMatchesStep(step, {
+      fromBlock: 107,
+      parentBlockHash: hashBlock(106, 'rollback'),
+    }),
+    false,
+  );
+});
+
+test('handleRollbackApply: reorgApplied counts ONLY a genuine below-tip cross-branch fork', async () => {
+  // (a) The committed K7 shape: fork block 104 served below the tip the client requests
+  // (fromBlock=107) and crossing branches (parent 103:main, self 104:rollback). This IS a reorg:
+  // the mock rolls the tip back to 104, so the non-vacuity counter fires exactly once.
+  const genuine = await reorgAppliedFor(
+    {
+      type: 'rollbackApply',
+      reorgBlock: 104,
+      count: 3,
+      branch: 'rollback',
+      parentBranch: 'main',
+      match: { fromBlock: 107, parentBlock: 106, parentBranch: 'main' },
+    },
+    { fromBlock: 107, parentBlockHash: hashBlock(106, 'main') },
+  );
+  assert.equal(genuine, 1);
+});
+
+test('handleRollbackApply: an APPEND-shaped rollbackApply does NOT increment reorgApplied', async () => {
+  // (b1) reorgBlock === fromBlock: the "fork" block is served AT the tip the client requests, so it
+  // carries the chain forward (append) rather than rolling it back. Not a reorg ⇒ counter stays 0,
+  // even though it still crosses branches (parent 106:main, self 107:rollback).
+  const appendAtTip = await reorgAppliedFor(
+    {
+      type: 'rollbackApply',
+      reorgBlock: 107,
+      count: 3,
+      branch: 'rollback',
+      parentBranch: 'main',
+      match: { fromBlock: 107, parentBlock: 106, parentBranch: 'main' },
+    },
+    { fromBlock: 107, parentBlockHash: hashBlock(106, 'main') },
+  );
+  assert.equal(appendAtTip, 0);
+
+  // (b2) parentBranch === branch: a below-tip block whose parent is on its OWN branch is a plain
+  // same-branch append with a different label, not a cross-branch fork ⇒ counter stays 0.
+  const sameBranch = await reorgAppliedFor(
+    {
+      type: 'rollbackApply',
+      reorgBlock: 104,
+      count: 3,
+      branch: 'rollback',
+      parentBranch: 'rollback',
+    },
+    { fromBlock: 107, parentBlockHash: hashBlock(106, 'main') },
+  );
+  assert.equal(sameBranch, 0);
 });
