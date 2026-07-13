@@ -1727,7 +1727,8 @@ scenario-design bug (a fork point *below* the finalized anchor, which correctly 
 parent/deep-reorg gap), not a mock or product limit. With the fork point corrected to sit strictly
 *above* the anchor, the same product code path (`reconcile → {kind:'reorg'}` then rollback-apply,
 `portal-realtime.ts:1105`) that K5-409 already exercises drives an accepted rollback, and the SIGKILL
-lands mid-apply — so the **crash-timing** half of K7 is now mock-covered. What remains RG4/RG5 is only
+lands mid-stream of the re-applied rollback branch — so the **crash-timing** half of K7 is now
+mock-covered. What remains RG4/RG5 is only
 the **live-protocol fork-choice fidelity** (a real Portal 409/reorg with competing finalized sources),
 not kill-during-rollback as a class.
 
