@@ -546,8 +546,11 @@ for (const klass of classes) {
     wrongForkFinalizeRejected: 0,
   });
   // Distinct empirical kill blocks (from each run's kill.phase.log) — proves K2's varied mid-stream
-  // coverage rather than one repeated fixed block.
-  const killBlocks = [...new Set(rows.map((r) => r.killAtBlock).filter((b) => b != null))].sort((a, b) => a - b);
+  // coverage rather than one repeated fixed block. `killBlocksRecorded` keeps every row's non-null
+  // block so a cert can demand that EVERY kill recorded a block (a dropped/null row must not be able
+  // to slip past a distinct-set check where another row happened to record the expected block).
+  const killBlocksRecorded = rows.map((r) => r.killAtBlock).filter((b) => b != null);
+  const killBlocks = [...new Set(killBlocksRecorded)].sort((a, b) => a - b);
   // Live-cutover proof: kills where the mock had seen >=1 live /stream request before the kill. For K6
   // this is the load-bearing evidence that the kill lands at the backfill→live cutover request, not on a startup probe.
   const killsWithLiveStream = rows.filter((r) => Number(r.killStats?.stream ?? 0) > 0).length;
@@ -558,6 +561,7 @@ for (const klass of classes) {
     variantLabels: [...new Set(rows.map((r) => r.variant).filter(Boolean))].join(', '),
     killCount: rows.length,
     killBlocks,
+    killBlocksRecordedCount: killBlocksRecorded.length,
     killsWithLiveStream,
     wrongForkRunCount: wrongForkRows.length,
     wrongForkConsumedRuns,
@@ -605,12 +609,16 @@ const acceptance = {
     || (perClass.K6.killCount > 0 && perClass.K6.killsWithLiveStream === perClass.K6.killCount),
   k6CutoverOrganicOk: !hasClass('K6')
     || (perClass.K6.killCount > 0
+    && perClass.K6.killBlocksRecordedCount === perClass.K6.killCount
     && perClass.K6.killBlocks.length === 1
     && perClass.K6.killBlocks[0] === 106
     && perClass.K6.killsWithLiveStream === perClass.K6.killCount),
   k2KillSpreadOk: !hasClass('K2') || perClass.K2.killBlocks.length >= 3,
+  // Left `undefined` (not `true`) when K7 is absent so the guards below skip it entirely — a class
+  // that never ran must not self-report a vacuous "non-vacuous: true" pass in RESULT.md.
   k7RollbackNonVacuousOk: !hasClass('K7')
-    || (perClass.K7.killCount > 0
+    ? undefined
+    : (perClass.K7.killCount > 0
       && perClass.K7.cleanResumeCount === perClass.K7.killCount
       && perClass.K7.digestMatchCount === perClass.K7.killCount),
 };
