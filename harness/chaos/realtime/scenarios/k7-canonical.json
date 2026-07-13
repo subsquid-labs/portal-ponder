@@ -48,8 +48,7 @@
       "type": "blocks",
       "count": 5,
       "branch": "main",
-      "turnDelayMs": 10,
-      "resumeTurnDelayMs": 1000
+      "turnDelayMs": 1000
     },
     {
       "type": "rollbackApply",
