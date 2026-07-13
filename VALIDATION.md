@@ -1798,10 +1798,11 @@ hidden:
   the existing unknown-parent/deep-reorg fatal (`Cannot reconcile safely`) before any kill could be
   taken. The invariant was not weakened; K7 remains RG4/RG5.
 - **The harness `invariant()` fast-path is a fatal-string tripwire, not the primary death detector.**
-  It grep-matches all seven real fatal throws in `portal/portal-realtime.ts` (the gap fatal, the
-  below-floor 409 fatal, the 409 no-progress cap, the deterministic-4xx fatal, the unknown-parent
-  reconcile fatal, and the two finalize fatals), but a real client **process death** fails the run
-  regardless of the tripwire — the tripwire is an early-exit convenience, not the safety net.
+  It grep-matches all eight real fatal throws in `portal/portal-realtime.ts` (the gap fatal, the
+  below-floor 409 fatal, the 409 no-progress cap, the deterministic-4xx fatal, the delivery-progress
+  watchdog fatal (INV-24), the unknown-parent reconcile fatal, and the two finalize fatals), but a real
+  client **process death** fails the run regardless of the tripwire — the tripwire is an early-exit
+  convenience, not the safety net.
 
 **What this does NOT prove → RG4/RG5.** RG3 Phase A is crash-timing safety against a scripted mock. It
 does **not** establish live-protocol reorg survival, live finalize-boundary reconciliation, multichain
