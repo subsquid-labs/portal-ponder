@@ -12,9 +12,10 @@
   ],
   "steps": [
     {
-      "type": "blocks",
-      "count": 7,
-      "killAt": { "block": 107, "phase": "K6-cutover" },
+      "type": "cutoverGate",
+      "fromBlock": 106,
+      "parentBlockHash": "0x0417c9cdf96ec9e443881e5968e1b96fd545ea7d8528131f98a17fa0f6d8423e",
+      "killAt": { "block": 106, "phase": "K6-cutover" },
       "logs": [
         {
           "block": 101,
@@ -37,6 +38,12 @@
           "logIndex": 0
         }
       ]
+    },
+    {
+      "type": "blocks",
+      "count": 6,
+      "turnDelayMs": 10,
+      "branch": "main"
     }
   ]
 }

@@ -213,6 +213,7 @@ const facts = {
   duplicateFinalizedRows: Number(process.env.VERIFY_DUP_COUNT || '0'),
   storeDigest: process.env.VERIFY_STORE_DIGEST || null,
   appDigest: process.env.VERIFY_APP_DIGEST || null,
+  wrongForkPhase: /K5-wrongfork/.test(process.env.VERIFY_TARGET_PHASE || ''),
 };
 fs.writeFileSync(process.env.VERIFY_FACTS, `${JSON.stringify(facts, null, 2)}\n`);
 NODE

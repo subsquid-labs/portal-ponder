@@ -64,9 +64,15 @@ export function advanceScenarioCursor(cursor, step) {
   if (step?.type === 'blocks' || step?.type === 'fork') {
     return cursor + Math.max(0, count);
   }
+  if (step?.type === 'rollbackApply') {
+    return cursor + Math.max(0, count || 1);
+  }
   if (step?.type === 'childDiscovery') return Number(step.block ?? cursor + 1);
   if (step?.type === 'gapTrigger') return Number(step.block ?? cursor + 1);
   if (step?.type === 'wrongForkFinalize') return cursor;
+  if (step?.type === 'cutoverGate') {
+    return cursor;
+  }
   if (step?.type === 'idle204' || step?.type === 'status409') return cursor;
   if (step?.type === 'awaitRedelivery') return cursor;
 
@@ -411,6 +417,8 @@ function isCursorStep(step) {
       'status409',
       'idle204',
       'wrongForkFinalize',
+      'cutoverGate',
+      'rollbackApply',
     ]).has(step.type) || step.match !== undefined
   );
 }
@@ -468,6 +476,8 @@ function createRuntime(initialScenario, options = {}) {
   let finalizedIndex = 0;
   let resumeMode = false;
   let seq = 0;
+  let pendingWrongForkHead;
+  let skipWrongForkRejection = false;
   let currentPhase = {
     name: 'idle',
     phase: 'idle',
@@ -489,6 +499,8 @@ function createRuntime(initialScenario, options = {}) {
     redeliveryReopens: 0,
     finalizedHeadGates: 0,
     wrongForkFinalizes: 0,
+    wrongForkFinalizeConsumed: 0,
+    wrongForkFinalizeRejected: 0,
     requestLog: [],
   };
   const phaseLog = options.phaseLog;
@@ -559,7 +571,11 @@ function createRuntime(initialScenario, options = {}) {
     stats.redeliveryReopens = 0;
     stats.finalizedHeadGates = 0;
     stats.wrongForkFinalizes = 0;
+    stats.wrongForkFinalizeConsumed = 0;
+    stats.wrongForkFinalizeRejected = 0;
     stats.requestLog = [];
+    pendingWrongForkHead = undefined;
+    skipWrongForkRejection = false;
   };
 
   const load = (override) => {
@@ -588,6 +604,40 @@ function createRuntime(initialScenario, options = {}) {
         : (step.turnDelayMs ?? 10),
     );
 
+  const observeWrongForkConsumed = (head) => {
+    if (pendingWrongForkHead === undefined) {
+      return;
+    }
+    if (head === undefined) {
+      return;
+    }
+    if (Number(head.number) !== pendingWrongForkHead.number) {
+      return;
+    }
+    if (head.hash !== pendingWrongForkHead.hash) {
+      return;
+    }
+
+    stats.wrongForkFinalizeConsumed += 1;
+    pendingWrongForkHead = undefined;
+    skipWrongForkRejection = false;
+  };
+
+  const observeWrongForkStreamRequest = (body) => {
+    if (pendingWrongForkHead === undefined) {
+      return;
+    }
+    if (skipWrongForkRejection) {
+      skipWrongForkRejection = false;
+      return;
+    }
+
+    if (body?.parentBlockHash !== pendingWrongForkHead.hash) {
+      stats.wrongForkFinalizeRejected += 1;
+      pendingWrongForkHead = undefined;
+    }
+  };
+
   const finalizedHead = async (res) => {
     recordRequest('finalizedHead');
     const head =
@@ -608,6 +658,7 @@ function createRuntime(initialScenario, options = {}) {
       );
       if (open === false) return;
     }
+    observeWrongForkConsumed(head);
     if (finalizedIndex < scenario.finalizedHeadSeq.length - 1) {
       finalizedIndex += 1;
     }
@@ -627,6 +678,7 @@ function createRuntime(initialScenario, options = {}) {
       scenario.finalizedHeadSeq[0] ?? {
         number: scenario.genesis.number,
       };
+    observeWrongForkConsumed(head);
     const to = Math.min(Number(body?.toBlock ?? head.number), head.number);
     if (from > to) {
       stats.r204 += 1;
@@ -687,6 +739,39 @@ function createRuntime(initialScenario, options = {}) {
       JSON.stringify({ previousBlocks: previousBlocksForStep(step, body) }),
     );
     stepIndex += 1;
+  };
+
+  const handleCutoverGate = async (step, body, res) => {
+    const number = Number(step.fromBlock);
+    const phase = phaseForStep(step);
+    if (phase !== undefined) {
+      const open = await gate(
+        phase,
+        {
+          stepIndex,
+          block: number,
+          fromBlock: body.fromBlock,
+          parentBlockHash: body.parentBlockHash,
+          cutoverBlock: number,
+        },
+        res,
+      );
+      if (open === false) return;
+    }
+
+    const branchId = step.branch ?? step.branchId ?? 'main';
+    res.writeHead(200, { 'content-type': 'application/x-ndjson' });
+    writeNdjson(
+      res,
+      blockBatch(number, body, {
+        header: headerFor(number, branchId),
+        logs: logsForBlock(step, number),
+      }),
+    );
+    streamCursor = number;
+    stepIndex += 1;
+    stats.r200 += 1;
+    res.end();
   };
 
   const handleIdle204 = async (step, body, res) => {
@@ -807,6 +892,50 @@ function createRuntime(initialScenario, options = {}) {
     res.end();
   };
 
+  const handleRollbackApply = async (step, body, res) => {
+    const reorgBlock = Number(step.reorgBlock ?? streamCursor - 1);
+    const count = Math.max(0, Number(step.count ?? 1));
+    const branchId = step.branch ?? step.branchId ?? 'rollback';
+    const parentBranchId = step.parentBranch ?? 'main';
+    res.writeHead(200, { 'content-type': 'application/x-ndjson' });
+    for (let i = 0; i < count; i++) {
+      const number = reorgBlock + i;
+      const phase = gatePhaseForBlock(step, number);
+      if (phase !== undefined) {
+        const open = await gate(
+          phase,
+          {
+            stepIndex,
+            block: number,
+            fromBlock: body.fromBlock,
+            parentBlockHash: body.parentBlockHash,
+            reorgBlock,
+          },
+          res,
+        );
+        if (open === false) return;
+      }
+
+      writeNdjson(
+        res,
+        blockBatch(number, body, {
+          header: headerFor(
+            number,
+            branchId,
+            number === reorgBlock ? parentBranchId : branchId,
+          ),
+          logs: logsForBlock(step, number),
+        }),
+      );
+      streamCursor = number;
+      await streamTurnDelay(turnDelayForStep(step));
+      if (res.destroyed || res.writableEnded) return;
+    }
+    stepIndex += 1;
+    stats.r200 += 1;
+    res.end();
+  };
+
   const handleGapTrigger = async (step, body, res) => {
     const number = Number(step.block ?? streamCursor + 1);
     const header = {
@@ -839,16 +968,21 @@ function createRuntime(initialScenario, options = {}) {
       );
       if (open === false) return;
     }
+    const hash =
+      step.hash ?? step.canonicalHash ?? hashBlock(number, 'wrong-fork');
     scenario.finalizedHeadSeq.splice(finalizedIndex, 0, {
       number,
-      hash: step.hash ?? step.canonicalHash ?? hashBlock(number, 'wrong-fork'),
+      hash,
     });
+    pendingWrongForkHead = { number, hash };
+    skipWrongForkRejection = true;
     stepIndex += 1;
     await stream(body, res);
   };
 
   const stream = async (body, res) => {
     recordRequest('stream', body);
+    observeWrongForkStreamRequest(body);
     const step = scenario.steps[stepIndex];
     if (step === undefined) {
       stats.r204 += 1;
@@ -871,6 +1005,9 @@ function createRuntime(initialScenario, options = {}) {
       case 'status409':
         await handleStatus409(step, body, res);
         return;
+      case 'cutoverGate':
+        await handleCutoverGate(step, body, res);
+        return;
       case 'idle204':
         await handleIdle204(step, body, res);
         return;
@@ -882,6 +1019,9 @@ function createRuntime(initialScenario, options = {}) {
         return;
       case 'gapTrigger':
         await handleGapTrigger(step, body, res);
+        return;
+      case 'rollbackApply':
+        await handleRollbackApply(step, body, res);
         return;
       case 'wrongForkFinalize':
         await handleWrongForkFinalize(step, body, res);
