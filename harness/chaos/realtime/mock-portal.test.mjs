@@ -481,14 +481,12 @@ test('handleBlocks: a /stream reopened at a fresh fromBlock mid-flight starts at
 
   const reconnectSeq = streamedNumbers(resReconnect);
 
-  // The reconnect must begin at its own fromBlock and stay contiguous — never inherit the in-flight
-  // stream's cursor position.
-  assert.equal(
-    reconnectSeq[0],
-    300,
-    `reconnect started at ${reconnectSeq[0]}, expected its own fromBlock 300; full sequence ${JSON.stringify(
-      reconnectSeq,
-    )}`,
-  );
+  // Sanity: the reconnect streamed its full window off its OWN fromBlock (guards against a vacuous
+  // pass where it emitted nothing/too few and "contiguity" held trivially). Under the shared cursor
+  // it would inherit the in-flight stream's position instead of honoring fromBlock 300.
+  assert.deepEqual(reconnectSeq, [300, 301, 302]);
+
+  // The load-bearing property: the reconnect begins at its own fromBlock and stays contiguous —
+  // never inherits the in-flight stream's cursor position.
   assertContiguous(reconnectSeq, 'reconnect (fromBlock=300)');
 });
