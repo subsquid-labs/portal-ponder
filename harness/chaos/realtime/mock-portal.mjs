@@ -469,7 +469,7 @@ function streamTurnDelay(ms = 10) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
-function createRuntime(initialScenario, options = {}) {
+export function createRuntime(initialScenario, options = {}) {
   let scenario = normalizeScenario(initialScenario);
   let stepIndex = 0;
   let streamCursor = scenario.genesis.number;
@@ -910,15 +910,27 @@ function createRuntime(initialScenario, options = {}) {
     const count = Math.max(0, Number(step.count ?? 1));
     const branchId = step.branch ?? step.branchId ?? 'rollback';
     const parentBranchId = step.parentBranch ?? 'main';
+    // The tip the client is requesting on this resume cursor. The fork block is a genuine reorg only
+    // when it lands strictly BELOW this tip; served at (or above) the tip it is a plain append.
+    const requestFromBlock = Number(
+      body?.fromBlock ?? step.match?.fromBlock ?? streamCursor + 1,
+    );
+    // A genuine below-tip cross-branch fork requires ALL of:
+    //   (1) the fork block is served below the tip the client is requesting (reorgBlock < fromBlock) —
+    //       an APPEND-shaped rollbackApply (reorgBlock === fromBlock) would carry the tip forward, not
+    //       roll it back, so it is NOT a reorg even with a different branch label; and
+    //   (2) the fork block crosses branches (parentBranchId !== branchId): `headerFor(reorgBlock,
+    //       branchId, parentBranchId)` gives it parentHash = hashBlock(reorgBlock - 1, parentBranchId),
+    //       i.e. its parent is (reorgBlock - 1) on `parentBranch` — the below-tip cross-branch splice
+    //       that drives the product's reconcile -> {kind:'reorg'} rollback-apply.
+    // Encoding the non-vacuity invariant at the counter (not only in the committed scenario) means an
+    // append masquerading as a rollback can never self-report a K7 pass.
+    const isBelowTipCrossBranchFork =
+      reorgBlock < requestFromBlock && parentBranchId !== branchId;
     res.writeHead(200, { 'content-type': 'application/x-ndjson' });
     for (let i = 0; i < count; i++) {
       const number = reorgBlock + i;
-      // Count the reorg branch actually being served: the fork block (i === 0) carries a CROSS-branch
-      // parentHash (parent on `parentBranchId`, self on `branchId`), which is what drives the product's
-      // reconcile -> {kind:'reorg'} rollback-apply. A scenario that silently degraded to a plain
-      // tip-append (fork point == branch) has parentBranchId === branchId and never increments this,
-      // so a vacuous "append masquerading as rollback" cannot self-report a K7 pass.
-      if (i === 0 && parentBranchId !== branchId) {
+      if (i === 0 && isBelowTipCrossBranchFork) {
         stats.reorgApplied += 1;
       }
 
