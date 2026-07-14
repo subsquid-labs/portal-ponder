@@ -26,9 +26,9 @@ const PORTAL = (slug: string) => `https://portal.sqd.dev/datasets/${slug}`;
 //  - rpc: keyless *archive* public RPCs (drpc.org) — realtime tip + state reads. Archive is
 //    required because reads happen at historical blocks. Rate-limited under load; set
 //    PONDER_RPC_URL_<chainId> to your own for real work.
-//  - endBlock: mainnet defaults to the verified 120k-block live window used by euler-subgraph.
-//    Base and Arbitrum keep short factory-deploy windows (~DEMO_SPAN blocks) until their live
-//    payoff windows are probed. Set PONDER_FULL=1 to backfill full history.
+//  - endBlock: each chain defaults to a ~DEMO_SPAN-block window anchored at its FIRST EVault
+//    ProxyCreated event, so the demo indexes real factory children (not an empty pre-deploy range).
+//    Set PONDER_FULL=1 to backfill full history.
 const DEMO_SPAN = Number(process.env.PONDER_DEMO_SPAN ?? 200_000);
 const FULL = process.env.PONDER_FULL === '1';
 
@@ -36,6 +36,17 @@ const MAINNET_DEMO_START = 22_681_265;
 const MAINNET_DEMO_END = 22_801_264;
 const MAINNET_FULL_START = 20_429_973;
 const MAINNET_FULL_END = 25_423_884;
+
+// Base and Arbitrum: the GenericFactory is deployed far earlier than its first vault, so the demo
+// starts at the first EVault ProxyCreated (verified against the Portal dataset) rather than the
+// factory-deploy block — otherwise the ~DEMO_SPAN window lands in an empty pre-vault range and the
+// chain indexes zero events. FULL still backfills from the factory-deploy block.
+const BASE_DEMO_START = 36_016_000; // first EVault ProxyCreated on base: 36_016_090
+const BASE_FULL_START = 18_000_000;
+const BASE_FULL_END = 47_979_047;
+const ARBITRUM_DEMO_START = 317_852_000; // first EVault ProxyCreated on arbitrum: 317_852_641
+const ARBITRUM_FULL_START = 255_000_000;
+const ARBITRUM_FULL_END = 478_620_027;
 
 // Bound the demo to [start, min(start + DEMO_SPAN, fullEnd)] unless PONDER_FULL=1.
 const bound = (start: number, fullEnd: number) => {
@@ -75,13 +86,13 @@ export default createConfig({
         },
         base: {
           address: '0x7F321498A801A191a93C840750ed637149dDf8D0',
-          startBlock: 18_000_000,
-          endBlock: bound(18_000_000, 47_979_047),
+          startBlock: FULL ? BASE_FULL_START : BASE_DEMO_START,
+          endBlock: bound(BASE_DEMO_START, BASE_FULL_END),
         },
         arbitrum: {
           address: '0x78Df1CF5bf06a7f27f2ACc580B934238C1b80D50',
-          startBlock: 255_000_000,
-          endBlock: bound(255_000_000, 478_620_027),
+          startBlock: FULL ? ARBITRUM_FULL_START : ARBITRUM_DEMO_START,
+          endBlock: bound(ARBITRUM_DEMO_START, ARBITRUM_FULL_END),
         },
       },
     },
@@ -103,8 +114,8 @@ export default createConfig({
             event: proxyCreated,
             parameter: 'proxy',
           }),
-          startBlock: 18_000_000,
-          endBlock: bound(18_000_000, 47_979_047),
+          startBlock: FULL ? BASE_FULL_START : BASE_DEMO_START,
+          endBlock: bound(BASE_DEMO_START, BASE_FULL_END),
         },
         arbitrum: {
           address: factory({
@@ -112,8 +123,8 @@ export default createConfig({
             event: proxyCreated,
             parameter: 'proxy',
           }),
-          startBlock: 255_000_000,
-          endBlock: bound(255_000_000, 478_620_027),
+          startBlock: FULL ? ARBITRUM_FULL_START : ARBITRUM_DEMO_START,
+          endBlock: bound(ARBITRUM_DEMO_START, ARBITRUM_FULL_END),
         },
       },
     },
