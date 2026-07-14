@@ -105,6 +105,22 @@ export class PortalDatasetStartError extends Error {
   }
 }
 
+/**
+ * A dataset that has no such TABLE at all ("table 'traces' does not exist"). Distinct from a missing
+ * COLUMN (PortalSchemaFieldError): a whole table is absent, so field-degradation can't recover — the
+ * source type simply isn't served for this network/range (e.g. a chain with no call traces, or one that
+ * only serves traces above a cutoff block like Optimism's Bedrock). Caught in the stream loop and
+ * reworded into an actionable message that names the source and the remedy.
+ */
+export class PortalMissingTableError extends Error {
+  readonly table: string;
+  constructor(table: string) {
+    super(`Portal 400: table '${table}' does not exist`);
+    this.name = 'PortalMissingTableError';
+    this.table = table;
+  }
+}
+
 /** A request body that exceeded the Portal's raw query-size cap ("query is too large"). */
 export class PortalQueryTooLargeError extends Error {
   readonly cursor: number;

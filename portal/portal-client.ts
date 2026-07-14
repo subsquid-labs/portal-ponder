@@ -20,6 +20,7 @@ import {
   PortalDatasetStartError,
   PortalHttpError,
   PortalIncompleteRangeError,
+  PortalMissingTableError,
   PortalQueryTooLargeError,
   PortalSchemaFieldError,
   PortalThrottleError,
@@ -193,6 +194,20 @@ const colToFieldKey = (col: string, table: string): string => {
     COL_SPECIAL[col] ??
     col.replace(/_([a-z0-9])/g, (_, c: string) => c.toUpperCase());
   return `${key}.${field}`;
+};
+
+/**
+ * Per-table guidance for the "table does not exist" 400 (PortalMissingTableError). Keyed by the Portal
+ * table name; `source` names the user-facing ponder feature and `remedy` the config change to make.
+ * `traces` is the only optional table ponder reaches today (logs/transactions/blocks always exist), so
+ * it's the only specific entry; any other table falls back to a generic named message.
+ */
+const TABLE_SOURCE_HELP: Record<string, { source: string; remedy: string }> = {
+  traces: {
+    source: 'call traces',
+    remedy:
+      'remove the trace sources (contract `includeCallTraces`, and `account`/`transfer` filters) for this chain',
+  },
 };
 
 /**
@@ -568,6 +583,11 @@ export function createPortalClient(deps: PortalClientDeps): PortalClient {
           res.status === 400 &&
           text.match(/dataset starts (?:from|at) block (\d+)/i);
         if (s) throw new PortalDatasetStartError(Number(s[1]));
+        // a dataset that has no such TABLE (e.g. a network with no traces, or below a trace cutoff) 400s
+        // with "table 'traces' does not exist". A whole table is absent — field-degradation can't recover.
+        const t =
+          res.status === 400 && text.match(/table '([a-z_]+)' does not exist/i);
+        if (t) throw new PortalMissingTableError(t[1]!);
         // a dense range can exceed the Portal's per-query size/work estimate → 400 "Query is too large".
         if (res.status === 400 && /query is too large/i.test(text))
           throw new PortalQueryTooLargeError(cursor);
@@ -658,6 +678,21 @@ export function createPortalClient(deps: PortalClientDeps): PortalClient {
             // body still overflows, the address batch itself is too big → fail loud with the lever.
             throw new Error(
               `Portal query body exceeds MAX_RAW_QUERY_SIZE even after merging event filters — lower PORTAL_MAX_ADDRESSES (currently ${PORTAL_MAX_ADDRESSES}) to shrink the address batch. @ ${cursor}`,
+            );
+          }
+          if (err instanceof PortalMissingTableError) {
+            // The whole table is absent for this dataset — not a transient or degradable condition. Name
+            // the source and the remedy instead of leaking the raw "table 'traces' does not exist" 400.
+            const label = TABLE_SOURCE_HELP[err.table];
+            const what = label
+              ? `does not serve ${label.source}`
+              : `has no '${err.table}' table`;
+            const remedy = label
+              ? label.remedy
+              : `remove the source that requests '${err.table}' for this chain`;
+
+            throw new Error(
+              `Portal dataset for ${chainName} ${what} over blocks [${cursor},${to}]. Some networks omit it entirely; others only serve it above a cutoff block (e.g. Optimism call traces from the Bedrock block). ${remedy}, or index a network/range that provides it.`,
             );
           }
           if (err instanceof PortalDatasetStartError) {
