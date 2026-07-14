@@ -41,7 +41,7 @@ index acea95b..c502c66 100644
    pollingInterval: number;
    finalityBlockCount: number;
 diff --git a/packages/core/src/rpc/actions.ts b/packages/core/src/rpc/actions.ts
-index 32ba7a8..0dabd74 100644
+index 32ba7a8..c443cb6 100644
 --- a/packages/core/src/rpc/actions.ts
 +++ b/packages/core/src/rpc/actions.ts
 @@ -1,6 +1,8 @@
@@ -192,7 +192,22 @@ index 32ba7a8..0dabd74 100644
  /**
   * Helper function for "eth_getTransactionReceipt" request.
   */
-@@ -893,6 +1017,33 @@ export const standardizeTransactions = (
+@@ -787,6 +911,14 @@ export const standardizeTransactions = (
+     { method: "eth_getBlockByNumber" | "eth_getBlockByHash" }
+   >,
+ ): SyncTransaction[] => {
++  // PORTAL_ALLOW_MISSING_ACCESS_LIST — opt-in to consuming from a non-standard RPC provider (e.g.
++  // SQD's zkSync proxy) that omits the spec-required `accessList` on typed-envelope txs. Default
++  // OFF: a missing accessList is a loud RpcProviderError (below). When set, the missing value is
++  // allowed through and stored as an honest NULL. Read once per call — cheap, hoisted above the
++  // loop — so ops can flip it via env without a rebuild, and tests can toggle it per call. (issue #27)
++  const allowMissingAccessList = Boolean(
++    process.env.PORTAL_ALLOW_MISSING_ACCESS_LIST,
++  );
+   const transactionIds = new Set<Hex>();
+ 
+   for (const transaction of transactions) {
+@@ -893,6 +1025,38 @@ export const standardizeTransactions = (
        transaction.gas = "0x0";
      }
  
@@ -203,9 +218,12 @@ index 32ba7a8..0dabd74 100644
 +    // defaulting to `[]`, which would fabricate an empty list over a real one. Legacy (0x0), OP
 +    // deposit (0x7e), and unknown/system envelopes (e.g. Arbitrum internals) carry no access list
 +    // and are left untouched. An explicit `accessList: null` is treated the same as an omitted key
-+    // (`== null`): encode.ts maps both to the same permanent NULL, so both must fail loud.
++    // (`== null`): encode.ts maps both to the same permanent NULL, so both must fail loud —
++    // UNLESS the operator opts in via PORTAL_ALLOW_MISSING_ACCESS_LIST (see above), in which case
++    // the missing value flows through to that honest NULL by design.
 +    const txType: string | undefined = transaction.type;
 +    if (
++      !allowMissingAccessList &&
 +      (txType === "0x1" ||
 +        txType === "0x2" ||
 +        txType === "0x3" ||
@@ -216,7 +234,9 @@ index 32ba7a8..0dabd74 100644
 +        `Invalid RPC response: 'transaction.accessList' is a required property on type ${txType} transactions`,
 +      );
 +      error.meta = [
-+        "Please report this error to the RPC operator.",
++        "This RPC provider omits the spec-required 'accessList' on typed transactions. If that is " +
++          "expected for this endpoint (e.g. SQD's zkSync proxy), set PORTAL_ALLOW_MISSING_ACCESS_LIST=1 " +
++          "to store the missing access list as NULL and continue; otherwise report this to the RPC operator.",
 +        requestText(request),
 +      ];
 +      error.stack = undefined;

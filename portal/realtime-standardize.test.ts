@@ -117,3 +117,86 @@ test('type-0x2 with accessList ([] and non-empty) passes through unchanged and e
     encodeTransaction({ transaction: outFull[0]!, chainId: 1 }).accessList,
   ).toBe(JSON.stringify(list));
 });
+
+// ─────────────────────── (f) opt-in: PORTAL_ALLOW_MISSING_ACCESS_LIST ───────────────────────
+// The default guard is right for a compliant provider, but SQD's own zkSync RPC proxy returns
+// EIP-1559 (0x2) txs with NO `accessList` key at all — so on that documented-supported endpoint
+// the guard crashes the whole app. `PORTAL_ALLOW_MISSING_ACCESS_LIST` (default OFF) lets an
+// operator who knows the omission is legitimate proceed and store the honest NULL, exactly as the
+// Portal path already does for datasets that lack the column entirely (#27, #110/#111).
+
+// Run `body` with the knob forced to `value`, restoring the prior env afterwards (no cross-test leak).
+const withKnob = (value: string | undefined, body: () => void): void => {
+  const prev = process.env.PORTAL_ALLOW_MISSING_ACCESS_LIST;
+  if (value === undefined) {
+    delete process.env.PORTAL_ALLOW_MISSING_ACCESS_LIST;
+  } else {
+    process.env.PORTAL_ALLOW_MISSING_ACCESS_LIST = value;
+  }
+
+  try {
+    body();
+  } finally {
+    if (prev === undefined) {
+      delete process.env.PORTAL_ALLOW_MISSING_ACCESS_LIST;
+    } else {
+      process.env.PORTAL_ALLOW_MISSING_ACCESS_LIST = prev;
+    }
+  }
+};
+
+// The loud default error must NAME the escape hatch — an operator hitting the zkSync crash needs to
+// be told the exact knob, not left to grep the source. The guidance rides on `RpcProviderError.meta`
+// (surfaced by the logger, like every other error here), not the terse message line.
+test('default (knob unset) → missing accessList still throws, and the guidance names the knob', () => {
+  withKnob(undefined, () => {
+    const t = tx({ type: '0x2' });
+    expect(() => standardize(t)).toThrowError(/transaction\.accessList/);
+
+    let meta: string[] = [];
+    try {
+      standardize(t);
+    } catch (err) {
+      meta = (err as { meta?: string[] }).meta ?? [];
+    }
+
+    expect(meta.join(' ')).toMatch(/PORTAL_ALLOW_MISSING_ACCESS_LIST/);
+  });
+});
+
+// With the knob set, EVERY typed envelope missing accessList flows through instead of throwing, and
+// the absent value stays `undefined` → encodeTransaction maps it to a NULL (honest absence, not []).
+test('knob set → missing accessList on 0x1/0x2/0x3/0x4 passes through, encodes to NULL', () => {
+  withKnob('1', () => {
+    for (const type of ['0x1', '0x2', '0x3', '0x4']) {
+      const t = tx({ type });
+      expect(() => standardize(t)).not.toThrow();
+      const out = standardize(t);
+      expect(out[0]!.accessList).toBeUndefined();
+      expect(
+        encodeTransaction({ transaction: out[0]!, chainId: 1 }).accessList,
+      ).toBeNull();
+    }
+  });
+});
+
+// The knob is an escape hatch for ABSENT lists only — it must never fabricate or drop a REAL one:
+// a present access list still round-trips unchanged when the knob is on.
+test('knob set → a present accessList is still preserved unchanged', () => {
+  withKnob('1', () => {
+    const list = [
+      {
+        address: '0x000000000000000000000000000000000000dead',
+        storageKeys: [
+          '0x0000000000000000000000000000000000000000000000000000000000000001',
+        ],
+      },
+    ];
+    const t = tx({ type: '0x2', accessList: list });
+    const out = standardize(t);
+    expect(out[0]!.accessList).toEqual(list);
+    expect(
+      encodeTransaction({ transaction: out[0]!, chainId: 1 }).accessList,
+    ).toBe(JSON.stringify(list));
+  });
+});
