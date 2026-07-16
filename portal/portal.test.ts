@@ -1828,6 +1828,145 @@ test('regression (#140): a chain that streams 0 blocks in its window STILL emits
   }
 });
 
+test('regression (#143): a window whose raw logs are ALL re-match-dropped emits inserted.logs=0 (store count, not raw-streamed)', async () => {
+  // The Portal's merged server-side log filter over-returns rows assembly drops: here a log matching the
+  // BOUNDED filter B by topic, but at a block ABOVE B.toBlock — out of B's range → `logMatched` re-matches
+  // it away (it is not filter A's topic either). So the window STREAMS raw logs (stats.logs > 0) yet
+  // ASSEMBLES 0 logs and 0 blocks → syncBlockData takes the 0-block early-out and inserts nothing.
+  //
+  // BEFORE the fix: `inserted.logs` mapped to the raw streamed `stats.logs`, so the emitted metrics file
+  // reported `inserted.logs > 0` while `inserted.blocks = 0` and ZERO logs were actually inserted — the
+  // count contradicted reality (issue #143). AFTER: `inserted.logs` is the store-inserted (assembled)
+  // count, so both read 0.
+  // MUTATION: map `inserted.logs` back to `stats.logs` in portal-metrics.ts (revert the fix) → this test
+  // fails with `inserted.logs` = 1 (the raw streamed, dropped log), against the asserted 0.
+  const CHAIN_ID = 10; // optimism — an arbitrary per-chain id for the metrics file name
+  const OTHER_TOPIC0 = `0x${'cc'.repeat(32)}`;
+  const DROP_BLOCK = 150; // above filter B's toBlock=100 → re-matched away by assembly
+  const metricsFile = join(
+    tmpdir(),
+    `portal-metrics-rematch-drop-${process.pid}`,
+  );
+  const perChainFile = `${metricsFile}.${CHAIN_ID}`;
+  rmSync(perChainFile, { force: true });
+  process.env.PORTAL_METRICS_FILE = metricsFile;
+
+  // In-range window [0, 5000] (head 2e9 ≫ window): the server returns ONE block at 150 carrying an
+  // OTHER-topic log (matches bounded filter B by topic, but 150 > B.toBlock=100 → dropped on re-match),
+  // then terminates at the range-end anchor. No log survives → 0 blocks assembled.
+  const srv = http.createServer((req, res) => {
+    let body = '';
+    req.on('data', (c) => {
+      body += c;
+    });
+    req.on('end', () => {
+      if (req.url?.includes('finalized-head')) {
+        res.writeHead(200, { 'content-type': 'application/json' });
+        res.end(JSON.stringify({ number: 2_000_000_000 }));
+
+        return;
+      }
+      const q = body ? JSON.parse(body) : {};
+      const from = q.fromBlock ?? 0;
+      const to = q.toBlock ?? 1e12;
+      if (from <= DROP_BLOCK && to >= DROP_BLOCK) {
+        anchorRes(res, to, [mkTopicBlock(DROP_BLOCK, OTHER_TOPIC0)]);
+
+        return;
+      }
+
+      anchorRes(res, to); // header-only anchor elsewhere
+    });
+  });
+  const p: number = await new Promise((r) =>
+    srv.listen(0, () => r((srv.address() as AddressInfo).port)),
+  );
+  try {
+    const inserted = { blocks: [] as any[], logs: [] as any[] };
+    const syncStore: any = {
+      insertLogs: (x: any) => inserted.logs.push(...x.logs),
+      insertBlocks: (x: any) => inserted.blocks.push(...x.blocks),
+      insertTransactions: () => {},
+      insertTransactionReceipts: () => {},
+      insertTraces: () => {},
+    };
+    const filterA: any = {
+      type: 'log',
+      chainId: CHAIN_ID,
+      sourceId: 'a',
+      address: VAULT,
+      topic0: DEPOSIT_TOPIC0, // the DROP_BLOCK log is OTHER_TOPIC0 → never matches A
+      topic1: null,
+      topic2: null,
+      topic3: null,
+      fromBlock: 0,
+      toBlock: undefined, // unbounded → the merged request spans DROP_BLOCK so the log is streamed
+      hasTransactionReceipt: false,
+      include: [],
+    };
+    const filterB: any = {
+      type: 'log',
+      chainId: CHAIN_ID,
+      sourceId: 'b',
+      address: VAULT,
+      topic0: OTHER_TOPIC0, // matches the DROP_BLOCK log by topic …
+      topic1: null,
+      topic2: null,
+      topic3: null,
+      fromBlock: 0,
+      toBlock: 100, // … but bounded at 100 → the block-150 log is OUT OF RANGE → re-matched away
+      hasTransactionReceipt: false,
+      include: [],
+    };
+    const sync = createPortalHistoricalSync({
+      common: {
+        logger: { debug() {}, info() {}, warn() {}, error() {}, trace() {} },
+      } as any,
+      chain: {
+        id: CHAIN_ID,
+        name: 'optimism',
+        portal: `http://localhost:${p}`,
+      } as any,
+      childAddresses: new Map(),
+      eventCallbacks: [{ filter: filterA }, { filter: filterB }],
+    } as any);
+
+    const interval: [number, number] = [0, 5000];
+    const logs = await sync.syncBlockRangeData({
+      interval,
+      requiredIntervals: [
+        { interval, filter: filterA },
+        { interval, filter: filterB },
+      ],
+      requiredFactoryIntervals: [],
+      syncStore,
+    });
+    await sync.syncBlockData({ interval, logs, syncStore } as any);
+
+    // Precondition: the over-returned log was re-match-dropped — nothing was inserted into the store.
+    expect(inserted.logs).toHaveLength(0);
+    expect(inserted.blocks).toHaveLength(0);
+
+    // THE FIX: the emitted metrics file reports the store-insertion truth — 0 logs, 0 blocks — not the
+    // raw streamed count. Under the bug, inserted.logs would be 1 (the streamed-then-dropped log).
+    expect(existsSync(perChainFile)).toBe(true);
+    const parsed = JSON.parse(readFileSync(perChainFile, 'utf8'));
+    expect(parsed.inserted.logs).toBe(0);
+    expect(parsed.inserted.blocks).toBe(0);
+    expect(parsed.inserted).toEqual({
+      logs: 0,
+      blocks: 0,
+      txs: 0,
+      receipts: 0,
+      traces: 0,
+    });
+  } finally {
+    srv.close();
+    rmSync(perChainFile, { force: true });
+    delete process.env.PORTAL_METRICS_FILE;
+  }
+});
+
 test('regression (C6): deep matched trace is stored at its FULL-tree pre-order index (7), not filter-local (0)', async () => {
   // Ponder's RPC sync numbers trace_index as the pre-order DFS rank over each tx's FULL call tree,
   // THEN filters — so a lone deep match keeps its true position. Portal used to push the trace
