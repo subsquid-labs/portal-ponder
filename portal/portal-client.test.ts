@@ -540,6 +540,39 @@ test("'query is too large' 400 → actionable PORTAL_MAX_ADDRESSES error (bytes 
   );
 });
 
+test("'table does not exist' 400 → actionable missing-source error (names the source + remedy, not the raw 400)", async () => {
+  const client = mk({
+    chainName: 'optimism',
+    fetchImpl: (async () =>
+      badRes("couldn't parse request: table 'traces' does not exist")) as any,
+  });
+  const err = await collect(client.stream(QUERY, 0, 10)).then(
+    () => undefined,
+    (e) => e as Error,
+  );
+  expect(err?.message).toMatch(/optimism/);
+  expect(err?.message).toMatch(/call traces/);
+  expect(err?.message).toMatch(/includeCallTraces/);
+  // the raw Portal wording must NOT be what surfaces
+  expect(err?.message).not.toMatch(/couldn't parse request/);
+});
+
+test("'table does not exist' 400 for a table with no specific help → generic named fallback", async () => {
+  // stateDiffs is a real Portal table ponder never requests → no specific entry → the generic branch:
+  // still names the chain + table + a remove-the-source remedy, never the raw Portal wording.
+  const client = mk({
+    chainName: 'somechain',
+    fetchImpl: (async () => badRes("table 'stateDiffs' does not exist")) as any,
+  });
+  const err = await collect(client.stream(QUERY, 0, 10)).then(
+    () => undefined,
+    (e) => e as Error,
+  );
+  expect(err?.message).toMatch(/somechain/);
+  expect(err?.message).toMatch(/stateDiffs/);
+  expect(err?.message).toMatch(/remove the source/);
+});
+
 test('an unrecognised 400 surfaces as PortalHttpError', async () => {
   const client = mk({
     fetchImpl: (async () => badRes('some unexpected failure')) as any,
