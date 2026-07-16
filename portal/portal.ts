@@ -946,6 +946,10 @@ export const createPortalHistoricalSync = (
       evictBehind(interval[0]); // free chunks fully behind the cursor + their memory budget
 
       await syncStore.insertLogs({ logs: assembled.logs, chainId: chain.id });
+      // #143: count logs ACTUALLY inserted (post-re-match), not the raw streamed `stats.logs`. A window
+      // whose over-returned logs are all re-match-dropped inserts 0 here, so `inserted.logs` reads 0
+      // rather than contradicting `inserted.blocks=0`.
+      stats.insertedLogs += assembled.logs.length;
       // INV-12: a stash entry is created then consumed exactly once. An upstream retry can legitimately
       // re-issue a range, so production (`on`) keeps the pre-refactor OVERWRITE semantics with a debug
       // log; `strict` (tests/CI) makes the double-set loud.

@@ -24,7 +24,15 @@ export type PortalStats = {
   extends: number;
   discChunks: number;
   http: number;
+  /** RAW logs streamed off the Portal (pre-re-match) — a progress/streaming signal, NOT an insert count. */
   logs: number;
+  /**
+   * #143: logs ACTUALLY inserted into the sync-store (`assembled.logs.length` at the insertLogs site,
+   * post-re-match). The Portal's merged server-side filter over-returns rows assembly drops (a bounded
+   * filter's out-of-range logs, a factory child's pre-creation logs), so `logs` (raw) can exceed this.
+   * `inserted.logs` maps to THIS so it is uniformly a store-insertion count alongside blocks/txs/…
+   */
+  insertedLogs: number;
   errors: number;
   retries: number;
   bytes: number;
@@ -47,6 +55,7 @@ export const createStats = (): PortalStats => ({
   discChunks: 0,
   http: 0,
   logs: 0,
+  insertedLogs: 0,
   errors: 0,
   retries: 0,
   bytes: 0,
@@ -113,7 +122,9 @@ export function writeMetrics(args: {
         },
         portalGate: gate.snapshot(),
         inserted: {
-          logs: stats.logs,
+          // #143: store-inserted (assembled) logs, NOT raw-streamed `stats.logs`. A window whose raw logs
+          // are all re-match-dropped inserts 0 logs — this must read 0, consistent with inserted.blocks=0.
+          logs: stats.insertedLogs,
           blocks: stats.blocks,
           txs: stats.txs,
           receipts: stats.receipts,
@@ -260,7 +271,10 @@ export function createCompletionSummary(args: {
           : `${stats.rpcFallback} block range(s) fell back to JSON-RPC`;
       logInfo({
         service: 'portal',
-        msg: `Portal ${chainName} complete: blocks=${stats.blocks} logs=${stats.logs} txs=${stats.txs} receipts=${stats.receipts} mb_streamed=${formatMb(stats.bytes)} elapsed=${(elapsedMs / 1000).toFixed(1)}s avg_blocks_per_s=${formatRate(stats.blocks, elapsedMs)} rpc_fallback=${stats.rpcFallback} — ${provenance}`,
+        // #143: `logs=` is the store-inserted (assembled) count — consistent with its siblings
+        // blocks=/txs=/receipts=, all of which report inserted rows. `mb_streamed` remains the raw
+        // Portal I/O volume (its own streaming semantic), so the two are not conflated.
+        msg: `Portal ${chainName} complete: blocks=${stats.blocks} logs=${stats.insertedLogs} txs=${stats.txs} receipts=${stats.receipts} mb_streamed=${formatMb(stats.bytes)} elapsed=${(elapsedMs / 1000).toFixed(1)}s avg_blocks_per_s=${formatRate(stats.blocks, elapsedMs)} rpc_fallback=${stats.rpcFallback} — ${provenance}`,
       });
     } catch {
       /* completion logging is best-effort */

@@ -30,7 +30,8 @@ test('writeMetrics: the metrics file matches the documented shape field-for-fiel
   stats.gateWaitMs = 10.4;
   stats.fetchMs = 20.6;
   stats.transformMs = 30.2;
-  stats.logs = 100;
+  stats.logs = 100; // RAW streamed (a streaming/progress signal) — deliberately ≠ insertedLogs below
+  stats.insertedLogs = 88; // #143: store-inserted (post-re-match) — this is what inserted.logs reports
   stats.blocks = 40;
   stats.txs = 40;
   stats.receipts = 6;
@@ -77,7 +78,8 @@ test('writeMetrics: the metrics file matches the documented shape field-for-fiel
       },
       timing: { gateWaitMs: 10, fetchMs: 21, transformMs: 30 }, // Math.round of the cumulative ms
       portalGate: { limit: 16, active: 3, rows: 42 },
-      inserted: { logs: 100, blocks: 40, txs: 40, receipts: 6, traces: 2 },
+      inserted: { logs: 88, blocks: 40, txs: 40, receipts: 6, traces: 2 }, // #143: insertedLogs, not raw 100
+
       rpcFallbackIntervals: 1,
     });
   } finally {
@@ -206,7 +208,8 @@ test('progress ticker: disabled interval and logger failures never throw', () =>
 test('completion summary: fires exactly once, reporting event counts and zero-fallback provenance', () => {
   const stats = createStats();
   stats.blocks = 40;
-  stats.logs = 100;
+  stats.logs = 100; // RAW streamed — deliberately ≠ insertedLogs so the line's source is unambiguous
+  stats.insertedLogs = 88; // #143: the completion line's `logs=` must report THIS (store-inserted)
   stats.txs = 55;
   stats.receipts = 6;
   stats.bytes = 2 * 1024 * 1024;
@@ -227,7 +230,10 @@ test('completion summary: fires exactly once, reporting event counts and zero-fa
   // fails every one — the mutation red.
   expect(logs).toHaveLength(1);
   expect(logs[0]).toContain('blocks=40');
-  expect(logs[0]).toContain('logs=100');
+  // #143: `logs=` reports the store-inserted count (88), NOT the raw streamed 100 — a build that
+  // still reads `stats.logs` here prints `logs=100` and fails this pair.
+  expect(logs[0]).toContain('logs=88');
+  expect(logs[0]).not.toContain('logs=100');
   expect(logs[0]).toContain('txs=55');
   expect(logs[0]).toContain('receipts=6');
   expect(logs[0]).toContain('mb_streamed=2.00');
