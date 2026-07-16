@@ -52,6 +52,11 @@ import {
 } from './portal-realtime.js';
 import { hx } from './portal-transform.js';
 
+// INV-17 finalize-path dedupe, re-exported so the wiring hook in runtime/realtime.ts imports it from the
+// SAME module it already imports getPortalRealtimeEventGenerator/isPortalRealtime from — one import line, a
+// minimal per-version patch surface. The dedupe logic lives in portal-child-dedupe, shared with the
+// historical path (portal.ts) so both sync modes run byte-identical INV-17 semantics.
+export { dedupeFinalizeChildAddresses } from './portal-child-dedupe.js';
 export type { PortalLogRequest } from './portal-filters.js';
 export { buildPortalLogRequests, uniqueFactories } from './portal-filters.js';
 
