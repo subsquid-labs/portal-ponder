@@ -276,6 +276,7 @@ scenario_for_class () {
 baseline_scenario_for_class () {
   case "$1" in
     K5) echo "$CDIR/scenarios/k5-canonical.json" ;;
+    K7) echo "$CDIR/scenarios/k7-canonical.json" ;;
     *) scenario_for_class "$1" ;;
   esac
 }
