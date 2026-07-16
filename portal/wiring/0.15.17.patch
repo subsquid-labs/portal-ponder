@@ -736,21 +736,22 @@ index a7fd553..fbaa23e 100644
        const childAddresses = await getChildAddresses({
          filters: eventCallbacks.map(({ filter }) => filter),
 diff --git a/packages/core/src/runtime/realtime.ts b/packages/core/src/runtime/realtime.ts
-index 6e727a8..234c163 100644
+index 6e727a8..3848a69 100644
 --- a/packages/core/src/runtime/realtime.ts
 +++ b/packages/core/src/runtime/realtime.ts
-@@ -24,6 +24,10 @@ import {
+@@ -24,6 +24,11 @@ import {
    type RealtimeSyncEvent,
    createRealtimeSync,
  } from "@/sync-realtime/index.js";
 +import {
++  dedupeFinalizeChildAddresses,
 +  getPortalRealtimeEventGenerator,
 +  isPortalRealtime,
 +} from "@/sync-historical/portal-realtime-wire.js";
  import { createSyncStore } from "@/sync-store/index.js";
  import {
    ZERO_CHECKPOINT_STRING,
-@@ -765,6 +769,15 @@ export async function* getRealtimeEventGenerator(params: {
+@@ -765,6 +770,15 @@ export async function* getRealtimeEventGenerator(params: {
    childAddresses: ChildAddresses;
    database: Database;
  }) {
@@ -766,6 +767,34 @@ index 6e727a8..234c163 100644
    const realtimeSync = createRealtimeSync(params);
  
    let childCount = 0;
+@@ -966,6 +980,18 @@ export async function handleRealtimeSyncEvent(
+         async (tx) => {
+           const syncStore = createSyncStore({ common: params.common, qb: tx });
+ 
++          // INV-17 (write-side idempotence), extended to the realtime finalize path: a resumed
++          // single-writer re-streams the same finalized child-creation blocks and would re-INSERT the
++          // same children (insertChildAddresses is a plain INSERT, factory_addresses has no UNIQUE).
++          // Dedupe against the store BEFORE the insert — the SAME LEAST-semantics guard the historical
++          // path runs (portal.ts persistPendingChildren), shared via portal-child-dedupe. Read before
++          // the insert spread (not concurrently in promiseAllSettledWithThrow) so getChildAddresses sees
++          // committed prior-finalize history, not this transaction's own in-flight inserts.
++          const dedupedChildAddresses = await dedupeFinalizeChildAddresses(
++            childAddresses,
++            syncStore,
++          );
++
+           await promiseAllSettledWithThrow([
+             syncStore.insertBlocks({
+               blocks: finalizedBlocks
+@@ -1002,7 +1028,7 @@ export async function handleRealtimeSyncEvent(
+               ),
+               chainId: params.chain.id,
+             }),
+-            ...Array.from(childAddresses.entries()).map(
++            ...Array.from(dedupedChildAddresses.entries()).map(
+               ([factory, childAddresses]) =>
+                 syncStore.insertChildAddresses({
+                   factory,
 diff --git a/packages/core/src/sync-realtime/index.ts b/packages/core/src/sync-realtime/index.ts
 index 1b48c32..f41f9e1 100644
 --- a/packages/core/src/sync-realtime/index.ts
