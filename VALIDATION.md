@@ -1700,7 +1700,7 @@ End-to-end verification grounded the fix at scale. Across all 12 preserved Porta
 The stream-realtime campaign (its plan lives alongside this document under `.agents/plans/`) gates a
 `PORTAL_REALTIME=stream` production label on a six-gate dossier; **RG3** is its realtime chaos gate:
 *≥200 kills across ≥6 timing classes, 100 % clean resumes, byte-identical digests*. This subsection
-records the **RG3 Phase-A** result plus the **Phase-B** delta and — as with every claim in this document — states plainly what it
+records the **RG3 Phase-A** result plus the **Phase-B** full-suite re-certification and — as with every claim in this document — states plainly what it
 does and does **not** prove. It is deliberately scoped and self-contained: the full §5.8 rewrite that
 folds RG3–RG5 into a single reorg/finality dossier is a later (RG6) task, not this one.
 
@@ -1746,24 +1746,43 @@ All three RG3 numeric thresholds are met: **238 ≥ 200** kills across **7 ≥ 6
 **100 %** clean resumes, and every resumed cluster **byte-identical** to its unkilled baseline with
 **zero** double-indexed finalized rows.
 
-**Phase B delta (this worktree run).**
+**Phase B capstone — full-suite re-certification (from the operator's evidence archive).** A single
+orchestrated run later drove **all seven** timing classes end-to-end to acceptance on one unbroken pass,
+superseding the earlier partial Phase-B probes below: the K2-midstream baseline now **does** reach
+`K2-midstream`, so the full suite runs without the earlier abort.
 
 | Metric | Value |
 |--------|-------|
-| K6 organic-cutover kills | **10** (`CHAOS_CLASSES=K6 CHAOS_KILLS_PER_CLASS=10`) |
-| Clean resumes | **10 / 10** |
-| Store↔app digest match | **10 / 10** byte-identical |
-| Duplicate FINALIZED rows | **0** |
-| K6 organic cutover | **10 / 10** (every kill on block 106, the chunk boundary) |
-| K5 wrong-fork consumed in-window | **deferred** — default clean run consumed **0 / 1**; a stretched post-injection window makes the product correctly raise the wrong-fork finalize fatal |
-| K7 kill-during-rollback-apply | **mock-covered (crash-timing)** — fork point corrected to sit ABOVE the finalized anchor (≤102), so `reconcile → {kind:'reorg'}` rolls back 104..106:main and re-applies the rollback branch. The SIGKILL fires mid-stream of the rollback branch — the mock has written fork block 104 and is holding at the block-105 gate — and the run resumes byte-identical. The proof of the rollback-apply code path is the byte-identical **resume** digest (baseline reorgs, resume reorgs), NOT a witnessed client apply-before-kill (the kill fires on the mock-side gate; whether the client consumed 104 and applied the reorg before SIGKILL is an unwitnessed event-loop race). `k7RollbackNonVacuousOk` self-certs kill-block=={105}, live /stream before every kill, and the mock served the cross-branch fork (`reorgApplied>0`). **Live-protocol fork fidelity remains RG4/RG5.** |
+| Kills, total | **272** (K1 34 · K2 34 · K3 34 · K4 34 · K5 68 [409 + wrong-fork] · K6 34 · K7 34) |
+| Timing classes | **7** (the six K1–K6 classes + the K7 rollback-apply class) |
+| Clean resumes | **272 / 272** (0 non-ok status) |
+| Store↔app digest match | **272 / 272** byte-identical (0 mismatch) |
+| Duplicate FINALIZED rows | **0** (238 finalized rows scanned across K2–K7 — the dup check is load-bearing, not vacuous) |
+| K2 mid-stream kill spread | **8** distinct interior blocks (103–110 over the 101..112 stream) |
+| K6 organic cutover | **34 / 34** on block 106 (the client's natural `fromBlock=106` chunk boundary) |
+| K7 rollback non-vacuous | **34 / 34** with `reorgApplied=1` each (the below-tip cross-branch fork was actually served, never a degraded append) |
 
-The full K1–K6 moderate rerun was attempted with
-`CHAOS_KILLS_PER_CLASS=10 CHAOS_MIN_PER_CLASS=10 CHAOS_TOTAL_KILLS=70`, but it stopped before Phase-B
-classes because the current K2 baseline did not reach `K2-midstream`: the app raised the product
-unknown-parent fatal after child discovery at block 101 left block 102 absent from the unfinalized
-window and block 103 arrived. A timing-only K2 probe (`turnDelayMs` 450 → 900) did not change that
-outcome, so Phase B does not claim a new full-suite acceptance number here.
+All ten harness self-certs pass — `totalKillsOk`, `perClassKillsOk`, `cleanResumeOk`, `digestMatchOk`,
+`duplicateFinalizedRowsOk`, `dupCheckLoadBearingOk`, `k6CutoverNonVacuousOk`, `k6CutoverOrganicOk`,
+`k2KillSpreadOk`, `k7RollbackNonVacuousOk` — so the run self-reports `accepted: true`. This **retires the
+earlier Phase-B caveat** that the K2-midstream baseline did not reach mid-stream: with the scenario's
+child-discovery / unfinalized-window timing corrected, block 102 is present when block 103 arrives, the
+unknown-parent fatal no longer fires, and K2 records 34 mid-stream kills across 8 interior blocks with 34
+finalized rows scanned and zero duplicates. The **272 ≥ 200** kills across **7 ≥ 6** timing classes,
+**100 %** clean resumes, and **byte-identical** resumes with **zero** double-indexed finalized rows meet
+every RG3 numeric threshold on a single full-suite run.
+
+The mock-fidelity caveats below are **unchanged** by this capstone — it raises the kill *count* and
+closes the K2-midstream-reachability gap, but K5 remains handler-**reachability** evidence, K6 a
+MEDIUM-fidelity organic-within-the-mock cutover, and K7 mock-side crash-timing coverage of INV-10's
+rollback arm. Live-protocol fork/finalize fidelity remains **RG4/RG5**.
+
+The earlier partial Phase-B probes that this capstone supersedes were: a K6-only organic-cutover run
+(**10 / 10** clean, byte-identical, all on block 106) that first proved the `cutoverGate` fix organic;
+and a K7 kill-during-rollback-apply probe (fork point moved ABOVE the ≤102 finalized anchor so
+`reconcile → {kind:'reorg'}` rolls back 104..106:main and re-applies the rollback branch). Their earlier
+timing-only K2 probe (`turnDelayMs` 450 → 900) did not by itself reach `K2-midstream`; the full-suite
+run above resolves that via the corrected scenario window rather than a turn-delay change.
 
 **The K6 cutover fix is now proven organic within the mock.** An adversarial review of the harness caught that the
 original K6 "cutover" kill landed on the **first `/finalized-head` startup probe**, before any live
