@@ -200,3 +200,39 @@ test('knob set → a present accessList is still preserved unchanged', () => {
     ).toBe(JSON.stringify(list));
   });
 });
+
+// ─────────────────────── (g) strict parse: falsy strings must NOT enable the opt-in ───────────────────────
+// The knob gates a DATA-INTEGRITY guard, so its parse must be strict: `Boolean(process.env.X)` is a
+// footgun — `X=0`, `X=false`, `X=no` are all non-empty strings, so `Boolean(...)` is `true` and the
+// guard would be silently DISABLED by a value an operator plainly means as "off". The parse is
+// `=== '1'` (mirroring PORTAL_REALTIME's `=== 'stream'`): only the exact string `'1'` opts in;
+// everything else — including `'0'`/`'false'`/`'no'`/`''` and unset — keeps the guard fail-loud.
+// This test is the mutation lock: flipping the parse to always-enabled (e.g. `Boolean(...)` or a
+// constant `true`) turns every `.toThrow()` below RED.
+test('strict parse → only "1" enables; "0"/"false"/"no"/"" (and unset) stay fail-loud', () => {
+  // Every value an operator could reasonably intend as OFF must leave the guard throwing.
+  for (const off of ['0', 'false', 'no', '', undefined]) {
+    withKnob(off, () => {
+      const t = tx({ type: '0x2' });
+      expect(t.accessList).toBeUndefined();
+      expect(() => standardize(t)).toThrowError(/transaction\.accessList/);
+      expect(() => standardize(t)).toThrowError(/0x2/);
+    });
+  }
+
+  // And a non-"1" truthy-looking string is still OFF (guards the exact-match, not merely "non-empty").
+  withKnob('true', () => {
+    const t = tx({ type: '0x2' });
+    expect(() => standardize(t)).toThrowError(/transaction\.accessList/);
+  });
+
+  // Only the exact "1" opts in — the missing list flows through and encodes to an honest NULL.
+  withKnob('1', () => {
+    const t = tx({ type: '0x2' });
+    expect(() => standardize(t)).not.toThrow();
+    expect(
+      encodeTransaction({ transaction: standardize(t)[0]!, chainId: 1 })
+        .accessList,
+    ).toBeNull();
+  });
+});

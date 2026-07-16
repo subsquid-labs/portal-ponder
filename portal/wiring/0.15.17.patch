@@ -41,7 +41,7 @@ index acea95b..c502c66 100644
    pollingInterval: number;
    finalityBlockCount: number;
 diff --git a/packages/core/src/rpc/actions.ts b/packages/core/src/rpc/actions.ts
-index 32ba7a8..c443cb6 100644
+index 32ba7a8..5246376 100644
 --- a/packages/core/src/rpc/actions.ts
 +++ b/packages/core/src/rpc/actions.ts
 @@ -1,6 +1,8 @@
@@ -65,7 +65,7 @@ index 32ba7a8..c443cb6 100644
    BlockNotFoundError,
    type Hex,
    TransactionReceiptNotFoundError,
-@@ -102,6 +106,126 @@ export const eth_getLogs = async (
+@@ -102,6 +106,131 @@ export const eth_getLogs = async (
    });
  };
  
@@ -189,10 +189,15 @@ index 32ba7a8..c443cb6 100644
 +  );
 +};
 +
++// One-shot guard so the PORTAL_ALLOW_MISSING_ACCESS_LIST opt-in warning below is emitted ONCE per
++// process at first use, not once per `standardizeTransactions` call (i.e. per fetched block). It
++// flips the first time the enabled knob is read and stays set for the process lifetime. (issue #27)
++let warnedAllowMissingAccessList = false;
++
  /**
   * Helper function for "eth_getTransactionReceipt" request.
   */
-@@ -787,6 +911,14 @@ export const standardizeTransactions = (
+@@ -787,6 +916,25 @@ export const standardizeTransactions = (
      { method: "eth_getBlockByNumber" | "eth_getBlockByHash" }
    >,
  ): SyncTransaction[] => {
@@ -200,14 +205,25 @@ index 32ba7a8..c443cb6 100644
 +  // SQD's zkSync proxy) that omits the spec-required `accessList` on typed-envelope txs. Default
 +  // OFF: a missing accessList is a loud RpcProviderError (below). When set, the missing value is
 +  // allowed through and stored as an honest NULL. Read once per call — cheap, hoisted above the
-+  // loop — so ops can flip it via env without a rebuild, and tests can toggle it per call. (issue #27)
-+  const allowMissingAccessList = Boolean(
-+    process.env.PORTAL_ALLOW_MISSING_ACCESS_LIST,
-+  );
++  // loop — so ops can flip it via env without a rebuild, and tests can toggle it per call. Parsed
++  // STRICTLY (`=== "1"`, matching PORTAL_REALTIME's `=== "stream"` convention): only the exact
++  // value "1" enables it, so `=0`/`=false`/`=no`/`` all keep the data-integrity guard fail-loud
++  // — `Boolean(process.env.…)` would (mis)treat every one of those as ON. Enabling the opt-in
++  // emits a ONE-TIME loud warning (see `warnedAllowMissingAccessList`). (issue #27)
++  const allowMissingAccessList =
++    process.env.PORTAL_ALLOW_MISSING_ACCESS_LIST === "1";
++  if (allowMissingAccessList && !warnedAllowMissingAccessList) {
++    warnedAllowMissingAccessList = true;
++    console.warn(
++      "PORTAL_ALLOW_MISSING_ACCESS_LIST is enabled: transactions missing accessList will be " +
++        "stored with accessList=NULL instead of failing. Only use this for RPCs that legitimately " +
++        "omit accessList (e.g. some proxies).",
++    );
++  }
    const transactionIds = new Set<Hex>();
  
    for (const transaction of transactions) {
-@@ -893,6 +1025,38 @@ export const standardizeTransactions = (
+@@ -893,6 +1041,38 @@ export const standardizeTransactions = (
        transaction.gas = "0x0";
      }
  
