@@ -13,6 +13,7 @@ import {
   buildPortalLogRequests,
   checkpointBlockNumber,
   clampFinalizedToPortalHead,
+  dedupeFinalizeChildAddresses,
   deriveFinalityFloor,
   discoverChildAddresses,
   getPortalRealtimeEventGenerator,
@@ -1685,4 +1686,135 @@ test('getPortalRealtimeEventGenerator: a 1-block orphan at tip HEALS via 409 for
     expect(typeof b.parentBlockHash).toBe('string');
     expect(b.parentBlockHash.length).toBeGreaterThan(0);
   }
+});
+
+// ── INV-17 realtime finalize idempotence (K2 chaos capstone: single-writer SIGKILL/resume dup) ──
+// The realtime chaos K2 scenario (mid-stream SIGKILL + resume) ended with a DUPLICATE
+// ponder_sync.factory_addresses row: the factory child discovered at the child-creation block was
+// inserted twice — once by the pre-kill finalize, once by the resume finalize (two SEQUENTIAL finalize
+// transactions, a SINGLE writer). Root cause: INV-17's read→dedupe (LEAST semantics) closed the HISTORICAL
+// call site (portal.ts persistPendingChildren) but the realtime FINALIZE path (runtime/realtime.ts
+// handleRealtimeSyncEvent) inserted its childAddresses with NO dedupe — a plain INSERT into a table with no
+// UNIQUE(factory_id, chain_id, address). The fork now runs the SAME shared dedupe on the finalize path via
+// dedupeFinalizeChildAddresses (the wiring hook), so a resumed single-writer that re-streams the same
+// finalized child-creation blocks inserts NOTHING the second time.
+//
+// This models the finalize path's fork-owned sequence FAITHFULLY: build the
+// `Map<Factory, Map<Address, number>>` exactly as handleRealtimeSyncEvent does from finalized blocks,
+// dedupe against the tx-scoped store, then run upstream's insert loop. Run TWICE over the SAME
+// child-creation block (pre-kill finalize, then resume finalize) against ONE persistent store whose reads
+// see committed history — as the real sequential single-writer does. Mutation proof: reverting the finalize
+// hook to insert the raw `childAddresses` (i.e. skipping dedupeFinalizeChildAddresses) ends with the child
+// row ×2 — `expected … a length of 1 but got 2`.
+
+// The store's factory_addresses identity: factory minus id/sourceId (mirrors sync-store/index.ts, and the
+// historical-path test's storeFactoryKey). Aliased factories share one row-set.
+const finalizeStoreKey = (factory: Factory): string => {
+  const rest: Record<string, unknown> = {};
+  for (const key of Object.keys(factory).sort()) {
+    if (key === 'id' || key === 'sourceId') continue;
+
+    rest[key] = (factory as unknown as Record<string, unknown>)[key];
+  }
+
+  return JSON.stringify(rest);
+};
+
+// A tx-committed store double: getChildAddresses reads committed rows (min-merged, like upstream), and each
+// insertChildAddresses commits into the SAME map (min-merge) so a second finalize's read sees the first's
+// rows — exactly the sequential single-writer resume shape.
+const mkFinalizeStore = (
+  store: Map<string, Map<Address, number>>,
+  onInsert: (p: {
+    factory: Factory;
+    childAddresses: Map<Address, number>;
+  }) => void,
+) => ({
+  getChildAddresses: async ({ factory }: { factory: Factory }) =>
+    new Map(store.get(finalizeStoreKey(factory)) ?? []),
+  insertChildAddresses: async (p: {
+    factory: Factory;
+    childAddresses: Map<Address, number>;
+    chainId: number;
+  }) => {
+    onInsert(p);
+    const key = finalizeStoreKey(p.factory);
+    let rows = store.get(key);
+    if (rows === undefined) {
+      rows = new Map();
+      store.set(key, rows);
+    }
+    for (const [addr, block] of p.childAddresses) {
+      const prev = rows.get(addr);
+      if (prev === undefined || prev > block) rows.set(addr, block);
+    }
+  },
+});
+
+// Replays runtime/realtime.ts handleRealtimeSyncEvent's finalize child-persistence step: build the
+// Factory→(child→block) map from the finalized blocks' discovered children (child folded at its block),
+// dedupe against the store (the fork hook), then run upstream's per-factory insert loop over the DEDUPED
+// map. Returns nothing; the assertion inspects `store` + the insert calls captured by `onInsert`.
+const runFinalizePersist = async (
+  finalizedBlocks: { number: number; children: Map<Factory, Set<Address>> }[],
+  syncStore: ReturnType<typeof mkFinalizeStore>,
+) => {
+  // upstream: childAddresses.set(factory, child→firstSeenBlock) folding all finalized blocks
+  const childAddresses = new Map<Factory, Map<Address, number>>();
+  for (const block of finalizedBlocks) {
+    for (const [factory, addrs] of block.children) {
+      if (childAddresses.has(factory) === false) {
+        childAddresses.set(factory, new Map());
+      }
+      for (const address of addrs) {
+        if (childAddresses.get(factory)!.has(address) === false) {
+          childAddresses.get(factory)!.set(address, block.number);
+        }
+      }
+    }
+  }
+
+  // the fork hook: dedupe against the store BEFORE the insert spread
+  const deduped = await dedupeFinalizeChildAddresses(childAddresses, syncStore);
+
+  // upstream: ...Array.from(deduped.entries()).map(insertChildAddresses)
+  await Promise.all(
+    Array.from(deduped.entries()).map(([factory, children]) =>
+      syncStore.insertChildAddresses({
+        factory,
+        childAddresses: children,
+        chainId: 1,
+      }),
+    ),
+  );
+};
+
+test('regression (K2 chaos, INV-17 realtime finalize): a resumed single-writer re-finalizing the SAME child-creation block does NOT duplicate the factory_addresses row', async () => {
+  const factory = eulerFactory();
+  const child = '0x1111111111111111111111111111111111111111' as Address;
+  // the child is created at block 101 (the K2 scenario's child-creation block) and finalized together
+  const finalizedBlocks = [
+    { number: 101, children: new Map([[factory, new Set([child])]]) },
+  ];
+
+  const store = new Map<string, Map<Address, number>>();
+  const inserts: { factory: Factory; childAddresses: Map<Address, number> }[] =
+    [];
+  const syncStore = mkFinalizeStore(store, (p) => inserts.push(p));
+
+  // pre-kill finalize: discovers + persists the child (one write, one row at block 101)
+  await runFinalizePersist(finalizedBlocks, syncStore);
+  expect(inserts).toHaveLength(1);
+  expect([
+    ...(store.get(finalizeStoreKey(factory)) as Map<Address, number>),
+  ]).toEqual([[child, 101]]);
+
+  // resume finalize: a fresh process re-streams + re-finalizes the SAME block 101 after the SIGKILL. Its
+  // reads see the committed pre-kill row; the shared INV-17 dedupe drops the already-persisted child.
+  // THE REGRESSION: no second insert, so factory_addresses still has EXACTLY ONE row.
+  await runFinalizePersist(finalizedBlocks, syncStore);
+  expect(inserts).toHaveLength(1); // the resume finalize inserted nothing — fully deduped
+  const rows = store.get(finalizeStoreKey(factory)) as Map<Address, number>;
+  expect([...rows]).toHaveLength(1);
+  expect([...rows]).toEqual([[child, 101]]);
 });

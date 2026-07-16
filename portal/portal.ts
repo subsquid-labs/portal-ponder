@@ -15,11 +15,9 @@
  * The public seam is FROZEN: `createPortalHistoricalSync({common, chain, rpc, childAddresses,
  * eventCallbacks}) : HistoricalSync`. See portal/INVARIANTS.md for the invariant catalog (INV-1…INV-17).
  */
-import type { Address } from 'viem';
 import type { Common } from '@/internal/common.js';
 import type {
   Chain,
-  Factory,
   Filter,
   SyncBlockHeader,
   SyncTransaction,
@@ -37,6 +35,7 @@ import {
   type ChunkData,
   createChunkData,
 } from './portal-assemble.js';
+import { dedupeChildAddressesAgainstStore } from './portal-child-dedupe.js';
 import {
   chunkRange,
   evictionPlan,
@@ -89,27 +88,6 @@ type CreateHistoricalSyncParameters = {
 };
 
 type StashEntry = Omit<AssembledRange, 'logs'>;
-
-// The sync store resolves a factory to its `factory_addresses` rows by STORE IDENTITY, not by
-// `factory.id`: both `insertChildAddresses` and `getChildAddresses` strip `id` and `sourceId`
-// (`const { id, sourceId: _sourceId, ..._factory } = factory`) and upsert/select the `factories`
-// row keyed on that remaining `_factory` value (`UNIQUE (factory)` — sync-store/index.ts). So two
-// sources whose factories are identical except `id`/`sourceId` (a legal config: two contracts
-// sharing one factory) map to the SAME store row. `storeFactoryKey` mirrors that identity so the
-// INV-17 guard groups aliased factories before it reads/inserts — otherwise both would read absence
-// and BOTH insert the same children (the guard reads all, then inserts all). Deterministic: sort the
-// surviving keys so field order never splits an alias pair. Value shapes (`address` may be an array)
-// are compared by `JSON.stringify`, which is exact for the store's stored `_factory` value.
-const storeFactoryKey = (factory: Factory): string => {
-  const rest: Record<string, unknown> = {};
-  for (const key of Object.keys(factory).sort()) {
-    if (key === 'id' || key === 'sourceId') continue;
-
-    rest[key] = (factory as unknown as Record<string, unknown>)[key];
-  }
-
-  return JSON.stringify(rest);
-};
 
 export const createPortalHistoricalSync = (
   args: CreateHistoricalSyncParameters,
@@ -771,68 +749,20 @@ export const createPortalHistoricalSync = (
       // in `getChildAddresses` (LEAST semantics): keep a child only if it is not yet persisted OR
       // is re-discovered at a STRICTLY LOWER creation block (whose lower row wins the min-merge on
       // read). Re-flushes at an equal/higher block become no-ops, so re-inserting the same set
-      // cannot grow the table. `getChildAddresses` returns the store's min-merged map, and the
-      // fork owns only this call site (the store method is upstream), so the guard lives here.
+      // cannot grow the table. The dedupe (group by store identity, read `getChildAddresses`,
+      // case-normalize, LEAST-keep) is the SHARED `dedupeChildAddressesAgainstStore` core — the
+      // realtime finalize path (runtime/realtime.ts, `dedupeFinalizeChildAddresses`) runs the same
+      // logic, so both sync modes are byte-identically idempotent (see portal-child-dedupe.ts).
       //
       // The read→dedupe→insert→insertIntervals sequence all runs inside ONE store transaction (the
       // syncStore is created from the tx handle in runtime/historical.ts), so for a SINGLE writer the
       // guard is transactional — no interleaving read/insert can slip a duplicate past it. (Two
       // concurrent writers are two transactions: both can read absence and INSERT — only a DB UNIQUE
       // closes that; documented residual on INV-17.)
-      //
-      // Group by STORE IDENTITY first (storeFactoryKey — factory minus id/sourceId): the store keys
-      // `factory_addresses` by that value, so aliased factories (same fields, different id/sourceId)
-      // share ONE row-set. Reading per `factory.id` and inserting all would let two aliases each read
-      // absence and BOTH insert the same children — durable duplicates. Canonicalizing collapses each
-      // alias group to one read + one insert; the group min-merges its members' children (LEAST), and
-      // inserting once under any member's factory object suffices for the whole group because
-      // `insertChildAddresses` upserts the `factories` row by that same stripped value and resolves
-      // `factory_id` from it (identical for every alias).
-      const groups = new Map<
-        string,
-        { factory: Factory; children: Map<Address, number> }
-      >();
-      for (const [factory, children] of flush) {
-        const key = storeFactoryKey(factory);
-        let group = groups.get(key);
-        if (group === undefined) {
-          group = { factory, children: new Map() };
-          groups.set(key, group);
-        }
-        for (const [address, block] of children) {
-          const prev = group.children.get(address);
-          if (prev === undefined || prev > block) {
-            group.children.set(address, block);
-          }
-        }
-      }
-
-      const deduped: PendingFlush = [];
-      for (const { factory, children } of groups.values()) {
-        const persisted = await syncStore.getChildAddresses({ factory });
-        // getChildAddresses returns stored text verbatim and min-merges case-SENSITIVELY, so a
-        // checksummed pre-existing row would not match a discovered child. Discovery lowercases every
-        // child (portal-discovery.ts), and upstream runtime matching lowercases its lookups, so the
-        // canonical child key is lowercase — normalize the persisted map to that before comparing.
-        const persistedLower = new Map<Address, number>();
-        for (const [address, block] of persisted) {
-          const lower = address.toLowerCase() as Address;
-          const prev = persistedLower.get(lower);
-          if (prev === undefined || prev > block) {
-            persistedLower.set(lower, block);
-          }
-        }
-
-        let toInsert: Map<Address, number> | undefined;
-        for (const [address, block] of children) {
-          const prev = persistedLower.get(address);
-          if (prev !== undefined && prev <= block) continue;
-
-          if (toInsert === undefined) toInsert = new Map();
-          toInsert.set(address, block);
-        }
-        if (toInsert !== undefined) deduped.push([factory, toInsert]);
-      }
+      const deduped: PendingFlush = await dedupeChildAddressesAgainstStore(
+        flush,
+        ({ factory }) => syncStore.getChildAddresses({ factory }),
+      );
 
       if (deduped.length > 0) {
         await Promise.all(
