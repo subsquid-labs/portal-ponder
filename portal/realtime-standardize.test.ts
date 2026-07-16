@@ -117,3 +117,122 @@ test('type-0x2 with accessList ([] and non-empty) passes through unchanged and e
     encodeTransaction({ transaction: outFull[0]!, chainId: 1 }).accessList,
   ).toBe(JSON.stringify(list));
 });
+
+// ─────────────────────── (f) opt-in: PORTAL_ALLOW_MISSING_ACCESS_LIST ───────────────────────
+// The default guard is right for a compliant provider, but SQD's own zkSync RPC proxy returns
+// EIP-1559 (0x2) txs with NO `accessList` key at all — so on that documented-supported endpoint
+// the guard crashes the whole app. `PORTAL_ALLOW_MISSING_ACCESS_LIST` (default OFF) lets an
+// operator who knows the omission is legitimate proceed and store the honest NULL, exactly as the
+// Portal path already does for datasets that lack the column entirely (#27, #110/#111).
+
+// Run `body` with the knob forced to `value`, restoring the prior env afterwards (no cross-test leak).
+const withKnob = (value: string | undefined, body: () => void): void => {
+  const prev = process.env.PORTAL_ALLOW_MISSING_ACCESS_LIST;
+  if (value === undefined) {
+    delete process.env.PORTAL_ALLOW_MISSING_ACCESS_LIST;
+  } else {
+    process.env.PORTAL_ALLOW_MISSING_ACCESS_LIST = value;
+  }
+
+  try {
+    body();
+  } finally {
+    if (prev === undefined) {
+      delete process.env.PORTAL_ALLOW_MISSING_ACCESS_LIST;
+    } else {
+      process.env.PORTAL_ALLOW_MISSING_ACCESS_LIST = prev;
+    }
+  }
+};
+
+// The loud default error must NAME the escape hatch — an operator hitting the zkSync crash needs to
+// be told the exact knob, not left to grep the source. The guidance rides on `RpcProviderError.meta`
+// (surfaced by the logger, like every other error here), not the terse message line.
+test('default (knob unset) → missing accessList still throws, and the guidance names the knob', () => {
+  withKnob(undefined, () => {
+    const t = tx({ type: '0x2' });
+    expect(() => standardize(t)).toThrowError(/transaction\.accessList/);
+
+    let meta: string[] = [];
+    try {
+      standardize(t);
+    } catch (err) {
+      meta = (err as { meta?: string[] }).meta ?? [];
+    }
+
+    expect(meta.join(' ')).toMatch(/PORTAL_ALLOW_MISSING_ACCESS_LIST/);
+  });
+});
+
+// With the knob set, EVERY typed envelope missing accessList flows through instead of throwing, and
+// the absent value stays `undefined` → encodeTransaction maps it to a NULL (honest absence, not []).
+test('knob set → missing accessList on 0x1/0x2/0x3/0x4 passes through, encodes to NULL', () => {
+  withKnob('1', () => {
+    for (const type of ['0x1', '0x2', '0x3', '0x4']) {
+      const t = tx({ type });
+      expect(() => standardize(t)).not.toThrow();
+      const out = standardize(t);
+      expect(out[0]!.accessList).toBeUndefined();
+      expect(
+        encodeTransaction({ transaction: out[0]!, chainId: 1 }).accessList,
+      ).toBeNull();
+    }
+  });
+});
+
+// The knob is an escape hatch for ABSENT lists only — it must never fabricate or drop a REAL one:
+// a present access list still round-trips unchanged when the knob is on.
+test('knob set → a present accessList is still preserved unchanged', () => {
+  withKnob('1', () => {
+    const list = [
+      {
+        address: '0x000000000000000000000000000000000000dead',
+        storageKeys: [
+          '0x0000000000000000000000000000000000000000000000000000000000000001',
+        ],
+      },
+    ];
+    const t = tx({ type: '0x2', accessList: list });
+    const out = standardize(t);
+    expect(out[0]!.accessList).toEqual(list);
+    expect(
+      encodeTransaction({ transaction: out[0]!, chainId: 1 }).accessList,
+    ).toBe(JSON.stringify(list));
+  });
+});
+
+// ─────────────────────── (g) strict parse: falsy strings must NOT enable the opt-in ───────────────────────
+// The knob gates a DATA-INTEGRITY guard, so its parse must be strict: `Boolean(process.env.X)` is a
+// footgun — `X=0`, `X=false`, `X=no` are all non-empty strings, so `Boolean(...)` is `true` and the
+// guard would be silently DISABLED by a value an operator plainly means as "off". The parse is
+// `=== '1'` (mirroring PORTAL_REALTIME's `=== 'stream'`): only the exact string `'1'` opts in;
+// everything else — including `'0'`/`'false'`/`'no'`/`''` and unset — keeps the guard fail-loud.
+// This test is the mutation lock: flipping the parse to always-enabled (e.g. `Boolean(...)` or a
+// constant `true`) turns every `.toThrow()` below RED.
+test('strict parse → only "1" enables; "0"/"false"/"no"/"" (and unset) stay fail-loud', () => {
+  // Every value an operator could reasonably intend as OFF must leave the guard throwing.
+  for (const off of ['0', 'false', 'no', '', undefined]) {
+    withKnob(off, () => {
+      const t = tx({ type: '0x2' });
+      expect(t.accessList).toBeUndefined();
+      expect(() => standardize(t)).toThrowError(/transaction\.accessList/);
+      expect(() => standardize(t)).toThrowError(/0x2/);
+    });
+  }
+
+  // And a non-"1" truthy-looking string is still OFF (guards the exact-match, not merely "non-empty").
+  withKnob('true', () => {
+    const t = tx({ type: '0x2' });
+    expect(() => standardize(t)).toThrowError(/transaction\.accessList/);
+  });
+
+  // Only the exact "1" opts in — the missing list flows through and encodes to an honest NULL.
+  withKnob('1', () => {
+    const t = tx({ type: '0x2' });
+    expect(() => standardize(t)).not.toThrow();
+    expect(
+      encodeTransaction({ transaction: standardize(t)[0]!, chainId: 1 })
+        .accessList,
+    ).toBeNull();
+  });
+});
