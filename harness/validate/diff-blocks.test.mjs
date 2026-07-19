@@ -309,6 +309,25 @@ test('blocksVerdict U-eth: a base_fee null-vs-0 diff with a missing/empty hash i
   assert.equal(v.baseFeeTolerated.length, 0);
 });
 
+// T-uEth-outofscope — scope sentinel: the exact null-vs-0 signature (sole diff, equal hash) on an
+// OUT-OF-SCOPE chain (56 = BSC) is NOT tolerated → FAILS. The tolerance is scoped to eth-mainnet
+// (BASE_FEE_PRELONDON_CHAINS = {1}), the only chain with a pre-1559 era in the matrix; a non-eth chain
+// exhibiting this class must FAIL (prompting review + an evidence-backed set addition), never be masked.
+// MUTATION: neuter the scope guard (`if (false) return false;`) and this test goes RED — the row lands
+// in baseFeeTolerated and v.ok flips to true.
+test('blocksVerdict U-eth: a base_fee null-vs-0 diff on an OUT-OF-SCOPE chain (56=BSC) is NOT tolerated → FAILS', () => {
+  const portal = [bfBlock(12453996, null, '0xbe086c', 56)];
+  const rpc = [bfBlock(12453996, '0', '0xbe086c', 56)];
+  const v = blocksVerdict(portal, rpc);
+  assert.equal(
+    v.ok,
+    false,
+    'the null-vs-0 class on an out-of-scope chain is a real divergence, not the eth-mainnet pre-London class',
+  );
+  assert.deepEqual(v.mismatch, ['56:12453996']);
+  assert.equal(v.baseFeeTolerated.length, 0);
+});
+
 test('setDiff: multi-chain STRICT tables do not conflate — same-height rows differ per chain', () => {
   // STRICT tables (logs/transactions/receipts/traces) compare full normalized row-strings (which
   // include chain_id) as a set, so they never had the number-key conflation. This pins that: two

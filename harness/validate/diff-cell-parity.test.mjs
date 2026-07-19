@@ -264,6 +264,25 @@ test('#78 parity: blocks verdict matches diff.mjs incl. the #76/#106 size-only +
     'both differs tolerate the U-eth pre-London base_fee null-vs-0 diff identically',
   );
 
+  // scope parity: the SAME null-vs-0 signature on an OUT-OF-SCOPE chain (56 = BSC) is a real mismatch
+  // in BOTH differs — the tolerance is scoped to eth-mainnet (BASE_FEE_PRELONDON_CHAINS = {1}), so a
+  // non-eth chain exhibiting the class FAILs identically in both mirrors (lockstep on the scope guard).
+  const bfOosP = [blockRow(12453996, { base_fee_per_gas: null, chain_id: 56 })];
+  const bfOosR = [blockRow(12453996, { base_fee_per_gas: 0n, chain_id: 56 })];
+  const mjsBfOos = diffMjsBlocks(bfOosP, bfOosR);
+  const batchedBfOos = await batchedBlocks(bfOosP, bfOosR);
+  assert.deepEqual(mjsBfOos, {
+    ok: false,
+    sizeTolerated: 0,
+    baseFeeTolerated: 0,
+    mismatch: 1,
+  });
+  assert.deepEqual(
+    batchedBfOos,
+    mjsBfOos,
+    'both differs FAIL the null-vs-0 class on an out-of-scope chain identically (scope guard lockstep)',
+  );
+
   // a size-only diff with a differing hash is NOT anchored → both FAIL it as a mismatch (the safety
   // invariant: hash is the second diff, so it is never masked).
   const badSzP = [blockRow(100, { size: 30000, hash: '0xAAA' })];

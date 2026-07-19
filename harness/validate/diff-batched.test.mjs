@@ -267,8 +267,11 @@ test('strict mode: a size-only diff is NOT tolerated under strict (scoped to blo
 // shared block whose SOLE differing field is `base_fee_per_gas` — Portal null vs RPC "0" — is counted
 // in res.baseFeeTolerated (not res.mismatch) and does NOT fail, ANCHORED on both rows carrying a
 // present, equal `hash`. A non-null Portal value, a non-0 RPC value, a second differing field, a
-// missing hash, and strict mode all FAIL. (0n is passed unnormalized so normRow renders it "0".)
+// missing hash, and strict mode all FAIL. (0n is passed unnormalized so normRow renders it "0".) The
+// tolerance is chain-scoped (BASE_FEE_PRELONDON_CHAINS — eth-mainnet chain_id 1, the sole pre-London
+// chain), so the positive-class rows carry chain_id 1 by default; an out-of-scope chain (below) FAILS.
 const bfBlock = (number, base_fee_per_gas, extra = {}) => ({
+  chain_id: 1,
   number,
   hash: 'h',
   base_fee_per_gas,
@@ -367,6 +370,30 @@ test('strict mode U-eth: a base_fee null-vs-0 diff is NOT tolerated under strict
     },
   );
   assert.equal(r.fail, true, 'strict mode tolerates nothing');
+  assert.equal(r.mismatch, 1);
+  assert.equal(r.baseFeeTolerated, 0);
+});
+
+// T-uEth-outofscope — scope sentinel: the exact null-vs-0 signature (sole diff, equal hash) on an
+// OUT-OF-SCOPE chain (56 = BSC) is NOT tolerated → FAILS. The tolerance is scoped to eth-mainnet
+// (BASE_FEE_PRELONDON_CHAINS = {1}), the only chain with a pre-1559 era in the matrix; a non-eth chain
+// exhibiting this class must FAIL (prompting review + an evidence-backed set addition), never be masked.
+// MUTATION: neuter the scope guard (`if (false) return false;`) and this test goes RED — baseFeeTolerated
+// becomes 1 and fail flips to false.
+test('blocks mode U-eth: a base_fee null-vs-0 diff on an OUT-OF-SCOPE chain (56=BSC) is NOT tolerated → FAILS', async () => {
+  const r = await mergeCompare(
+    [bfBlock(12453996, null, { chain_id: 56 })],
+    [bfBlock(12453996, 0n, { chain_id: 56 })],
+    {
+      keyFn: blockKey,
+      mode: 'blocks',
+    },
+  );
+  assert.equal(
+    r.fail,
+    true,
+    'the null-vs-0 class on an out-of-scope chain is a real divergence, not the eth-mainnet pre-London class',
+  );
   assert.equal(r.mismatch, 1);
   assert.equal(r.baseFeeTolerated, 0);
 });

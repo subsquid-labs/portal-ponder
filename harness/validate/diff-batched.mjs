@@ -153,20 +153,36 @@ function sizeOnlyDiffTolerated(portalRow, rpcRow) {
 // SAFETY INVARIANT (why this cannot mask a real base-fee bug): the tolerance fires ONLY when the Portal
 // side (A) is SQL NULL — the honest "field absent" value — AND the RPC side (B) is exactly "0" (the
 // coerced-absent outlier), anchored on a present, non-empty, EQUAL `hash` (identical canonical block
-// proof, exactly as the size tolerance). A POST-London block has a real non-zero base fee, so a genuine
-// Portal base-fee defect makes the Portal side NON-NULL (or the RPC side non-"0") and the predicate
-// returns false → real MISMATCH → FAIL. Any SECOND differing field also returns false (column-scoped,
-// not row-scoped), and a missing/empty/unequal hash defeats the anchor. Self-retiring: if the RPC path
-// ever stops coercing absent→0 (stores NULL too), the rows compare equal and this never fires.
+// proof, exactly as the size tolerance), AND ONLY on an in-scope chain (BASE_FEE_PRELONDON_CHAINS —
+// eth-mainnet 1, the sole chain with a pre-1559 era observed in the matrix, scoped exactly like the
+// access_list gap). A POST-London block has a real non-zero base fee, so a genuine Portal base-fee
+// defect makes the Portal side NON-NULL (or the RPC side non-"0") and the predicate returns false →
+// real MISMATCH → FAIL. Any SECOND differing field also returns false (column-scoped, not row-scoped),
+// a missing/empty/unequal hash defeats the anchor, and an out-of-scope chain never gets this leniency
+// (a future non-eth chain exhibiting the class FAILs → prompting review + an evidence-backed addition
+// to the set, never a silent mask). Self-retiring: if the RPC path ever stops coercing absent→0
+// (stores NULL too), the rows compare equal and this never fires.
+
+// The chain_id set with a pre-1559 era where an absent baseFeePerGas is coerced to 0 by the RPC-sync
+// path (eth-mainnet 1 only — the sole chain observed with a pre-London window in the matrix; grow with
+// evidence exactly like ACCESS_LIST_GAP_CHAINS). chain_id is a COMPARED column present in every blocks
+// row (the PK leads with it), so the scope is read from the row itself — no env threading. A chain
+// outside this set is never tolerated.
+export const BASE_FEE_PRELONDON_CHAINS = new Set([1]);
 
 // portalRow / rpcRow are normalized block row-strings (normRow output: sorted keys, bigint→decimal,
-// bytes→hex, total_difficulty dropped). Returns true iff `base_fee_per_gas` is the SOLE differing
-// field, the Portal side (A) is SQL NULL, the RPC side (B) is exactly "0", AND both rows carry a
-// present, equal `hash` (the safety anchor above). A non-NULL Portal value, a non-"0" RPC value, a
-// second differing field, or a missing/unequal hash all return false → FAIL (cell U-eth).
+// bytes→hex, total_difficulty dropped). Returns true iff the row's chain_id is an in-scope pre-London
+// chain (eth-mainnet 1), `base_fee_per_gas` is the SOLE differing field, the Portal side (A) is SQL
+// NULL, the RPC side (B) is exactly "0", AND both rows carry a present, equal `hash` (the safety anchor
+// above). An out-of-scope chain, a non-NULL Portal value, a non-"0" RPC value, a second differing
+// field, or a missing/unequal hash all return false → FAIL (cell U-eth).
 function baseFeeNullVsZeroTolerated(portalRow, rpcRow) {
   const p = JSON.parse(portalRow);
   const r = JSON.parse(rpcRow);
+
+  // Scope guard: only chains with a pre-1559 era (eth-mainnet 1). chain_id is normalized to a decimal
+  // string (bigint→decimal in normRow); compare numerically against the scope set.
+  if (!BASE_FEE_PRELONDON_CHAINS.has(Number(p.chain_id))) return false;
 
   let diffField = null;
   for (const k of new Set([...Object.keys(p), ...Object.keys(r)])) {
@@ -254,10 +270,12 @@ function accessListColumnGapTolerated(portalRow, rpcRow) {
 //     block.size derivation artifact (issues #76, #106) — a shared block whose ONLY differing field is
 //     `size`, over a present+equal hash, is counted in res.sizeTolerated, not res.mismatch, and does
 //     NOT fail — AND the pre-London base_fee_per_gas null-vs-0 representational diff (cell U-eth) — a
-//     shared block whose ONLY differing field is `base_fee_per_gas`, Portal side (A) SQL NULL vs RPC
-//     side (B) "0", over a present+equal hash, counted in res.baseFeeTolerated, not res.mismatch. Any
-//     second differing field (including hash), a non-NULL Portal base fee, or a non-"0" RPC base fee
-//     still FAILS (self-retiring). Before the #19 fix 'blocks' was vacuous — it failed only on a shared
+//     shared block on an in-scope chain (BASE_FEE_PRELONDON_CHAINS — eth-mainnet chain_id 1, scoped
+//     like the access_list gap, not universally) whose ONLY differing field is `base_fee_per_gas`,
+//     Portal side (A) SQL NULL vs RPC side (B) "0", over a present+equal hash, counted in
+//     res.baseFeeTolerated, not res.mismatch. Any second differing field (including hash), a non-NULL
+//     Portal base fee, a non-"0" RPC base fee, or an out-of-scope chain still FAILS (self-retiring).
+//     Before the #19 fix 'blocks' was vacuous — it failed only on a shared
 //     mismatch and let a portal-only block sail through the F-full differ.
 //   • 'transactions' : STRICT one-sided semantics (a portal-only OR rpc-only tx FAILS, exactly like
 //     strict), plus ONE tolerated shared-key class — the upstream access_list column gap (issues #83,
