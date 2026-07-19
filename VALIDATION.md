@@ -54,49 +54,71 @@ class of defect. A claim is only as strong as the layer that backs it.
 
 ### Layer A — Unit + invariant tests, on every supported upstream version
 
-The Portal layer (`portal/`) is organised around **explicit, numbered invariants** (INV-1 … INV-18),
-each with a stable, grep-able identity across **doc ⟷ code ⟷ test**. The catalog and its rationale
+The Portal layer (`portal/`) is organised around **explicit, numbered invariants** (INV-1 … INV-25,
+IDs stable and chronological, not table order), each with a stable, grep-able identity across
+**doc ⟷ code ⟷ test**. The catalog and its rationale
 live in [`portal/INVARIANTS.md`](portal/INVARIANTS.md); the runtime asserts them under
 `PORTAL_CHECKS` (`on` = O(1) tripwires that throw `InvariantViolation`; `strict` = additional
 whole-structure O(n) checks used in CI), and the suite proves them with property-based tests
 (`fast-check`, seed-pinned for deterministic runs).
 
-The suite runs **against all four supported upstream Ponder versions** — `0.15.17`, `0.16.6`,
-`0.16.7`, and `0.16.8` — by grafting the Portal layer onto a pinned Ponder checkout:
+The suite runs **against every tracked upstream Ponder version** — `0.15.17`, `0.16.6`, `0.16.7`,
+`0.16.8`, `0.16.9`, `0.16.10`, and `0.17.0` (`compat.tested` in `versions.json`) — by grafting the
+Portal layer onto a pinned Ponder checkout:
 
 ```bash
 scripts/sync-upstream.sh 0.15.17 --test
 scripts/sync-upstream.sh 0.16.6  --test
 scripts/sync-upstream.sh 0.16.7  --test
 scripts/sync-upstream.sh 0.16.8  --test
+scripts/sync-upstream.sh 0.16.9  --test
+scripts/sync-upstream.sh 0.16.10 --test
+scripts/sync-upstream.sh 0.17.0  --test
 ```
 
 (config `portal/vite.portal.config.ts`, files `portal/*.test.ts`). The seam
 (`HistoricalSync.syncBlockRangeData` / `syncBlockData`) is verified identical in shape across that
-version range (`versions.json`), and CI's seam matrix (derived from `compat.tested`) runs all four on
-every push. `0.16.7` was registered by **[#74](../../pull/74)** (2026-07-06) on a
-**seam-identity + full-suite** basis: the `0.16.6` wiring patch applies to the `0.16.7` tree
-byte-identically (zero rejects, all 10 files) and the full Portal suite (**272/272** at that cut) passes
-on the graft; the lone upstream delta `0.16.6 → 0.16.7` is a single DB-layer PR (`ponder-sh/ponder#2314`,
-live-query notification batching) with **zero Portal-graft-surface overlap**. The newest, `0.16.8`, was
-registered on the **same basis** by **[#129](../../pull/129)** (2026-07-10): the same wiring patch
-applies to the `0.16.8` tree byte-identically (same 10 files) and the full Portal suite (**310/310** at
-that cut) passes on the graft; the lone upstream delta `0.16.7 → 0.16.8` is realtime-only — it adds
-`isAsyncExecutionChain` (in `sync-realtime/index.ts` + `utils/finality.ts`) so async-execution chains
-can surface blocks before `logsBloom` is execution-ready — and **neither file is on the Portal graft
-surface** (`sync-historical`, `runtime/historical`, `sync-store`, `rpc`, `sync`), so the 81 Portal
-realtime tests pass unchanged. As with `0.15.17`, that basis is **not** a fresh RPC byte-diff or
-cross-validation — the §3 / §5 byte-diff and A/B evidence remains on `0.16.6`.
+version range (`versions.json`), and CI's seam matrix (derived from `compat.tested`) runs them on
+every push. Each version past `0.16.6` was registered on a **seam-identity + full-suite** basis, not a
+fresh RPC byte-diff: the wiring patch applies to the newer tree, the graft builds, and the **full
+current Portal suite passes on the graft** while each upstream delta lands **off the Portal graft
+surface** (`sync-historical`, `runtime/historical`, `sync-store`, `rpc`, `sync`). Concretely, per
+`versions.json`:
+
+- `0.16.7` ([#74](../../pull/74)) and `0.16.8` ([#129](../../pull/129)) apply the `0.16.6` wiring
+  patch byte-identically (same 10 files); `0.16.6 → 0.16.7` is one DB-layer PR (`ponder-sh/ponder#2314`,
+  live-query notification batching) and `0.16.7 → 0.16.8` is a realtime-only `isAsyncExecutionChain`
+  addition (`sync-realtime/index.ts` + `utils/finality.ts`) — neither touches the graft surface.
+- `0.16.9` applies the `0.16.8` wiring patch verbatim; `0.16.8 → 0.16.9` is a single off-surface file
+  (`indexing-store/cache.ts`, a bytea-COPY fix). It is the **published `latest`** fork build
+  (`@subsquid/ponder@0.16.9-sqd.1`, published 2026-07-14).
+- `0.16.10` ([#178](../../pull/178)) applies the `0.16.9` wiring patch verbatim; `0.16.9 → 0.16.10` is a
+  three-file commit-path resilience fix (`runtime/isolated.ts` / `multichain.ts` / `omnichain.ts`) that
+  sits ~500 lines off the wiring region, so the patch applies with zero rejects.
+- `0.17.0` ([#179](../../pull/179)) is the one non-verbatim graft: `0.16.10 → 0.17.0` is a tree-wide
+  **mechanical reformat** (import reorder, `static override readonly`, `@ts-ignore` → `@ts-expect-error`)
+  plus dep bumps (`@ponder/utils` 0.2.18 → 0.3.0, `pg` ^8.11 → ^8.16), so the wiring patch was
+  **re-derived** — the 5 rejected hunks were all pure import-block additions re-placed byte-for-byte
+  (comm-verified identical to the `0.16.10` added lines, zero delta), and the graft seam survives
+  untouched. It also bumps the required `pnpm` to 11, which the `sync-upstream.sh` harness now honours by
+  reading the clone's own `packageManager`.
+
+The full current Portal suite is **370 tests across 19 files**, green on every tracked version via the
+one-command gate (verified in the `0.16.10` / `0.17.0` compat work). As with `0.15.17`, this basis is
+**not** a fresh RPC byte-diff or cross-validation on the newer versions — the §3 / §5 byte-diff and A/B
+evidence remains on `0.16.6` (see below).
 
 **Evidence base version and seam-identity transfer.** The data-correctness evidence in §3 / §5 (the
-paid-matrix byte-diff and the A/B soak) was gathered on the `0.16.6` graft, whereas the published fork
-is `@subsquid/ponder@0.16.8-sqd.1`. That evidence **transfers to the shipped artifact by seam
-identity**: the Portal wiring patch is byte-identical (sha256-equal) across the `0.16.6` / `0.16.7` /
-`0.16.8` grafts, and each upstream delta over that range lands off the Portal graft surface (Layer A
-above). A version bump therefore does **not** invalidate the matrix or the soak, and we deliberately do
-**not** re-run the paid matrix or restart the soak for it. Alongside that transfer, three **direct
-anchors on the shipped `0.16.8-sqd.1` package** — two landed, one planned — tie the evidence to the
-exact published build:
+paid-matrix byte-diff and the A/B soak) was gathered on the `0.16.6` graft, whereas the published `latest`
+fork is now `@subsquid/ponder@0.16.9-sqd.1` (superseding `0.16.8-sqd.1`; `0.16.10` and `0.17.0` are
+tracked but not yet published — publishing is a deliberate, human-reserved step, `versions.json`). That
+evidence **transfers to the shipped artifact by seam identity**: the Portal wiring patch is byte-identical
+(sha256-equal) across the `0.16.6` / `0.16.7` / `0.16.8` grafts and carries forward verbatim to `0.16.9`
+(and to `0.16.10`; `0.17.0` re-derives the patch but re-places every added wiring line byte-for-byte,
+Layer A above), and each upstream delta over that range lands off the Portal graft surface. A version
+bump therefore does **not** invalidate the matrix or the soak, and we deliberately do **not** re-run the
+paid matrix or restart the soak for it. Alongside that transfer, three **direct anchors on the shipped
+`0.16.8-sqd.1` package** — two landed, one planned — tie the evidence to that exact published build:
 1. the examples end-to-end freshness gate ran against the **published** package
    ([#139](../../pull/139)) — the `euler-subgraph` example reproduced its exact baseline row counts
    (vaults / deposits / withdraws / borrows / repays), a no-regression check on the shipped tag — **done**;
@@ -1269,6 +1291,31 @@ fix ships in all four wiring patches (byte-identical hunk) with a mutation-verif
 the empty-fallback guard are proven at runtime (mutation-RED when either is removed). The realtime path
 remains **experimental** pending the longer soak (same framing as the rest of §5.2).
 
+**[#175](../../pull/175) — INV-17 write-side idempotence on the realtime finalize path.** A realtime
+`SIGKILL` + resume by a **single writer** duplicated a `ponder_sync.factory_addresses` row: a factory
+child discovered at its creation block was inserted once by the pre-kill `finalize` transaction and once
+by the resume `finalize` (two **sequential** finalize transactions). App data stays byte-identical (the
+only consumer, `getChildAddresses`, min-merges to a set), but the duplicate breaks store-identity/digest
+tooling and grows the table unbounded under repeated realtime crash/resume. Invariant **INV-17**
+(factory-children write-side idempotence) already deduped the **historical** call site
+(`portal.ts` `persistPendingChildren`) against the store's persisted rows; the **realtime finalize**
+path (`runtime/realtime.ts` `handleRealtimeSyncEvent`) re-inserted its finalized children with **no**
+dedupe — `insertChildAddresses` is a plain `INSERT` and `factory_addresses` carries no
+`UNIQUE (factory_id, chain_id, address)`. #175 extracts the dedupe into a shared core
+(`portal/portal-child-dedupe.ts` `dedupeChildAddressesAgainstStore`) and runs it at **both** call sites
+— on the realtime path inside the finalize `syncQB.transaction`, before the `insertChildAddresses`
+spread — so both sync modes are byte-identically idempotent for a resumed **single writer**. The change
+also **corrects an earlier over-claim** in this repo's own invariant note (which had attributed the ×2
+solely to a concurrent-instance test driver and called SIGKILL/resume harmless): the resumed
+single-writer case was a genuine completeness gap on the realtime path, now closed. Pinned by
+`portal-realtime-wire.test.ts` — *"regression (K2 chaos, INV-17 realtime finalize): a resumed
+single-writer re-finalizing the SAME child-creation block does NOT duplicate the factory_addresses row"*
+(mutation-verified: reverting the finalize dedupe to a pass-through fails it, *"expected […] to have a
+length of 1 but got 2"*). This **addresses the fork-side hardening proposed in
+[#53](../../issues/53)** (the `factory_addresses` idempotence gap, §5.8(C)); the **residual** is
+genuinely only the two-transaction / two-concurrent-writer TOCTOU, which the portal-layer dedupe does
+not close and which needs a DB `UNIQUE` + `ON CONFLICT` (documented in INV-17).
+
 ### 5.3 Benign / tolerated diff classes (declared, bounded, removable)
 
 Both differ paths — the **A/B soak differ** (Layer D) and the **paid-matrix byte-diff** (Layer E) —
@@ -1333,6 +1380,24 @@ the harness is part of the evidence, and its bugs belong in the open too.
 | [#79](../../issues/79) | **CLOSED (fixed [#80](../../pull/80), merged `b1affeec`)** | **Results-doc tag collision across specs.** When one cell runs two window specs that reuse the same window **tags** (L-eth's seed-101 2k and seed-102 5k both emit `rand#0…rand#3`), the results JSON **folds** one spec's window records into the same-tagged records' `attempts` arrays, so the two specs' verdicts read as retries of each other. Surfaced on L-eth (§3.4), where the four 2k windows appear as `attempts` of the four 5k windows. | A **results-labelling** defect in the harness (Layer E), not a data defect: **budget sums and per-window verdicts are unaffected** — the full run is recovered by reading windows **and** attempts together (as §3.4 does), and every recorded window keeps its own range / verdict / request count. The **fix landed in [#80](../../pull/80)** (merged `b1affeec`, 2026-07-06), which makes seeded-random window tags unique across specs so records no longer fold together. |
 | (matrix design; no issue) | **VACUOUS — no verdict recorded** | **Random-window factory (F-*) cells can score a vacuous 0-rows-both-sides "pass."** The `F-polygon` cell reported 4 / 4 windows `pass=true` — but with **`portal = 0`, `rpc = 0` rows across *every* table** (`logs` / `transactions` / `transaction_receipts` / `traces` / `blocks`), ~75 requests/window (an empty factory-discovery scan). A 0=0 match is **not byte-identity evidence** — it proves nothing about the Portal path. | A **harness/matrix-design** finding (Layer E), **not** a fork or dataset defect. Root cause (code-confirmed): `harness/diff/euler-app/ponder.config.ts` uses Ponder's `factory()` with `startBlock = window.from`, so factory child discovery is **anchored at the window start** — children created *before* a random isolated window are never discovered, and a window yields child data only if a `ProxyCreated` fires *inside* it. Polygon's Euler factory deployed at block 86932985 with only ~25 vaults across 2.5M blocks, so the seeded 4×50k windows (~8% coverage) all missed the creations → both Portal and RPC do the **same** empty in-window discovery → a trivial 0=0 match. This makes **all five random-window `F-*` cells** (`F-base`/`F-arbitrum`/`F-bsc`/`F-avalanche`/`F-polygon`) vacuous-prone by the same design; only **`F-full`** (eth, full-range from the factory deploy, ~872 vaults — §3.2) exercises real factory discovery, and the **`L-*` `erc20` cells** (a fixed dense token per chain) are the reliable random-window path since any window hits dense transfers. **No verdict was recorded off this vacuous pass** — `F-polygon` is *not* counted as a factory PASS; it is logged candidly here as vacuous, and all five `F-*` seeded-window cells are marked **`RETIRED`** in the matrix (§3) rather than left as open `PENDING` work. |
 
+**Metric-reporting correctness — `inserted.logs` now counts store-inserted rows
+([#177](../../pull/177) / [#143](../../issues/143)).** One fork-side observability fix belongs with the
+evidence infrastructure, because the per-chain metrics file is read by the benchmark and soak harnesses.
+`inserted.logs` previously mapped to `stats.logs` — the **raw** count of logs *streamed off the Portal*
+(before client-side re-match) — while actual insertion uses the **assembled** (post-re-match) set
+(`syncStore.insertLogs({ logs: assembled.logs })`). Because the Portal's merged server-side filter
+legitimately over-returns rows assembly drops (a bounded filter's out-of-range logs, a factory child's
+pre-creation logs), a window whose raw logs were **all** re-match-dropped could report
+`inserted.logs > 0` alongside `inserted.blocks = 0` with **zero** logs actually inserted — the count
+contradicted the store. #177 introduces `stats.insertedLogs`, incremented by `assembled.logs.length` at
+the `insertLogs` site, so `inserted.*` is uniformly a **store-insertion** count (logs alongside
+blocks/txs/receipts/traces), and reconciles the completion log line's `logs=` to the same count; the raw
+streamed count is retained under its own name for the progress-ticker fingerprint, so raw-vs-inserted are
+not conflated. Mutation-verified in `portal.test.ts` (a window that over-returns one out-of-range log
+asserts `inserted.logs === 0` / `inserted.blocks === 0`; reverting the mapping to `stats.logs` fails it,
+*"expected 1 to be +0"*). This is a **reporting** correction — no sync-store row or byte-identity claim
+(§3) changes; it makes the metrics honest, not the data different.
+
 ### 5.6 Validation-matrix data findings (Layer E) — upstream-dataset gaps
 
 The paid matrix (Layer E) surfaced two confirmed **upstream SQD Portal dataset** gaps and, on top of
@@ -1395,6 +1460,25 @@ This is the same discipline as the A/B differ's tolerated classes (§5.3): decla
 designed to be deleted. The candor point is the headline: **the byte-diff gate caught a real
 upstream-dataset defect that a coarser check would have waved through** — that is evidence the gate
 works, not a blemish on it.
+
+**Operator opt-in for RPCs that omit `accessList` ([#173](../../pull/173)).** The same honest-NULL
+principle extends to the fork's **RPC** path. The fork hardens ponder's `standardizeTransactions`
+(`rpc/actions.ts`, added by every wiring patch) to **throw** when a typed (`0x1`/`0x2`/`0x3`/`0x4`)
+transaction's RPC response omits `accessList` — correct in general, since a silent omission would
+otherwise encode a permanent `NULL` (or the old fabricated `"[]"`) over a genuinely-present on-chain
+access list (#27/#32). But **SQD's own zkSync RPC proxy returns EIP-1559 (`0x2`) transactions with no
+`accessList` key** (verified 11/11 type-`0x2` txs across 50 near-tip blocks), so a zkSync app crashed at
+startup on that documented proxy — a regression vs stock ponder, which has no such guard. #173 adds an
+opt-in escape hatch **`PORTAL_ALLOW_MISSING_ACCESS_LIST`** (default **OFF**, matching the fork's
+`PORTAL_*` boolean convention): unset, a missing `accessList` on a typed tx is still a loud
+`RpcProviderError` (now naming the knob so the operator is told exactly how to proceed); set, the
+missing value is stored as an **honest SQL `NULL`** — the *same* value the Portal path already stores
+for datasets that drop the column entirely (#110/#111). The escape hatch is for **absent** lists only: a
+**present** access list still round-trips unchanged with the knob on, so the guard never fabricates or
+drops a real one. Covered by three mutation-verified cases in `portal/realtime-standardize.test.ts`
+(default-throw-names-the-knob; knob-on stores `NULL` for `0x1`–`0x4`; knob-on preserves a present list),
+gates green. This is a **mitigation, not a cure** for the proxy's non-compliance — the honest boundary
+is the same as #110/#111: `NULL` means "we don't have this value here," never a fabricated empty list.
 
 ### 5.7 Layer-F third-party corroboration — consolidated
 
@@ -1586,8 +1670,8 @@ for the LOGIC**, backed by ~30 reorg/finality unit tests across `portal/portal-r
 | stream-mode finalized boundary **never RAISES** above RPC finalized; **floor never regresses** on restart | `clampFinalizedToPortalHead: Portal at/ahead of RPC finalized → no clamp (never RAISES the boundary)` · `clampFinalizedToPortalHead: a probed head BELOW the persisted floor is clamped UP to the floor — a restart against a lagging replica must not re-stream already-finalized (unrevertable) blocks` · `clampFinalizedToPortalHead: the floor overrides a PORTAL_FINALIZED_HEAD pin below it — a pin below persisted finality must not re-open the double-indexing hole` — `portal/portal-realtime-wire.test.ts` |
 | **foreign-checkpoint restart** maps a foreign checkpoint's timestamp to a local floor (omnichain, [#57](../../issues/57)) | `deriveFinalityFloor: a FOREIGN checkpoint is TIMESTAMP-MAPPED to the local chain’s highest block at/below that timestamp — the floor is a LOCAL block, not the foreign height (issue #57)` · `deriveFinalityFloor → clampFinalizedToPortalHead: the timestamp-mapped floor actually CLAMPS the stream-mode boundary UP — a lagging replica must not re-stream already-finalized blocks after an omnichain restart (issue #57)` — `portal/portal-realtime-wire.test.ts` |
 
-These tests are **mutation-verified** (each fails on the pre-fix code) and gate on **both supported
-upstream Ponder versions** via `scripts/sync-upstream.sh <ver> --test`, in line with this document's
+These tests are **mutation-verified** (each fails on the pre-fix code) and gate on **every tracked
+upstream Ponder version** via `scripts/sync-upstream.sh <ver> --test`, in line with this document's
 standing evidence rule (§6: *"every fix is backed by a mutation-verified regression test"*). Much of
 this logic landed as the **stream-realtime correctness wave, PR [#26](../../pull/26)** (§5.2), whose
 follow-up hardening (the 409 step-down / floor / diagnostics) is captured by the `issue #33`-tagged
@@ -1622,9 +1706,11 @@ window**, not continuous and not over the unfinalized tip; it establishes that t
 agree, which is where correctness must hold. The stream leg it exercises is **experimental** (§1,
 §5.2). Two currently-open issues on that path are **robustness, not reorg-correctness**, and are named
 so as not to overstate the claim: [#48](../../issues/48) is a stream-wire teardown/undici abort-hang
-race (a shutdown-unwind hardening item), and [#53](../../issues/53) is a `factory_addresses`
-idempotence gap that is app-invisible but breaks store-identity tooling (a sync-store tooling item).
-Neither is a reorg-correctness defect.
+race (a shutdown-unwind hardening item), and [#53](../../issues/53) was a `factory_addresses`
+idempotence gap that is app-invisible but breaks store-identity tooling (a sync-store tooling item) —
+its fork-side hardening has since landed for the **single-writer** case via
+[#175](../../pull/175)'s INV-17 realtime-finalize dedupe (§5.2), leaving only the two-concurrent-writer
+TOCTOU (a DB-`UNIQUE` change). Neither is a reorg-correctness defect.
 
 #### What this section does NOT claim
 
@@ -1970,10 +2056,14 @@ this document's newest bullet. The stream path remains experimental (§1, §6).
 
 **Proven today (with reproducible evidence in this repo):**
 
-- The Portal layer's invariants (INV-1 … INV-18) hold under property-based tests **on all four
-  supported upstream Ponder versions** (`0.15.17`, `0.16.6`, `0.16.7`, `0.16.8` — the last two
-  registered by [#74](../../pull/74) / [#129](../../pull/129) on a seam-identity + full-suite basis,
-  §2), and every fix is backed by a mutation-verified regression test.
+- The Portal layer's invariants (INV-1 … INV-25) hold under property-based tests **on every tracked
+  upstream Ponder version** (`0.15.17`, `0.16.6`, `0.16.7`, `0.16.8`, `0.16.9`, `0.16.10`, `0.17.0` —
+  each past `0.16.6` registered on a **seam-identity + full-suite** basis, *not* a fresh RPC byte-diff,
+  §2; the full current suite is **370 tests / 19 files**, green on all of them), and every fix is backed
+  by a mutation-verified regression test. The realtime `/stream` liveness invariants INV-22…INV-25 and
+  the #175 rework of INV-17 (write-side idempotence on the realtime finalize path) are code +
+  mutation-verified **unit-test** evidence on the **experimental** stream path (§5.2, §5.12), not a
+  paid-matrix byte-identity or live-protocol claim.
 - **Crash/resume is safe, and resume-from-partial-persisted-state is now proven.** Tier 0 (PGlite,
   §4.1): 203 kills across 41/41 completed backfills, `SIGKILL`-atomic and restart-idempotent,
   byte-identical to an unkilled baseline across all five row families, intervals tiling exactly, zero
@@ -2039,7 +2129,7 @@ All tooling is `bash` + `node` only (no extra dependencies) and lives in this re
 
 | Evidence | Tool | Doc |
 |----------|------|-----|
-| Unit + invariant suite (all four versions) | `scripts/sync-upstream.sh <ver> --test` | `CLAUDE.md`, `portal/INVARIANTS.md` |
+| Unit + invariant suite (every tracked version) | `scripts/sync-upstream.sh <ver> --test` | `CLAUDE.md`, `portal/INVARIANTS.md` |
 | Chaos kill-loop + resume (Tier 0, PGlite byte-diff) | `harness/chaos/kill-loop.sh`, `verify-resume.sh`, `proxy.mjs` | `harness/validate/README.md` §Chaos |
 | Chaos resume-from-partial (Tier 1, Postgres logical-digest) | `harness/chaos/chaos-pg-driver.sh`, `build-baseline-pg.sh`, `pg-ctl-chaos.sh`, `verify-resume-pg.sh`, `pg-digest.mjs`, `snapshot-coverage-pg.mjs`, `check-intervals-pg.mjs` | §4.2 (this doc); tool headers |
 | Validation matrix (fork vs stock) | `harness/validate/run-cell.sh`, `ctrl-cell.sh`, `cells.json` | `harness/validate/README.md` |
