@@ -7,12 +7,20 @@
   "seam": "HistoricalSync.syncBlockRangeData / syncBlockData (interval-scoped) — identical in shape across the tested range",
   "versions": [
     {
+      "ponder": "0.16.10",
+      "wiring": "wiring/0.16.10.patch",
+      "rev": 1,
+      "status": "verified",
+      "published": false,
+      "note": "0.16.10-sqd.1 grafts the current Portal layer (invariant-first re-architecture INV-1…INV-18 + the full correctness wave through the #47 mid-range-204 fix, the #50 bounded-time-to-first-commit warmup, the #20/#94 needed-field scoping, the #110/#111 access_list honest-NULL fix, the #23 realtime body-cap filtered fallback, the #175 INV-17 realtime-finalize write-side idempotence, and the #143 inserted.logs store-inserted metric) onto ponder@0.16.10. wiring/0.16.10.patch is a verbatim copy of wiring/0.16.9.patch (sha256 19743650…): 0.16.9→0.16.10 is a three-file upstream change — runtime/isolated.ts, runtime/multichain.ts, runtime/omnichain.ts only — wrapping the per-event checkpoint-update + pglite live-query TRUNCATE in a try/catch that invalidates+clears the in-memory indexing cache before rethrowing (a commit-path resilience fix). Those edits sit in the per-event processing loop (isolated ~L643, multichain ~L732, omnichain ~L752), ~500 lines below the run* entry-point region (~L152-177) the wiring patch modifies — non-overlapping, so the patch applies with zero rejects. It builds and passes the full current Portal suite (370 tests) on ponder@0.16.10 (scripts/sync-upstream.sh 0.16.10 --test). The changed region is off the graft seam (HistoricalSync.syncBlockRangeData/syncBlockData, untouched), so the fork passively inherits the upstream cache-invalidation resilience fix. No fresh RPC byte-diff on 0.16.10; compat rests on seam-identity + the full suite, as for 0.16.9/0.16.8/0.15.17. As the newest tracked ponder version it will publish with --tag latest when released; publishing is a separate, deliberate, human-reserved step, so this row stays published:false and 0.16.9-sqd.1 remains latest until then. (Upstream 0.17.0 exists but is a tree-wide mechanical reformat — import reorder, `static override`, `@ts-ignore`→`@ts-expect-error` — plus @ponder/utils 0.3.0 + pg ^8.16 dep bumps; the seam survives but the wiring patch needs hunk-by-hunk re-derivation, tracked separately, not a verbatim copy like 0.16.10.)"
+    },
+    {
       "ponder": "0.16.9",
       "wiring": "wiring/0.16.9.patch",
       "rev": 1,
       "status": "verified",
-      "published": false,
-      "note": "0.16.9-sqd.1 grafts the current Portal layer (invariant-first re-architecture INV-1…INV-18 + the correctness wave: the #47 mid-range-204 fix, the #50 bounded-time-to-first-commit warmup, the #20/#94 needed-field scoping, the #110/#111 access_list honest-NULL fix, and the #23 realtime body-cap filtered fallback) onto ponder@0.16.9. wiring/0.16.9.patch is a verbatim copy of wiring/0.16.8.patch: 0.16.8→0.16.9 is a single-file upstream change — src/indexing-store/cache.ts only (ponder-sh/ponder#2323: fix p.bytes() bytea encoding on the Postgres COPY flush path, emitting \\x<hex> for Buffer values to fix `DelayedInsertError: invalid byte sequence for encoding \"UTF8\": 0x00`) — and every upstream file the wiring patch modifies is byte-identical between 0.16.8 and 0.16.9, so the patch applies with zero rejects. It builds and passes the full current Portal suite (328 tests) on ponder@0.16.9 (scripts/sync-upstream.sh 0.16.9 --test). indexing-store/cache.ts is off the graft surface (sync-historical, runtime/historical, sync-store, rpc, sync, sync-realtime), so the seam is untouched and the fork passively inherits the upstream bytea-COPY correctness fix. No fresh RPC byte-diff on 0.16.9; compat rests on seam-identity + the full suite, as for 0.16.8/0.16.7/0.15.17. As the newest ponder version it will publish with --tag latest when released; publishing is a separate, deliberate, human-reserved step, so this row stays published:false and 0.16.8-sqd.1 remains latest until then."
+      "published": true,
+      "note": "0.16.9-sqd.1 grafts the current Portal layer (invariant-first re-architecture INV-1…INV-18 + the correctness wave: the #47 mid-range-204 fix, the #50 bounded-time-to-first-commit warmup, the #20/#94 needed-field scoping, the #110/#111 access_list honest-NULL fix, and the #23 realtime body-cap filtered fallback) onto ponder@0.16.9. wiring/0.16.9.patch is a verbatim copy of wiring/0.16.8.patch: 0.16.8→0.16.9 is a single-file upstream change — src/indexing-store/cache.ts only (ponder-sh/ponder#2323: fix p.bytes() bytea encoding on the Postgres COPY flush path, emitting \\x<hex> for Buffer values to fix `DelayedInsertError: invalid byte sequence for encoding \"UTF8\": 0x00`) — and every upstream file the wiring patch modifies is byte-identical between 0.16.8 and 0.16.9, so the patch applies with zero rejects. It builds and passes the full current Portal suite (328 tests) on ponder@0.16.9 (scripts/sync-upstream.sh 0.16.9 --test). indexing-store/cache.ts is off the graft surface (sync-historical, runtime/historical, sync-store, rpc, sync, sync-realtime), so the seam is untouched and the fork passively inherits the upstream bytea-COPY correctness fix. No fresh RPC byte-diff on 0.16.9; compat rests on seam-identity + the full suite, as for 0.16.8/0.16.7/0.15.17. It was published as 0.16.9-sqd.1 with --tag latest on 2026-07-14 and is now the default `npm install @subsquid/ponder`, superseding 0.16.8-sqd.1 as latest; it remains latest until a newer tracked version (0.16.10) is deliberately published."
     },
     {
       "ponder": "0.16.8",
@@ -48,8 +56,8 @@
     }
   ],
   "compat": {
-    "tested": ["0.16.9", "0.16.8", "0.16.7", "0.16.6", "0.15.17"],
-    "seamStableRange": "0.15.17 - 0.16.9 (verified identical by inspection; CI matrix promotes to 'tested' as patches land)",
+    "tested": ["0.16.10", "0.16.9", "0.16.8", "0.16.7", "0.16.6", "0.15.17"],
+    "seamStableRange": "0.15.17 - 0.16.10 (verified identical by inspection; CI matrix promotes to 'tested' as patches land)",
     "howToAdd": "see PUBLISHING.md — scripts/sync-upstream.sh <ver> --test, then add the row here"
   }
 }
