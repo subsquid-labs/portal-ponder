@@ -16,7 +16,7 @@ VER="${1:?usage: sync-upstream.sh <ponder-version> [--test | --coverage]}"
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 WORK="${SYNC_WORKDIR:-/tmp/sqd-ponder-fork}/$VER"
 WIRING="$ROOT/portal/wiring/$VER.patch"
-PNPM="corepack pnpm@9.10.0"
+PNPM="corepack pnpm@9.10.0" # fallback default; overridden from the clone's packageManager below
 
 [ -f "$WIRING" ] || { echo "✗ no wiring patch for $VER at portal/wiring/$VER.patch — author it (PUBLISHING.md §'Adding a version')"; exit 1; }
 
@@ -30,6 +30,12 @@ fi
 
 echo "▶ cloning ponder@$VER → $WORK"
 rm -rf "$WORK"; git clone --quiet --depth 1 --branch "ponder@$VER" https://github.com/ponder-sh/ponder "$WORK"
+
+# ponder 0.17.0 bumped engines.pnpm to >=11 (packageManager pnpm@11.0.0); older versions pin
+# pnpm@9.10.0. Track the clone's own packageManager so each version builds with the pnpm it
+# declares; fall back to the historical pin when the field is absent.
+PM="$(node -e "try{process.stdout.write(require('$WORK/package.json').packageManager||'')}catch{}")"
+PNPM="corepack ${PM:-pnpm@9.10.0}"
 
 CORE="$WORK/packages/core"
 SYNC="$CORE/src/sync-historical"
@@ -84,7 +90,12 @@ provision_fastcheck() {
 if [ "${2:-}" = "--test" ]; then
   provision_fastcheck
   echo "▶ running Portal-layer tests"
-  ( cd "$CORE" && pnpm exec vitest run --config vite.portal.config.ts )
+  # Run the vitest binary directly rather than via `pnpm exec`: the workspace→real-version rewrite
+  # above intentionally diverges packages/core/package.json from pnpm-lock.yaml, and pnpm 11 (which
+  # 0.17.0 pins via packageManager) gates `pnpm exec` behind an install-status check that aborts on
+  # that divergence under frozen-lockfile (CI default) — ERR_PNPM_OUTDATED_LOCKFILE. The binary path
+  # locates + runs vitest with no deps gate, identically on pnpm 9.10.0 and pnpm 11.
+  ( cd "$CORE" && node_modules/.bin/vitest run --config vite.portal.config.ts )
 fi
 
 # --coverage: run the same suite with v8 coverage scoped to the Portal source (see the `coverage`
@@ -102,7 +113,9 @@ if [ "${2:-}" = "--coverage" ]; then
   provision_fastcheck
 
   echo "▶ running Portal-layer tests with coverage"
-  ( cd "$CORE" && pnpm exec vitest run --config vite.portal.config.ts --coverage )
+  # Direct binary (not `pnpm exec`) — see the --test note: avoids pnpm 11's exec-time deps-status
+  # gate tripping over the intentional workspace→real-version manifest/lockfile divergence.
+  ( cd "$CORE" && node_modules/.bin/vitest run --config vite.portal.config.ts --coverage )
   echo "✓ coverage summary → $CORE/portal-coverage/coverage-summary.json"
 fi
 
