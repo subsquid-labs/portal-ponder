@@ -90,7 +90,12 @@ provision_fastcheck() {
 if [ "${2:-}" = "--test" ]; then
   provision_fastcheck
   echo "▶ running Portal-layer tests"
-  ( cd "$CORE" && pnpm exec vitest run --config vite.portal.config.ts )
+  # Run the vitest binary directly rather than via `pnpm exec`: the workspace→real-version rewrite
+  # above intentionally diverges packages/core/package.json from pnpm-lock.yaml, and pnpm 11 (which
+  # 0.17.0 pins via packageManager) gates `pnpm exec` behind an install-status check that aborts on
+  # that divergence under frozen-lockfile (CI default) — ERR_PNPM_OUTDATED_LOCKFILE. The binary path
+  # locates + runs vitest with no deps gate, identically on pnpm 9.10.0 and pnpm 11.
+  ( cd "$CORE" && node_modules/.bin/vitest run --config vite.portal.config.ts )
 fi
 
 # --coverage: run the same suite with v8 coverage scoped to the Portal source (see the `coverage`
@@ -108,7 +113,9 @@ if [ "${2:-}" = "--coverage" ]; then
   provision_fastcheck
 
   echo "▶ running Portal-layer tests with coverage"
-  ( cd "$CORE" && pnpm exec vitest run --config vite.portal.config.ts --coverage )
+  # Direct binary (not `pnpm exec`) — see the --test note: avoids pnpm 11's exec-time deps-status
+  # gate tripping over the intentional workspace→real-version manifest/lockfile divergence.
+  ( cd "$CORE" && node_modules/.bin/vitest run --config vite.portal.config.ts --coverage )
   echo "✓ coverage summary → $CORE/portal-coverage/coverage-summary.json"
 fi
 
