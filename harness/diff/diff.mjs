@@ -96,13 +96,83 @@ function sizeOnlyDiffTolerated(portalRow, rpcRow) {
   return hash !== null && hash !== undefined && hash !== '' && hash === r.hash;
 }
 
+// ── known representational diff: pre-London blocks.base_fee_per_gas null-vs-0 (cell U-eth) ────────
+// EIP-1559 (the London hard fork, eth-mainnet block 12,965,000) introduced the `baseFeePerGas` block
+// header field. PRE-London blocks have NO such field — a full node's `eth_getBlockByNumber` omits
+// `baseFeePerGas` entirely (geth-verified absent on block 12453996). The two sync paths render that
+// absence differently: the Portal-backfill leg (A) stores the honest SQL NULL ("the field does not
+// exist", matching portal/portal-filters.ts baseFeePerGas pre-1559 → null); the stock-RPC leg (B),
+// through ponder-core's RPC store, COERCES the absent field to 0 (bigint 0 → the decimal string "0").
+// So on a pre-London block a `blocks` row can differ on `base_fee_per_gas` alone — Portal NULL vs RPC
+// "0" — while the block hash, every other column, and all logs/transactions/receipts/traces are
+// byte-identical. Portal's NULL is CANONICALLY CORRECT; the RPC baseline's "0" is the outlier. Observed
+// once in cell U-eth (UniswapV3 factory-stress, ethereum): 10 windows, 9 byte-identical, one all-pre-
+// London window [12453996, 12454496] exhibiting exactly this. Mirrors harness/validate/diff-batched.mjs.
+//
+// SAFETY INVARIANT: the tolerance fires ONLY when the Portal side (A) is SQL NULL AND the RPC side (B)
+// is exactly "0", anchored on a present, non-empty, EQUAL `hash`, AND ONLY on an in-scope chain
+// (BASE_FEE_PRELONDON_CHAINS — eth-mainnet 1, the sole chain with a pre-1559 era observed in the
+// matrix, scoped exactly like the access_list gap). A POST-London block has a real non-zero base fee,
+// so a genuine Portal base-fee defect makes Portal NON-NULL (or RPC non-"0") → false → real MISMATCH →
+// FAIL. Any SECOND differing field also fails (column-scoped), a missing/empty/unequal hash defeats the
+// anchor, and an out-of-scope chain never gets this leniency (a future non-eth chain exhibiting the
+// class FAILs → prompting review + an evidence-backed addition to the set, never a silent mask).
+// Self-retiring: if the RPC path ever stores NULL for absent base fees the rows compare equal and this
+// never fires.
+
+// The chain_id set with a pre-1559 era where an absent baseFeePerGas is coerced to 0 by the RPC-sync
+// path (eth-mainnet 1 only — the sole chain observed with a pre-London window in the matrix; grow with
+// evidence exactly like ACCESS_LIST_GAP_CHAINS). chain_id is a COMPARED column in every blocks row (the
+// PK leads with it), so the scope is read from the row itself. Mirrors harness/validate/diff-batched.mjs.
+export const BASE_FEE_PRELONDON_CHAINS = new Set([1]);
+
+// portalRow / rpcRow are normalized block row-strings (norm output: sorted keys, bigint→decimal,
+// bytes→hex, total_difficulty dropped). Returns true iff the row's chain_id is an in-scope pre-London
+// chain (eth-mainnet 1), `base_fee_per_gas` is the SOLE differing field, the Portal side (A) is SQL
+// NULL, the RPC side (B) is exactly "0", AND both rows carry a present, equal `hash` (the safety anchor
+// above). An out-of-scope chain, a non-NULL Portal value, a non-"0" RPC value, a second differing field,
+// or a missing/unequal hash all return false → FAIL (cell U-eth).
+function baseFeeNullVsZeroTolerated(portalRow, rpcRow) {
+  const p = JSON.parse(portalRow);
+  const r = JSON.parse(rpcRow);
+
+  // Scope guard: only chains with a pre-1559 era (eth-mainnet 1). chain_id is normalized to a decimal
+  // string (bigint→decimal in norm); compare numerically against the scope set.
+  if (!BASE_FEE_PRELONDON_CHAINS.has(Number(p.chain_id))) return false;
+
+  let diffField = null;
+  for (const k of new Set([...Object.keys(p), ...Object.keys(r)])) {
+    if (p[k] === r[k]) continue;
+
+    if (diffField !== null) return false;
+
+    diffField = k;
+  }
+
+  if (diffField !== 'base_fee_per_gas') return false;
+
+  // Regression sentinel: tolerate ONLY the honest pre-London class — Portal side SQL NULL (field truly
+  // absent) against the RPC baseline's coerced "0". A non-NULL Portal base fee, or an RPC side not
+  // exactly "0", is a real divergence and must FAIL (a post-London base-fee bug is never masked).
+  if (p.base_fee_per_gas !== null || r.base_fee_per_gas !== '0') return false;
+
+  // Safety anchor: the null-vs-0 diff is a representational artifact ONLY over an identical canonical
+  // block, which a present, equal hash proves. A missing/empty hash on either side is not anchored → FAIL.
+  const { hash } = p;
+
+  return hash !== null && hash !== undefined && hash !== '' && hash === r.hash;
+}
+
 // Block-identity keyed by (CHAIN_ID, NUMBER) — parsed from each normalized row-string. Rules:
 //   • a (chain,number) PRESENT on both sides whose full-row string differs → MISMATCH → FAIL
 //     (keying by hash would hide a same-number/different-hash reorg divergence as two one-sided
-//      extras that the old `ok` never checked) — EXCEPT the known upstream block.size derivation
-//      artifact (issues #76, #106): a shared block whose ONLY differing field is `size`, over a
-//      present+equal hash, is classified `sizeTolerated`, not `mismatch`, so it does not fail
-//      (any second differing field, including hash, still FAILS; self-retiring)
+//      extras that the old `ok` never checked) — EXCEPT two tolerated representational classes over a
+//      present+equal hash, each classified separately from `mismatch` so it does not fail (any second
+//      differing field, including hash, still FAILS; self-retiring):
+//        · the upstream block.size derivation artifact (issues #76, #106) → `sizeTolerated`
+//        · the pre-London base_fee_per_gas null-vs-0 diff (cell U-eth), Portal NULL vs RPC "0", on an
+//          in-scope chain (BASE_FEE_PRELONDON_CHAINS — eth-mainnet chain_id 1, scoped like the
+//          access_list gap, not universally; an out-of-scope chain FAILs) → `baseFeeTolerated`
 //   • a portal-only (chain,number) (in A, not B) → FAIL — the Portal path invented a block RPC never saw
 //   • an rpc-only (chain,number) (in B, not A) → tolerated: the stock RPC path stores inert event-less
 //     blocks it traced (never referenced)
@@ -127,15 +197,20 @@ export function blocksVerdict(
   const b = new Map(bRows.map((r) => [keyOf(r), r]));
   const shared = [...a.keys()].filter((n) => b.has(n));
 
-  // A shared key whose row-strings differ is a MISMATCH, EXCEPT the tolerated upstream size-only
-  // derivation artifact (issues #76, #106) — those are split into sizeTolerated and do NOT fail.
+  // A shared key whose row-strings differ is a MISMATCH, EXCEPT two tolerated representational classes,
+  // split off so they do NOT fail: the upstream size-only derivation artifact (issues #76, #106) →
+  // sizeTolerated, and the pre-London base_fee_per_gas null-vs-0 diff (cell U-eth), scoped to
+  // BASE_FEE_PRELONDON_CHAINS (eth-mainnet chain_id 1, like the access_list gap) → baseFeeTolerated.
   const mismatch = [];
   const sizeTolerated = [];
+  const baseFeeTolerated = [];
   for (const n of shared) {
     if (a.get(n) === b.get(n)) continue;
 
     if (sizeOnlyDiffTolerated(a.get(n), b.get(n))) {
       sizeTolerated.push(n);
+    } else if (baseFeeNullVsZeroTolerated(a.get(n), b.get(n))) {
+      baseFeeTolerated.push(n);
     } else {
       mismatch.push(n);
     }
@@ -152,6 +227,7 @@ export function blocksVerdict(
     shared,
     mismatch,
     sizeTolerated,
+    baseFeeTolerated,
     portalOnly,
     rpcExtra,
     sampleA: (n) => a.get(n),
@@ -353,6 +429,9 @@ async function main() {
       `  ${v.ok ? '✅' : '❌'} ${'blocks'.padEnd(20)} portal=${String(v.aSize).padStart(6)}  rpc=${String(v.bSize).padStart(6)}  shared=${v.shared.length} match` +
         (v.sizeTolerated.length
           ? `, ${v.sizeTolerated.length} tolerated (upstream size-only derivation, issues #76/#106)`
+          : '') +
+        (v.baseFeeTolerated.length
+          ? `, ${v.baseFeeTolerated.length} tolerated (pre-London base_fee null-vs-0, canonical absent)`
           : '') +
         (v.rpcExtra.length
           ? `, +${v.rpcExtra.length} inert event-less (RPC-only)`

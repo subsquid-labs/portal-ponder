@@ -260,6 +260,144 @@ test('strict mode: a size-only diff is NOT tolerated under strict (scoped to blo
   assert.equal(r.sizeTolerated, 0);
 });
 
+// ── cell U-eth: tolerated pre-London base_fee_per_gas null-vs-0 representational diff (blocks mode) ─
+// Mirrors harness/diff/diff.mjs blocksVerdict. A=portal, B=rpc. EIP-1559 (London, eth block
+// 12,965,000) added the baseFeePerGas header; PRE-London blocks have no such field. The Portal leg
+// stores the honest SQL NULL; the stock-RPC leg coerces absent → 0 (bigint 0n → "0" after normRow). A
+// shared block whose SOLE differing field is `base_fee_per_gas` — Portal null vs RPC "0" — is counted
+// in res.baseFeeTolerated (not res.mismatch) and does NOT fail, ANCHORED on both rows carrying a
+// present, equal `hash`. A non-null Portal value, a non-0 RPC value, a second differing field, a
+// missing hash, and strict mode all FAIL. (0n is passed unnormalized so normRow renders it "0".) The
+// tolerance is chain-scoped (BASE_FEE_PRELONDON_CHAINS — eth-mainnet chain_id 1, the sole pre-London
+// chain), so the positive-class rows carry chain_id 1 by default; an out-of-scope chain (below) FAILS.
+const bfBlock = (number, base_fee_per_gas, extra = {}) => ({
+  chain_id: 1,
+  number,
+  hash: 'h',
+  base_fee_per_gas,
+  ...extra,
+});
+
+// T-uEth-positive — the observed U-eth signature (block 12453996, pre-London): Portal null vs RPC 0n
+// ("0"), sole diff, hash equal → tolerated. MUTATION: origin/main has no base_fee tolerance, so na!==nb
+// sets res.mismatch/res.fail and r.baseFeeTolerated is undefined → this test FAILS on the pre-fix code.
+test('blocks mode U-eth: a pre-London base_fee null-vs-0 (hash equal) is tolerated', async () => {
+  const r = await mergeCompare(
+    [bfBlock(12453996, null)],
+    [bfBlock(12453996, 0n)],
+    {
+      keyFn: blockKey,
+      mode: 'blocks',
+    },
+  );
+  assert.equal(
+    r.fail,
+    false,
+    'a lone pre-London base_fee null-vs-0 diff (hash equal) does not fail',
+  );
+  assert.equal(r.baseFeeTolerated, 1);
+  assert.equal(r.mismatch, 0, 'the tolerated row is not counted as a mismatch');
+  assert.equal(r.shared, 1);
+});
+
+// T-uEth-nonnull — regression sentinel: a NON-NULL Portal base fee that differs from RPC is a real
+// post-London base-fee divergence and must NEVER be masked (only the honest-null class is tolerated).
+test('blocks mode U-eth: a NON-NULL Portal base_fee that differs still FAILS (never masked)', async () => {
+  const r = await mergeCompare(
+    [bfBlock(13000000, 100n)],
+    [bfBlock(13000000, 0n)],
+    {
+      keyFn: blockKey,
+      mode: 'blocks',
+    },
+  );
+  assert.equal(
+    r.fail,
+    true,
+    'a non-null Portal base fee is a real divergence, not the honest-null class',
+  );
+  assert.equal(r.mismatch, 1);
+  assert.equal(r.baseFeeTolerated, 0);
+});
+
+// T-uEth-2field — a second differing field defeats the tolerance even with the base_fee null-vs-0 class.
+test('blocks mode U-eth: base_fee null-vs-0 AND a SECOND field (gas_used) differs still FAILS', async () => {
+  const portal = [bfBlock(12453996, null, { gas_used: 100n })];
+  const rpc = [bfBlock(12453996, 0n, { gas_used: 200n })];
+  const r = await mergeCompare(portal, rpc, {
+    keyFn: blockKey,
+    mode: 'blocks',
+  });
+  assert.equal(
+    r.fail,
+    true,
+    'a second differing field defeats the base_fee tolerance',
+  );
+  assert.equal(r.mismatch, 1);
+  assert.equal(r.baseFeeTolerated, 0);
+});
+
+// T-uEth-no-hash — defensive: a base_fee null-vs-0 diff with an empty hash on one side is NOT anchored
+// (no identical-block proof) → NOT tolerated → mismatch.
+test('blocks mode U-eth: a base_fee null-vs-0 diff with a missing/empty hash is NOT anchored → FAILS', async () => {
+  const r = await mergeCompare(
+    [bfBlock(12453996, null, { hash: '' })],
+    [bfBlock(12453996, 0n, { hash: '' })],
+    {
+      keyFn: blockKey,
+      mode: 'blocks',
+    },
+  );
+  assert.equal(
+    r.fail,
+    true,
+    'an empty hash cannot anchor the base_fee tolerance (no identical-block proof)',
+  );
+  assert.equal(r.mismatch, 1);
+  assert.equal(r.baseFeeTolerated, 0);
+});
+
+test('strict mode U-eth: a base_fee null-vs-0 diff is NOT tolerated under strict (scoped to blocks mode)', async () => {
+  // The tolerance is calibrated for the asymmetric portal-vs-rpc blocks comparison only. Under strict
+  // (logs/txs/receipts/traces, and portal-vs-portal STRICT_BLOCKS) a base_fee difference is a real
+  // mismatch.
+  const r = await mergeCompare(
+    [bfBlock(12453996, null)],
+    [bfBlock(12453996, 0n)],
+    {
+      keyFn: blockKey,
+      mode: 'strict',
+    },
+  );
+  assert.equal(r.fail, true, 'strict mode tolerates nothing');
+  assert.equal(r.mismatch, 1);
+  assert.equal(r.baseFeeTolerated, 0);
+});
+
+// T-uEth-outofscope — scope sentinel: the exact null-vs-0 signature (sole diff, equal hash) on an
+// OUT-OF-SCOPE chain (56 = BSC) is NOT tolerated → FAILS. The tolerance is scoped to eth-mainnet
+// (BASE_FEE_PRELONDON_CHAINS = {1}), the only chain with a pre-1559 era in the matrix; a non-eth chain
+// exhibiting this class must FAIL (prompting review + an evidence-backed set addition), never be masked.
+// MUTATION: neuter the scope guard (`if (false) return false;`) and this test goes RED — baseFeeTolerated
+// becomes 1 and fail flips to false.
+test('blocks mode U-eth: a base_fee null-vs-0 diff on an OUT-OF-SCOPE chain (56=BSC) is NOT tolerated → FAILS', async () => {
+  const r = await mergeCompare(
+    [bfBlock(12453996, null, { chain_id: 56 })],
+    [bfBlock(12453996, 0n, { chain_id: 56 })],
+    {
+      keyFn: blockKey,
+      mode: 'blocks',
+    },
+  );
+  assert.equal(
+    r.fail,
+    true,
+    'the null-vs-0 class on an out-of-scope chain is a real divergence, not the eth-mainnet pre-London class',
+  );
+  assert.equal(r.mismatch, 1);
+  assert.equal(r.baseFeeTolerated, 0);
+});
+
 test('blocks mode: total_difficulty is excluded, real field mismatch still fails', async () => {
   const drop = new Set(['total_difficulty']);
   const portal = [{ number: 100, hash: 'h', total_difficulty: null }];

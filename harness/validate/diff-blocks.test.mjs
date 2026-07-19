@@ -218,6 +218,116 @@ test('blocksVerdict: a size-only diff with a missing/empty hash is NOT anchored 
   assert.equal(v.sizeTolerated.length, 0);
 });
 
+// ── cell U-eth: tolerated pre-London base_fee_per_gas null-vs-0 representational diff ─────────────
+// EIP-1559 (London, eth block 12,965,000) added the baseFeePerGas header; PRE-London blocks have no
+// such field. The Portal leg (A) stores the honest SQL NULL; the stock-RPC leg (B) coerces absent → 0
+// ("0" after normalization). blocksVerdict tolerates a shared block whose SOLE differing field is
+// `base_fee_per_gas` — Portal null vs RPC "0" — ANCHORED on a present, equal hash. A non-null Portal
+// value, a non-"0" RPC value, a second differing field, or a missing hash all FAIL. base_fee-bearing
+// row: same (chain_id, number, hash) both sides so `base_fee_per_gas` is the SOLE diff by default.
+const bfBlock = (number, base_fee_per_gas, hash = '0xbe086c', chain_id = 1) =>
+  JSON.stringify({ base_fee_per_gas, chain_id, hash, number });
+
+// T-uEth-positive — the observed U-eth signature: Portal null vs RPC "0" over an equal hash, sole diff
+// → tolerated. MUTATION: origin/main has no base_fee tolerance, so na!==nb lands in `mismatch` and
+// v.ok is false → this test FAILS on the pre-fix code.
+test('blocksVerdict U-eth: a pre-London base_fee null-vs-0 (hash equal) is tolerated', () => {
+  const portal = [bfBlock(12453996, null)];
+  const rpc = [bfBlock(12453996, '0')];
+  const v = blocksVerdict(portal, rpc);
+  assert.equal(
+    v.ok,
+    true,
+    'a lone pre-London base_fee null-vs-0 diff (hash equal) does not fail',
+  );
+  assert.deepEqual(v.baseFeeTolerated, ['1:12453996']);
+  assert.equal(
+    v.mismatch.length,
+    0,
+    'the tolerated row is not counted as a mismatch',
+  );
+  assert.equal(v.shared.length, 1);
+});
+
+// T-uEth-nonnull — regression sentinel: a NON-NULL Portal base fee that differs from RPC is a real
+// post-London base-fee divergence and must NEVER be masked by this tolerance.
+test('blocksVerdict U-eth: a NON-NULL Portal base_fee that differs still FAILS (never masked)', () => {
+  const portal = [bfBlock(13000000, '100')];
+  const rpc = [bfBlock(13000000, '0')];
+  const v = blocksVerdict(portal, rpc);
+  assert.equal(
+    v.ok,
+    false,
+    'a non-null Portal base fee is a real divergence, not the honest-null class',
+  );
+  assert.deepEqual(v.mismatch, ['1:13000000']);
+  assert.equal(v.baseFeeTolerated.length, 0);
+});
+
+// T-uEth-2field — a second differing field defeats the tolerance even with the base_fee null-vs-0 class.
+test('blocksVerdict U-eth: base_fee null-vs-0 AND a SECOND field (gas_used) differs still FAILS', () => {
+  const portal = [
+    JSON.stringify({
+      base_fee_per_gas: null,
+      chain_id: 1,
+      gas_used: 100,
+      hash: '0xbe086c',
+      number: 12453996,
+    }),
+  ];
+  const rpc = [
+    JSON.stringify({
+      base_fee_per_gas: '0',
+      chain_id: 1,
+      gas_used: 200,
+      hash: '0xbe086c',
+      number: 12453996,
+    }),
+  ];
+  const v = blocksVerdict(portal, rpc);
+  assert.equal(
+    v.ok,
+    false,
+    'a second differing field defeats the base_fee tolerance',
+  );
+  assert.deepEqual(v.mismatch, ['1:12453996']);
+  assert.equal(v.baseFeeTolerated.length, 0);
+});
+
+// T-uEth-no-hash — defensive: a base_fee null-vs-0 diff with an empty hash on one side is NOT anchored
+// (no identical-block proof) → NOT tolerated → mismatch.
+test('blocksVerdict U-eth: a base_fee null-vs-0 diff with a missing/empty hash is NOT anchored → FAILS', () => {
+  const portal = [bfBlock(12453996, null, '')];
+  const rpc = [bfBlock(12453996, '0', '')];
+  const v = blocksVerdict(portal, rpc);
+  assert.equal(
+    v.ok,
+    false,
+    'an empty hash cannot anchor the base_fee tolerance (no identical-block proof)',
+  );
+  assert.deepEqual(v.mismatch, ['1:12453996']);
+  assert.equal(v.baseFeeTolerated.length, 0);
+});
+
+// T-uEth-outofscope — scope sentinel: the exact null-vs-0 signature (sole diff, equal hash) on an
+// OUT-OF-SCOPE chain (56 = BSC) is NOT tolerated → FAILS. The tolerance is scoped to eth-mainnet
+// (BASE_FEE_PRELONDON_CHAINS = {1}), the only chain with a pre-1559 era in the matrix; a non-eth chain
+// exhibiting this class must FAIL (prompting review + an evidence-backed set addition), never be masked.
+// MUTATION: neuter the scope guard (`if (false) return false;`) and this test goes RED — the row lands
+// in baseFeeTolerated and v.ok flips to true.
+test('blocksVerdict U-eth: a base_fee null-vs-0 diff on an OUT-OF-SCOPE chain (56=BSC) is NOT tolerated → FAILS', () => {
+  const portal = [bfBlock(12453996, null, '0xbe086c', 56)];
+  const rpc = [bfBlock(12453996, '0', '0xbe086c', 56)];
+  const v = blocksVerdict(portal, rpc);
+  assert.equal(
+    v.ok,
+    false,
+    'the null-vs-0 class on an out-of-scope chain is a real divergence, not the eth-mainnet pre-London class',
+  );
+  assert.deepEqual(v.mismatch, ['56:12453996']);
+  assert.equal(v.baseFeeTolerated.length, 0);
+});
+
 test('setDiff: multi-chain STRICT tables do not conflate — same-height rows differ per chain', () => {
   // STRICT tables (logs/transactions/receipts/traces) compare full normalized row-strings (which
   // include chain_id) as a set, so they never had the number-key conflation. This pins that: two
