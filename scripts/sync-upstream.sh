@@ -16,7 +16,7 @@ VER="${1:?usage: sync-upstream.sh <ponder-version> [--test | --coverage]}"
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 WORK="${SYNC_WORKDIR:-/tmp/sqd-ponder-fork}/$VER"
 WIRING="$ROOT/portal/wiring/$VER.patch"
-PNPM="corepack pnpm@9.10.0"
+PNPM="corepack pnpm@9.10.0" # fallback default; overridden from the clone's packageManager below
 
 [ -f "$WIRING" ] || { echo "✗ no wiring patch for $VER at portal/wiring/$VER.patch — author it (PUBLISHING.md §'Adding a version')"; exit 1; }
 
@@ -30,6 +30,12 @@ fi
 
 echo "▶ cloning ponder@$VER → $WORK"
 rm -rf "$WORK"; git clone --quiet --depth 1 --branch "ponder@$VER" https://github.com/ponder-sh/ponder "$WORK"
+
+# ponder 0.17.0 bumped engines.pnpm to >=11 (packageManager pnpm@11.0.0); older versions pin
+# pnpm@9.10.0. Track the clone's own packageManager so each version builds with the pnpm it
+# declares; fall back to the historical pin when the field is absent.
+PM="$(node -e "try{process.stdout.write(require('$WORK/package.json').packageManager||'')}catch{}")"
+PNPM="corepack ${PM:-pnpm@9.10.0}"
 
 CORE="$WORK/packages/core"
 SYNC="$CORE/src/sync-historical"
