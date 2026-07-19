@@ -135,6 +135,62 @@ function sizeOnlyDiffTolerated(portalRow, rpcRow) {
   return hash !== null && hash !== undefined && hash !== '' && hash === r.hash;
 }
 
+// ── known representational diff: pre-London blocks.base_fee_per_gas null-vs-0 (cell U-eth) ────────
+// Mirrors harness/diff/diff.mjs exactly. EIP-1559 (the London hard fork, eth-mainnet block 12,965,000)
+// introduced the `baseFeePerGas` block-header field. PRE-London blocks have NO such field — a full
+// node's `eth_getBlockByNumber` omits `baseFeePerGas` entirely (geth-verified absent on block
+// 12453996). The two sync paths render that absence differently:
+//   • the Portal-backfill leg (A) stores the honest SQL NULL — "the field does not exist" — matching
+//     the design intent in portal/portal-filters.ts (baseFeePerGas pre-1559 → store as null).
+//   • the stock-RPC leg (B), through ponder-core's RPC store, COERCES the absent field to 0, so it
+//     lands as the bigint 0 (normRow renders 0n → the decimal string "0").
+// So on a pre-London block a `blocks` row can differ on `base_fee_per_gas` alone — Portal NULL vs RPC
+// "0" — while the block hash, every other column, and all logs/transactions/receipts/traces are
+// byte-identical. Portal's NULL is the CANONICALLY-CORRECT value (the field is truly absent); the RPC
+// baseline's "0" is the outlier. Observed once in cell U-eth (UniswapV3 factory-stress, ethereum): 10
+// windows, 9 byte-identical, one all-pre-London window [12453996, 12454496] exhibiting exactly this.
+//
+// SAFETY INVARIANT (why this cannot mask a real base-fee bug): the tolerance fires ONLY when the Portal
+// side (A) is SQL NULL — the honest "field absent" value — AND the RPC side (B) is exactly "0" (the
+// coerced-absent outlier), anchored on a present, non-empty, EQUAL `hash` (identical canonical block
+// proof, exactly as the size tolerance). A POST-London block has a real non-zero base fee, so a genuine
+// Portal base-fee defect makes the Portal side NON-NULL (or the RPC side non-"0") and the predicate
+// returns false → real MISMATCH → FAIL. Any SECOND differing field also returns false (column-scoped,
+// not row-scoped), and a missing/empty/unequal hash defeats the anchor. Self-retiring: if the RPC path
+// ever stops coercing absent→0 (stores NULL too), the rows compare equal and this never fires.
+
+// portalRow / rpcRow are normalized block row-strings (normRow output: sorted keys, bigint→decimal,
+// bytes→hex, total_difficulty dropped). Returns true iff `base_fee_per_gas` is the SOLE differing
+// field, the Portal side (A) is SQL NULL, the RPC side (B) is exactly "0", AND both rows carry a
+// present, equal `hash` (the safety anchor above). A non-NULL Portal value, a non-"0" RPC value, a
+// second differing field, or a missing/unequal hash all return false → FAIL (cell U-eth).
+function baseFeeNullVsZeroTolerated(portalRow, rpcRow) {
+  const p = JSON.parse(portalRow);
+  const r = JSON.parse(rpcRow);
+
+  let diffField = null;
+  for (const k of new Set([...Object.keys(p), ...Object.keys(r)])) {
+    if (p[k] === r[k]) continue;
+
+    if (diffField !== null) return false;
+
+    diffField = k;
+  }
+
+  if (diffField !== 'base_fee_per_gas') return false;
+
+  // Regression sentinel: tolerate ONLY the honest pre-London class — Portal side SQL NULL (field truly
+  // absent) against the RPC baseline's coerced "0". A non-NULL Portal base fee, or an RPC side that is
+  // not exactly "0", is a real divergence and must FAIL (a post-London base-fee bug is never masked).
+  if (p.base_fee_per_gas !== null || r.base_fee_per_gas !== '0') return false;
+
+  // Safety anchor: the null-vs-0 diff is a representational artifact ONLY over an identical canonical
+  // block, which a present, equal hash proves. A missing/empty hash on either side is not anchored → FAIL.
+  const { hash } = p;
+
+  return hash !== null && hash !== undefined && hash !== '' && hash === r.hash;
+}
+
 // ── known upstream dataset gap: transactions.access_list column dropped (issues #83, #32) ─────────
 // Mirrors harness/diff/diff.mjs exactly. The SQD Portal dataset for base-mainnet, arbitrum-one, and
 // avalanche-mainnet DROPS the `transactions.access_list` column (upstream #83-family gap, refining
@@ -197,9 +253,12 @@ function accessListColumnGapTolerated(portalRow, rpcRow) {
 //     reported, not failed. A shared-key field mismatch is always a FAIL, EXCEPT the known upstream
 //     block.size derivation artifact (issues #76, #106) — a shared block whose ONLY differing field is
 //     `size`, over a present+equal hash, is counted in res.sizeTolerated, not res.mismatch, and does
-//     NOT fail; any second differing field (including hash) still FAILS (self-retiring). Before the #19
-//     fix 'blocks' was vacuous — it failed only on a shared mismatch and let a portal-only block sail
-//     through the F-full differ.
+//     NOT fail — AND the pre-London base_fee_per_gas null-vs-0 representational diff (cell U-eth) — a
+//     shared block whose ONLY differing field is `base_fee_per_gas`, Portal side (A) SQL NULL vs RPC
+//     side (B) "0", over a present+equal hash, counted in res.baseFeeTolerated, not res.mismatch. Any
+//     second differing field (including hash), a non-NULL Portal base fee, or a non-"0" RPC base fee
+//     still FAILS (self-retiring). Before the #19 fix 'blocks' was vacuous — it failed only on a shared
+//     mismatch and let a portal-only block sail through the F-full differ.
 //   • 'transactions' : STRICT one-sided semantics (a portal-only OR rpc-only tx FAILS, exactly like
 //     strict), plus ONE tolerated shared-key class — the upstream access_list column gap (issues #83,
 //     #32). A shared tx whose ONLY differing column is `access_list`, where the Portal side (A) is SQL
@@ -234,6 +293,7 @@ export async function streamingDiff(
     onlyB: 0,
     mismatch: 0,
     sizeTolerated: 0,
+    baseFeeTolerated: 0,
     accessListTolerated: 0,
     shared: 0,
     samples: [],
@@ -291,14 +351,18 @@ export async function streamingDiff(
       const na = normRow(a.value, drop);
       const nb = normRow(b.value, drop);
       if (na !== nb) {
-        // Two tolerated shared-key classes, each scoped to exactly one mode; strict tolerates nothing.
-        //   • blocks mode: the upstream size-only derivation artifact (issues #76, #106).
+        // Tolerated shared-key classes, each scoped to exactly one mode; strict tolerates nothing.
+        //   • blocks mode: the upstream size-only derivation artifact (issues #76, #106); AND the
+        //     pre-London base_fee_per_gas null-vs-0 representational diff (cell U-eth) — Portal NULL vs
+        //     RPC "0" over an equal hash.
         //   • transactions mode: the upstream access_list column gap (issues #83, #32) — Portal-side
         //     NULL on a #83-family chain, access_list the sole differing column.
         // Anything else (a second differing column, a non-NULL Portal access_list incl. #110's "[]",
         // an out-of-scope chain) FAILS.
         if (mode === 'blocks' && sizeOnlyDiffTolerated(na, nb)) {
           res.sizeTolerated++;
+        } else if (mode === 'blocks' && baseFeeNullVsZeroTolerated(na, nb)) {
+          res.baseFeeTolerated++;
         } else if (
           mode === 'transactions' &&
           accessListColumnGapTolerated(na, nb)
@@ -640,6 +704,9 @@ async function diffStores(
         `  shared=${r.shared} match` +
         (r.sizeTolerated
           ? `, ${r.sizeTolerated} tolerated (upstream size-only derivation, issues #76/#106)`
+          : '') +
+        (r.baseFeeTolerated
+          ? `, ${r.baseFeeTolerated} tolerated (pre-London base_fee null-vs-0, canonical absent)`
           : '') +
         (r.onlyB ? `, +${r.onlyB} inert event-less (RPC-only)` : '') +
         (r.onlyA ? `, +${r.onlyA} portal-only` : '') +

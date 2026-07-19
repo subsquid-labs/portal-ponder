@@ -129,6 +129,7 @@ function diffMjsBlocks(portal, rpc) {
   return {
     ok: v.ok,
     sizeTolerated: v.sizeTolerated.length,
+    baseFeeTolerated: v.baseFeeTolerated.length,
     mismatch: v.mismatch.length,
   };
 }
@@ -140,7 +141,12 @@ async function batchedBlocks(portal, rpc) {
     { keyFn: blockKey, drop, mode: 'blocks' },
   );
 
-  return { ok: !r.fail, sizeTolerated: r.sizeTolerated, mismatch: r.mismatch };
+  return {
+    ok: !r.fail,
+    sizeTolerated: r.sizeTolerated,
+    baseFeeTolerated: r.baseFeeTolerated,
+    mismatch: r.mismatch,
+  };
 }
 
 test('#78 parity: the two differs normalize a row byte-for-byte identically', async () => {
@@ -188,17 +194,19 @@ test('#78 parity: STRICT-table verdict matches diff.mjs on identical / mismatch 
   assert.equal(await batchedStrict(onlyB_p, onlyB_r), false);
 });
 
-test('#78 parity: blocks verdict matches diff.mjs incl. the #76/#106 tolerated size-only diff', async () => {
+test('#78 parity: blocks verdict matches diff.mjs incl. the #76/#106 size-only + U-eth base_fee tolerances', async () => {
   // identical → both OK, nothing tolerated
   const same = [blockRow(100), blockRow(102)];
   assert.deepEqual(diffMjsBlocks(same, same.slice()), {
     ok: true,
     sizeTolerated: 0,
+    baseFeeTolerated: 0,
     mismatch: 0,
   });
   assert.deepEqual(await batchedBlocks(same, same.slice()), {
     ok: true,
     sizeTolerated: 0,
+    baseFeeTolerated: 0,
     mismatch: 0,
   });
 
@@ -208,7 +216,12 @@ test('#78 parity: blocks verdict matches diff.mjs incl. the #76/#106 tolerated s
   const tolR = [blockRow(19963775, { size: 66756 })];
   const mjsTol = diffMjsBlocks(tolP, tolR);
   const batchedTol = await batchedBlocks(tolP, tolR);
-  assert.deepEqual(mjsTol, { ok: true, sizeTolerated: 1, mismatch: 0 });
+  assert.deepEqual(mjsTol, {
+    ok: true,
+    sizeTolerated: 1,
+    baseFeeTolerated: 0,
+    mismatch: 0,
+  });
   assert.deepEqual(
     batchedTol,
     mjsTol,
@@ -221,11 +234,34 @@ test('#78 parity: blocks verdict matches diff.mjs incl. the #76/#106 tolerated s
   const bscR = [blockRow(97964878, { size: 33096 })];
   const mjsBsc = diffMjsBlocks(bscP, bscR);
   const batchedBsc = await batchedBlocks(bscP, bscR);
-  assert.deepEqual(mjsBsc, { ok: true, sizeTolerated: 1, mismatch: 0 });
+  assert.deepEqual(mjsBsc, {
+    ok: true,
+    sizeTolerated: 1,
+    baseFeeTolerated: 0,
+    mismatch: 0,
+  });
   assert.deepEqual(
     batchedBsc,
     mjsBsc,
     'both differs tolerate the #106 sub-threshold size-only diff identically',
+  );
+
+  // U-eth tolerated: a lone pre-London base_fee null-vs-0 diff over an equal hash → both differs
+  // classify it baseFeeTolerated identically (Portal null vs RPC "0", canonical field-absent).
+  const bfP = [blockRow(12453996, { base_fee_per_gas: null })];
+  const bfR = [blockRow(12453996, { base_fee_per_gas: 0n })];
+  const mjsBf = diffMjsBlocks(bfP, bfR);
+  const batchedBf = await batchedBlocks(bfP, bfR);
+  assert.deepEqual(mjsBf, {
+    ok: true,
+    sizeTolerated: 0,
+    baseFeeTolerated: 1,
+    mismatch: 0,
+  });
+  assert.deepEqual(
+    batchedBf,
+    mjsBf,
+    'both differs tolerate the U-eth pre-London base_fee null-vs-0 diff identically',
   );
 
   // a size-only diff with a differing hash is NOT anchored → both FAIL it as a mismatch (the safety
@@ -235,11 +271,13 @@ test('#78 parity: blocks verdict matches diff.mjs incl. the #76/#106 tolerated s
   assert.deepEqual(diffMjsBlocks(badSzP, badSzR), {
     ok: false,
     sizeTolerated: 0,
+    baseFeeTolerated: 0,
     mismatch: 1,
   });
   assert.deepEqual(await batchedBlocks(badSzP, badSzR), {
     ok: false,
     sizeTolerated: 0,
+    baseFeeTolerated: 0,
     mismatch: 1,
   });
 
