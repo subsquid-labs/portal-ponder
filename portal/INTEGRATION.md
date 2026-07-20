@@ -19,7 +19,7 @@ const historicalSync = params.chain.portal
   : createHistoricalSync(params);        // stock RPC path, unchanged
 ```
 
-The Portal sync receives the **same** `params` as the stock sync — `chain`, `rpc`, `childAddresses`, and the chain's full `eventCallbacks` (its complete filter set). No handler or config shape is translated; the fork reads Ponder's own filters and factory map directly. Because it satisfies Ponder's existing interface rather than a public API, the integration is a small fork generated from upstream Ponder plus a short wiring patch (`portal/wiring/`), and it tracks Ponder closely — the seam is identical across the tested range (0.15.17–0.16.7, see [`versions.json`](../versions.json)).
+The Portal sync receives the **same** `params` as the stock sync — `chain`, `rpc`, `childAddresses`, and the chain's full `eventCallbacks` (its complete filter set). No handler or config shape is translated; the fork reads Ponder's own filters and factory map directly. Because it satisfies Ponder's existing interface rather than a public API, the integration is a small fork generated from upstream Ponder plus a short wiring patch (`portal/wiring/`), and it tracks Ponder closely — the seam is identical across the tested range (0.15.17–0.17.0, see [`versions.json`](../versions.json)).
 
 Within an interval the two methods split the work:
 

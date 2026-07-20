@@ -95,14 +95,11 @@ Full adoption path — check, swap, run, validate, roll back — in [`MIGRATION.
 
 ## Ponder versions
 
-`@subsquid/ponder@X.Y.Z-sqd.<rev>` is `ponder@X.Y.Z` plus the Portal layer, pinned to a known Ponder version; `-sqd.<rev>` ships a fork-side fix on the same Ponder version. The seam is stable across 0.15.17–0.17.0.
+`@subsquid/ponder@X.Y.Z-sqd.<rev>` is `ponder@X.Y.Z` plus the Portal layer, pinned to a known Ponder version; `-sqd.<rev>` ships a fork-side fix on the same Ponder version. The seam is stable across 0.15.17–0.16.8.
 
 | Ponder | `@subsquid/ponder` | Status |
 |---|---|---|
-| 0.17.0 | `0.17.0-sqd.1` | **latest** |
-| 0.16.10 | `0.16.10-sqd.1` | published · dist-tag `ponder-0.16.10` |
-| 0.16.9 | `0.16.9-sqd.1` | published · pin exact (no dist-tag) |
-| 0.16.8 | `0.16.8-sqd.1` | published · pin exact (no dist-tag) |
+| 0.16.8 | `0.16.8-sqd.1` | **latest** |
 | 0.16.7 | `0.16.7-sqd.1` | published · pin exact (no dist-tag) |
 | 0.16.6 | `0.16.6-sqd.2` | published · dist-tag `ponder-0.16.6` |
 | 0.15.17 | `0.15.17-sqd.2` | published · dist-tag `ponder-0.15.17` |
