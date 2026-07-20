@@ -118,8 +118,9 @@ evidence **transfers to the shipped artifact by seam identity**: the Portal wiri
 (and to `0.16.10`; `0.17.0` re-derives the patch but re-places every added wiring line byte-for-byte,
 Layer A above), and each upstream delta over that range lands off the Portal graft surface. A version
 bump therefore does **not** invalidate the matrix or the soak, and we deliberately do **not** re-run the
-paid matrix or restart the soak for it. Alongside that transfer, three **direct anchors on the shipped
-`0.16.8-sqd.1` package** — two landed, one planned — tie the evidence to that exact published build:
+paid matrix or restart the soak for it. Alongside that transfer, three **direct anchors on the then-shipped
+`0.16.8-sqd.1` package** (now superseded by `0.17.0-sqd.1`; their assurance carries forward by the same
+seam identity) — two landed, one planned — tie the evidence to that exact published build:
 1. the examples end-to-end freshness gate ran against the **published** package
    ([#139](../../pull/139)) — the `euler-subgraph` example reproduced its exact baseline row counts
    (vaults / deposits / withdraws / borrows / repays), a no-regression check on the shipped tag — **done**;
@@ -1155,7 +1156,7 @@ To stress the dense-source / factory-child discovery path (many concurrent `data
 
 - **This section does NOT assert, and deliberately does not claim, that a fresh dense process's first discovery scan is warmup-bounded.** On attempt 1 of a fresh process, the first `portal-dense-discovery-scan` covers the ENTIRE range in ~8 windows (a grid-aligned `[20528000, 20579207]`, ~51.2k blocks, starting just below the configured floor `20529207` — do not reconcile it against the 50000-block data range) because the concurrent `dataChunk` fan-out supplies a full-range `needTo` when Ponder feeds a large first interval. This is expected (a consequence of `planDiscovery`'s `to = max(needTo, min(endHint, through+quantum))` tracking a large interval, not the watermark) — it is NOT a #50 regression and NOT a fork bug, because a wide discovery scan fetches no data, does not delay first commit, and only front-loads factory-child discovery I/O.
 
-### 4.5 Adversarial network/transport-fault campaign on the shipped `0.16.8-sqd.1` build (ACCEPTED 2026-07-11)
+### 4.5 Adversarial network/transport-fault campaign on the then-shipped `0.16.8-sqd.1` build (ACCEPTED 2026-07-11)
 
 The §4.1–§4.4 campaigns kill the **app process** and prove crash/resume identity. This campaign leaves
 the app running and instead injects **network and transport faults** on the wire between the app and
@@ -1163,9 +1164,12 @@ the **public** Portal, via an in-path fault proxy (`harness/chaos/proxy.mjs`, un
 `proxy.test.mjs`), driven by `harness/chaos/fault-proxy-campaign.sh`. It proves a complementary
 property: under an adversarial network, the Portal backfill still **completes byte-identical to a clean
 baseline** — a fault surfaces as a retry, never as silent data corruption or coverage loss. It ran on
-the **shipped `0.16.8-sqd.1` package** (tarball `subsquid-ponder-0.16.8-sqd.1.tgz`, sha256
-`b5a0daa6f8439a67afd36d715451f040a9addc1e7d55f7043400092ac3869b70`), the fault-proxy code merged in
-[#149](../../pull/149) (`5a2fe88`), so it doubles as the §2 shipped-build anchor #2. Backend is
+the then-shipped **`0.16.8-sqd.1` package** (tarball `subsquid-ponder-0.16.8-sqd.1.tgz`, sha256
+`b5a0daa6f8439a67afd36d715451f040a9addc1e7d55f7043400092ac3869b70`), now superseded by `0.17.0-sqd.1`;
+the fault-proxy code merged in [#149](../../pull/149) (`5a2fe88`), so it doubles as the §2 shipped-build
+anchor #2. Because it injects on the Portal HTTP wire — the graft surface that is byte-identical across
+the `0.16.8`–`0.16.10` grafts and re-placed byte-for-byte in `0.17.0` — its assurance carries forward to
+`0.17.0-sqd.1`, on which it was not re-run. Backend is
 `postgres16` (`fsync=on`, recorded `postgres16-fsync-on`), app `euler-app` (factory
 `0x29a56a1b8214D9Cf7c5561811750D5cBDb45CC8e`), chain 1 (ethereum) range `[20529207, 20579207]` (span
 50000), Portal `portal.sqd.dev/datasets/ethereum-mainnet`. The clean baseline logical digest is
