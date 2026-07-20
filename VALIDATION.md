@@ -90,8 +90,9 @@ surface** (`sync-historical`, `runtime/historical`, `sync-store`, `rpc`, `sync`)
   live-query notification batching) and `0.16.7 → 0.16.8` is a realtime-only `isAsyncExecutionChain`
   addition (`sync-realtime/index.ts` + `utils/finality.ts`) — neither touches the graft surface.
 - `0.16.9` applies the `0.16.8` wiring patch verbatim; `0.16.8 → 0.16.9` is a single off-surface file
-  (`indexing-store/cache.ts`, a bytea-COPY fix). It is the **published `latest`** fork build
-  (`@subsquid/ponder@0.16.9-sqd.1`, published 2026-07-14).
+  (`indexing-store/cache.ts`, a bytea-COPY fix). It was the **published `latest`** fork build
+  (`@subsquid/ponder@0.16.9-sqd.1`, published 2026-07-14), superseded as `latest` by `0.17.0-sqd.1` on
+  2026-07-20 (now installable by exact version, no dist-tag).
 - `0.16.10` ([#178](../../pull/178)) applies the `0.16.9` wiring patch verbatim; `0.16.9 → 0.16.10` is a
   three-file commit-path resilience fix (`runtime/isolated.ts` / `multichain.ts` / `omnichain.ts`) that
   sits ~500 lines off the wiring region, so the patch applies with zero rejects.
@@ -110,8 +111,8 @@ evidence remains on `0.16.6` (see below).
 
 **Evidence base version and seam-identity transfer.** The data-correctness evidence in §3 / §5 (the
 paid-matrix byte-diff and the A/B soak) was gathered on the `0.16.6` graft, whereas the published `latest`
-fork is now `@subsquid/ponder@0.16.9-sqd.1` (superseding `0.16.8-sqd.1`; `0.16.10` and `0.17.0` are
-tracked but not yet published — publishing is a deliberate, human-reserved step, `versions.json`). That
+fork is now `@subsquid/ponder@0.17.0-sqd.1` (published 2026-07-20 with `--tag latest`, superseding
+`0.16.9-sqd.1`; `0.16.10-sqd.1` published the same day under dist-tag `ponder-0.16.10`, `versions.json`). That
 evidence **transfers to the shipped artifact by seam identity**: the Portal wiring patch is byte-identical
 (sha256-equal) across the `0.16.6` / `0.16.7` / `0.16.8` grafts and carries forward verbatim to `0.16.9`
 (and to `0.16.10`; `0.17.0` re-derives the patch but re-places every added wiring line byte-for-byte,
