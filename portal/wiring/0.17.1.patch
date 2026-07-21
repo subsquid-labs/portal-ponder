@@ -1,0 +1,919 @@
+diff --git a/packages/core/src/build/config.ts b/packages/core/src/build/config.ts
+index 5f2b8e8..ae1cf2a 100644
+--- a/packages/core/src/build/config.ts
++++ b/packages/core/src/build/config.ts
+@@ -1056,6 +1056,7 @@ export function buildConfig({
+         id: chain.id,
+         name: chainName,
+         rpc: chain.rpc,
++        portal: chain.portal,
+         ws: chain.ws,
+         pollingInterval: chain.pollingInterval ?? 1_000,
+         finalityBlockCount: getFinalityBlockCount({ chain: matchedChain }),
+diff --git a/packages/core/src/config/index.ts b/packages/core/src/config/index.ts
+index a77e6c8..4ea9b49 100644
+--- a/packages/core/src/config/index.ts
++++ b/packages/core/src/config/index.ts
+@@ -94,6 +94,12 @@ type ChainConfig<chain> = {
+   id: chain extends { id: infer id extends number } ? id | number : number;
+   /** RPC url. */
+   rpc: string | string[] | Transport | undefined;
++  /**
++   * SQD Portal dataset URL for historical backfill (e.g.
++   * "https://portal.sqd.dev/datasets/ethereum-mainnet"). When set, historical
++   * sync streams from Portal; realtime/frontfill still uses `rpc`.
++   */
++  portal?: string;
+   ws?: string;
+   /** Polling interval (in ms). Default: `1_000`. */
+   pollingInterval?: number;
+diff --git a/packages/core/src/internal/types.ts b/packages/core/src/internal/types.ts
+index bd81dcb..1d474a1 100644
+--- a/packages/core/src/internal/types.ts
++++ b/packages/core/src/internal/types.ts
+@@ -300,6 +300,8 @@ export type Chain = {
+   name: string;
+   id: number;
+   rpc: string | string[] | Transport;
++  /** SQD Portal dataset URL for historical backfill. Realtime still uses `rpc`. */
++  portal: string | undefined;
+   ws: string | undefined;
+   pollingInterval: number;
+   finalityBlockCount: number;
+diff --git a/packages/core/src/rpc/actions.ts b/packages/core/src/rpc/actions.ts
+index e1e4014..ba85ee1 100644
+--- a/packages/core/src/rpc/actions.ts
++++ b/packages/core/src/rpc/actions.ts
+@@ -1,4 +1,5 @@
+ import {
++  type Address,
+   BlockNotFoundError,
+   type Hex,
+   hexToBigInt,
+@@ -10,7 +11,9 @@ import {
+ } from "viem";
+ import { RpcProviderError } from "@/internal/errors.js";
+ import type {
++  Factory,
+   LightBlock,
++  LogFilter,
+   SyncBlock,
+   SyncBlockHeader,
+   SyncLog,
+@@ -19,6 +22,7 @@ import type {
+   SyncTransactionReceipt,
+ } from "@/internal/types.js";
+ import type { RequestParameters, Rpc } from "@/rpc/index.js";
++import { isAddressFactory } from "@/runtime/filter.js";
+ import { zeroLogsBloom } from "@/sync-realtime/bloom.js";
+ import { PG_BIGINT_MAX, PG_INTEGER_MAX } from "@/utils/pg.js";
+ 
+@@ -102,6 +106,131 @@ export const eth_getLogs = async (
+   });
+ };
+ 
++/**
++ * Whether `error` is (or wraps, via its `cause` chain) viem's `ResponseBodyTooLargeError` —
++ * thrown when a JSON-RPC response body exceeds viem's hardcoded ~10 MiB `readResponseBody` cap
++ * (viem >=2.31). Matched by `name` rather than `instanceof`: the class is absent from older
++ * pinned viem, and the ponder core floats `viem: ">=2"`, so a name test is version-robust. (issue #23)
++ */
++export const isResponseBodyTooLargeError = (error: unknown): boolean => {
++  for (let e: unknown = error; e instanceof Error; e = e.cause) {
++    if (e.name === "ResponseBodyTooLargeError") return true;
++  }
++
++  return false;
++};
++
++/**
++ * Build the set of FILTERED "eth_getLogs" params that together cover every log the realtime
++ * block-data path needs from a block, without the unfiltered full-block fetch. Each registered
++ * log filter contributes `{ address, topic0 }` (a factory-address filter contributes a wildcard
++ * address — its child addresses are discovered from this block's own logs, so we cannot pre-filter
++ * by them); each factory contributes `{ address: factory.address, topic0: factory.eventSelector }`
++ * so the child-address-emitting logs are fetched too. `topic1..3` and factory child-address
++ * matching are intentionally omitted — the caller re-applies the exact filter/factory matching on
++ * the assembled logs, so this only over-fetches (bounded, and identical to what historical sync
++ * already fetches per filter), never under-fetches. Requests are deduped by their `{address,topic0}`
++ * shape to avoid redundant round-trips. (issue #23)
++ */
++export const buildFilteredBlockLogRequests = ({
++  logFilters,
++  factories,
++}: {
++  logFilters: Pick<LogFilter, "address" | "topic0">[];
++  factories: Pick<Factory, "address" | "eventSelector">[];
++}): { address: Address | Address[] | undefined; topic0: Hex }[] => {
++  const requests: {
++    address: Address | Address[] | undefined;
++    topic0: Hex;
++  }[] = [];
++  const seen = new Set<string>();
++
++  const push = (
++    address: Address | Address[] | undefined,
++    topic0: Hex,
++  ): void => {
++    const addressKey = Array.isArray(address)
++      ? [...address].sort().join(",")
++      : (address ?? "");
++    const key = `${addressKey}|${topic0}`;
++    if (seen.has(key)) return;
++
++    seen.add(key);
++    requests.push({ address, topic0 });
++  };
++
++  for (const filter of logFilters) {
++    // A factory-address filter's concrete child addresses are discovered from this block's logs,
++    // so it can only be fetched as a wildcard-by-topic0 here (re-narrowed downstream).
++    const address = isAddressFactory(filter.address)
++      ? undefined
++      : (filter.address as Address | Address[] | undefined);
++    push(address, filter.topic0);
++  }
++
++  for (const factory of factories) {
++    push(factory.address, factory.eventSelector);
++  }
++
++  return requests;
++};
++
++/**
++ * Filtered fallback for the realtime block-data log fetch when the UNFILTERED full-block
++ * "eth_getLogs" (pinned by `blockHash`) exceeds viem's ~10 MiB response-body cap
++ * (`ResponseBodyTooLargeError`). Issues one bounded, filtered `eth_getLogs` per distinct
++ * `{ address, topic0 }` derived from the registered filters/factories, then concatenates and
++ * dedupes the results by `(blockHash, logIndex)` and sorts by `logIndex` — reproducing the block's
++ * relevant logs as a `SyncLog[]` for the same downstream factory-discovery + filter-matching that
++ * the unfiltered path feeds. Mirrors what historical/backfill sync fetches anyway. (issue #23)
++ */
++export const eth_getFilteredBlockLogs = async (
++  rpc: Rpc,
++  blockHash: Hex,
++  {
++    logFilters,
++    factories,
++  }: {
++    logFilters: Pick<LogFilter, "address" | "topic0">[];
++    factories: Pick<Factory, "address" | "eventSelector">[];
++  },
++  context?: Parameters<Rpc["request"]>[1],
++): Promise<SyncLog[]> => {
++  const requests = buildFilteredBlockLogRequests({ logFilters, factories });
++
++  if (requests.length === 0) return [];
++
++  const results = await Promise.all(
++    requests.map(({ address, topic0 }) =>
++      eth_getLogs(
++        rpc,
++        [
++          address === undefined
++            ? { blockHash, topics: [topic0] }
++            : { blockHash, address, topics: [topic0] },
++        ],
++        context,
++      ),
++    ),
++  );
++
++  const byKey = new Map<string, SyncLog>();
++  for (const logs of results) {
++    for (const log of logs) {
++      byKey.set(`${log.blockHash}-${log.logIndex}`, log);
++    }
++  }
++
++  return [...byKey.values()].sort(
++    (a, b) => hexToNumber(a.logIndex) - hexToNumber(b.logIndex),
++  );
++};
++
++// One-shot guard so the PORTAL_ALLOW_MISSING_ACCESS_LIST opt-in warning below is emitted ONCE per
++// process at first use, not once per `standardizeTransactions` call (i.e. per fetched block). It
++// flips the first time the enabled knob is read and stays set for the process lifetime. (issue #27)
++let warnedAllowMissingAccessList = false;
++
+ /**
+  * Helper function for "eth_getTransactionReceipt" request.
+  */
+@@ -787,6 +916,25 @@ export const standardizeTransactions = (
+     { method: "eth_getBlockByNumber" | "eth_getBlockByHash" }
+   >,
+ ): SyncTransaction[] => {
++  // PORTAL_ALLOW_MISSING_ACCESS_LIST — opt-in to consuming from a non-standard RPC provider (e.g.
++  // SQD's zkSync proxy) that omits the spec-required `accessList` on typed-envelope txs. Default
++  // OFF: a missing accessList is a loud RpcProviderError (below). When set, the missing value is
++  // allowed through and stored as an honest NULL. Read once per call — cheap, hoisted above the
++  // loop — so ops can flip it via env without a rebuild, and tests can toggle it per call. Parsed
++  // STRICTLY (`=== "1"`, matching PORTAL_REALTIME's `=== "stream"` convention): only the exact
++  // value "1" enables it, so `=0`/`=false`/`=no`/`` all keep the data-integrity guard fail-loud
++  // — `Boolean(process.env.…)` would (mis)treat every one of those as ON. Enabling the opt-in
++  // emits a ONE-TIME loud warning (see `warnedAllowMissingAccessList`). (issue #27)
++  const allowMissingAccessList =
++    process.env.PORTAL_ALLOW_MISSING_ACCESS_LIST === "1";
++  if (allowMissingAccessList && !warnedAllowMissingAccessList) {
++    warnedAllowMissingAccessList = true;
++    console.warn(
++      "PORTAL_ALLOW_MISSING_ACCESS_LIST is enabled: transactions missing accessList will be " +
++        "stored with accessList=NULL instead of failing. Only use this for RPCs that legitimately " +
++        "omit accessList (e.g. some proxies).",
++    );
++  }
+   const transactionIds = new Set<Hex>();
+ 
+   for (const transaction of transactions) {
+@@ -893,6 +1041,38 @@ export const standardizeTransactions = (
+       transaction.gas = "0x0";
+     }
+ 
++    // `accessList` is mandatory on every typed-envelope transaction: EIP-2930 (0x1), EIP-1559
++    // (0x2), EIP-4844 (0x3), and EIP-7702 (0x4) all carry it per spec. A non-compliant provider
++    // that omits the key would otherwise sail through here and encode to a permanent NULL in the
++    // sync store (`onConflictDoNothing`) — silent column-level data loss. Fail loud instead of
++    // defaulting to `[]`, which would fabricate an empty list over a real one. Legacy (0x0), OP
++    // deposit (0x7e), and unknown/system envelopes (e.g. Arbitrum internals) carry no access list
++    // and are left untouched. An explicit `accessList: null` is treated the same as an omitted key
++    // (`== null`): encode.ts maps both to the same permanent NULL, so both must fail loud —
++    // UNLESS the operator opts in via PORTAL_ALLOW_MISSING_ACCESS_LIST (see above), in which case
++    // the missing value flows through to that honest NULL by design.
++    const txType: string | undefined = transaction.type;
++    if (
++      !allowMissingAccessList &&
++      (txType === "0x1" ||
++        txType === "0x2" ||
++        txType === "0x3" ||
++        txType === "0x4") &&
++      (transaction as { accessList?: unknown }).accessList == null
++    ) {
++      const error = new RpcProviderError(
++        `Invalid RPC response: 'transaction.accessList' is a required property on type ${txType} transactions`,
++      );
++      error.meta = [
++        "This RPC provider omits the spec-required 'accessList' on typed transactions. If that is " +
++          "expected for this endpoint (e.g. SQD's zkSync proxy), set PORTAL_ALLOW_MISSING_ACCESS_LIST=1 " +
++          "to store the missing access list as NULL and continue; otherwise report this to the RPC operator.",
++        requestText(request),
++      ];
++      error.stack = undefined;
++      throw error;
++    }
++
+     if (hexToBigInt(transaction.blockNumber) > PG_BIGINT_MAX) {
+       const error = new RpcProviderError(
+         `Invalid RPC response: 'transaction.blockNumber' (${hexToBigInt(transaction.blockNumber)}) is larger than the maximum allowed value (${PG_BIGINT_MAX}).`,
+diff --git a/packages/core/src/rpc/index.ts b/packages/core/src/rpc/index.ts
+index 6d8573c..b38ddaa 100644
+--- a/packages/core/src/rpc/index.ts
++++ b/packages/core/src/rpc/index.ts
+@@ -936,7 +936,18 @@ export const createRpc = ({
+ /**
+  * @link https://github.com/wevm/viem/blob/main/src/utils/buildtask.ts#L192
+  */
+-function shouldRetry(error: Error) {
++export function shouldRetry(error: Error) {
++  // A viem `ResponseBodyTooLargeError` (>=2.31: the JSON-RPC response body exceeded viem's
++  // hard ~10 MiB `readResponseBody` cap) is deterministic for a given request — every retry
++  // re-fetches the same oversized body and fails identically. Retrying only stalls the chain
++  // and eventually surfaces as an `unhandledRejection`. Match by `name` (walking the `cause`
++  // chain) rather than `instanceof`: the class is absent from older pinned viem (<2.31), and
++  // the ponder core floats `viem: ">=2"`, so a name test is robust across both. The realtime
++  // block-data fetch catches this same error and falls back to filtered `eth_getLogs`. (issue #23)
++  for (let e: unknown = error; e instanceof Error; e = e.cause) {
++    if (e.name === "ResponseBodyTooLargeError") return false;
++  }
++
+   if ("code" in error && typeof error.code === "number") {
+     // Invalid JSON
+     if (error.code === ParseRpcError.code) return false;
+diff --git a/packages/core/src/runtime/historical.ts b/packages/core/src/runtime/historical.ts
+index 87ea9aa..d04cdd0 100644
+--- a/packages/core/src/runtime/historical.ts
++++ b/packages/core/src/runtime/historical.ts
+@@ -8,6 +8,7 @@ import type {
+   Event,
+   EventCallback,
+   IndexingBuild,
++  LightBlock,
+   RawEvent,
+   SyncBlock,
+ } from "@/internal/types.js";
+@@ -15,6 +16,16 @@ import { eth_getBlockByNumber } from "@/rpc/actions.js";
+ import type { Rpc } from "@/rpc/index.js";
+ import { buildEvents, decodeEvents } from "@/runtime/events.js";
+ import { createHistoricalSync } from "@/sync-historical/index.js";
++import { createPortalHistoricalSync } from "@/sync-historical/portal.js";
++import {
++  cutoverExcludedIndices,
++  cutoverProbeIndices,
++  isEndCappedAtCutover,
++  omnichainCutoverProbeIndices,
++  shouldSkipCutoverRound,
++  shouldSkipOmnichainCutoverRound,
++} from "@/sync-historical/portal-cutover-guard.js";
++import { clampFinalizedToPortalHead } from "@/sync-historical/portal-realtime-wire.js";
+ import { createSyncStore, type SyncStore } from "@/sync-store/index.js";
+ import {
+   decodeCheckpoint,
+@@ -311,6 +322,39 @@ export async function* getHistoricalEventsOmnichain(params: {
+       yield { type: "events", result: mergeResults };
+     }
+ 
++    // Portal cutover guard (INV-18): an end-capped chain (configured end ≤ finalized) is provably
++    // range-neutral at cutover — its `to = min(finalized, end) = end` cannot move — so it must never be
++    // probed here (a flaky RPC on such a probe delays /ready or kills a fully-indexed app with exit 75).
++    // When EVERY chain is end-capped the whole round is a no-op — exit the cutover loop. Omnichain has NO
++    // 30s freshness gate, so this is the only thing that stops a permanently-failing RPC blocking forever.
++    //
++    // Take the all-capped break ONLY when `pendingEvents` is empty. Parked events (checkpoint above the
++    // omnichain finalized checkpoint, held for cross-chain ordering) drain via the probe/catchup path: an
++    // unconditional break would `yield { type: "pending" }` them to realtime, which skips every end-capped
++    // chain — silently DROPPING them. With pending non-empty, fall through unchanged; it converges (finalized
++    // rises → `omnichainTo` rises → pending drains → a later empty-pending round breaks).
++    if (
++      shouldSkipOmnichainCutoverRound(
++        params.indexingBuild.chains,
++        params.perChainSync,
++        pendingEvents.length,
++      )
++    ) {
++      break;
++    }
++
++    // PHASE 1 of the two-phase cutover probe (INV-18). The probe set is NECESSITY-GATED on parked
++    // events: with `pendingEvents` non-empty it includes EVERY chain (upstream behaviour); with pending
++    // empty it excludes end-capped chains (zero refetches for a fully-bounded app). Excluding an end-
++    // capped chain is only safe per-round in isolation — see phase 2 below, which restores main-equivalent
++    // adoption on any catchup round so an excluded chain's stale finalized can never cap `omnichainTo`
++    // and park (then DROP) another chain's events at the trailing `yield { type: "pending" }`.
++    const cutoverProbe = omnichainCutoverProbeIndices(
++      params.indexingBuild.chains,
++      params.perChainSync,
++      pendingEvents.length,
++    );
++
+     const context = {
+       logger: params.common.logger.child({ action: "refetch_finalized_block" }),
+       retryNullBlockRequest: true,
+@@ -318,41 +362,78 @@ export async function* getHistoricalEventsOmnichain(params: {
+ 
+     const endClock = startClock();
+ 
++    // Probe a single chain's finalized head (upstream `latest` → `latest − finalityBlockCount`). Shared
++    // by phase 1 and phase 2; the caller decides which indices to probe.
++    const probeFinalizedBlock = (chain: Chain, rpc: Rpc) =>
++      eth_getBlockByNumber(rpc, ["latest", false], context)
++        .then((latest) =>
++          eth_getBlockByNumber(
++            rpc,
++            [
++              numberToHex(
++                Math.max(
++                  hexToNumber(latest.number) - chain.finalityBlockCount,
++                  0,
++                ),
++              ),
++              false,
++            ],
++            context,
++          ),
++        )
++        .then((finalizedBlock) => {
++          const finalizedBlockNumber = hexToNumber(finalizedBlock.number);
++          params.common.logger.debug({
++            msg: "Refetched finalized block for backfill cutover",
++            chain: chain.name,
++            chain_id: chain.id,
++            finalized_block: finalizedBlockNumber,
++            duration: endClock(),
++          });
++
++          return finalizedBlock;
++        });
++
++    // Portal stream-realtime: clamp a probed finalized block to the Portal head (pass-through in the
++    // A-path) so the backfill cutover never targets past the Portal head. The previously adopted boundary
++    // is the in-run finality floor: a stale-LOW probe on chain i must not regress it when ANOTHER chain's
++    // advance triggers the catchup assignment below. Excluded chains never reach here — their finalized is
++    // passed through untouched, and in stream mode the clamp probes the Portal head and THROWS on an
++    // unknown head, which would drag an excluded chain back onto the cutover critical path.
++    const clampProbedFinalized = (i: number, finalizedBlock: LightBlock) =>
++      clampFinalizedToPortalHead({
++        chain: params.indexingBuild.chains[i]!,
++        rpc: params.indexingBuild.rpcs[i]!,
++        finalizedBlock,
++        floor: hexToNumber(
++          params.perChainSync.get(params.indexingBuild.chains[i]!)!.syncProgress
++            .finalized.number,
++        ),
++        common: params.common,
++      });
++
+     const finalizedBlocks = await Promise.all(
+       params.indexingBuild.chains.map((chain, i) => {
+         const rpc = params.indexingBuild.rpcs[i]!;
+ 
+-        return eth_getBlockByNumber(rpc, ["latest", false], context)
+-          .then((latest) =>
+-            eth_getBlockByNumber(
+-              rpc,
+-              [
+-                numberToHex(
+-                  Math.max(
+-                    hexToNumber(latest.number) - chain.finalityBlockCount,
+-                    0,
+-                  ),
+-                ),
+-                false,
+-              ],
+-              context,
+-            ),
+-          )
+-          .then((finalizedBlock) => {
+-            const finalizedBlockNumber = hexToNumber(finalizedBlock.number);
+-            params.common.logger.debug({
+-              msg: "Refetched finalized block for backfill cutover",
+-              chain: chain.name,
+-              chain_id: chain.id,
+-              finalized_block: finalizedBlockNumber,
+-              duration: endClock(),
+-            });
++        // End-capped chains are excluded from the probe: pass their current finalized block through
++        // untouched (a refetch could only raise it, never changing `to = min(finalized, end) = end`).
++        if (cutoverProbe.includes(i) === false) {
++          return Promise.resolve(
++            params.perChainSync.get(chain)!.syncProgress.finalized,
++          );
++        }
+ 
+-            return finalizedBlock;
+-          });
++        return probeFinalizedBlock(chain, rpc);
+       }),
+     );
+ 
++    for (let i = 0; i < finalizedBlocks.length; i++) {
++      if (cutoverProbe.includes(i) === false) continue;
++
++      finalizedBlocks[i] = await clampProbedFinalized(i, finalizedBlocks[i]!);
++    }
++
+     let shouldCatchup = false;
+ 
+     for (let i = 0; i < params.indexingBuild.chains.length; i++) {
+@@ -373,6 +454,28 @@ export async function* getHistoricalEventsOmnichain(params: {
+ 
+     if (shouldCatchup === false) break;
+ 
++    // PHASE 2 of the two-phase cutover probe (INV-18). Phase 1 caught up, but its reduced probe set left
++    // the excluded end-capped chains carrying STALE finalized blocks. Upstream main probes AND adopts
++    // EVERY chain on a catchup round; adopting a stale-low finalized here would keep `omnichainTo` capped
++    // below an active chain's end, park that chain's events, and — when the excluded chain later advances
++    // by ≤ `finalityBlockCount` — break the loop and DROP them to realtime. So re-probe + clamp exactly
++    // the excluded complement now, before adopting, making the catchup-round adoption main-equivalent.
++    // (When no chain advances, `shouldCatchup` is false and this never runs, so a steady-state fully-
++    // bounded app still probes its end-capped chains ZERO times — issue #70's availability win holds.)
++    const excludedProbe = cutoverExcludedIndices(
++      params.indexingBuild.chains,
++      cutoverProbe,
++    );
++
++    for (const i of excludedProbe) {
++      const probed = await probeFinalizedBlock(
++        params.indexingBuild.chains[i]!,
++        params.indexingBuild.rpcs[i]!,
++      );
++
++      finalizedBlocks[i] = await clampProbedFinalized(i, probed);
++    }
++
+     for (let i = 0; i < params.indexingBuild.chains.length; i++) {
+       const chain = params.indexingBuild.chains[i]!;
+       const finalizedBlock = finalizedBlocks[i]!;
+@@ -568,6 +671,21 @@ export async function* getHistoricalEventsMultichain(params: {
+     }
+     lastUnfinalizedRefetch = Date.now();
+ 
++    // Portal cutover guard (INV-18): an end-capped chain (configured end ≤ finalized) is provably
++    // range-neutral at cutover — its `to = min(finalized, end) = end` cannot move — so it must never be
++    // probed here (a flaky RPC on such a probe delays /ready or kills a fully-indexed app with exit 75).
++    // When EVERY chain is end-capped the whole round is a no-op — exit the cutover loop.
++    if (
++      shouldSkipCutoverRound(params.indexingBuild.chains, params.perChainSync)
++    ) {
++      break;
++    }
++
++    const cutoverProbe = cutoverProbeIndices(
++      params.indexingBuild.chains,
++      params.perChainSync,
++    );
++
+     const context = {
+       logger: params.common.logger.child({ action: "refetch_finalized_block" }),
+       retryNullBlockRequest: true,
+@@ -579,6 +697,14 @@ export async function* getHistoricalEventsMultichain(params: {
+       params.indexingBuild.chains.map((chain, i) => {
+         const rpc = params.indexingBuild.rpcs[i]!;
+ 
++        // End-capped chains are excluded from the probe: pass their current finalized block through
++        // untouched (a refetch could only raise it, never changing `to = min(finalized, end) = end`).
++        if (cutoverProbe.includes(i) === false) {
++          return Promise.resolve(
++            params.perChainSync.get(chain)!.syncProgress.finalized,
++          );
++        }
++
+         return eth_getBlockByNumber(rpc, ["latest", false], context)
+           .then((latest) =>
+             eth_getBlockByNumber(
+@@ -610,6 +736,28 @@ export async function* getHistoricalEventsMultichain(params: {
+       }),
+     );
+ 
++    // Portal stream-realtime: clamp each refetched finalized block to the Portal head (pass-through in the
++    // A-path) so the backfill cutover never targets past the Portal head — realtime keeps serving the tip.
++    // Excluded (end-capped) chains bypass the clamp entirely: their finalized was passed through untouched
++    // above, so the clamp is a no-op by construction — and in stream mode it probes the Portal head and
++    // THROWS on an unknown head, which would drag an excluded chain back onto the cutover critical path.
++    for (let i = 0; i < finalizedBlocks.length; i++) {
++      if (cutoverProbe.includes(i) === false) continue;
++
++      finalizedBlocks[i] = await clampFinalizedToPortalHead({
++        chain: params.indexingBuild.chains[i]!,
++        rpc: params.indexingBuild.rpcs[i]!,
++        finalizedBlock: finalizedBlocks[i]!,
++        // The previously adopted boundary is the in-run finality floor: a stale-LOW probe on chain i must
++        // not regress it when ANOTHER chain's advance triggers the catchup assignment below.
++        floor: hexToNumber(
++          params.perChainSync.get(params.indexingBuild.chains[i]!)!.syncProgress
++            .finalized.number,
++        ),
++        common: params.common,
++      });
++    }
++
+     let shouldCatchup = false;
+ 
+     for (let i = 0; i < params.indexingBuild.chains.length; i++) {
+@@ -784,6 +932,11 @@ export async function* getHistoricalEventsIsolated(params: {
+ 
+     cursor = to;
+ 
++    // Portal cutover guard (INV-18): an end-capped chain (configured end ≤ finalized) is provably
++    // range-neutral at cutover — its `to = min(finalized, end) = end` cannot move — so never probe it
++    // here. This isolated chain is the whole app: end-capped ⇒ exit the cutover loop (zero refetches).
++    if (isEndCappedAtCutover(params.syncProgress)) break;
++
+     if (Date.now() - lastUnfinalizedRefetch < 30_000) {
+       break;
+     }
+@@ -813,6 +966,17 @@ export async function* getHistoricalEventsIsolated(params: {
+         ],
+         context,
+       ),
++    ).then((fb) =>
++      // Portal stream-realtime: clamp the cutover finalized block to the Portal head (A-path pass-through).
++      clampFinalizedToPortalHead({
++        chain: params.chain,
++        rpc,
++        finalizedBlock: fb,
++        // The previously adopted boundary is the in-run finality floor — a stale-LOW probe must not regress
++        // it (RT-2; INERT given the isolated adopt-guard below, defense/parity per RG0).
++        floor: hexToNumber(params.syncProgress.finalized.number),
++        common: params.common,
++      }),
+     );
+ 
+     const finalizedBlockNumber = hexToNumber(finalizedBlock.number);
+@@ -1203,7 +1367,9 @@ export async function* getLocalSyncGenerator(params: {
+       return;
+     } else if (params.isCatchup === false) {
+       params.common.logger.info({
+-        msg: "Started fetching backfill JSON-RPC data",
++        msg: params.chain.portal
++          ? "Started fetching backfill data from SQD Portal"
++          : "Started fetching backfill JSON-RPC data",
+         chain: params.chain.name,
+         chain_id: params.chain.id,
+         cached_block: hexToNumber(params.syncProgress.current.number),
+@@ -1214,14 +1380,18 @@ export async function* getLocalSyncGenerator(params: {
+     first = hexToNumber(params.syncProgress.current.number) + 1;
+   } else {
+     params.common.logger.info({
+-      msg: "Started fetching backfill JSON-RPC data",
++      msg: params.chain.portal
++        ? "Started fetching backfill data from SQD Portal"
++        : "Started fetching backfill JSON-RPC data",
+       chain: params.chain.name,
+       chain_id: params.chain.id,
+       cache_rate: "0%",
+     });
+   }
+ 
+-  const historicalSync = createHistoricalSync(params);
++  const historicalSync = params.chain.portal
++    ? createPortalHistoricalSync(params)
++    : createHistoricalSync(params);
+ 
+   const { callback: intervalCallback, generator: intervalGenerator } =
+     createCallbackGenerator<{
+diff --git a/packages/core/src/runtime/index.ts b/packages/core/src/runtime/index.ts
+index bb1e924..944473c 100644
+--- a/packages/core/src/runtime/index.ts
++++ b/packages/core/src/runtime/index.ts
+@@ -11,6 +11,8 @@ import type {
+ } from "@/internal/types.js";
+ import { eth_getBlockByNumber } from "@/rpc/actions.js";
+ import type { Rpc } from "@/rpc/index.js";
++import { assertStreamModeSupported, clampFinalizedToPortalHead, deriveFinalityFloor, isPortalRealtime } from "@/sync-historical/portal-realtime-wire.js";
++import type { SafeCrashRecoveryBlockLookup } from "@/sync-historical/portal-realtime-wire.js";
+ import {
+   getFilterFactories,
+   getFilterFromBlock,
+@@ -76,6 +78,10 @@ export async function getLocalSyncProgress(params: {
+   filters: Filter[];
+   finalizedBlock: LightBlock;
+   cachedIntervals: CachedIntervals;
++  /** Ponder's persisted safe checkpoint for this chain — the Portal finality floor across restarts. */
++  crashRecoveryCheckpoint?: string | undefined;
++  /** Maps a FOREIGN checkpoint's timestamp to a local block (omnichain floor). See `deriveFinalityFloor`. */
++  getSafeCrashRecoveryBlock?: SafeCrashRecoveryBlockLookup;
+ }): Promise<SyncProgress> {
+   const syncProgress = {
+     isEnd: () => {
+@@ -146,7 +152,28 @@ export async function getLocalSyncProgress(params: {
+         ],
+   );
+ 
+-  syncProgress.finalized = params.finalizedBlock;
++  // Fail loud at process start (not after a multi-day backfill) if stream mode can't serve a source. (finding 5)
++  if (isPortalRealtime(params.chain))
++    assertStreamModeSupported(params.filters, params.chain.name);
++  // Never let a lagging replica's stale-LOW head pull the boundary below finality ponder has already
++  // persisted — realtime would re-stream (head, floor] and double-index rows crash recovery cannot revert.
++  // A same-chain checkpoint floors at its own block; a FOREIGN one (omnichain writes the omnichain
++  // checkpoint to every chain's row) is timestamp-mapped to a local block via getSafeCrashRecoveryBlock.
++  const floor = await deriveFinalityFloor({
++    checkpoint: params.crashRecoveryCheckpoint,
++    chainId: params.chain.id,
++    getSafeCrashRecoveryBlock: params.getSafeCrashRecoveryBlock,
++  });
++  // Portal stream-realtime: lower the finalized block to the Portal head so historical stops there and
++  // realtime streams `[portal-head+1 → tip]`. Pass-through in the A-path (no portal / flag off).
++  const finalizedBlock = await clampFinalizedToPortalHead({
++    chain: params.chain,
++    rpc: params.rpc,
++    finalizedBlock: params.finalizedBlock,
++    floor,
++    common: params.common,
++  });
++  syncProgress.finalized = finalizedBlock;
+   syncProgress.start = diagnostics[0];
+   if (diagnostics.length === 2) {
+     syncProgress.current = diagnostics[1];
+@@ -159,7 +186,7 @@ export async function getLocalSyncProgress(params: {
+   // Latest `toBlock` among all `filters`
+   const end = Math.max(...params.filters.map((filter) => filter.toBlock!));
+ 
+-  if (end > hexToNumber(params.finalizedBlock.number)) {
++  if (end > hexToNumber(finalizedBlock.number)) {
+     syncProgress.end = {
+       number: toHex(end),
+       hash: "0x",
+diff --git a/packages/core/src/runtime/isolated.ts b/packages/core/src/runtime/isolated.ts
+index 206467a..c56300d 100644
+--- a/packages/core/src/runtime/isolated.ts
++++ b/packages/core/src/runtime/isolated.ts
+@@ -152,6 +152,13 @@ export async function runIsolated({
+     rpc: indexingBuild.rpcs[0]!,
+     finalizedBlock: indexingBuild.finalizedBlocks[0]!,
+     cachedIntervals,
++    // Portal stream-realtime: the persisted safe checkpoint is the finality floor across restarts.
++    crashRecoveryCheckpoint: crashRecoveryCheckpoint?.find(
++      ({ chainId }) => chainId === chain.id,
++    )?.checkpoint,
++    // Isolated writes per-chain checkpoints (same-chain fast path), but pass the lookup for a uniform seam
++    // — deriveFinalityFloor only queries it when a checkpoint is foreign (never in this ordering).
++    getSafeCrashRecoveryBlock: syncStore.getSafeCrashRecoveryBlock,
+   });
+   const childAddresses = await getChildAddresses({
+     filters: eventCallbacks.map(({ filter }) => filter),
+diff --git a/packages/core/src/runtime/multichain.ts b/packages/core/src/runtime/multichain.ts
+index 8e5e960..1376165 100644
+--- a/packages/core/src/runtime/multichain.ts
++++ b/packages/core/src/runtime/multichain.ts
+@@ -174,6 +174,13 @@ export async function runMultichain({
+         finalizedBlock:
+           indexingBuild.finalizedBlocks[indexingBuild.chains.indexOf(chain)]!,
+         cachedIntervals,
++        // Portal stream-realtime: the persisted safe checkpoint is the finality floor across restarts.
++        crashRecoveryCheckpoint: crashRecoveryCheckpoint?.find(
++          ({ chainId }) => chainId === chain.id,
++        )?.checkpoint,
++        // Multichain writes per-chain checkpoints (same-chain fast path), but pass the lookup for a uniform
++        // seam — deriveFinalityFloor only queries it when a checkpoint is foreign (never in this ordering).
++        getSafeCrashRecoveryBlock: syncStore.getSafeCrashRecoveryBlock,
+       });
+       const childAddresses = await getChildAddresses({
+         filters: eventCallbacks.map(({ filter }) => filter),
+diff --git a/packages/core/src/runtime/omnichain.ts b/packages/core/src/runtime/omnichain.ts
+index b5140d9..a8b5d41 100644
+--- a/packages/core/src/runtime/omnichain.ts
++++ b/packages/core/src/runtime/omnichain.ts
+@@ -177,6 +177,13 @@ export async function runOmnichain({
+         finalizedBlock:
+           indexingBuild.finalizedBlocks[indexingBuild.chains.indexOf(chain)]!,
+         cachedIntervals,
++        // Portal stream-realtime: the persisted safe checkpoint is the finality floor across restarts.
++        crashRecoveryCheckpoint: crashRecoveryCheckpoint?.find(
++          ({ chainId }) => chainId === chain.id,
++        )?.checkpoint,
++        // Omnichain writes the omnichain checkpoint to every chain's row, so this chain's row can encode a
++        // FOREIGN chain's block; the floor timestamp-maps it to a local block (see deriveFinalityFloor).
++        getSafeCrashRecoveryBlock: syncStore.getSafeCrashRecoveryBlock,
+       });
+       const childAddresses = await getChildAddresses({
+         filters: eventCallbacks.map(({ filter }) => filter),
+diff --git a/packages/core/src/runtime/realtime.ts b/packages/core/src/runtime/realtime.ts
+index d848e60..102ae6f 100644
+--- a/packages/core/src/runtime/realtime.ts
++++ b/packages/core/src/runtime/realtime.ts
+@@ -25,6 +25,11 @@ import {
+   createRealtimeSync,
+   type RealtimeSyncEvent,
+ } from "@/sync-realtime/index.js";
++import {
++  dedupeFinalizeChildAddresses,
++  getPortalRealtimeEventGenerator,
++  isPortalRealtime,
++} from "@/sync-historical/portal-realtime-wire.js";
+ import { createSyncStore } from "@/sync-store/index.js";
+ import {
+   blockToCheckpoint,
+@@ -765,6 +770,15 @@ export async function* getRealtimeEventGenerator(params: {
+   childAddresses: ChildAddresses;
+   database: Database;
+ }) {
++  // Portal-native realtime (PORTAL_REALTIME="stream" + chain.portal): source the realtime region from the
++  // Portal `/stream` instead of rpc.subscribe + createRealtimeSync. It yields the SAME
++  // `{chain, event: RealtimeSyncEvent}` stream, so the omni/multi/isolated consumers are unchanged. When
++  // the flag is off (the "A-path"), this is skipped and the RPC realtime path below runs byte-for-byte.
++  if (isPortalRealtime(params.chain)) {
++    yield* getPortalRealtimeEventGenerator(params);
++    return;
++  }
++
+   const realtimeSync = createRealtimeSync(params);
+ 
+   let childCount = 0;
+@@ -966,6 +980,18 @@ export async function handleRealtimeSyncEvent(
+         async (tx) => {
+           const syncStore = createSyncStore({ common: params.common, qb: tx });
+ 
++          // INV-17 (write-side idempotence), extended to the realtime finalize path: a resumed
++          // single-writer re-streams the same finalized child-creation blocks and would re-INSERT the
++          // same children (insertChildAddresses is a plain INSERT, factory_addresses has no UNIQUE).
++          // Dedupe against the store BEFORE the insert — the SAME LEAST-semantics guard the historical
++          // path runs (portal.ts persistPendingChildren), shared via portal-child-dedupe. Read before
++          // the insert spread (not concurrently in promiseAllSettledWithThrow) so getChildAddresses sees
++          // committed prior-finalize history, not this transaction's own in-flight inserts.
++          const dedupedChildAddresses = await dedupeFinalizeChildAddresses(
++            childAddresses,
++            syncStore,
++          );
++
+           await promiseAllSettledWithThrow([
+             syncStore.insertBlocks({
+               blocks: finalizedBlocks
+@@ -1002,7 +1028,7 @@ export async function handleRealtimeSyncEvent(
+               ),
+               chainId: params.chain.id,
+             }),
+-            ...Array.from(childAddresses.entries()).map(
++            ...Array.from(dedupedChildAddresses.entries()).map(
+               ([factory, childAddresses]) =>
+                 syncStore.insertChildAddresses({
+                   factory,
+diff --git a/packages/core/src/sync-realtime/index.ts b/packages/core/src/sync-realtime/index.ts
+index c02443b..6ebf845 100644
+--- a/packages/core/src/sync-realtime/index.ts
++++ b/packages/core/src/sync-realtime/index.ts
+@@ -31,8 +31,10 @@ import {
+   eth_getBlockByHash,
+   eth_getBlockByNumber,
+   eth_getBlockReceipts,
++  eth_getFilteredBlockLogs,
+   eth_getLogs,
+   eth_getTransactionReceipt,
++  isResponseBodyTooLargeError,
+   validateLogsAndBlock,
+   validateReceiptsAndBlock,
+   validateTracesAndBlock,
+@@ -308,40 +310,73 @@ export const createRealtimeSync = (
+ 
+     let logs: SyncLog[] = [];
+     if (shouldRequestLogs) {
+-      if (block === undefined) {
+-        [block, logs] = await Promise.all([
+-          eth_getBlockByHash(args.rpc, [maybeBlockHeader.hash, true], context),
+-          eth_getLogs(
+-            args.rpc,
+-            [{ blockHash: maybeBlockHeader.hash }],
+-            context,
+-          ),
+-        ]);
+-      } else {
+-        logs = await eth_getLogs(
++      // The unfiltered full-block `eth_getLogs` (pinned by `blockHash`, all logs in the block) can
++      // exceed viem's ~10 MiB response-body cap on a "monster" block, throwing a deterministic,
++      // non-retryable `ResponseBodyTooLargeError`. When it does, fall back to bounded FILTERED
++      // `eth_getLogs` per registered filter/factory for the SAME block and assemble the logs from
++      // those — mirroring what historical/backfill sync fetches anyway. The block fetch is kept
++      // independent of the logs fetch so an oversized logs leg doesn't discard a healthy block. The
++      // assembled logs feed the same downstream factory-discovery + filter-matching unchanged. (#23)
++      let usedFilteredLogsFallback = false;
++
++      const blockPromise: Promise<SyncBlock> =
++        block === undefined
++          ? eth_getBlockByHash(args.rpc, [maybeBlockHeader.hash, true], context)
++          : Promise.resolve(block);
++
++      const blockHash = block?.hash ?? maybeBlockHeader.hash;
++
++      const logsPromise = eth_getLogs(
++        args.rpc,
++        [{ blockHash }],
++        context,
++      ).catch((error) => {
++        if (isResponseBodyTooLargeError(error) === false) throw error;
++
++        usedFilteredLogsFallback = true;
++        args.common.logger.warn({
++          msg: "Full-block eth_getLogs exceeded the RPC response-body size cap; falling back to filtered per-filter eth_getLogs for this block",
++          action: "fetch_block_data",
++          chain: args.chain.name,
++          chain_id: args.chain.id,
++          hash: blockHash,
++        });
++
++        return eth_getFilteredBlockLogs(
+           args.rpc,
+-          [{ blockHash: block.hash }],
++          blockHash,
++          { logFilters, factories },
+           context,
+         );
+-      }
++      });
+ 
+-      validateLogsAndBlock(
+-        logs,
+-        block,
+-        {
+-          method: "eth_getLogs",
+-          params: [{ blockHash: block.hash }],
+-        },
+-        ethGetBlockMethod === "eth_getBlockByNumber"
+-          ? {
+-              method: "eth_getBlockByNumber",
+-              params: [block.number, true],
+-            }
+-          : {
+-              method: "eth_getBlockByHash",
+-              params: [block.hash, true],
+-            },
+-      );
++      [block, logs] = await Promise.all([blockPromise, logsPromise]);
++
++      // `validateLogsAndBlock` throws when `logs.length === 0` on a block with a non-empty
++      // `logsBloom` — a valid invariant for the UNFILTERED fetch, but not for the FILTERED fallback,
++      // whose result is legitimately empty when no registered filter/factory matches this (monster)
++      // block. Skip that single check only in the empty-fallback case (the historical filtered path
++      // guards the same call with `logs.length > 0`); all per-log consistency checks still run when
++      // the fallback returns logs. (#23)
++      if (usedFilteredLogsFallback === false || logs.length > 0) {
++        validateLogsAndBlock(
++          logs,
++          block,
++          {
++            method: "eth_getLogs",
++            params: [{ blockHash: block.hash }],
++          },
++          ethGetBlockMethod === "eth_getBlockByNumber"
++            ? {
++                method: "eth_getBlockByNumber",
++                params: [block.number, true],
++              }
++            : {
++                method: "eth_getBlockByHash",
++                params: [block.hash, true],
++              },
++        );
++      }
+ 
+       // Note: Exact `logsBloom` validations were considered too strict to add to `validateLogsAndBlock`.
+       let isInvalidLogsBloom = false;
