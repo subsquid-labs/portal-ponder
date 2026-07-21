@@ -12,6 +12,6 @@
     "abitype": "^0.10.2",
     "hono": "^4.5.0",
     "viem": "^2.21.3",
-    "@subsquid/ponder": "0.17.0-sqd.1"
+    "@subsquid/ponder": "0.17.1-sqd.1"
   }
 }
