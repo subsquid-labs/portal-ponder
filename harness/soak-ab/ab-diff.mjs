@@ -1280,35 +1280,53 @@ export function restartStats(lines, nowMs = Date.now()) {
 
 const SEP = '\x1f'; // unit separator — never appears in the hex/numeric fields we select
 
+// Build psql's argv. The SQL is NOT here: it rides through the child's stdin (`-f -`), so the argv is
+// a small constant regardless of query size. Passing the query via `-c <sql>` instead put the whole
+// statement into a SINGLE argv string, which on Linux is capped at MAX_ARG_STRLEN (PAGE_SIZE*32 =
+// 128 KiB) — independent of the much larger total ARG_MAX. A chunked IN-list of ~5000 tx hashes
+// (~340 KiB) blew that per-arg cap on the ethereum chain (chain 1, by far the largest onlyA set),
+// spawning `psql` with E2BIG while smaller chains squeaked under. Reading from stdin removes the query
+// text from argv entirely, so ANY query size is safe for every caller at once. Pure + exported so a
+// test can assert the SQL never appears in argv (the E2BIG regression guard).
+export function psqlArgs(url) {
+  return [
+    url,
+    '-X',
+    '-q',
+    '-A',
+    '-t',
+    '-v',
+    'ON_ERROR_STOP=1',
+    '-F',
+    SEP,
+    '-f',
+    '-', // read the query from stdin, not argv — E2BIG-proof for any query length
+  ];
+}
+
 // Stream rows of a query as string[] (fields split on SEP), constant memory. `-v ON_ERROR_STOP=1`
 // makes a mid-query server error a non-zero exit rather than a partial stream; we additionally await
 // the child's terminal state and throw on any non-clean exit (spawn error / signal / non-zero code)
-// so a failed query can NEVER be silently read as "zero rows" (the false-PASS class).
-async function* psqlRows(url, sql) {
-  const proc = spawn(
-    'psql',
-    [
-      url,
-      '-X',
-      '-q',
-      '-A',
-      '-t',
-      '-v',
-      'ON_ERROR_STOP=1',
-      '-F',
-      SEP,
-      '-c',
-      sql,
-    ],
-    {
-      stdio: ['ignore', 'pipe', 'inherit'],
-    },
-  );
+// so a failed query can NEVER be silently read as "zero rows" (the false-PASS class). The query text is
+// streamed via stdin (`-f -`, see psqlArgs) rather than `-c <sql>` so no query — however large — can
+// hit the per-argv MAX_ARG_STRLEN cap (the chain-1 E2BIG class). Exported so an integration test can
+// drive a query longer than MAX_ARG_STRLEN through the real spawn/stream path and assert no E2BIG.
+export async function* psqlRows(url, sql) {
+  const proc = spawn('psql', psqlArgs(url), {
+    stdio: ['pipe', 'pipe', 'inherit'],
+  });
 
   let spawnError = null;
   proc.on('error', (e) => {
     spawnError = e.message;
   });
+
+  // Feed the query through stdin and close it. If psql errors early (bad SQL under ON_ERROR_STOP=1) it
+  // may exit before draining stdin, breaking the pipe; swallow that EPIPE here so it surfaces as the
+  // non-clean exit below (via psqlExitVerdict) rather than an unhandled 'error' crashing the differ.
+  proc.stdin.on('error', () => {});
+  proc.stdin.write(sql);
+  proc.stdin.end();
 
   const exited = new Promise((resolve) => {
     proc.on('close', (code, signal) => {
