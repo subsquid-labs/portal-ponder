@@ -1,10 +1,12 @@
 import assert from 'node:assert/strict';
 import {
+  chmodSync,
   existsSync,
   mkdtempSync,
   readdirSync,
   readFileSync,
   rmSync,
+  writeFileSync,
 } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
@@ -45,7 +47,9 @@ import {
   formatToleratedIssue36Line,
   knownBadRows,
   ONLYB_ROW_CAP,
+  psqlArgs,
   psqlExitVerdict,
+  psqlRows,
   readStagnationThreshold,
   restartStats,
   sampleToleratedOnlyB,
@@ -243,6 +247,92 @@ test('psqlExitVerdict: a clean exit passes; ANY non-clean exit fails (no silent 
   });
   assert.equal(noBin.ok, false);
   assert.match(noBin.reason, /ENOENT/);
+});
+
+// The chain-1 E2BIG regression: the query text must NEVER ride in argv. psqlArgs uses `-f -` (read the
+// statement from stdin) with NO `-c <sql>` entry, so argv is a small constant no matter how large the
+// query is. A 5000-hash IN-list (~340 KiB) blew Linux's per-arg MAX_ARG_STRLEN (128 KiB) on the
+// ethereum chain under the old `-c` path; reverting to `'-c', sql` fails this assertion. Pure — no spawn.
+test('psqlArgs: SQL rides via stdin (-f -), never in argv — E2BIG-proof', () => {
+  const args = psqlArgs('postgres://user@host/db');
+
+  // the argv is the fixed flag set; it must NOT contain `-c` (which would inline the SQL into one arg)
+  assert.equal(
+    args.includes('-c'),
+    false,
+    'no -c: the query must not be inlined into argv',
+  );
+
+  // it MUST read the statement from stdin: `-f -`
+  const fIdx = args.indexOf('-f');
+  assert.ok(fIdx >= 0, '-f is present');
+  assert.equal(args[fIdx + 1], '-', '-f - reads the query from stdin');
+
+  // and the essential flags/URL survive the refactor unchanged
+  assert.equal(args[0], 'postgres://user@host/db');
+  for (const flag of ['-X', '-q', '-A', '-t', '-F']) {
+    assert.ok(args.includes(flag), `${flag} preserved`);
+  }
+  const vIdx = args.indexOf('-v');
+  assert.equal(args[vIdx + 1], 'ON_ERROR_STOP=1', 'ON_ERROR_STOP=1 preserved');
+});
+
+// End-to-end proof through the REAL spawn/stream path: run a query whose text is far larger than
+// MAX_ARG_STRLEN (128 KiB) against a stub `psql` on PATH. Under the old `-c <sql>` argv, node's spawn
+// would throw E2BIG before the child even ran; via stdin it streams fine. The stub echoes back the
+// stdin byte count so we prove the WHOLE oversized query was delivered (not truncated), and asserts it
+// was NOT handed a `-c` arg — belt-and-braces against a partial revert.
+test('psqlRows: a query larger than MAX_ARG_STRLEN streams via stdin without E2BIG', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'ab-e2big-'));
+  const fakePsql = join(dir, 'psql');
+
+  // A stub psql: fail loud if handed `-c` (the E2BIG path); otherwise count stdin bytes and emit the
+  // tally as a single SEP-free row so psqlRows yields it and exits 0 (clean).
+  writeFileSync(
+    fakePsql,
+    [
+      '#!/usr/bin/env bash',
+      'set -euo pipefail',
+      'for a in "$@"; do',
+      '  if [ "$a" = "-c" ]; then echo "STUB: got -c (argv), E2BIG path" >&2; exit 3; fi',
+      'done',
+      'n=$(wc -c)', // reads all of stdin
+      'printf "%s\\n" "$n"',
+    ].join('\n'),
+    'utf8',
+  );
+  chmodSync(fakePsql, 0o755);
+
+  // a query whose text alone exceeds MAX_ARG_STRLEN (131072) — as a single -c arg this is a hard E2BIG
+  const bigLen = 300_000;
+  const sql = `select 1 -- ${'x'.repeat(bigLen)}`;
+  assert.ok(
+    sql.length > 131072,
+    'the query exceeds the per-arg MAX_ARG_STRLEN cap',
+  );
+
+  const prevPath = process.env.PATH;
+  process.env.PATH = `${dir}:${prevPath}`;
+  try {
+    const rows = [];
+    for await (const row of psqlRows('postgres://ignored', sql)) {
+      rows.push(row);
+    }
+
+    assert.equal(
+      rows.length,
+      1,
+      'the stub emitted exactly one row (clean exit, streamed OK)',
+    );
+    assert.equal(
+      Number(rows[0][0]),
+      sql.length,
+      'the FULL oversized query reached the child via stdin (byte count matches, not truncated)',
+    );
+  } finally {
+    process.env.PATH = prevPath;
+    rmSync(dir, { recursive: true, force: true });
+  }
 });
 
 test('compareBucketHashes: shared buckets must match; one-sided buckets are reported not failed', () => {
