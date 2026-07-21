@@ -63,7 +63,7 @@ whole-structure O(n) checks used in CI), and the suite proves them with property
 (`fast-check`, seed-pinned for deterministic runs).
 
 The suite runs **against every tracked upstream Ponder version** — `0.15.17`, `0.16.6`, `0.16.7`,
-`0.16.8`, `0.16.9`, `0.16.10`, and `0.17.0` (`compat.tested` in `versions.json`) — by grafting the
+`0.16.8`, `0.16.9`, `0.16.10`, `0.17.0`, and `0.17.1` (`compat.tested` in `versions.json`) — by grafting the
 Portal layer onto a pinned Ponder checkout:
 
 ```bash
@@ -74,6 +74,7 @@ scripts/sync-upstream.sh 0.16.8  --test
 scripts/sync-upstream.sh 0.16.9  --test
 scripts/sync-upstream.sh 0.16.10 --test
 scripts/sync-upstream.sh 0.17.0  --test
+scripts/sync-upstream.sh 0.17.1  --test
 ```
 
 (config `portal/vite.portal.config.ts`, files `portal/*.test.ts`). The seam
@@ -103,23 +104,31 @@ surface** (`sync-historical`, `runtime/historical`, `sync-store`, `rpc`, `sync`)
   (comm-verified identical to the `0.16.10` added lines, zero delta), and the graft seam survives
   untouched. It also bumps the required `pnpm` to 11, which the `sync-upstream.sh` harness now honours by
   reading the clone's own `packageManager`.
+- `0.17.1` ([#187](../../pull/187)) applies the `0.17.0` wiring patch **verbatim** (a sha256-equal copy,
+  same 12 files); `0.17.0 → 0.17.1` is a single off-seam upstream perf PR
+  ([`ponder-sh/ponder#2338`](https://github.com/ponder-sh/ponder/pull/2338), narrowing Ponder's internal
+  trace/log read-back query in `sync-store/index.ts` to the block ranges of the active filters) —
+  downstream of the Portal fetch/insert, so every wiring-touched file is byte-identical between `0.17.0`
+  and `0.17.1`, the patch applies with zero rejects, and the seam is untouched.
 
 The full current Portal suite is **370 tests across 19 files**, green on every tracked version via the
-one-command gate (verified in the `0.16.10` / `0.17.0` compat work). As with `0.15.17`, this basis is
+one-command gate (verified in the `0.16.10` / `0.17.0` / `0.17.1` compat work). As with `0.15.17`, this basis is
 **not** a fresh RPC byte-diff or cross-validation on the newer versions — the §3 / §5 byte-diff and A/B
 evidence remains on `0.16.6` (see below).
 
 **Evidence base version and seam-identity transfer.** The data-correctness evidence in §3 / §5 (the
 paid-matrix byte-diff and the A/B soak) was gathered on the `0.16.6` graft, whereas the published `latest`
-fork is now `@subsquid/ponder@0.17.0-sqd.1` (published 2026-07-20 with `--tag latest`, superseding
-`0.16.9-sqd.1`; `0.16.10-sqd.1` published the same day under dist-tag `ponder-0.16.10`, `versions.json`). That
+fork is now `@subsquid/ponder@0.17.1-sqd.1` (published 2026-07-21 with `--tag latest`, superseding
+`0.17.0-sqd.1`, which now installs by exact version; `0.16.10-sqd.1` remains under dist-tag
+`ponder-0.16.10`, `versions.json`). That
 evidence **transfers to the shipped artifact by seam identity**: the Portal wiring patch is byte-identical
 (sha256-equal) across the `0.16.6` / `0.16.7` / `0.16.8` grafts and carries forward verbatim to `0.16.9`
-(and to `0.16.10`; `0.17.0` re-derives the patch but re-places every added wiring line byte-for-byte,
-Layer A above), and each upstream delta over that range lands off the Portal graft surface. A version
+(and to `0.16.10`; `0.17.0` re-derives the patch but re-places every added wiring line byte-for-byte, and
+`0.17.1` is a sha256-equal verbatim copy of the `0.17.0` patch, Layer A above), and each upstream delta over
+that range lands off the Portal graft surface. A version
 bump therefore does **not** invalidate the matrix or the soak, and we deliberately do **not** re-run the
 paid matrix or restart the soak for it. Alongside that transfer, three **direct anchors on the then-shipped
-`0.16.8-sqd.1` package** (now superseded by `0.17.0-sqd.1`; their assurance carries forward by the same
+`0.16.8-sqd.1` package** (now superseded by `0.17.1-sqd.1`; their assurance carries forward by the same
 seam identity) — two landed, one planned — tie the evidence to that exact published build:
 1. the examples end-to-end freshness gate ran against the **published** package
    ([#139](../../pull/139)) — the `euler-subgraph` example reproduced its exact baseline row counts
@@ -1236,7 +1245,11 @@ The injected fault-counter tallies differ run-to-run (injection timing is non-de
 load-bearing invariant — every expected fault fired and every in-scope store digest equals the baseline —
 holds identically on `0.17.0-sqd.1`. The `0.16.8-sqd.1` tarball, artifacts, and digest above remain the
 retained historical anchor; this note **adds** the direct confirmation on the current shipped build rather
-than replacing it.
+than replacing it. (`0.17.1-sqd.1`, published 2026-07-21 and now `latest`, grafts the identical Portal layer
+via a **verbatim** copy of `wiring/0.17.0.patch` (sha256-equal), and the `0.17.0 → 0.17.1` upstream delta is
+a single off-seam `sync-store` read-query optimization — so this direct `0.17.0-sqd.1` fault evidence carries
+forward unchanged to the current `0.17.1-sqd.1` build by verbatim-patch + seam identity; it was not re-run
+against `0.17.1-sqd.1`.)
 
 **What this proves:**
 
@@ -2092,7 +2105,7 @@ this document's newest bullet. The stream path remains experimental (§1, §6).
 **Proven today (with reproducible evidence in this repo):**
 
 - The Portal layer's invariants (INV-1 … INV-25) hold under property-based tests **on every tracked
-  upstream Ponder version** (`0.15.17`, `0.16.6`, `0.16.7`, `0.16.8`, `0.16.9`, `0.16.10`, `0.17.0` —
+  upstream Ponder version** (`0.15.17`, `0.16.6`, `0.16.7`, `0.16.8`, `0.16.9`, `0.16.10`, `0.17.0`, `0.17.1` —
   each past `0.16.6` registered on a **seam-identity + full-suite** basis, *not* a fresh RPC byte-diff,
   §2; the full current suite is **370 tests / 19 files**, green on all of them), and every fix is backed
   by a mutation-verified regression test. The realtime `/stream` liveness invariants INV-22…INV-25 and

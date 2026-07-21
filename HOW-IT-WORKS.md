@@ -49,7 +49,7 @@ const historicalSync = params.chain.portal
 
 The Portal sync receives the **same** `params` as the stock one — `chain`, `rpc`, `childAddresses`, and the chain's full `eventCallbacks` — and reads Ponder's own filters and factory maps directly. Nothing about handlers, schema, or config is translated.
 
-**Why a fork and not a plugin.** That seam is an internal interface, not part of Ponder's public API; there is no extension point to register an alternative historical sync. So the integration is a fork — but a deliberately thin one. The repository carries only the `portal/` layer plus a short wiring patch ([`portal/wiring/`](portal/wiring/)) that adds a `portal?` field to the chain config, threads it through `buildConfig` and the internal `Chain` type, and swaps the one constructor above. The published package is *generated* from upstream Ponder plus that patch, so it tracks Ponder closely — the seam has held identical across 0.15.17–0.17.0 ([`versions.json`](versions.json)).
+**Why a fork and not a plugin.** That seam is an internal interface, not part of Ponder's public API; there is no extension point to register an alternative historical sync. So the integration is a fork — but a deliberately thin one. The repository carries only the `portal/` layer plus a short wiring patch ([`portal/wiring/`](portal/wiring/)) that adds a `portal?` field to the chain config, threads it through `buildConfig` and the internal `Chain` type, and swaps the one constructor above. The published package is *generated* from upstream Ponder plus that patch, so it tracks Ponder closely — the seam has held identical across 0.15.17–0.17.1 ([`versions.json`](versions.json)).
 
 ## Making the network disappear: chunking and read-ahead
 
