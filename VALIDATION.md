@@ -126,7 +126,8 @@ seam identity) — two landed, one planned — tie the evidence to that exact pu
    (vaults / deposits / withdraws / borrows / repays), a no-regression check on the shipped tag — **done**;
 2. an adversarial network/transport fault-injection campaign on the **published** `0.16.8-sqd.1`
    package (Layer C, §4.5) — the backfill completed **byte-identical** to a clean baseline under all 8
-   body/transport faults plus a frozen finalized head — **done**;
+   body/transport faults plus a frozen finalized head — **done**, and since re-verified directly on the
+   shipped `0.17.0-sqd.1` build (§4.5);
 3. a ≥72 h A/B soak confirmation leg on the `0.16.8-sqd.1` build after the current soak completes its
    milestone — **planned**.
 The one pending anchor is tracked and not yet claimed as evidence; until it lands, the shipped-build
@@ -1169,7 +1170,8 @@ the then-shipped **`0.16.8-sqd.1` package** (tarball `subsquid-ponder-0.16.8-sqd
 the fault-proxy code merged in [#149](../../pull/149) (`5a2fe88`), so it doubles as the §2 shipped-build
 anchor #2. Because it injects on the Portal HTTP wire — the graft surface that is byte-identical across
 the `0.16.8`–`0.16.10` grafts and re-placed byte-for-byte in `0.17.0` — its assurance carries forward to
-`0.17.0-sqd.1`, on which it was not re-run. Backend is
+`0.17.0-sqd.1`; that carry-forward has now been **confirmed directly** by re-running the full campaign on
+the shipped `0.17.0-sqd.1` build (re-verification note below). Backend is
 `postgres16` (`fsync=on`, recorded `postgres16-fsync-on`), app `euler-app` (factory
 `0x29a56a1b8214D9Cf7c5561811750D5cBDb45CC8e`), chain 1 (ethereum) range `[20529207, 20579207]` (span
 50000), Portal `portal.sqd.dev/datasets/ethereum-mainnet`. The clean baseline logical digest is
@@ -1218,6 +1220,23 @@ all seven interval fragments (one factory + six log) tiling `[20529207, 20579208
 "digest identical" line. The two not-applicable scenarios carry `pass:false, notApplicable:true,
 digest:"n/a"` — so the "8 pass + 1 recovery + 2 n/a" tally is exactly what the on-disk verdicts say,
 not a summarized claim.
+
+**Direct re-verification on the shipped `0.17.0-sqd.1` build (2026-07-20).** To upgrade the seam-identity
+carry-forward from inference to direct evidence on the current release, the entire campaign was re-run
+against the shipped `0.17.0-sqd.1` package (tarball `subsquid-ponder-0.17.0-sqd.1.tgz`, sha256
+`c104630ff1ecf10e29091fc568894fe42003ef70eeddeb67d37adda2a17485e6`) — same app (`euler-app`, factory
+`0x29a56a1b8214D9Cf7c5561811750D5cBDb45CC8e`), same range `[20529207, 20579207]`, same Portal
+`portal.sqd.dev/datasets/ethereum-mainnet`, same `postgres16-fsync-on` backend, on an isolated throwaway
+cluster. The aggregate came back `status: pass`, matching the `0.16.8-sqd.1` run outcome-for-outcome: all
+8 body/transport-fault scenarios completed **byte-identical** (each `digestEqual:true` with logical digest
+`360af5126a0efffc49b871594b8ac3ea` — the same baseline digest as the original run — and `verifyExit:0`,
+each expected fault non-vacuously fired ≥ 1), head-freeze recovered byte-identical, and
+head-regression-100k / head-flap were the same two NOT-APPLICABLE (head stays ≥ `endBlock`) as before.
+The injected fault-counter tallies differ run-to-run (injection timing is non-deterministic), but the
+load-bearing invariant — every expected fault fired and every in-scope store digest equals the baseline —
+holds identically on `0.17.0-sqd.1`. The `0.16.8-sqd.1` tarball, artifacts, and digest above remain the
+retained historical anchor; this note **adds** the direct confirmation on the current shipped build rather
+than replacing it.
 
 **What this proves:**
 
