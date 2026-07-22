@@ -101,19 +101,25 @@ export const knownBadRows = [
 // change to one silently move the other's tolerance boundary.
 //
 // issue36OnlyBRowLoss — issue #36: leg A (RPC realtime) silently LOST on-chain log rows and block rows
-// that leg B (Portal stream) holds, at scattered recent blocks on chain 1, INSIDE the finalized
-// overlap. Third-party confirmed: leg B is chain-true (its rows match on-chain receipts byte-for-byte);
-// leg A is the lossy side. The loss is a genuine A-side gap, so it surfaces as onlyB rows the strict
-// differ (correctly) FAILs on — and the count GROWS while leg A keeps missing rows. That is by design:
-// the class is toBlock-open (null) so it never silently caps. Tolerated ONLY at/above the per-chain
+// that leg B (Portal stream) holds, at scattered recent blocks, INSIDE the finalized overlap.
+// Third-party confirmed: leg B is chain-true (its rows match on-chain receipts byte-for-byte); leg A is
+// the lossy side. The loss is a genuine A-side gap, so it surfaces as onlyB rows the strict differ
+// (correctly) FAILs on — and the count GROWS while leg A keeps missing rows. That is by design: the
+// class is toBlock-open (null) so it never silently caps. Tolerated ONLY at/above the per-chain
 // realtime-era floor: BELOW the floor leg A's store came from the historical backfill path (complete by
 // construction from the Portal), so any A-missing row below the floor is a HARD FAIL, never this class.
 // A chain with onlyB rows but NO configured floor is a HARD FAIL too (an unknown chain is never
-// default-tolerated — the #30 missing-floor semantic). Ships with chain 1 ONLY (the only chain observed
-// lossy on this class; 8453/42161 are currently clean). `perChainFloor` is the measured realtime-era
-// start per chain; `toBlock` stays null until leg A is repaired or the leg is retired. REMOVE this
-// entry when issue #36 is resolved (A repaired or the RPC-realtime leg retired) to restore full
-// strictness with no other code change (classifyOnlyBRow returns 'mismatch' for everything then).
+// default-tolerated — the #30 missing-floor semantic). Configured for chain 1 AND Base chain 8453: the
+// same issue-#36 shape (leg-A silent gap; leg-B rows chain-true) was confirmed on 8453 by direct store
+// inspection on 2026-07-22 — scattered blocks present in leg B, absent from leg A, inside the finalized
+// overlap and below leg A's own advanced frontier; a third-party spot audit against a public Base node
+// confirmed the sampled leg-B-only txs are real on-chain, so leg B is complete and leg A is the lossy
+// side. 42161 remains clean and unconfigured. `perChainFloor` is the measured realtime-era start per
+// chain (the 8453 floor is that measured cutover — an INDEPENDENT numeric literal that happens to
+// coincide with issue #27's own 8453 floor today, kept separate on purpose per the note above);
+// `toBlock` stays null until leg A is repaired or the leg is retired. REMOVE this entry when issue #36
+// is resolved (A repaired or the RPC-realtime leg retired) to restore full strictness with no other
+// code change (classifyOnlyBRow returns 'mismatch' for everything then).
 //
 // CANDOR — the limit of what cross-validation alone can prove here: within the tolerated span the A/B
 // differ CANNOT, by itself, distinguish leg-A row loss (leg A dropped an on-chain row leg B holds — the
@@ -129,7 +135,7 @@ export const knownBadRows = [
 export const TOLERATED_ONLYB_CLASSES = {
   issue36OnlyBRowLoss: {
     issue: 'https://github.com/subsquid-labs/portal-ponder/issues/36',
-    perChainFloor: { 1: 25445239 },
+    perChainFloor: { 1: 25445239, 8453: 48092254 },
     toBlock: null,
   },
 };
