@@ -1378,7 +1378,7 @@ in both byte-diff paths (`harness/diff/diff.mjs` and `harness/validate/diff-batc
 | **realtime parent-tx gap** | leg B missing *parent* transactions for realtime-ingested spans, each referenced by a leg-A log; any tx present on **both** sides must be byte-identical | The stream wire did not carry parent txs for these spans (the verified pre-#26 wire gap). This is an availability gap on leg B, never wrong data — the shared txs are byte-identical. | Closes as the parent-tx population from PR #26 covers the span; a non-referenced onlyA tx, or any shared-tx byte diff, is a hard FAIL. |
 | **access_list-null (#27)** | a single already-diverged **shared** tx whose *only* divergence is `access_list` (every other column byte-identical: ex-`access_list` md5s equal) | The RPC leg persisted NULL where the Portal leg has the real list (#27). Tolerated **only** while the divergence stays access_list-only. | If any *second* column ever diverges on that row, it stops being tolerated → hard FAIL. Removed when #27 is fixed. |
 | **pinned known-bad row (#32)** | exactly one transaction hash on chain 42161 with the fabricated-empty `[]` shape | Isolates the single anomalous #32 row so it does not mask new drift. Note: the *fork-side* fabrication that produced this shape is now fixed on the historical-backfill path — [#110](../../pull/110)/[#111](../../pull/111) store NULL, not `"[]"`, when the upstream dataset drops the column (§5.6); the pin is left in place conservatively pending #32's own closure. | The pin protects **only** the measured `[]`-vs-concrete-list shape — it does **not** tolerate an A-NULL / B-non-null drift or a B-side rot on that hash. Removed with #32. |
-| **leg-A onlyB row-loss (#36)** | `onlyB` log/block rows (present in leg B, missing in leg A) at/above a per-chain realtime-era floor; **chain 1 only** (the only chain where the loss was observed) | Leg A silently lost on-chain rows leg B holds (#36); below the floor leg A's store came from the complete-by-construction historical backfill path. | A chain with `onlyB` rows but **no** configured floor is a hard FAIL (unknown chains are never default-tolerated). Removed when leg A is repaired or the leg is retired. |
+| **leg-A onlyB row-loss (#36)** | `onlyB` log/block rows (present in leg B, missing in leg A) at/above a per-chain realtime-era floor; **chain 1 and chain 8453 (base)** — the two chains where the loss has been directly observed and store-confirmed ([#190](../../pull/190) added the 8453 floor after the Base gap was **β-confirmed** by two-time-point store inspection, §5.13) | Leg A silently lost on-chain rows leg B holds (#36); below the floor leg A's store came from the complete-by-construction historical backfill path. | A chain with `onlyB` rows but **no** configured floor is a hard FAIL (unknown chains are never default-tolerated). Removed when leg A is repaired or the leg is retired. |
 | **upstream-dataset block.size (#76)** *(paid matrix, Layer E)* | a shared `blocks` row whose **only** divergence is `block.size` with `rpc = portal + 1`, on blocks of canonical size **≥ 65 540** (the RLP 2^16 boundary) | The upstream SQD Portal dataset serves `block.size` one byte low at the boundary (§5.6); the fork persists it faithfully, and every other block column plus all `logs` / `transactions` / `transaction_receipts` / `traces` rows are byte-identical. | Any *second* differing column, the opposite delta direction, or a sub-threshold size is a hard FAIL. **Self-retiring**: it matches nothing once the upstream size is correct. Removed when [#76](../../issues/76) is fixed. |
 | **access_list column gap (#83/#32)** *(paid matrix, Layer E)* | a shared `transactions` row whose **only** divergence is `access_list`, where the **Portal side is SQL NULL**, on **base-mainnet / arbitrum-one / avalanche-mainnet** (chain_id 8453 / 42161 / 43114) | The upstream SQD Portal dataset **drops** the `transactions.access_list` column on these three chains (#83-family gap, §5.6); our fork stores an **honest SQL NULL** there ([#110](../../pull/110)/[#111](../../pull/111) — never a fabricated `"[]"`), while the stock-RPC leg persists the real list. Every other `transactions` column plus all `logs` / `blocks` rows are byte-identical. | Bounded to **Portal-IS-NULL only** — a **non-NULL** Portal value that differs from RPC (in particular a reappearing `"[]"`, the exact **#110 regression sentinel**) is a hard FAIL, as is any *second* differing column or the same shape on an **out-of-scope chain** (which serves the column). **Self-retiring**: drops away if the Portal ever serves `access_list`. Removed when [#83](../../issues/83) is fixed. |
 | **pre-London base_fee null-vs-0 (`U-eth`)** *(paid matrix, Layer E)* | a shared `blocks` row whose **only** divergence is `base_fee_per_gas`, where the **Portal side is SQL NULL** and the **RPC side is `0`**, on a **pre-London block** on **eth-mainnet** (chain_id **1**, below block 12,965,000) — chain-scoped exactly like the access_list gap, not chain-agnostic — anchored on a present, equal `hash` | Pre-London blocks predate EIP-1559 and carry **no `baseFeePerGas` header field** — a full node's `eth_getBlockByNumber` omits it entirely (geth-verified absent on block 12453996). The Portal leg stores the **honest SQL NULL** (the field is truly absent — the design intent in `portal/portal-filters.ts`); the stock-RPC leg, through ponder-core's RPC store, **coerces absent → 0**. So **Portal's NULL is the canonically-correct value and the RPC baseline's `0` is the outlier**. Every other `blocks` column plus all `logs` / `transactions` / `transaction_receipts` / `traces` rows are byte-identical, over an identical block hash. Eth-mainnet is the only chain with a pre-1559 era observed in the matrix. | Bounded to **Portal-IS-NULL vs RPC-IS-`0` only**, and **scoped to eth-mainnet (chain_id 1)** — a **non-NULL** Portal base fee, a non-`0` RPC value, or the same shape on an **out-of-scope chain** is a real divergence and a hard FAIL (narrowing fails safe: a future non-eth chain exhibiting the class FAILs, prompting review + an evidence-backed addition to the scope set rather than a silent mask), as is any *second* differing column or a missing/unequal `hash` (the same-canonical-block anchor). **Self-retiring**: drops away if the RPC path ever stores NULL for absent base fees. |
@@ -2097,6 +2097,76 @@ live-protocol reorg survival or finalize-boundary reconciliation (RG4/RG5, §5.1
 byte-identity claims (§3) are historical-backfill, not realtime. And **INV-25's floor is explicitly
 inert** — the load-bearing safety on that path is the pre-existing break-before-adopt guard (RG0), not
 this document's newest bullet. The stream path remains experimental (§1, §6).
+
+### 5.13 A/B realtime soak — a leg-A (RPC-realtime baseline) silent gap on Base (chain 8453), β-confirmed
+
+The **RG5** A/B realtime soak runs two indexers of the same app, on the same host, over the same chains,
+and diffs their finalized-overlap stores hourly. Its two legs are deliberately asymmetric so the diff is
+comparative evidence, not a self-check:
+
+- **Leg A** — an **RPC-realtime baseline (upstream ponder)**, driven by an RPC provider held to a typical
+  provider rate limit.
+- **Leg B** — the **Portal-native realtime path** (the fork's `/stream` mode).
+
+**The finding on Base (chain_id 8453).** A finalized-overlap comparison surfaced rows present in **leg B
+but ABSENT from leg A**, every one of them **below leg A's own committed frontier** and inside the
+compared window — so this is not a catch-up frontier artifact but a hole *behind* where leg A claims to be
+complete. At first observation the leg-B-only set was ~**3,147 blocks / ~12,428 logs / ~3,164
+transactions**; on a later run the set had **grown** to ~**3,719 blocks / ~14,746 logs / ~3,817
+transactions**. Every table showed `onlyA = 0` and `mismatch = 0` — a purely **one-sided** shape (rows
+leg B holds that leg A lacks, never a shared-row byte disagreement).
+
+**Third-party spot audit (Layer F).** An independent public Base node (no keys) was sampled against the
+leg-B-only set: **24 / 24** sampled leg-B-only transactions are real on-chain Base transactions at their
+in-window block heights, scattered across a ~506k-block span (block **48,346,729 → 48,853,251**),
+tens-to-hundreds of thousands of blocks **below** leg A's frontier. So for the audited sample **leg B is
+complete and chain-true** and the gap is on leg A. **Candor:** 24/24 is a *spread sample* of the leg-B-only
+population, not a proof of every missing row — as in §5.3's cross-validation-limit note, the tie-breaker is
+a third-party spot audit over a bounded sample kept reproducible from the status JSON, never an exhaustive
+guarantee.
+
+**α vs β resolved to β (persistent silent gap).** A transient catch-up (α: leg A merely mid-backfill,
+its gap closing as it advances) and a persistent silent gap (β: leg A live at the tip yet still missing
+scattered rows behind it) surface identically in a single diff. The two were separated by **direct
+inspection of the two stores at two time points** (an operator with store access ran the
+two-time-point discriminator):
+
+| Signal | Observation | Reads as |
+|--------|-------------|----------|
+| Sampled leg-B-only blocks vs leg A's frontier | Blocks **48,346,729 / 48,592,381 / 48,853,251** all **ABSENT** from leg A while leg A's frontier had advanced to **48,970,459** — i.e. **117k–624k blocks PAST** them | Checkpoint ahead of persisted data: leg A reports complete past rows it never stored |
+| Wall-clock skew between the two runs | **CLOSED** ≈52,438 s → ≈5,228 s (leg A caught up at the tip) | A merely mid-catch-up (α) leg would be shrinking its gap |
+| Leg-B-only set between the same two runs | **GREW** — blocks 3,147 → 3,719 · logs 12,428 → 14,746 · txs 3,164 → 3,817 | A live-at-tip leg still missing scattered rows behind it — the **β silent-gap signature** |
+
+A transient α gap **shrinks** as the leg catches up. Here the skew closed **and the gap grew** — leg A
+reached the tip while its hole behind the frontier kept widening. **α is excluded; this is the persistent
+β silent gap.**
+
+**Comparative mechanism (the point of the A/B soak).** An RPC-realtime baseline at a typical provider
+rate limit **structurally cannot keep pace with a fast chain** once its rate budget saturates. The soak
+makes that a first-class comparative measurement across chain speeds: on a fast chain (Arbitrum,
+~4 blocks/s) the RPC leg falls ~**1.3M blocks** behind and persists essentially **no** matched events —
+total event loss; on **Base** it drops **scattered** rows — the β gap documented here; on **Ethereum**
+(slower) it **keeps up**. Throughout, the **Portal-native leg (B) stayed complete, live, and chain-true at
+a 1–4 ms indexing cadence**. This is favorable, identical-app / identical-host **comparative evidence for
+the Portal path — not a Portal defect**: the differ FAIL is a **true-positive detection of a leg-A
+(RPC-realtime baseline) gap**, exactly what the A/B design exists to catch.
+
+**Relationship to existing findings.** This is the **same class as [#36](../../issues/36)** (chain 1,
+§5.1) — RPC-realtime scattered silent row loss where leg B holds the chain-true rows — now **observed and
+store-confirmed on chain 8453 (Base)**. It is the second chain on which the #36 shape has been directly
+witnessed.
+
+**Config follow-up (already landed).** **[#190](../../pull/190)** (merged) added an 8453 floor to the
+issue-#36 tolerated-`onlyB` class
+(`TOLERATED_ONLYB_CLASSES.issue36OnlyBRowLoss.perChainFloor`, value **`48092254`** — the **measured
+realtime-era cutover** on Base), reclassifying these `onlyB` rows from a hard FAIL into the **reported +
+spot-auditable** issue-#36 class, mirroring what chain 1 already does (§5.3). The floor value is the
+measured realtime-era cutover — a floor **≥** the true cutover — so no *below-cutover* historical-backfill
+gap can ever be masked by it: below the floor leg A's store came from the complete-by-construction Portal
+historical backfill, and any A-missing row there is still a hard FAIL. A chain with `onlyB` rows but **no**
+configured floor remains a hard FAIL (unknown chains are never default-tolerated). The tolerance is only
+ever as sound as its external control; it is a **reported, spot-auditable exception**, removed when leg A
+is repaired or the RPC-realtime leg is retired.
 
 ---
 
