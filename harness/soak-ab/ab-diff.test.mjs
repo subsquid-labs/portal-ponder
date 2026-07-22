@@ -1130,18 +1130,26 @@ test('FINDING 3 — buildTxSql SELECT column order matches the classifySharedTx 
 // classifyBucketMismatches only excuses a bucket md5 mismatch that is EXACTLY the tolerated onlyB rows.
 // Each adversarial case below is its own test; the PR body records which clause each mutation guards.
 
-// The shipped chain-1 realtime-era floor (issue #36). Tolerated cases sit at/above it; sub-floor below.
+// The shipped realtime-era floors (issue #36). Tolerated cases sit at/above the chain's floor; sub-floor
+// below is a HARD FAIL. Sourced from the config so a floor change here breaks the binding tests.
 const ISSUE_36_FLOOR_1 = 25445239; // TOLERATED_ONLYB_CLASSES.issue36OnlyBRowLoss.perChainFloor[1]
+// Base chain 8453 — its measured realtime-era cutover; an INDEPENDENT literal that coincides with issue
+// #27's 8453 floor today by design (the two classes are deliberately kept as separate literals).
+const ISSUE_36_FLOOR_8453 =
+  TOLERATED_ONLYB_CLASSES.issue36OnlyBRowLoss.perChainFloor[8453];
 
-test('classifyOnlyBRow: config ships chain 1 ONLY at the measured realtime-era floor', () => {
+test('classifyOnlyBRow: config ships chain 1 AND Base 8453 at their measured realtime-era floors', () => {
   assert.equal(
     TOLERATED_ONLYB_CLASSES.issue36OnlyBRowLoss.perChainFloor[1],
     ISSUE_36_FLOOR_1,
   );
-  // ship chain 1 ONLY — 8453/42161 are currently clean on this class and must NOT be pre-tolerated.
+  // 8453 was confirmed lossy (leg-A silent gap, leg-B chain-true) by direct store inspection 2026-07-22
+  // → configured at its measured realtime-era cutover, the value issue #27 also measured for 8453.
+  assert.equal(ISSUE_36_FLOOR_8453, 48092254);
+  // ship chain 1 + 8453 ONLY — 42161 is currently clean on this class and must NOT be pre-tolerated.
   assert.deepEqual(
     Object.keys(TOLERATED_ONLYB_CLASSES.issue36OnlyBRowLoss.perChainFloor),
-    ['1'],
+    ['1', '8453'],
   );
   // open-ended window by design (the class grows while leg A stays lossy).
   assert.equal(TOLERATED_ONLYB_CLASSES.issue36OnlyBRowLoss.toBlock, null);
@@ -1167,17 +1175,37 @@ test('classifyOnlyBRow: an onlyB row BELOW the chain-1 floor → mismatch (HARD 
   );
 });
 
+test('classifyOnlyBRow: an onlyB row at/above the Base 8453 floor → tolerated', () => {
+  // 8453 is now a configured issue-#36 chain (leg-A silent gap DB-confirmed 2026-07-22). At/above its
+  // measured realtime-era floor an onlyB row is the tolerated shape. MUTATION (revert the 8453 config
+  // line) → this fails (no floor for 8453 → 'mismatch').
+  assert.equal(
+    classifyOnlyBRow({ blockNumber: ISSUE_36_FLOOR_8453 }, 8453),
+    'tolerated',
+  );
+  assert.equal(
+    classifyOnlyBRow({ blockNumber: ISSUE_36_FLOOR_8453 + 100_000 }, 8453),
+    'tolerated',
+  );
+});
+
+test('classifyOnlyBRow: an onlyB row BELOW the Base 8453 floor → mismatch (HARD FAIL — no below-cutover gap is ever masked)', () => {
+  // Below the 8453 cutover leg A's store came from the complete-by-construction historical backfill, so
+  // an A-missing row there is a real, hard gap. MUTATION (drop the `block >= floor` clause) → this fails.
+  assert.equal(
+    classifyOnlyBRow({ blockNumber: ISSUE_36_FLOOR_8453 - 1 }, 8453),
+    'mismatch',
+  );
+});
+
 test('classifyOnlyBRow: a chain with NO configured floor → mismatch (HARD FAIL, the #30 missing-floor semantic)', () => {
-  // chains 8453 and 42161 are NOT in the shipped config → an onlyB row there is a hard fail, never a
-  // default-tolerate. MUTATION (default-tolerate an unknown chain) → this fails.
+  // 42161 is NOT in the shipped config, nor is a synthetic unknown chain → an onlyB row there is a hard
+  // fail, never a default-tolerate. MUTATION (default-tolerate an unknown chain) → this fails.
   assert.equal(
-    classifyOnlyBRow({ blockNumber: ISSUE_36_FLOOR_1 }, 8453),
+    classifyOnlyBRow({ blockNumber: ISSUE_36_FLOOR_1 }, 42161),
     'mismatch',
   );
-  assert.equal(
-    classifyOnlyBRow({ blockNumber: 999_999_999 }, 42161),
-    'mismatch',
-  );
+  assert.equal(classifyOnlyBRow({ blockNumber: 999_999 }, 999_999), 'mismatch');
 });
 
 test('classifyOnlyBRow: a deleted/absent config entry → mismatch for all (full strictness restored)', () => {
@@ -1254,12 +1282,14 @@ test('classifyOnlyBDiff: 88 tolerated + 1 below-floor onlyB → HARD FAIL (the b
 });
 
 test('classifyOnlyBDiff: onlyB rows on an unconfigured chain → HARD FAIL (missing floor)', () => {
+  // 42161 is NOT in the shipped config → every onlyB row on it is a hard fail (missing-floor semantic),
+  // no default-tolerate. (8453 was moved out of this role — it is now a configured issue-#36 chain.)
   const diff = { onlyA: 0, onlyB: 2, mismatch: 0 };
   const rows = [
     onlyBRow(ISSUE_36_FLOOR_1, 0),
     onlyBRow(ISSUE_36_FLOOR_1 + 1, 1),
   ];
-  const r = classifyOnlyBDiff(diff, rows, 8453);
+  const r = classifyOnlyBDiff(diff, rows, 42161);
   assert.equal(r.fail, true);
   assert.equal(r.hardOnlyB, 2);
   assert.equal(r.toleratedOnlyB.count, 0);
@@ -1318,10 +1348,36 @@ test('classifyOnlyBTx: a wholly-A-absent block BELOW the floor → mismatch (the
   );
 });
 
+test('classifyOnlyBTx: Base 8453 — a wholly-A-absent block at/above the floor → tolerated', () => {
+  // 8453 is now a configured issue-#36 chain. A tx whose block is WHOLLY absent from leg A, at/above the
+  // 8453 realtime-era floor, is the tolerated shape. MUTATION (revert the 8453 config line) → this fails
+  // (no floor for 8453 → 'mismatch').
+  const absent = new Set([ISSUE_36_FLOOR_8453, ISSUE_36_FLOOR_8453 + 5]);
+  assert.equal(
+    classifyOnlyBTx({ blockNumber: ISSUE_36_FLOOR_8453 }, 8453, absent),
+    'tolerated',
+  );
+  assert.equal(
+    classifyOnlyBTx({ blockNumber: ISSUE_36_FLOOR_8453 + 5 }, 8453, absent),
+    'tolerated',
+  );
+});
+
+test('classifyOnlyBTx: Base 8453 — a wholly-A-absent block BELOW the floor → mismatch (the floor conjunct still bites)', () => {
+  // Below the 8453 cutover leg A came from the historical backfill, so even a wholly-absent block there
+  // is a real gap, never this class. MUTATION (drop the `block >= floor` clause) → this fails.
+  const absent = new Set([ISSUE_36_FLOOR_8453 - 1]);
+  assert.equal(
+    classifyOnlyBTx({ blockNumber: ISSUE_36_FLOOR_8453 - 1 }, 8453, absent),
+    'mismatch',
+  );
+});
+
 test('classifyOnlyBTx: an unconfigured chain (no floor) → mismatch even for a wholly-absent block (the #30 missing-floor semantic)', () => {
+  // 42161 is NOT in the shipped config → not default-tolerated even for a wholly-A-absent block.
   const absent = new Set([ISSUE_36_FLOOR_1]);
   assert.equal(
-    classifyOnlyBTx({ blockNumber: ISSUE_36_FLOOR_1 }, 8453, absent),
+    classifyOnlyBTx({ blockNumber: ISSUE_36_FLOOR_1 }, 42161, absent),
     'mismatch',
   );
 });
