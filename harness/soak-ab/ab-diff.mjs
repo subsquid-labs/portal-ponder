@@ -564,38 +564,6 @@ export async function collectReferenced(hashes, lookup, size = 5000) {
   return referenced;
 }
 
-// A membership predicate — `<col> = any(string_to_array('h1,h2,…', ','))` — that reaches ONE column
-// against a set of hash strings as a SINGLE parse node: the whole list rides as one string literal
-// (Const), which `string_to_array` splits into a text[] and `= any(...)` membership-tests, BOTH at
-// EXECUTION, so the parse tree is flat and constant-shape for any N. Result set is byte-identical to
-// the old `col in ('h1','h2',…)` IN-list (same equality membership, same rows — verified on an
-// ephemeral PG16 at 3000 present / 2000 absent hashes: identical output).
-//
-// WHY move off the IN-list, and the honest caveat: a *scalar* `col in (const-list)` is NOT actually a
-// parse-stack hazard — Postgres transforms it to a single flat `ScalarArrayOpExpr`, so it parses
-// cleanly even at 500_000 literals (empirically confirmed on PG16 @ 2 MB max_stack_depth). The
-// confirmed `stack depth limit exceeded` thrower on chain 1 is the SIBLING row-value IN-list in
-// buildBucketExclusionFilter (`(a,b) in ((x,y),…)` → a right-recursive OR/AND tree that overflows at
-// ~7_000 pairs); see its note. This array form is therefore a DEFENSIVE, uniform hardening of the
-// referenced lookup — same flat-parse guarantee, provably byte-identical rows, zero downside — not the
-// fix for the observed crash. It also complements #189: stdin (`-f -`) escaped the argv MAX_ARG_STRLEN
-// (E2BIG) cap; this keeps the list a single Const so no list-shaped query can ever be the parse hazard.
-//
-// INJECTION SURFACE: the values are ponder tx hashes — `0x`+hex, produced by the sync store, never
-// user input. We still defensively strip any `'` (so a stray quote can't close the literal) AND any
-// `,` (the array delimiter — a comma inside a value would split it into two phantom elements). A hex
-// hash contains neither, so this is a no-op on real data and a hard guard on anything malformed.
-// Empty batch ⇒ `false` (matches nothing) rather than an empty `any('{}')` — same zero-row result,
-// no degenerate SQL. Pure + exported so the flat-parse shape is asserted without psql.
-export function hashArrayMembership(col, hashes) {
-  const list = (hashes ?? []).map((h) => String(h).replace(/[',]/g, ''));
-  if (list.length === 0) {
-    return 'false';
-  }
-
-  return `${col} = any(string_to_array('${list.join(',')}', ','))`;
-}
-
 // _ponder_checkpoint (or any progress value) must never go backwards across runs.
 export function checkpointMonotonic(values) {
   for (let i = 1; i < values.length; i++) {
@@ -1725,9 +1693,19 @@ async function diffTx(urlA, urlB, chain, lo, hi) {
   // classifyTxDiff saw every gap as unreferenced and mass-FAILed a healthy run. collectReferenced
   // accumulates across every chunk so any onlyA size is fully verified.
   const referenced = await collectReferenced(onlyA, (batch) => {
+    // Scalar IN-list over ponder tx hashes (`0x`+hex from the sync store, `'`-stripped defensively).
+    // Kept as a plain scalar `col in (...)` — NOT a parse-stack hazard: Postgres flattens a scalar
+    // `col in (const-list)` to a single ScalarArrayOpExpr, so it parses cleanly even at 500_000
+    // literals (confirmed on an ephemeral PG16 @ 2 MB max_stack_depth). It was never the chain-1
+    // `stack depth limit exceeded` thrower — that is the ROW-VALUE IN-list in
+    // buildBucketExclusionFilter (see its note). Scalar IN is also more index-friendly than
+    // `= any(text[])`, and #189's stdin (`-f -`) already escaped the argv MAX_ARG_STRLEN/E2BIG cap
+    // for this list, so it needs no array rewrite.
+    const inList = batch.map((h) => `'${h.replace(/'/g, '')}'`).join(',');
+
     return psqlList(
       urlA,
-      `select distinct transaction_hash from ponder_sync.logs where chain_id=${chain} and ${hashArrayMembership('transaction_hash', batch)}`,
+      `select distinct transaction_hash from ponder_sync.logs where chain_id=${chain} and transaction_hash in (${inList})`,
     );
   });
 
@@ -1761,16 +1739,23 @@ async function bucketHashes(url, chain, lo, hi, bucket) {
 // A SQL predicate excluding a set of specific log rows by their (block_number, log_index) identity, for
 // recomputing leg B's per-bucket md5 with the tolerated issue #36 onlyB rows removed. `rows` are the
 // tolerated onlyB LOG rows ({ blockNumber, logIndex }); block-table onlyB rows have no log_index and are
-// irrelevant to the LOGS bucket hashes, so they are dropped. Emits the FLAT-PARSE array form
-// `and not (block_number::text || '/' || log_index::text = any('{b0/i0,b1/i1,…}'::text[]))` (see the
-// return below for why this shape and not a row-value `in (…)` list). Empty ⇒ '' (no exclusion).
-// Numbers are coerced via Number() and formatted as integers, so no string injection is possible from
-// these internally-derived keys, and the `b/i` composite key is injective over integers. Pure + exported
-// so the exclusion contract is asserted without psql. The bucket-explained attribution in
-// classifyBucketMismatches depends on this excluding EXACTLY the tolerated rows and nothing else — an
-// over- or under-exclusion here would mis-attribute a bucket, so its shape is mutation-verified.
+// irrelevant to the LOGS bucket hashes, so they are dropped. Emits the NUMERIC-EXACT FLAT-PARSE anti-join
+// `and not exists (select 1 from unnest('{b0,b1,…}'::int8[], '{i0,i1,…}'::int4[]) as e(b, i)
+//                  where e.b = block_number and e.i = log_index)` (see the return below for why this
+// shape and not a row-value `in (…)` list). Empty ⇒ '' (no exclusion). Pure + exported so the exclusion
+// contract is asserted without psql. The bucket-explained attribution in classifyBucketMismatches
+// depends on this excluding EXACTLY the tolerated rows and nothing else — an over- or under-exclusion
+// here would mis-attribute a bucket, so its shape is mutation-verified.
+//
+// DOMAIN INVARIANT the numeric-exact form relies on: in the ponder sync store the logs table's
+// block_number is `bigint NOT NULL` (int8) and log_index is `integer NOT NULL` (int4) — see the drizzle
+// sync-store schema (ponder@0.17.x packages/core/src/sync-store/schema.js: `logs` — blockNumber
+// `t.bigint({ mode: 'bigint' }).notNull()`, logIndex `t.integer().notNull()`). Both columns are
+// therefore non-null integers on the SAME numeric scale as the array elements below, so the comparison
+// is a pure int=int join with no NULL, no numeric-vs-text, and no unsafe-integer render to reason about.
 export function buildBucketExclusionFilter(rows) {
-  const keys = [];
+  const blocks = [];
+  const indexes = [];
   for (const r of rows ?? []) {
     const b = Number(r.blockNumber);
     const i = Number(r.logIndex);
@@ -1778,29 +1763,37 @@ export function buildBucketExclusionFilter(rows) {
       continue;
     }
 
-    // A single composite key `b/i` per excluded pair. b and i are Number()-coerced finite integers, so
-    // their text renderings are pure `[0-9]` (non-negative block heights / log indices) — the separator
-    // `/` and the array-element delimiter `,` appear in NEITHER. That makes the encoding INJECTIVE (no
-    // `(1/,'')` vs `(1,'/')` collision is possible when both components are digit-only) and free of any
-    // string-injection surface. `${b}` renders the integer, not the raw input, so garbage never leaks.
-    keys.push(`${b}/${i}`);
+    // b and i are Number()-coerced finite integers rendered by `${b}`/`${i}`, so each array element is a
+    // pure `[0-9-]` integer literal — NOT the raw input. `Number.isFinite` already dropped NaN/Infinity,
+    // and the numeric render carries no `'`, `,`, `{`, `}` or other array-literal metacharacter, so there
+    // is NO string-injection surface and NO text-render equivalence to argue: correctness rests only on
+    // int=int equality, not on how a value stringifies.
+    blocks.push(`${b}`);
+    indexes.push(`${i}`);
   }
-  if (keys.length === 0) {
+  if (blocks.length === 0) {
     return '';
   }
 
-  // FLAT-PARSE form (mirrors hashArrayMembership): the excluded pairs ride as ONE string-array Const —
-  // `= any('{b0/i0,b1/i1,…}'::text[])` — a single parse node, expanded to an array and membership-tested
-  // at EXECUTION. The prior `(block_number, log_index) in ((b0,i0),…)` was the REAL parse-stack bomb:
-  // Postgres has no ScalarArrayOpExpr for row types, so it expands the row-value IN-list into a
-  // right-recursive `(a=x0 AND b=y0) OR (a=x1 AND b=y1) OR …` tree — O(N) deep — which overran the
-  // server's 2 MB `max_stack_depth` at PARSE time (`ERROR: stack depth limit exceeded`), reproduced on
-  // an ephemeral PG16 to throw at ~7_000 pairs. On chain 1 (the largest onlyA/onlyB set) the tolerated
-  // issue-#36 onlyB set can exceed that. The composite-key match is EQUIVALENT to the pair IN test:
-  // `block_number::text || '/' || log_index::text` uniquely (injectively — both are digit-only
-  // integers) encodes each (block, index) pair, so `not (... = any(...))` excludes EXACTLY the given
-  // pairs and nothing else (mutation-verified; byte-identical rows to the old form on ephemeral PG16).
-  return ` and not (block_number::text || '/' || log_index::text = any('{${keys.join(',')}}'::text[]))`;
+  // NUMERIC-EXACT FLAT-PARSE form: the excluded (block, index) pairs ride as TWO parallel array Consts —
+  // an int8[] of block numbers and an int4[] of log indices — each a SINGLE parse node (one Const), so
+  // the parse tree is flat and constant-shape for any N. Postgres multi-argument `unnest(arr1, arr2)`
+  // expands the two arrays ROW-WISE (element k of arr1 zipped with element k of arr2 — NOT a
+  // cross-product), so row k reconstructs exactly the pair (b_k, i_k); the anti-join `not exists (… where
+  // e.b = block_number and e.i = log_index)` then excludes EXACTLY those pairs and nothing else, compared
+  // int=int (see the DOMAIN INVARIANT above). Because the pairing is reconstructed positionally from the
+  // two int arrays, (12,3) and (1,23) stay DISTINCT and a would-be cross-product (12,23) is never excluded
+  // — no separator/collision reasoning needed. This REPLACES the prior `(block_number, log_index) in
+  // ((b0,i0),…)` row-value IN-list, which was the REAL parse-stack bomb: Postgres has no ScalarArrayOpExpr
+  // for row types, so it expanded that list into a right-recursive `(a=x0 AND b=y0) OR (a=x1 AND b=y1) OR …`
+  // tree — O(N) deep — overrunning the server's 2 MB `max_stack_depth` at PARSE time (`ERROR: stack depth
+  // limit exceeded`, reproduced on an ephemeral PG16 at ~7_000 pairs). On chain 1 (the largest onlyA/onlyB
+  // set) the tolerated issue-#36 onlyB set can exceed that. Mutation-verified; byte-identical excluded
+  // rows to the old form on an ephemeral PG16, flat-parse (clean) at ≥50k pairs.
+  return (
+    ` and not exists (select 1 from unnest('{${blocks.join(',')}}'::int8[], ` +
+    `'{${indexes.join(',')}}'::int4[]) as e(b, i) where e.b = block_number and e.i = log_index)`
+  );
 }
 
 // Recompute leg B's per-bucket LOG md5 with the tolerated issue #36 onlyB rows EXCLUDED, so
