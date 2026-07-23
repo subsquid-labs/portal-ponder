@@ -45,6 +45,7 @@ import {
   formatKnownBadRowsLine,
   formatToleratedIssue27Line,
   formatToleratedIssue36Line,
+  hashArrayMembership,
   knownBadRows,
   ONLYB_ROW_CAP,
   psqlArgs,
@@ -170,6 +171,89 @@ test('collectReferenced: unions referenced hashes across EVERY chunk (any onlyA 
     false,
     'a fully-referenced large onlyA is the expected gap, not a FAIL',
   );
+});
+
+// ── the referenced-parent-tx membership predicate must be FLAT-PARSE (defensive; see the source note).
+// A *scalar* `transaction_hash in ('h1',…)` is NOT itself a stack-depth hazard — Postgres flattens it
+// to one ScalarArrayOpExpr (clean at 500k literals on PG16). This array form is a uniform, provably
+// byte-identical hardening so no list-shaped query can EVER be the parse hazard; the confirmed chain-1
+// `stack depth limit exceeded` thrower is the sibling row-value IN-list in buildBucketExclusionFilter.
+// These assert the flat single-Const shape for a LARGE batch; the mutation below reds them on revert.
+
+test('hashArrayMembership: emits the single-Const array form, never a per-element IN-list', () => {
+  const pred = hashArrayMembership('transaction_hash', [
+    '0xaa',
+    '0xbb',
+    '0xcc',
+  ]);
+  assert.equal(
+    pred,
+    "transaction_hash = any(string_to_array('0xaa,0xbb,0xcc', ','))",
+    'the whole list rides as ONE string literal split at execution, not N literals',
+  );
+});
+
+test('hashArrayMembership: a 10_000-hash batch stays a flat single-Const predicate (no O(N) parse nodes)', () => {
+  // The exact chain-1 regression shape: a big batch. The FLAT form has EXACTLY ONE string literal and
+  // no comma-separated SQL scalar predicates / ARRAY[ constructor — so its parse tree is constant-shape
+  // for any N (what keeps it off the max_stack_depth cliff). A revert to the old IN-list would produce
+  // ~10_000 quoted scalars between `in (` … `)`, which these assertions reject.
+  const hashes = Array.from(
+    { length: 10_000 },
+    (_, i) => `0x${i.toString(16).padStart(64, '0')}`,
+  );
+  const pred = hashArrayMembership('transaction_hash', hashes);
+
+  // (a) the single-Const array form — one string_to_array call, one `= any(`
+  assert.match(
+    pred,
+    /= any\(string_to_array\('/,
+    'uses = any(string_to_array(...))',
+  );
+  assert.equal(
+    (pred.match(/string_to_array\(/g) ?? []).length,
+    1,
+    'exactly ONE string literal (one Const parse node) for the whole batch',
+  );
+
+  // (b) NOT the old per-element forms — no ` in (`, no ARRAY[ constructor
+  assert.ok(
+    !/\bin\s*\(/.test(pred),
+    'not a `in (…)` IN-list (N sibling parse nodes)',
+  );
+  assert.ok(
+    !/ARRAY\s*\[/i.test(pred),
+    'not an ARRAY[…] constructor (N ArrayExpr parse nodes)',
+  );
+
+  // (c) there is exactly ONE `'`-delimited literal — the whole list — not 10_000 quoted scalars.
+  assert.equal(
+    (pred.match(/'/g) ?? []).length,
+    4,
+    "exactly two string literals' worth of quotes (the list + the ',' delimiter), not 2*N",
+  );
+
+  // (d) the FULL batch is present, in order, comma-joined inside that one literal (no truncation).
+  assert.ok(
+    pred.includes(`'${hashes.join(',')}'`),
+    'the entire 10_000-hash list is the single string literal, byte-for-byte',
+  );
+});
+
+test('hashArrayMembership: strips both quote and comma from values (no injection, no phantom split)', () => {
+  // Hashes are 0x-hex (never a quote or comma), but a malformed value must never close the literal or
+  // split into a phantom element. Both `'` and the array delimiter `,` are stripped.
+  const pred = hashArrayMembership('transaction_hash', ["0xaa'", '0xb,b']);
+  assert.equal(
+    pred,
+    "transaction_hash = any(string_to_array('0xaa,0xbb', ','))",
+    'quote and internal comma removed → no injection, no element split',
+  );
+});
+
+test('hashArrayMembership: an empty batch → `false` (matches nothing), never degenerate SQL', () => {
+  assert.equal(hashArrayMembership('transaction_hash', []), 'false');
+  assert.equal(hashArrayMembership('transaction_hash', undefined), 'false');
 });
 
 test('checkpointMonotonic: non-decreasing passes, a regression fails at the point', () => {
@@ -1564,7 +1648,7 @@ test('buildBucketExclusionFilter: excludes exactly the given (block_number, log_
   ]);
   assert.equal(
     filter,
-    ' and not ((block_number, log_index) in ((25455946, 989), (25455946, 990), (25455045, 3)))',
+    " and not (block_number::text || '/' || log_index::text = any('{25455946/989,25455946/990,25455045/3}'::text[]))",
   );
 });
 
@@ -1582,7 +1666,63 @@ test('buildBucketExclusionFilter: rows without a finite (block, index) are dropp
   ]);
   assert.equal(
     filter,
-    ' and not ((block_number, log_index) in ((25455946, 989)))',
+    " and not (block_number::text || '/' || log_index::text = any('{25455946/989}'::text[]))",
+  );
+});
+
+test('buildBucketExclusionFilter: a LARGE excluded set stays a flat single-Const array (no RowExpr IN-list)', () => {
+  // The CONFIRMED chain-1 stack-depth thrower: the old `(block_number, log_index) in ((b0,i0),…)` was a
+  // row-value IN-list Postgres expands into a right-recursive OR/AND tree — O(N) deep — which overran
+  // the 2 MB max_stack_depth at parse time (reproduced throwing at ~7_000 pairs on an ephemeral PG16).
+  // Normally the tolerated-onlyB set is tiny, but on chain 1 it can exceed that. Assert the flat
+  // single-Const array form even for a large set.
+  const rows = Array.from({ length: 5_000 }, (_, i) =>
+    onlyBRow(1_000_000 + i, i),
+  );
+  const filter = buildBucketExclusionFilter(rows);
+
+  // (a) single array-literal Const, membership-tested at execution
+  assert.match(
+    filter,
+    /= any\('\{.*\}'::text\[\]\)\)$/s,
+    "uses = any('{…}'::text[]) — one Const parse node",
+  );
+  assert.equal(
+    (filter.match(/::text\[\]/g) ?? []).length,
+    1,
+    'exactly ONE array literal for the whole excluded set',
+  );
+
+  // (b) NOT the old RowExpr IN-list — no `(block_number, log_index) in (`
+  assert.ok(
+    !/\(block_number,\s*log_index\)\s+in\s*\(/.test(filter),
+    'not the row-value-constructor IN-list (N RowExpr parse nodes)',
+  );
+  assert.ok(!/\bin\s*\(/.test(filter), 'no `in (…)` list at all');
+
+  // (c) the composite key uniquely encodes each pair, in order, comma-joined inside the one literal.
+  const expectedKeys = rows
+    .map((r) => `${r.blockNumber}/${r.logIndex}`)
+    .join(',');
+  assert.ok(
+    filter.includes(`'{${expectedKeys}}'::text[]`),
+    'every excluded pair is present as its b/i composite key, byte-for-byte',
+  );
+});
+
+test('buildBucketExclusionFilter: composite key is injective — distinct pairs never collide', () => {
+  // The `b/i` encoding is collision-free ONLY because both components are digit-only integers (no `/`
+  // in either), so `(1, 23)`, `(12, 3)` and `(123, 0)` must produce THREE distinct keys — a naive
+  // separator-less concat ("123") would merge them and under-exclude. Assert the three keys are unique.
+  const filter = buildBucketExclusionFilter([
+    onlyBRow(1, 23),
+    onlyBRow(12, 3),
+    onlyBRow(123, 0),
+  ]);
+  assert.equal(
+    filter,
+    " and not (block_number::text || '/' || log_index::text = any('{1/23,12/3,123/0}'::text[]))",
+    'each distinct (block, index) pair maps to a distinct key — no collision',
   );
 });
 
