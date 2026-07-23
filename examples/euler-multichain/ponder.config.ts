@@ -41,7 +41,7 @@ const MAINNET_FULL_END = 25_423_884;
 // starts at the first EVault ProxyCreated (verified against the Portal dataset) rather than the
 // factory-deploy block — otherwise the ~DEMO_SPAN window lands in an empty pre-vault range and the
 // chain indexes zero events. FULL still backfills from the factory-deploy block.
-const BASE_DEMO_START = 36_016_000; // first EVault ProxyCreated on base: 36_016_090
+const BASE_DEMO_START = 22_952_000; // first EVault ProxyCreated on base: 22_952_393
 const BASE_FULL_START = 18_000_000;
 const BASE_FULL_END = 47_979_047;
 const ARBITRUM_DEMO_START = 317_852_000; // first EVault ProxyCreated on arbitrum: 317_852_641
