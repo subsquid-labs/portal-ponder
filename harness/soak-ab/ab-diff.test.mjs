@@ -1562,9 +1562,12 @@ test('buildBucketExclusionFilter: excludes exactly the given (block_number, log_
     onlyBRow(25455946, 990),
     onlyBRow(25455045, 3),
   ]);
+  // NUMERIC-EXACT anti-join: two PARALLEL integer array Consts (int8[] blocks, int4[] indices) zipped
+  // row-wise by multi-arg unnest, then an anti-join on int=int equality. The k-th block pairs with the
+  // k-th index, so this excludes EXACTLY these three pairs.
   assert.equal(
     filter,
-    ' and not ((block_number, log_index) in ((25455946, 989), (25455946, 990), (25455045, 3)))',
+    " and not exists (select 1 from unnest('{25455946,25455946,25455045}'::int8[], '{989,990,3}'::int4[]) as e(b, i) where e.b = block_number and e.i = log_index)",
   );
 });
 
@@ -1574,7 +1577,8 @@ test('buildBucketExclusionFilter: an empty set → empty string (no exclusion)',
 });
 
 test('buildBucketExclusionFilter: rows without a finite (block, index) are dropped, never injected', () => {
-  // a block-table onlyB row has no logIndex; a NaN/garbage key must never leak into the SQL.
+  // a block-table onlyB row has no logIndex; a NaN/garbage value must never leak into the SQL. The two
+  // arrays must stay POSITIONALLY ALIGNED after drops — the surviving pair keeps its block WITH its index.
   const filter = buildBucketExclusionFilter([
     { blockNumber: 25455946 }, // no logIndex → dropped
     { blockNumber: 'x', logIndex: 5 }, // non-finite block → dropped
@@ -1582,7 +1586,74 @@ test('buildBucketExclusionFilter: rows without a finite (block, index) are dropp
   ]);
   assert.equal(
     filter,
-    ' and not ((block_number, log_index) in ((25455946, 989)))',
+    " and not exists (select 1 from unnest('{25455946}'::int8[], '{989}'::int4[]) as e(b, i) where e.b = block_number and e.i = log_index)",
+  );
+});
+
+test('buildBucketExclusionFilter: a LARGE excluded set stays a flat two-Const anti-join (no RowExpr IN-list)', () => {
+  // The CONFIRMED chain-1 stack-depth thrower: the old `(block_number, log_index) in ((b0,i0),…)` was a
+  // row-value IN-list Postgres expands into a right-recursive OR/AND tree — O(N) deep — which overran
+  // the 2 MB max_stack_depth at parse time (reproduced throwing at ~7_000 pairs on an ephemeral PG16).
+  // Normally the tolerated-onlyB set is tiny, but on chain 1 it can exceed that. Assert the flat
+  // two-Const anti-join form even for a large set.
+  const rows = Array.from({ length: 5_000 }, (_, i) =>
+    onlyBRow(1_000_000 + i, i),
+  );
+  const filter = buildBucketExclusionFilter(rows);
+
+  // (a) the numeric-exact anti-join over two array-literal Consts, zipped by multi-arg unnest
+  assert.match(
+    filter,
+    /^ and not exists \(select 1 from unnest\('\{.*\}'::int8\[\], '\{.*\}'::int4\[\]\) as e\(b, i\) where e\.b = block_number and e\.i = log_index\)$/s,
+    'uses `not exists (… unnest(int8[], int4[]) …)` — two Const parse nodes',
+  );
+  // exactly ONE int8[] block array and ONE int4[] index array (each a single Const), never per-pair
+  assert.equal(
+    (filter.match(/::int8\[\]/g) ?? []).length,
+    1,
+    'exactly ONE int8[] block array for the whole excluded set',
+  );
+  assert.equal(
+    (filter.match(/::int4\[\]/g) ?? []).length,
+    1,
+    'exactly ONE int4[] index array for the whole excluded set',
+  );
+
+  // (b) NOT the old RowExpr IN-list — no `(block_number, log_index) in (`, no list at all
+  assert.ok(
+    !/\(block_number,\s*log_index\)\s+in\s*\(/.test(filter),
+    'not the row-value-constructor IN-list (N RowExpr parse nodes)',
+  );
+  assert.ok(!/\bin\s*\(/.test(filter), 'no `in (…)` list at all');
+
+  // (c) the two arrays carry every block and index in order (positionally aligned), byte-for-byte.
+  const expectedBlocks = rows.map((r) => r.blockNumber).join(',');
+  const expectedIndexes = rows.map((r) => r.logIndex).join(',');
+  assert.ok(
+    filter.includes(`'{${expectedBlocks}}'::int8[]`),
+    'every excluded block is present in the int8[] array, in order, byte-for-byte',
+  );
+  assert.ok(
+    filter.includes(`'{${expectedIndexes}}'::int4[]`),
+    'every excluded index is present in the int4[] array, in order, byte-for-byte',
+  );
+});
+
+test('buildBucketExclusionFilter: pairing is positional/injective — distinct pairs never collide, no cross-product', () => {
+  // The anti-join reconstructs each pair POSITIONALLY from the two int arrays (unnest zips element k of
+  // blocks with element k of indices), so (1,23), (12,3) and (123,0) stay THREE DISTINCT pairs. A naive
+  // separator-less string concat would merge (1,23) and (12,3) into "123" and under-exclude; a
+  // cross-product over the arrays would wrongly also exclude (1,0), (12,23), (123,3) etc. Assert the
+  // exact zipped shape: block k lines up with index k, and nothing cross-pairs.
+  const filter = buildBucketExclusionFilter([
+    onlyBRow(1, 23),
+    onlyBRow(12, 3),
+    onlyBRow(123, 0),
+  ]);
+  assert.equal(
+    filter,
+    " and not exists (select 1 from unnest('{1,12,123}'::int8[], '{23,3,0}'::int4[]) as e(b, i) where e.b = block_number and e.i = log_index)",
+    'blocks {1,12,123} zip position-for-position with indices {23,3,0} — (1,23),(12,3),(123,0), never a cross-product',
   );
 });
 
