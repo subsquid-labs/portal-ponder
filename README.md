@@ -99,7 +99,7 @@ Full adoption path — check, swap, run, validate, roll back — in [`MIGRATION.
 
 | Ponder | `@subsquid/ponder` | Status |
 |---|---|---|
-| 0.17.1 | `0.17.1-sqd.1` | **latest** |
+| 0.17.1 | `0.17.1-sqd.2` | **latest** |
 | 0.17.0 | `0.17.0-sqd.1` | published · pin exact (no dist-tag) |
 | 0.16.10 | `0.16.10-sqd.1` | published · dist-tag `ponder-0.16.10` |
 | 0.16.9 | `0.16.9-sqd.1` | published · pin exact (no dist-tag) |
