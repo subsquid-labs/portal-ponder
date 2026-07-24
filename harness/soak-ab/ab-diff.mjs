@@ -2210,7 +2210,13 @@ async function main() {
     // no restart log yet — Soak B not started, or first boot
   }
 
-  const alerts = composeAlerts(results, regressions, restarts);
+  // Verdict-reason taxonomy (skew-arming): present ONLY on a FAIL. Additive telemetry — it does NOT
+  // change `verdict`, the fold, or the exit code, and it never excuses a real failure. A downstream
+  // reader uses `tag` to tell the known §5.13 leg-A-stagnation FAIL (Portal clean) from a genuine
+  // windowed divergence.
+  const failTaxonomy = classifyFailTaxonomy(results, verdict);
+
+  const alerts = composeAlerts(results, regressions, restarts, failTaxonomy);
 
   const toleratedIssue27 = aggregateToleratedIssue27(results);
   const knownBadRowsAgg = aggregateKnownBadRows(results);
@@ -2220,6 +2226,9 @@ async function main() {
     ts: new Date().toISOString(),
     chains: results.map((r) => r.chain),
     verdict,
+    // Only present on a FAIL (classifyFailTaxonomy returns null otherwise), so a PASS/PENDING status
+    // JSON carries no failTaxonomy key at all. Additive: verdict + exit code are untouched.
+    ...(failTaxonomy ? { failTaxonomy } : {}),
     restartCount: restarts.restartCount,
     lastRestartAt: restarts.lastRestartAt,
     restartsLastHour: restarts.restartsLastHour,
@@ -2454,6 +2463,105 @@ export function chainWindowedFail(r) {
   );
 }
 
+// The persist-stagnation reasons that constitute the SUSTAINED leg-A-vs-leg-B stall the §5.13 finding
+// documents: a sticky wedge carried across runs ('wedge-unrecovered') or an empty leg persisting nothing
+// while the other advances ('one-sided-empty'). A FRESH 'frozen' / 'skew-growing' fail is deliberately
+// NOT here — those are this run's first over-threshold observation and are treated as a real/other
+// divergence (the SAFE direction: the benign-skew tag is granted only to the narrow, sustained,
+// staleSide-'A' shape, never to a fresh or ambiguous wedge).
+const LEG_A_STAGNATION_REASONS = new Set([
+  'wedge-unrecovered',
+  'one-sided-empty',
+]);
+
+// A chain result is an ELIGIBLE leg-A stagnation FAIL iff it FAILed, has NO windowed hard-fail of its
+// own (chainWindowedFail false), and its persist-stagnation class is a SUSTAINED wedge with the STALE
+// leg on side A. This is the ONLY shape the skew-arming / likely-A-catchup tag ever applies to. Pure +
+// exported so the eligibility contract is asserted directly, without a DB. Everything it excludes — a
+// staleSide-'B' wedge, a fresh 'frozen'/'skew-growing' wedge, a checkpoint-regression-only FAIL, any
+// windowed hard-fail — is treated as a real divergence below, never excused.
+export function isLegAStagnationFail(r) {
+  if (r?.verdict !== 'FAIL') {
+    return false;
+  }
+  if (chainWindowedFail(r)) {
+    return false;
+  }
+
+  const s = r?.classes?.persistStagnation;
+
+  return Boolean(
+    s?.fail && s.staleSide === 'A' && LEG_A_STAGNATION_REASONS.has(s.reason),
+  );
+}
+
+// A machine-readable classification of WHY the OVERALL verdict is FAIL, so a downstream reader (the
+// RG6/§G5 dossier) can distinguish a leg-A-stagnation FAIL — the KNOWN, Portal-clean §5.13 story where
+// the RPC baseline is chronically starved and its newest-row timestamp freezes — from a genuine
+// windowed Portal-vs-baseline data divergence. It is a SEPARATE, ADDITIVE field: it NEVER changes the
+// `verdict` string, the fold, or the exit code, and it NEVER tolerates or hides a real failure. Derived
+// purely from the SAME per-chain results the verdict fold already used (no DB, no recompute). Pure +
+// exported so the taxonomy is asserted in isolation.
+//
+// Per chain (only FAIL/ERROR chains contribute a non-'clean' class):
+//   'leg-A-stagnation'    — an ELIGIBLE sustained staleSide-'A' wedge with NO windowed hard-fail.
+//   'windowed-divergence' — ANY OTHER kind of FAIL: a windowed hard-fail (logs/blocks/tx/buckets/ERROR),
+//                           OR a non-eligible stall (staleSide-'B', a fresh 'frozen'/'skew-growing'
+//                           wedge), OR a checkpoint-regression-only FAIL. Every non-excusable FAIL folds
+//                           here so nothing genuine is ever mislabelled as the benign leg-A story.
+//   'clean'               — a PASS / PENDING chain (did not contribute to the FAIL).
+//
+// legAStagnationOnly is true IFF at least one chain is 'leg-A-stagnation' AND no chain is
+// 'windowed-divergence' — the pure §5.13 case. tag folds the two contributions:
+//   'skew-arming:likely-A-catchup' — legAStagnationOnly (leg-A stall only, Portal clean).
+//   'windowed-divergence'          — a real divergence with NO leg-A-stagnation contribution.
+//   'mixed'                        — BOTH a leg-A-stagnation FAIL AND a windowed divergence present.
+export function classifyFailTaxonomy(results, verdict) {
+  if (verdict !== 'FAIL') {
+    return null;
+  }
+
+  const list = results ?? [];
+  const perChain = {};
+  let anyLegAStagnation = false;
+  let anyWindowedDivergence = false;
+  for (const r of list) {
+    if (isLegAStagnationFail(r)) {
+      perChain[r.chain] = 'leg-A-stagnation';
+      anyLegAStagnation = true;
+
+      continue;
+    }
+    // Any FAIL/ERROR that is NOT the eligible leg-A shape is a real divergence — never excused. A
+    // PASS/PENDING chain is 'clean' and contributes to neither tag.
+    if (r?.verdict === 'FAIL' || r?.verdict === 'ERROR') {
+      perChain[r.chain] = 'windowed-divergence';
+      anyWindowedDivergence = true;
+
+      continue;
+    }
+
+    perChain[r.chain] = 'clean';
+  }
+
+  const legAStagnationOnly = anyLegAStagnation && !anyWindowedDivergence;
+  let tag;
+  if (legAStagnationOnly) {
+    tag = 'skew-arming:likely-A-catchup';
+  } else if (anyLegAStagnation && anyWindowedDivergence) {
+    tag = 'mixed';
+  } else {
+    tag = 'windowed-divergence';
+  }
+
+  return {
+    legAStagnationOnly,
+    windowedDivergence: anyWindowedDivergence,
+    perChain,
+    tag,
+  };
+}
+
 // Compose the FULL alert list from the run results, the checkpoint regressions, and the restart stats.
 // Pure + exported (D3/D4): the alert composition — crash-loop, checkpoint-regression lines, per-chain
 // stagnation lines, and the generic finalized-diff line's SUPPRESSION logic — is asserted directly.
@@ -2464,7 +2572,12 @@ export function chainWindowedFail(r) {
 // chain Y must still surface it even while chain X carries a stagnation line. Checkpoint regressions
 // have their own precise lines and are NOT a windowed-diff cause, so they do not (by themselves) emit
 // the generic line either.
-export function composeAlerts(results, regressions, restarts) {
+export function composeAlerts(
+  results,
+  regressions,
+  restarts,
+  failTaxonomy = null,
+) {
   const alerts = [];
   if (restarts?.crashLoop) {
     alerts.push(
@@ -2487,6 +2600,20 @@ export function composeAlerts(results, regressions, restarts) {
   if ((results ?? []).some(chainWindowedFail)) {
     alerts.push(
       'finalized-diff: an unexpected finalized-overlap divergence (see diffClasses)',
+    );
+  }
+  // Additive human line for the verdict-reason taxonomy (skew-arming). Present only when a FAIL taxonomy
+  // was computed; it ANNOTATES the FAIL and never suppresses any line above. The pure-leg-A case reads
+  // as the known, Portal-clean §5.13 story; a windowed / mixed case names the real divergence.
+  if (failTaxonomy?.tag === 'skew-arming:likely-A-catchup') {
+    alerts.push(
+      'skew-arming: overall FAIL is leg-A stagnation ONLY (likely-A-catchup) — ' +
+        'RPC baseline starved, no windowed Portal-vs-baseline divergence (see failTaxonomy)',
+    );
+  } else if (failTaxonomy?.tag === 'mixed') {
+    alerts.push(
+      'skew-arming: overall FAIL is MIXED — a leg-A stagnation AND a real windowed divergence ' +
+        'are BOTH present (see failTaxonomy)',
     );
   }
 

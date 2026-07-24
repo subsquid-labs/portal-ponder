@@ -29,6 +29,7 @@ import {
   checkpointMonotonic,
   chunk,
   classifyBucketMismatches,
+  classifyFailTaxonomy,
   classifyOnlyBDiff,
   classifyOnlyBRow,
   classifyOnlyBTx,
@@ -45,6 +46,7 @@ import {
   formatKnownBadRowsLine,
   formatToleratedIssue27Line,
   formatToleratedIssue36Line,
+  isLegAStagnationFail,
   knownBadRows,
   ONLYB_ROW_CAP,
   psqlArgs,
@@ -4763,5 +4765,255 @@ test('stagnationDecision: S5 — a corrupt wedge (wedgeStaleSide/wedgeReason mis
     r.originalReason,
     'frozen',
     'a missing carried wedgeReason falls back to frozen',
+  );
+});
+
+// ── skew-arming: the verdict-reason taxonomy (leg-A-stagnation FAIL vs windowed divergence) ───────────
+//
+// The taxonomy is ADDITIVE telemetry: it tags WHY an OVERALL FAIL happened so a downstream reader can
+// tell the KNOWN §5.13 leg-A-stagnation story (Portal clean, the RPC baseline starved) from a genuine
+// windowed Portal-vs-baseline divergence. It NEVER changes the verdict string, the fold, or the exit
+// code, and it NEVER excuses a real failure. These tests lock that contract in isolation.
+
+// Fixtures matching the exact per-chain result shape compareChain emits (verdict + classes).
+const legAStagnationChain = (chain, reason = 'wedge-unrecovered') => ({
+  chain,
+  verdict: 'FAIL',
+  classes: {
+    persistStagnation: {
+      fail: true,
+      reason,
+      originalReason: reason === 'wedge-unrecovered' ? 'frozen' : undefined,
+      staleSide: 'A',
+      skewSeconds: reason === 'one-sided-empty' ? null : 10_800,
+      thresholdSeconds: 7200,
+      maxA: 90,
+      maxB: 100,
+      tsA: 989_200,
+      tsB: 1_000_000,
+    },
+    logs: { fail: false },
+    blocks: { fail: false },
+    transactions: { fail: false },
+    checkpointBuckets: { ok: true },
+  },
+});
+
+// A chain that FAILs for a real WINDOWED reason (a hard tx divergence) — models the current chain-1
+// residual: transactions.fail with 8 unexpectedB hashes under separate investigation (issue-tracked),
+// which MUST stay visibly FAIL and classified a windowed divergence, never a benign leg-A tag.
+const windowedFailChain = (chain) => ({
+  chain,
+  verdict: 'FAIL',
+  classes: {
+    persistStagnation: { fail: false, reason: 'both-populated-in-skew' },
+    logs: { fail: false },
+    blocks: { fail: false },
+    transactions: { fail: true, unexpectedB: 8 },
+    checkpointBuckets: { ok: true },
+  },
+});
+
+const passChain = (chain) => ({
+  chain,
+  verdict: 'PASS',
+  classes: {
+    persistStagnation: { fail: false, reason: 'both-populated-in-skew' },
+    logs: { fail: false },
+    blocks: { fail: false },
+    transactions: { fail: false },
+    checkpointBuckets: { ok: true },
+  },
+});
+
+test('isLegAStagnationFail: an ELIGIBLE sustained staleSide-A wedge (wedge-unrecovered / one-sided-empty) with no windowed fail → true', () => {
+  assert.equal(isLegAStagnationFail(legAStagnationChain(42161)), true);
+  assert.equal(
+    isLegAStagnationFail(legAStagnationChain(42161, 'one-sided-empty')),
+    true,
+  );
+});
+
+test('isLegAStagnationFail: a staleSide-B wedge is NEVER eligible (leg B stale is not the leg-A story)', () => {
+  const bWedge = legAStagnationChain(42161);
+  bWedge.classes.persistStagnation.staleSide = 'B';
+  // MUTATION (`s.staleSide === 'A'` → drop / `!== 'B'`): a leg-B wedge would wrongly read eligible.
+  assert.equal(
+    isLegAStagnationFail(bWedge),
+    false,
+    'a leg-B wedge must never be tagged leg-A-catchup',
+  );
+});
+
+test('isLegAStagnationFail: a FRESH frozen / skew-growing staleSide-A wedge is NOT eligible (only sustained reasons qualify — SAFE direction)', () => {
+  const frozen = legAStagnationChain(42161);
+  frozen.classes.persistStagnation.reason = 'frozen';
+  frozen.classes.persistStagnation.originalReason = undefined;
+  // MUTATION (widen LEG_A_STAGNATION_REASONS to include 'frozen'): a fresh frozen wedge would wrongly
+  // qualify for the benign tag. The eligible set is narrow BY DESIGN.
+  assert.equal(
+    isLegAStagnationFail(frozen),
+    false,
+    'a fresh frozen wedge is a real/other divergence, not the sustained leg-A story',
+  );
+  const growing = legAStagnationChain(42161);
+  growing.classes.persistStagnation.reason = 'skew-growing';
+  assert.equal(isLegAStagnationFail(growing), false);
+});
+
+test('isLegAStagnationFail: a staleSide-A wedge that ALSO has a windowed hard-fail is NOT eligible (the windowed fail wins)', () => {
+  const both = legAStagnationChain(42161);
+  both.classes.transactions = { fail: true, unexpectedB: 3 };
+  // MUTATION (drop the `chainWindowedFail(r)` guard): a chain with a real windowed fail would be
+  // mislabelled leg-A-stagnation and its divergence excused. The windowed fail MUST win.
+  assert.equal(
+    isLegAStagnationFail(both),
+    false,
+    'a co-occurring windowed hard-fail disqualifies the benign tag',
+  );
+});
+
+test('isLegAStagnationFail: a PASS / PENDING chain is never eligible', () => {
+  assert.equal(isLegAStagnationFail(passChain(1)), false);
+  assert.equal(
+    isLegAStagnationFail({ chain: 1, verdict: 'PENDING', classes: {} }),
+    false,
+  );
+});
+
+test('classifyFailTaxonomy: a non-FAIL verdict (PASS / PENDING) → null (no failTaxonomy field at all)', () => {
+  // MUTATION (drop the `verdict !== 'FAIL'` early return): a PASS run would sprout a failTaxonomy.
+  assert.equal(classifyFailTaxonomy([passChain(1)], 'PASS'), null);
+  assert.equal(classifyFailTaxonomy([passChain(1)], 'PENDING'), null);
+});
+
+test('classifyFailTaxonomy: PURE leg-A stagnation (only 42161 wedges, all rows clean) → tag skew-arming:likely-A-catchup, legAStagnationOnly true', () => {
+  const results = [passChain(1), passChain(8453), legAStagnationChain(42161)];
+  const tax = classifyFailTaxonomy(results, 'FAIL');
+  // MUTATION (map an eligible leg-A wedge to 'windowed-divergence' instead of 'leg-A-stagnation'):
+  // the tag would flip to 'windowed-divergence' and legAStagnationOnly to false.
+  assert.equal(tax.tag, 'skew-arming:likely-A-catchup');
+  assert.equal(tax.legAStagnationOnly, true);
+  assert.equal(tax.windowedDivergence, false);
+  assert.equal(tax.perChain[42161], 'leg-A-stagnation');
+  assert.equal(tax.perChain[1], 'clean');
+  assert.equal(tax.perChain[8453], 'clean');
+});
+
+test('classifyFailTaxonomy: a WINDOWED hard-fail present (chain 1 tx unexpectedB) → windowedDivergence true, that chain windowed-divergence, NOT leg-A-stagnation', () => {
+  const results = [windowedFailChain(1), passChain(8453), passChain(42161)];
+  const tax = classifyFailTaxonomy(results, 'FAIL');
+  // MUTATION (route a non-eligible FAIL to 'clean' instead of 'windowed-divergence'): windowedDivergence
+  // would read false and the real chain-1 tx divergence would silently vanish from the taxonomy.
+  assert.equal(tax.tag, 'windowed-divergence');
+  assert.equal(tax.windowedDivergence, true);
+  assert.equal(tax.legAStagnationOnly, false);
+  assert.equal(
+    tax.perChain[1],
+    'windowed-divergence',
+    'the chain-1 tx residual stays a windowed divergence, never excused as leg-A-catchup',
+  );
+});
+
+test('classifyFailTaxonomy: MIXED — a leg-A stagnation FAIL AND a windowed divergence both present → tag mixed', () => {
+  const results = [
+    windowedFailChain(1),
+    passChain(8453),
+    legAStagnationChain(42161),
+  ];
+  const tax = classifyFailTaxonomy(results, 'FAIL');
+  // MUTATION (drop the mixed branch / fall through to skew-arming): a real windowed divergence would be
+  // hidden behind the benign tag even though chain 1 is genuinely diverging.
+  assert.equal(tax.tag, 'mixed');
+  assert.equal(tax.legAStagnationOnly, false);
+  assert.equal(tax.windowedDivergence, true);
+  assert.equal(tax.perChain[42161], 'leg-A-stagnation');
+  assert.equal(tax.perChain[1], 'windowed-divergence');
+});
+
+test('classifyFailTaxonomy: a staleSide-B wedge FAIL (leg B stale) is a windowed-divergence, NOT leg-A-catchup', () => {
+  const bWedge = legAStagnationChain(42161);
+  bWedge.classes.persistStagnation.staleSide = 'B';
+  const tax = classifyFailTaxonomy([passChain(1), bWedge], 'FAIL');
+  // A leg-B stall must NOT be mislabelled the leg-A story; it folds to a real divergence (SAFE direction).
+  assert.equal(tax.tag, 'windowed-divergence');
+  assert.equal(tax.legAStagnationOnly, false);
+  assert.equal(tax.perChain[42161], 'windowed-divergence');
+});
+
+test('classifyFailTaxonomy: an ERROR chain (diff could not complete) counts as a windowed divergence', () => {
+  const results = [
+    { chain: 1, verdict: 'ERROR', classes: {} },
+    passChain(8453),
+  ];
+  const tax = classifyFailTaxonomy(results, 'FAIL');
+  assert.equal(tax.windowedDivergence, true);
+  assert.equal(tax.tag, 'windowed-divergence');
+  assert.equal(tax.perChain[1], 'windowed-divergence');
+});
+
+test('composeAlerts: a pure leg-A-stagnation FAIL surfaces the skew-arming human line (additive; existing lines untouched)', () => {
+  const results = [passChain(1), passChain(8453), legAStagnationChain(42161)];
+  const tax = classifyFailTaxonomy(results, 'FAIL');
+  const alerts = composeAlerts(results, [], { crashLoop: false }, tax);
+  // the existing per-chain stagnation line is still present (semantics unchanged)
+  assert.ok(
+    alerts.some((a) => /persist-stagnation: chain 42161/.test(a)),
+    'the existing stagnation line is untouched',
+  );
+  // the generic finalized-diff line does NOT fire (no windowed fail anywhere)
+  assert.equal(
+    alerts.some((a) => /finalized-diff/.test(a)),
+    false,
+  );
+  // MUTATION (drop the additive skew-arming push): the human-readable tag line goes missing.
+  assert.ok(
+    alerts.some((a) =>
+      /skew-arming: overall FAIL is leg-A stagnation ONLY/.test(a),
+    ),
+    'the additive skew-arming line names the likely-A-catchup case',
+  );
+});
+
+test('composeAlerts: a windowed-divergence FAIL does NOT get the benign skew-arming line; a mixed FAIL gets the MIXED line', () => {
+  // windowed-only: no skew-arming line
+  const windowed = [windowedFailChain(1)];
+  const wtax = classifyFailTaxonomy(windowed, 'FAIL');
+  const walerts = composeAlerts(windowed, [], { crashLoop: false }, wtax);
+  assert.equal(
+    walerts.some((a) => /skew-arming:/.test(a)),
+    false,
+    'a real windowed divergence never gets a skew-arming annotation',
+  );
+  assert.ok(
+    walerts.some((a) => /finalized-diff/.test(a)),
+    'the generic windowed line still fires',
+  );
+
+  // mixed: the MIXED line, not the likely-A-catchup line
+  const mixed = [windowedFailChain(1), legAStagnationChain(42161)];
+  const mtax = classifyFailTaxonomy(mixed, 'FAIL');
+  const malerts = composeAlerts(mixed, [], { crashLoop: false }, mtax);
+  // MUTATION (fold mixed into the likely-A-catchup branch): a mixed FAIL would falsely read benign.
+  assert.ok(
+    malerts.some((a) => /skew-arming: overall FAIL is MIXED/.test(a)),
+    'a mixed FAIL is annotated MIXED, not likely-A-catchup',
+  );
+  assert.equal(
+    malerts.some((a) => /likely-A-catchup/.test(a)),
+    false,
+    'a mixed FAIL is NOT annotated likely-A-catchup',
+  );
+});
+
+test('composeAlerts: called WITHOUT a failTaxonomy arg (legacy 3-arg call) behaves exactly as before', () => {
+  const results = [passChain(1), legAStagnationChain(42161)];
+  // MUTATION (make the 4th param required / crash on undefined): the legacy 3-arg call would throw.
+  const alerts = composeAlerts(results, [], { crashLoop: false });
+  assert.ok(alerts.some((a) => /persist-stagnation: chain 42161/.test(a)));
+  assert.equal(
+    alerts.some((a) => /skew-arming:/.test(a)),
+    false,
+    'no skew-arming line without the taxonomy arg — existing callers are unaffected',
   );
 });
