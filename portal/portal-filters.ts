@@ -30,6 +30,7 @@ import type {
   TransferFilter,
 } from '@/internal/types.js';
 import { getFilterFactories, isAddressFactory } from '@/runtime/filter.js';
+import { invariant } from './portal-invariant.js';
 
 export type ChildAddresses = Map<FactoryId, Map<Address, number>>;
 
@@ -263,9 +264,13 @@ export function mergeLogRequests(reqs: PortalLogRequest[]): PortalLogRequest[] {
  * inside one. Greedy bin-pack in the merged order: keep the current shard's serialized body under
  * budget; a bare `type/fields/logs` envelope (`envelope`) is measured with each candidate `logs`
  * subset. Guarantees: (a) EVERY shard body < SHARD_BODY_BUDGET < MAX_RAW_QUERY_SIZE; (b) the shards
- * partition `logs` (disjoint, order-preserving, union == input); (c) when the whole array fits one
- * body the result is EXACTLY ONE shard whose `logs` IS the input array (same objects, same order) —
- * so wrapping it in `envelope` is byte-identical to the un-sharded query (the no-op below the wall).
+ * partition `logs` (disjoint, order-preserving, union == input); (c) when the WHOLE array's envelope
+ * is < SHARD_BODY_BUDGET the result is EXACTLY ONE shard whose `logs` IS the input array (same objects,
+ * same order) — so wrapping it in `envelope` is byte-identical to the un-sharded query (the no-op). NB:
+ * the no-op is scoped to < SHARD_BODY_BUDGET, NOT < MAX_RAW_QUERY_SIZE — a body in the SHARD_SAFETY_MARGIN
+ * band (SHARD_BODY_BUDGET ≤ body < MAX_RAW_QUERY_SIZE) still shards into >1 shard (completeness-preserving,
+ * just not a single-body no-op). The validated corpus (≤872 children ≈ 40KB) is far below budget, so it is
+ * provably a byte-identical no-op for the entire validated corpus.
  */
 function shardLogs(
   logs: PortalLogRequest[],
@@ -281,6 +286,20 @@ function shardLogs(
   const shards: PortalQuery[] = [];
   let current: PortalLogRequest[] = [];
   for (const entry of logs) {
+    // Guarantee (a) has teeth: a shard NEVER starts smaller than one element, so if a single element's
+    // own envelope is already ≥ budget the bin-pack would silently emit an oversized shard (both the
+    // first-element push and the reset-to-singleton below). Not reachable today — each element is ≤
+    // PORTAL_MAX_ADDRESSES (1000) addresses ≈ 45KiB — but nothing in this function enforced it. Check
+    // every element ONCE, up front, so an oversized element is an attributable plan-build-time throw,
+    // not a 400 at stream time. It never fires below the wall (that path returned `[whole]` already).
+    const entrySize = JSON.stringify(envelope([entry])).length;
+    invariant(
+      '#194',
+      entrySize < SHARD_BODY_BUDGET,
+      `#194: a single merged log-request element (${entrySize}B) exceeds SHARD_BODY_BUDGET — reduce PORTAL_MAX_ADDRESSES or narrow the filter's topic0 union`,
+      () => ({ entrySize, budget: SHARD_BODY_BUDGET }),
+    );
+
     if (current.length === 0) {
       current.push(entry);
       continue;
@@ -353,14 +372,16 @@ export type FetchSpec = Readonly<{
   backfillStart: number;
   backfillEnd: number | undefined;
   /** Log-data query (matched logs + parent transactions); undefined when no log requests expand.
-   * Equals `logQueryShards()[0]` when the address union fits ONE body; kept as the single-body view
-   * for callers/tests that don't shard. */
+   * Equals `logQueryShards()[0]` when the whole body is < SHARD_BODY_BUDGET; kept as the single-body
+   * view for callers/tests that don't shard. */
   logQuery(): PortalQuery | undefined;
   /** #194: byte-budgeted partition of `logQuery()`'s address union into ≥1 shards, each a full
    * PortalQuery with IDENTICAL fields/topics and a DISJOINT address subset whose serialized body is
-   * strictly < MAX_RAW_QUERY_SIZE (see SHARD_BODY_BUDGET). Empty ⇒ [] (same as logQuery undefined).
-   * When the union fits one body it yields EXACTLY ONE shard byte-identical to logQuery() — the no-op
-   * guarantee below the wall. portal.ts streams these sequentially and UNIONs the rows (INV-11). */
+   * strictly < SHARD_BODY_BUDGET < MAX_RAW_QUERY_SIZE. Empty ⇒ [] (same as logQuery undefined).
+   * When the whole body is < SHARD_BODY_BUDGET it yields EXACTLY ONE shard byte-identical to logQuery()
+   * — the no-op. A body in the SHARD_SAFETY_MARGIN band (SHARD_BODY_BUDGET ≤ body < MAX_RAW_QUERY_SIZE)
+   * still shards into >1 shard (completeness-preserving, not a single-body no-op). portal.ts streams
+   * these sequentially and UNIONs the rows (INV-11). */
   logQueryShards(): PortalQuery[];
   /** Full-trace query (fetch-all, ranked+filtered client-side — INV-5); undefined when !needTraces. */
   traceQuery(): PortalQuery | undefined;

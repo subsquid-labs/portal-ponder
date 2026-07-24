@@ -13,13 +13,19 @@ current fail-loud + RPC-realtime escape. The tx (from/to) path is unchanged (§3
   is already ≤ `PORTAL_MAX_ADDRESSES` (1000) addresses ≈ 45 KiB (`logRequestsFor` batches at that
   width), so a single element always fits the budget — `PORTAL_MAX_ADDRESSES` COEXISTS as the
   within-shard batch size, the byte budget is the shard boundary (§4 Q3, coexist). `shardLogs` greedy
-  bin-packs elements in merged order; when the whole array fits one body it returns EXACTLY ONE shard
-  whose `logs` IS the input array (same objects, same order) ⇒ byte-identical to `logQuery()`.
+  bin-packs elements in merged order; when the whole body is `< SHARD_BODY_BUDGET` it returns EXACTLY
+  ONE shard whose `logs` IS the input array (same objects, same order) ⇒ byte-identical to `logQuery()`.
+  The no-op is scoped to `< SHARD_BODY_BUDGET`, NOT `< MAX_RAW_QUERY_SIZE`: a body in the 8 KiB
+  `SHARD_SAFETY_MARGIN` band (`SHARD_BODY_BUDGET ≤ body < MAX_RAW_QUERY_SIZE`) WILL shard into >1 shard
+  (still completeness-preserving, just not a single-body no-op). The validated corpus (≤872 children ≈
+  40 KB) is far below `SHARD_BODY_BUDGET`, so the no-op holds byte-identically for the entire validated
+  corpus.
 - **Scope of "log filters":** BOTH factory-child AND plain-address log filters shard (the design's
   scope exclusion is the tx path, not plain-address log filters). Both feed one merged `logs` array;
   `shardLogs` partitions the union of all address-bearing log requests (§3.2 multi-filter).
-- `logQuery()` is retained (single-body view; `= logQueryShards()[0]` below the wall) so callers/tests
-  that don't shard are unaffected. Both build from ONE `mergedLogRequests()` source so they can't drift.
+- `logQuery()` is retained (single-body view; `= logQueryShards()[0]` when the body is `<
+  SHARD_BODY_BUDGET`) so callers/tests that don't shard are unaffected. Both build from ONE
+  `mergedLogRequests()` source so they can't drift.
 - The pre-#194 portal.ts-level "over-limit body fails loud" behavior is intentionally REMOVED for log
   filters (they now shard). The client-level size guard (`client.stream`, portal-client.ts:488) is
   UNCHANGED and still fails loud on a single un-shardable body — it protects the tx path.
@@ -295,10 +301,13 @@ safely split — narrow the filter."* This is the key scoping decision.
 
 ### 3.5 Regression tests the fix will need
 
-1. **Byte-identity / no-op control (CRITICAL):** for a factory that fits one body (e.g. 872, ≤ budget)
-   the sharded builder yields EXACTLY ONE shard whose body is byte-identical to today's un-sharded
-   body. (Extends test (2) in the repro.) This proves the fix is a no-op below the wall — the
-   dominant safety guarantee for the existing validated corpus.
+1. **Byte-identity / no-op control (CRITICAL):** for a factory whose whole body is `< SHARD_BODY_BUDGET`
+   (e.g. 872 children ≈ 40 KB, far below budget) the sharded builder yields EXACTLY ONE shard whose body
+   is byte-identical to today's un-sharded body. (Extends test (2) in the repro.) This proves the fix is
+   a no-op for the entire validated corpus — the dominant safety guarantee. NB the no-op is scoped to
+   `< SHARD_BODY_BUDGET`, not `< MAX_RAW_QUERY_SIZE`: a body in the 8 KiB safety band still shards (>1
+   shard, completeness-preserving), so it is NOT a single-body no-op — but the validated corpus is far
+   below budget, so this distinction never bites it.
 2. **Shard count & budget:** N children just over the budget → 2 shards; each shard body `<
    MAX_RAW_QUERY_SIZE`; the multiplicity is `ceil` of the byte-budget, not the 1000-count.
 3. **Union completeness (INV-11 extension):** a fast-check property — union of the shard plan matches
