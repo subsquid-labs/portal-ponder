@@ -1,6 +1,35 @@
 # SHARD-DESIGN.md — issue #194: factory child-address query sharding
 
-**Status:** design + failing repro (this pass). NOT a merged fix. The fix is committee-gated
+**Status:** HISTORICAL-plane fix IMPLEMENTED on `fix/194-factory-shard` (committee-gate pending merge).
+Realtime `/stream` sharding remains scoped-out (§4 Q1) — a tracked follow-up; realtime keeps its
+current fail-loud + RPC-realtime escape. The tx (from/to) path is unchanged (§3.4, §4 Q2) — follow-up.
+
+**Implementation notes (what the code does, vs the design above):**
+- `SHARD_BODY_BUDGET = MAX_RAW_QUERY_SIZE − SHARD_SAFETY_MARGIN`, with `SHARD_SAFETY_MARGIN = 8 KiB`
+  (a fixed few-KiB allowance per §3.2/§4 Q4). The margin covers the `{...query, fromBlock, toBlock}`
+  envelope client.stream adds (~tens of bytes) plus any server-side accounting slack; each shard is
+  serialized whole and required `< SHARD_BODY_BUDGET`, so shards land with clear headroom below the cap.
+- **Partition granularity = the merged `logs[]` array ELEMENTS, never inside one element.** Each element
+  is already ≤ `PORTAL_MAX_ADDRESSES` (1000) addresses ≈ 45 KiB (`logRequestsFor` batches at that
+  width), so a single element always fits the budget — `PORTAL_MAX_ADDRESSES` COEXISTS as the
+  within-shard batch size, the byte budget is the shard boundary (§4 Q3, coexist). `shardLogs` greedy
+  bin-packs elements in merged order; when the whole array fits one body it returns EXACTLY ONE shard
+  whose `logs` IS the input array (same objects, same order) ⇒ byte-identical to `logQuery()`.
+- **Scope of "log filters":** BOTH factory-child AND plain-address log filters shard (the design's
+  scope exclusion is the tx path, not plain-address log filters). Both feed one merged `logs` array;
+  `shardLogs` partitions the union of all address-bearing log requests (§3.2 multi-filter).
+- `logQuery()` is retained (single-body view; `= logQueryShards()[0]` below the wall) so callers/tests
+  that don't shard are unaffected. Both build from ONE `mergedLogRequests()` source so they can't drift.
+- The pre-#194 portal.ts-level "over-limit body fails loud" behavior is intentionally REMOVED for log
+  filters (they now shard). The client-level size guard (`client.stream`, portal-client.ts:488) is
+  UNCHANGED and still fails loud on a single un-shardable body — it protects the tx path.
+- Completeness gate mutation-VERIFIED by hand: neutering the gate (`break` after the first shard in
+  `runStreams`) turned both completeness-gate tests RED (test-red, not build-red) — the later shard's
+  rows were silently dropped; restoring the shard loop made them green.
+
+---
+
+**Original design status:** design + failing repro. The fix is committee-gated
 (full 4-model, correctness-critical surface) before implementation.
 
 **The bug (field report, coordinator-verified):** a factory app hard-stops once its discovered
