@@ -376,9 +376,13 @@ const HIGH_BN = 20;
 // Build the sync + mock Portal for a >budget factory and drive one chunk over [LOW_BN, HIGH_BN].
 // Returns the inserted logs and, when `failShardOfHigh`, throws a 500 on the shard that requests the
 // high child so we can assert the chunk rejects (no partial cache) and retries the full plan.
+// When `sameBlock` is set, BOTH the shard-0 child and the last-shard child emit their log at that ONE
+// block number (instead of LOW_BN/HIGH_BN) — the cross-shard same-block union case (INV-11): the
+// earlier shard's row must survive when the later shard delivers a row at the identical block.
 const runShardedChunk = async (opts: {
   n: number;
   failHighOnce?: boolean;
+  sameBlock?: number;
 }): Promise<{
   insertedLogs: any[];
   requestedLow: number;
@@ -387,6 +391,11 @@ const runShardedChunk = async (opts: {
   const n = opts.n;
   const lowAddr = childAt(1); // shard 0
   const highAddr = childAt(n); // last shard
+
+  // Block each child's log is served at. Default: opposite ends (10 / 20). `sameBlock` collapses BOTH
+  // onto ONE block so the two shards' rows collide at the same map key in the cd merge.
+  const lowBlock = opts.sameBlock ?? LOW_BN;
+  const highBlock = opts.sameBlock ?? HIGH_BN;
 
   let requestedLow = 0;
   let requestedHigh = 0;
@@ -422,10 +431,10 @@ const runShardedChunk = async (opts: {
       }
 
       const out: any[] = [];
-      if (wantsLow && from <= LOW_BN && to >= LOW_BN)
-        out.push(shardBlock(LOW_BN, lowAddr, TOPIC0));
-      if (wantsHigh && from <= HIGH_BN && to >= HIGH_BN)
-        out.push(shardBlock(HIGH_BN, highAddr, TOPIC0));
+      if (wantsLow && from <= lowBlock && to >= lowBlock)
+        out.push(shardBlock(lowBlock, lowAddr, TOPIC0));
+      if (wantsHigh && from <= highBlock && to >= highBlock)
+        out.push(shardBlock(highBlock, highAddr, TOPIC0));
 
       // in-range window (head 1e9 ≫ chunk): terminate at the range-end anchor, never a mid-range 204.
       const end = Math.min(to, 1_000_000_000);
@@ -510,15 +519,48 @@ test('#194 completeness gate: a >budget factory streams ALL shards — the LAST 
   expect(insertedLogs).toHaveLength(2);
 });
 
+test('#194 completeness gate: two children in DIFFERENT shards emit at the SAME block — BOTH logs survive the cross-shard union', async () => {
+  // The shard-0 child AND the last-shard child BOTH log at block 15. Each shard is a SEPARATE
+  // client.stream(); their rows collide at the same `cd.logs` map key. The cd merge (portal.ts) unions
+  // by `.concat()`, so both must survive — the earlier shard's row is NOT overwritten by the later
+  // shard's same-block row. This is the cross-shard same-block loss the DIFFERENT-block gate above
+  // cannot see (there each child sits at its own block key). Real >budget multi-shard scenario (n=6000).
+  const { insertedLogs, requestedLow, requestedHigh } = await runShardedChunk({
+    n: 6000,
+    sameBlock: 15,
+  });
+
+  // >1 shard, both the shard-0 child and the last-shard child requested (disjoint address subsets).
+  expect(requestedLow).toBeGreaterThanOrEqual(1);
+  expect(requestedHigh).toBeGreaterThanOrEqual(1);
+
+  // BOTH logs must be present AT that one block — 2 logs at block 15, not 1. If the cd merge overwrote
+  // (instead of unioning) same-block rows across shards, the earlier shard's low-child log would be
+  // silently dropped and only the high child would remain. All inserted logs share ONE block key here,
+  // so the count IS the same-block count — assert on it directly (blockNumber is a hex string; every
+  // inserted log carries the SAME value, proving the collision is real).
+  const blockKeys = new Set(insertedLogs.map((l) => l.blockNumber));
+  expect(blockKeys.size).toBe(1); // both rows landed at the SAME block key (the collision)
+
+  const addrs = insertedLogs.map((l) => l.address?.toLowerCase());
+  expect(addrs).toContain(childAt(1).toLowerCase());
+  expect(addrs).toContain(childAt(6000).toLowerCase());
+  // exactly TWO logs at that one block — union preserved both shards' same-block rows.
+  expect(insertedLogs).toHaveLength(2);
+});
+
 test('#194 completeness gate: a shard throw mid-plan REJECTS the chunk (no partial cache) and a retry re-streams every shard', async () => {
-  const { insertedLogs, requestedHigh } = await runShardedChunk({
+  const { insertedLogs, requestedLow, requestedHigh } = await runShardedChunk({
     n: 6000,
     failHighOnce: true,
   });
 
   // The high-child shard was requested more than once: it 500'd first (rejecting the whole chunk), then
   // the retry re-streamed the ENTIRE plan — so the high child was re-requested and its log recovered.
+  // The low-child (shard-0) shard was ALSO re-requested: the retry re-streams EVERY shard fresh, not
+  // just the one that failed — so the whole plan is symmetric, no shard is skipped on retry.
   expect(requestedHigh).toBeGreaterThanOrEqual(2);
+  expect(requestedLow).toBeGreaterThanOrEqual(2);
 
   const addrs = insertedLogs.map((l) => l.address?.toLowerCase());
   expect(addrs).toContain(childAt(1).toLowerCase());
