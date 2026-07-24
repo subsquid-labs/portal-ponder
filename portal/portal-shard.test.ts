@@ -45,7 +45,7 @@ const fakeGate: Gate = {
 // array element (quotes + comma). 256*1024 / 45 ≈ 5825, i.e. the "~5.8k children" wall from the field
 // report. We synthesize an address per child from its index so every child is distinct.
 const childAt = (i: number): Address =>
-  (`0x${i.toString(16).padStart(40, '0')}`) as Address;
+  `0x${i.toString(16).padStart(40, '0')}` as Address;
 
 // The factory shape ponder's runtime hands the fetch-spec (isAddressFactory keys off `.id`). We only
 // touch the fields portal-filters reads: id / address / eventSelector.
