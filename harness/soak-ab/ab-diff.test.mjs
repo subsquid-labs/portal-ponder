@@ -5017,3 +5017,113 @@ test('composeAlerts: called WITHOUT a failTaxonomy arg (legacy 3-arg call) behav
     'no skew-arming line without the taxonomy arg — existing callers are unaffected',
   );
 });
+
+// ── checkpoint-regression disqualifier: a leg-B _ponder_checkpoint REWIND is a real divergence ──────
+//
+// A checkpoint regression is a leg-B (Portal) _ponder_checkpoint HEIGHT rewind — a silent-data-loss-class
+// Portal-side divergence. It is attached to a chain's classes (classes.checkpointRegression = {ok:false,
+// prev, cur}) and flips that chain's verdict to FAIL in main(), but it is DELIBERATELY NOT a
+// chainWindowedFail facet (a checkpoint regression must not emit the generic finalized-diff line — see the
+// composeAlerts suppression test). So a chain carrying BOTH a staleSide-'A' wedge AND a checkpoint
+// regression passes the !chainWindowedFail guard and, without its OWN disqualifier, would be swallowed into
+// the benign skew-arming:likely-A-catchup tag — the exact leak the 3-model committee found. These tests
+// lock that a checkpoint regression, ALONE or CO-OCCURRING with a leg-A wedge, is NEVER excused.
+
+// A chain with the eligible staleSide-'A' wedge that ALSO carries a leg-B checkpoint regression. The
+// regression flips verdict to FAIL and attaches classes.checkpointRegression = {ok:false, prev, cur} —
+// mirroring the exact shape main() writes at the regression site (checkpointMonotonic's fail return).
+const wedgePlusRegressionChain = (chain, reason = 'wedge-unrecovered') => {
+  const r = legAStagnationChain(chain, reason);
+  r.classes.checkpointRegression = { ok: false, prev: '500', cur: '400' };
+
+  return r;
+};
+
+// A PURE checkpoint-regression FAIL: the regression flipped verdict to FAIL, but there is NO
+// persist-stagnation fail (both legs healthy on the skew axis). Already routed to windowed-divergence.
+const pureRegressionChain = (chain) => ({
+  chain,
+  verdict: 'FAIL',
+  classes: {
+    persistStagnation: { fail: false, reason: 'both-populated-in-skew' },
+    logs: { fail: false },
+    blocks: { fail: false },
+    transactions: { fail: false },
+    checkpointBuckets: { ok: true },
+    checkpointRegression: { ok: false, prev: '500', cur: '400' },
+  },
+});
+
+test('isLegAStagnationFail: a staleSide-A wedge that ALSO has a leg-B checkpoint regression is NOT eligible (the rewind is a real divergence)', () => {
+  const compound = wedgePlusRegressionChain(42161);
+  // MUTATION (remove the new checkpointRegression disqualifier): a chain with BOTH a staleSide-'A' wedge
+  // AND a leg-B _ponder_checkpoint rewind would be mislabelled leg-A-stagnation and its rewind excused.
+  assert.equal(
+    isLegAStagnationFail(compound),
+    false,
+    'a co-occurring checkpoint regression disqualifies the benign leg-A tag',
+  );
+  // sanity: the SAME chain WITHOUT the regression is the eligible leg-A shape (the disqualifier is the
+  // only difference, so the mutation-red is unambiguously the regression path).
+  assert.equal(isLegAStagnationFail(legAStagnationChain(42161)), true);
+});
+
+test('classifyFailTaxonomy: the LEAK regression — a compound wedge + checkpoint regression chain routes to windowed-divergence, NOT skew-arming', () => {
+  const compound = wedgePlusRegressionChain(42161);
+  const results = [passChain(1), passChain(8453), compound];
+  const tax = classifyFailTaxonomy(results, 'FAIL');
+  // MUTATION (remove the new checkpointRegression disqualifier in isLegAStagnationFail): the compound
+  // chain reads eligible, perChain[42161] flips to 'leg-A-stagnation', legAStagnationOnly true, and the
+  // tag becomes the benign 'skew-arming:likely-A-catchup' — a leg-B Portal rewind silently excused.
+  assert.equal(
+    tax.perChain[42161],
+    'windowed-divergence',
+    'the leg-B checkpoint rewind is a real divergence, never the benign leg-A story',
+  );
+  assert.equal(tax.tag, 'windowed-divergence');
+  assert.equal(tax.windowedDivergence, true);
+  assert.equal(tax.legAStagnationOnly, false);
+  assert.equal(tax.perChain[1], 'clean');
+  assert.equal(tax.perChain[8453], 'clean');
+});
+
+test('classifyFailTaxonomy: MIXED — a genuine leg-A stagnation chain + a compound wedge+regression chain → tag mixed (the compound is windowed, the pure wedge is leg-A)', () => {
+  const chainX = legAStagnationChain(42161); // eligible wedge only → leg-A-stagnation
+  const chainY = wedgePlusRegressionChain(10); // wedge + rewind → windowed-divergence
+  const tax = classifyFailTaxonomy([passChain(1), chainX, chainY], 'FAIL');
+  // MUTATION (remove the disqualifier): chainY would ALSO read leg-A-stagnation → tag flips to the benign
+  // skew-arming:likely-A-catchup with legAStagnationOnly true, hiding chainY's real leg-B rewind.
+  assert.equal(tax.tag, 'mixed');
+  assert.equal(tax.legAStagnationOnly, false);
+  assert.equal(tax.windowedDivergence, true);
+  assert.equal(tax.perChain[42161], 'leg-A-stagnation');
+  assert.equal(tax.perChain[10], 'windowed-divergence');
+});
+
+test('classifyFailTaxonomy: a PURE checkpoint-regression FAIL (rewind, no stagnation) is a consistent windowed-divergence', () => {
+  const results = [passChain(1), pureRegressionChain(42161)];
+  const tax = classifyFailTaxonomy(results, 'FAIL');
+  // Already handled correctly (no persistStagnation fail → isLegAStagnationFail false → windowed branch),
+  // but locked so a future refactor can never route a bare leg-B rewind to the benign tag. Booleans are
+  // internally consistent: windowed present, no leg-A, tag windowed-divergence.
+  assert.equal(tax.perChain[42161], 'windowed-divergence');
+  assert.equal(tax.tag, 'windowed-divergence');
+  assert.equal(tax.windowedDivergence, true);
+  assert.equal(tax.legAStagnationOnly, false);
+  assert.equal(tax.perChain[1], 'clean');
+});
+
+test('classifyFailTaxonomy: empty results with an overall FAIL verdict does not throw and returns a consistent shape', () => {
+  // Degenerate defensive case: an overall FAIL with an empty result list. It must not crash and must
+  // return internally-consistent booleans (no leg-A, no windowed → both false). No divergence is being
+  // excused here — there are simply no chains to classify.
+  const tax = classifyFailTaxonomy([], 'FAIL');
+  assert.ok(
+    tax,
+    'empty results still return a taxonomy object on an overall FAIL',
+  );
+  assert.deepEqual(tax.perChain, {});
+  assert.equal(tax.legAStagnationOnly, false);
+  assert.equal(tax.windowedDivergence, false);
+  assert.equal(tax.tag, 'windowed-divergence');
+});

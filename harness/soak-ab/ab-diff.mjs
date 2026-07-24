@@ -2475,16 +2475,28 @@ const LEG_A_STAGNATION_REASONS = new Set([
 ]);
 
 // A chain result is an ELIGIBLE leg-A stagnation FAIL iff it FAILed, has NO windowed hard-fail of its
-// own (chainWindowedFail false), and its persist-stagnation class is a SUSTAINED wedge with the STALE
-// leg on side A. This is the ONLY shape the skew-arming / likely-A-catchup tag ever applies to. Pure +
-// exported so the eligibility contract is asserted directly, without a DB. Everything it excludes — a
-// staleSide-'B' wedge, a fresh 'frozen'/'skew-growing' wedge, a checkpoint-regression-only FAIL, any
-// windowed hard-fail — is treated as a real divergence below, never excused.
+// own (chainWindowedFail false), has NO checkpoint regression (a leg-B _ponder_checkpoint rewind), and
+// its persist-stagnation class is a SUSTAINED wedge with the STALE leg on side A. This is the ONLY shape
+// the skew-arming / likely-A-catchup tag ever applies to. Pure + exported so the eligibility contract is
+// asserted directly, without a DB. Everything it excludes — a staleSide-'B' wedge, a fresh
+// 'frozen'/'skew-growing' wedge, a checkpoint regression (ALONE or CO-OCCURRING with a staleSide-'A'
+// wedge), any windowed hard-fail — is treated as a real divergence below, never excused.
 export function isLegAStagnationFail(r) {
   if (r?.verdict !== 'FAIL') {
     return false;
   }
   if (chainWindowedFail(r)) {
+    return false;
+  }
+
+  // A checkpoint regression is a leg-B (Portal) _ponder_checkpoint rewind — a real divergence, never
+  // the benign leg-A story. It is deliberately NOT a chainWindowedFail facet (it must not emit the
+  // generic finalized-diff line — see composeAlerts), so it needs its OWN disqualifier here; otherwise a
+  // chain with BOTH a staleSide-'A' wedge AND a checkpoint regression would be mislabeled benign.
+  if (
+    r?.classes?.checkpointRegression &&
+    r.classes.checkpointRegression.ok === false
+  ) {
     return false;
   }
 
@@ -2507,8 +2519,10 @@ export function isLegAStagnationFail(r) {
 //   'leg-A-stagnation'    — an ELIGIBLE sustained staleSide-'A' wedge with NO windowed hard-fail.
 //   'windowed-divergence' — ANY OTHER kind of FAIL: a windowed hard-fail (logs/blocks/tx/buckets/ERROR),
 //                           OR a non-eligible stall (staleSide-'B', a fresh 'frozen'/'skew-growing'
-//                           wedge), OR a checkpoint-regression-only FAIL. Every non-excusable FAIL folds
-//                           here so nothing genuine is ever mislabelled as the benign leg-A story.
+//                           wedge), OR a checkpoint regression — a leg-B _ponder_checkpoint rewind, whether
+//                           ALONE or CO-OCCURRING with a staleSide-'A' wedge (isLegAStagnationFail
+//                           disqualifies it). Every non-excusable FAIL folds here so nothing genuine is
+//                           ever mislabelled as the benign leg-A story.
 //   'clean'               — a PASS / PENDING chain (did not contribute to the FAIL).
 //
 // legAStagnationOnly is true IFF at least one chain is 'leg-A-stagnation' AND no chain is
@@ -2529,7 +2543,6 @@ export function classifyFailTaxonomy(results, verdict) {
     if (isLegAStagnationFail(r)) {
       perChain[r.chain] = 'leg-A-stagnation';
       anyLegAStagnation = true;
-
       continue;
     }
     // Any FAIL/ERROR that is NOT the eligible leg-A shape is a real divergence — never excused. A
@@ -2537,7 +2550,6 @@ export function classifyFailTaxonomy(results, verdict) {
     if (r?.verdict === 'FAIL' || r?.verdict === 'ERROR') {
       perChain[r.chain] = 'windowed-divergence';
       anyWindowedDivergence = true;
-
       continue;
     }
 
