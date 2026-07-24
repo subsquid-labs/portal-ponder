@@ -111,7 +111,7 @@ surface** (`sync-historical`, `runtime/historical`, `sync-store`, `rpc`, `sync`)
   downstream of the Portal fetch/insert, so every wiring-touched file is byte-identical between `0.17.0`
   and `0.17.1`, the patch applies with zero rejects, and the seam is untouched.
 
-The full current Portal suite is **370 tests across 19 files**, green on every tracked version via the
+The full current Portal suite is **379 tests across 20 files**, green on every tracked version via the
 one-command gate (verified in the `0.16.10` / `0.17.0` / `0.17.1` compat work). As with `0.15.17`, this basis is
 **not** a fresh RPC byte-diff or cross-validation on the newer versions — the §3 / §5 byte-diff and A/B
 evidence remains on `0.16.6` (see below).
@@ -2181,7 +2181,7 @@ is repaired or the RPC-realtime leg is retired.
 - The Portal layer's invariants (INV-1 … INV-25) hold under property-based tests **on every tracked
   upstream Ponder version** (`0.15.17`, `0.16.6`, `0.16.7`, `0.16.8`, `0.16.9`, `0.16.10`, `0.17.0`, `0.17.1` —
   each past `0.16.6` registered on a **seam-identity + full-suite** basis, *not* a fresh RPC byte-diff,
-  §2; the full current suite is **370 tests / 19 files**, green on all of them), and every fix is backed
+  §2; the full current suite is **379 tests / 20 files**, green on all of them), and every fix is backed
   by a mutation-verified regression test. The realtime `/stream` liveness invariants INV-22…INV-25 and
   the #175 rework of INV-17 (write-side idempotence on the realtime finalize path) are code +
   mutation-verified **unit-test** evidence on the **experimental** stream path (§5.2, §5.12), not a
