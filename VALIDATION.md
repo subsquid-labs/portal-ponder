@@ -111,16 +111,18 @@ surface** (`sync-historical`, `runtime/historical`, `sync-store`, `rpc`, `sync`)
   downstream of the Portal fetch/insert, so every wiring-touched file is byte-identical between `0.17.0`
   and `0.17.1`, the patch applies with zero rejects, and the seam is untouched.
 
-The full current Portal suite is **370 tests across 19 files**, green on every tracked version via the
+The full current Portal suite is **379 tests across 20 files**, green on every tracked version via the
 one-command gate (verified in the `0.16.10` / `0.17.0` / `0.17.1` compat work). As with `0.15.17`, this basis is
 **not** a fresh RPC byte-diff or cross-validation on the newer versions — the §3 / §5 byte-diff and A/B
 evidence remains on `0.16.6` (see below).
 
 **Evidence base version and seam-identity transfer.** The data-correctness evidence in §3 / §5 (the
 paid-matrix byte-diff and the A/B soak) was gathered on the `0.16.6` graft, whereas the published `latest`
-fork is now `@subsquid/ponder@0.17.1-sqd.1` (published 2026-07-21 with `--tag latest`, superseding
-`0.17.0-sqd.1`, which now installs by exact version; `0.16.10-sqd.1` remains under dist-tag
-`ponder-0.16.10`, `versions.json`). That
+fork is now `@subsquid/ponder@0.17.1-sqd.2` (published 2026-07-24 with `--tag latest`, superseding
+`0.17.1-sqd.1`, which now installs by exact version; `0.16.10-sqd.1` remains under dist-tag
+`ponder-0.16.10`, `versions.json`). `0.17.1-sqd.2` re-cuts ponder@0.17.1 with the identical wiring patch as
+`0.17.1-sqd.1` plus the off-seam #194 factory log-query sharding fix (PR #195) inside the Portal fetch
+layer, so the transfer argument below is unaffected. That
 evidence **transfers to the shipped artifact by seam identity**: the Portal wiring patch is byte-identical
 (sha256-equal) across the `0.16.6` / `0.16.7` / `0.16.8` grafts and carries forward verbatim to `0.16.9`
 (and to `0.16.10`; `0.17.0` re-derives the patch but re-places every added wiring line byte-for-byte, and
@@ -128,7 +130,7 @@ evidence **transfers to the shipped artifact by seam identity**: the Portal wiri
 that range lands off the Portal graft surface. A version
 bump therefore does **not** invalidate the matrix or the soak, and we deliberately do **not** re-run the
 paid matrix or restart the soak for it. Alongside that transfer, three **direct anchors on the then-shipped
-`0.16.8-sqd.1` package** (now superseded by `0.17.1-sqd.1`; their assurance carries forward by the same
+`0.16.8-sqd.1` package** (now superseded by `0.17.1-sqd.2`; their assurance carries forward by the same
 seam identity) — two landed, one planned — tie the evidence to that exact published build:
 1. the examples end-to-end freshness gate ran against the **published** package
    ([#139](../../pull/139)) — the `euler-subgraph` example reproduced its exact baseline row counts
@@ -1245,11 +1247,13 @@ The injected fault-counter tallies differ run-to-run (injection timing is non-de
 load-bearing invariant — every expected fault fired and every in-scope store digest equals the baseline —
 holds identically on `0.17.0-sqd.1`. The `0.16.8-sqd.1` tarball, artifacts, and digest above remain the
 retained historical anchor; this note **adds** the direct confirmation on the current shipped build rather
-than replacing it. (`0.17.1-sqd.1`, published 2026-07-21 and now `latest`, grafts the identical Portal layer
-via a **verbatim** copy of `wiring/0.17.0.patch` (sha256-equal), and the `0.17.0 → 0.17.1` upstream delta is
-a single off-seam `sync-store` read-query optimization — so this direct `0.17.0-sqd.1` fault evidence carries
-forward unchanged to the current `0.17.1-sqd.1` build by verbatim-patch + seam identity; it was not re-run
-against `0.17.1-sqd.1`.)
+than replacing it. (`0.17.1-sqd.2`, published 2026-07-24 and now `latest`, grafts the identical Portal layer
+via a **verbatim** copy of `wiring/0.17.0.patch` (sha256-equal); the `0.17.0 → 0.17.1` upstream delta is
+a single off-seam `sync-store` read-query optimization, and the `-sqd.1 → -sqd.2` fork delta is the #194
+factory log-query sharding fix (PR #195) which lives off the seam in the Portal fetch layer and is a
+byte-identical no-op for this single-factory sub-cap scenario — so this direct `0.17.0-sqd.1` fault evidence
+carries forward unchanged to the current `0.17.1-sqd.2` build by verbatim-patch + seam identity; it was not
+re-run against `0.17.1-sqd.1` or `0.17.1-sqd.2`.)
 
 **What this proves:**
 
@@ -2177,7 +2181,7 @@ is repaired or the RPC-realtime leg is retired.
 - The Portal layer's invariants (INV-1 … INV-25) hold under property-based tests **on every tracked
   upstream Ponder version** (`0.15.17`, `0.16.6`, `0.16.7`, `0.16.8`, `0.16.9`, `0.16.10`, `0.17.0`, `0.17.1` —
   each past `0.16.6` registered on a **seam-identity + full-suite** basis, *not* a fresh RPC byte-diff,
-  §2; the full current suite is **370 tests / 19 files**, green on all of them), and every fix is backed
+  §2; the full current suite is **379 tests / 20 files**, green on all of them), and every fix is backed
   by a mutation-verified regression test. The realtime `/stream` liveness invariants INV-22…INV-25 and
   the #175 rework of INV-17 (write-side idempotence on the realtime finalize path) are code +
   mutation-verified **unit-test** evidence on the **experimental** stream path (§5.2, §5.12), not a
