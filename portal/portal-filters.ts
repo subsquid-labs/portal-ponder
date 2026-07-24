@@ -30,6 +30,7 @@ import type {
   TransferFilter,
 } from '@/internal/types.js';
 import { getFilterFactories, isAddressFactory } from '@/runtime/filter.js';
+import { invariant } from './portal-invariant.js';
 
 export type ChildAddresses = Map<FactoryId, Map<Address, number>>;
 
@@ -60,6 +61,18 @@ export type PortalQuery = {
 // addresses; a body that still overflows fails loud (portal-client).
 export const MAX_RAW_QUERY_SIZE = 256 * 1024;
 export const PORTAL_MAX_ADDRESSES = 1000;
+
+// #194 factory sharding. A factory whose child set is large enough (~5.8k children) blows a single
+// logQuery() body past MAX_RAW_QUERY_SIZE — a permanent hard stop. `logQueryShards()` partitions the
+// address union into multiple bodies, each strictly UNDER the cap, that portal.ts streams sequentially
+// and UNIONs (INV-11: disjoint address subsets, additive rows). SHARD_BODY_BUDGET is the per-shard
+// byte ceiling — held below MAX_RAW_QUERY_SIZE by SHARD_SAFETY_MARGIN so a shard never 400s
+// server-side. The margin absorbs (a) the `{...query, fromBlock, toBlock}` envelope client.stream adds
+// per POST (portal-client.ts:668 — a few tens of bytes) and (b) any server-side accounting that counts
+// slightly more than our JSON.stringify estimate. A few KiB is generous: the dominant term is the
+// address strings, and one shard boundary costs at most one under-budget shard, never data.
+export const SHARD_SAFETY_MARGIN = 8 * 1024;
+export const SHARD_BODY_BUDGET = MAX_RAW_QUERY_SIZE - SHARD_SAFETY_MARGIN;
 
 const REQUIRED_BLOCK_FIELDS = [
   'number',
@@ -244,6 +257,68 @@ export function mergeLogRequests(reqs: PortalLogRequest[]): PortalLogRequest[] {
   return [...groups.values()];
 }
 
+/**
+ * #194: partition a merged `logs: PortalLogRequest[]` array into byte-budgeted shards. Each element is
+ * already ≤ PORTAL_MAX_ADDRESSES (1000) addresses (`logRequestsFor` batches at that width ≈ 45 KiB),
+ * so a single element always fits SHARD_BODY_BUDGET — the partition is over ARRAY ELEMENTS, never
+ * inside one. Greedy bin-pack in the merged order: keep the current shard's serialized body under
+ * budget; a bare `type/fields/logs` envelope (`envelope`) is measured with each candidate `logs`
+ * subset. Guarantees: (a) EVERY shard body < SHARD_BODY_BUDGET < MAX_RAW_QUERY_SIZE; (b) the shards
+ * partition `logs` (disjoint, order-preserving, union == input); (c) when the WHOLE array's envelope
+ * is < SHARD_BODY_BUDGET the result is EXACTLY ONE shard whose `logs` IS the input array (same objects,
+ * same order) — so wrapping it in `envelope` is byte-identical to the un-sharded query (the no-op). NB:
+ * the no-op is scoped to < SHARD_BODY_BUDGET, NOT < MAX_RAW_QUERY_SIZE — a body in the SHARD_SAFETY_MARGIN
+ * band (SHARD_BODY_BUDGET ≤ body < MAX_RAW_QUERY_SIZE) still shards into >1 shard (completeness-preserving,
+ * just not a single-body no-op). The validated corpus (≤872 children ≈ 40KB) is far below budget, so it is
+ * provably a byte-identical no-op for the entire validated corpus.
+ */
+function shardLogs(
+  logs: PortalLogRequest[],
+  envelope: (logs: PortalLogRequest[]) => PortalQuery,
+): PortalQuery[] {
+  if (logs.length === 0) return [];
+
+  // A shard with ALL of `logs` — the common (below-the-wall) case. One serialize; if it fits, the
+  // single shard is byte-identical to the un-sharded query (same `logs` reference, same order).
+  const whole = envelope(logs);
+  if (JSON.stringify(whole).length < SHARD_BODY_BUDGET) return [whole];
+
+  const shards: PortalQuery[] = [];
+  let current: PortalLogRequest[] = [];
+  for (const entry of logs) {
+    // Guarantee (a) has teeth: a shard NEVER starts smaller than one element, so if a single element's
+    // own envelope is already ≥ budget the bin-pack would silently emit an oversized shard (both the
+    // first-element push and the reset-to-singleton below). Not reachable today — each element is ≤
+    // PORTAL_MAX_ADDRESSES (1000) addresses ≈ 45KiB — but nothing in this function enforced it. Check
+    // every element ONCE, up front, so an oversized element is an attributable plan-build-time throw,
+    // not a 400 at stream time. It never fires below the wall (that path returned `[whole]` already).
+    const entrySize = JSON.stringify(envelope([entry])).length;
+    invariant(
+      '#194',
+      entrySize < SHARD_BODY_BUDGET,
+      `#194: a single merged log-request element (${entrySize}B) exceeds SHARD_BODY_BUDGET — reduce PORTAL_MAX_ADDRESSES or narrow the filter's topic0 union`,
+      () => ({ entrySize, budget: SHARD_BODY_BUDGET }),
+    );
+
+    if (current.length === 0) {
+      current.push(entry);
+      continue;
+    }
+
+    const withEntry = [...current, entry];
+    if (JSON.stringify(envelope(withEntry)).length < SHARD_BODY_BUDGET) {
+      current = withEntry;
+      continue;
+    }
+
+    shards.push(envelope(current));
+    current = [entry];
+  }
+  if (current.length > 0) shards.push(envelope(current));
+
+  return shards;
+}
+
 /** The unique factories referenced by any filter (deduped by id). */
 export const uniqueFactories = (
   eventCallbacks: { filter: Filter }[],
@@ -296,8 +371,18 @@ export type FetchSpec = Readonly<{
   needTraces: boolean;
   backfillStart: number;
   backfillEnd: number | undefined;
-  /** Log-data query (matched logs + parent transactions); undefined when no log requests expand. */
+  /** Log-data query (matched logs + parent transactions); undefined when no log requests expand.
+   * Equals `logQueryShards()[0]` when the whole body is < SHARD_BODY_BUDGET; kept as the single-body
+   * view for callers/tests that don't shard. */
   logQuery(): PortalQuery | undefined;
+  /** #194: byte-budgeted partition of `logQuery()`'s address union into ≥1 shards, each a full
+   * PortalQuery with IDENTICAL fields/topics and a DISJOINT address subset whose serialized body is
+   * strictly < SHARD_BODY_BUDGET < MAX_RAW_QUERY_SIZE. Empty ⇒ [] (same as logQuery undefined).
+   * When the whole body is < SHARD_BODY_BUDGET it yields EXACTLY ONE shard byte-identical to logQuery()
+   * — the no-op. A body in the SHARD_SAFETY_MARGIN band (SHARD_BODY_BUDGET ≤ body < MAX_RAW_QUERY_SIZE)
+   * still shards into >1 shard (completeness-preserving, not a single-body no-op). portal.ts streams
+   * these sequentially and UNIONs the rows (INV-11). */
+  logQueryShards(): PortalQuery[];
   /** Full-trace query (fetch-all, ranked+filtered client-side — INV-5); undefined when !needTraces. */
   traceQuery(): PortalQuery | undefined;
   /** includeAllBlocks header scan for block-interval sources; undefined when !needBlocks. */
@@ -375,6 +460,24 @@ export function compileFetchSpec(
   const txFields = (): FieldMap =>
     needReceipts ? { ...TX_FIELDS, ...RECEIPT_FIELDS } : TX_FIELDS;
 
+  // The full merged+batched log-request array (reads the LIVE childAddresses map, so factory expansion
+  // reflects discovery). logQuery() wraps it whole; logQueryShards() partitions it byte-budgeted. Both
+  // build from THIS single source so the single-shard case is byte-identical to logQuery() (#194 no-op).
+  const mergedLogRequests = (): PortalLogRequest[] =>
+    mergeLogRequests(
+      logFilters.flatMap((f) => logRequestsFor(f, childAddresses)),
+    ).map((r) => ({ ...r, transaction: true }));
+
+  const logEnvelope = (logs: PortalLogRequest[]): PortalQuery => ({
+    type: 'evm',
+    fields: {
+      block: BLOCK_FIELDS,
+      log: LOG_FIELDS,
+      transaction: txFields(),
+    },
+    logs,
+  });
+
   const spec: FetchSpec = {
     id: Symbol('portal-fetch-spec'),
     logFilters,
@@ -390,20 +493,12 @@ export function compileFetchSpec(
     backfillStart,
     backfillEnd,
     logQuery: () => {
-      const logs = mergeLogRequests(
-        logFilters.flatMap((f) => logRequestsFor(f, childAddresses)),
-      ).map((r) => ({ ...r, transaction: true }));
+      const logs = mergedLogRequests();
       if (logs.length === 0) return undefined;
-      return {
-        type: 'evm',
-        fields: {
-          block: BLOCK_FIELDS,
-          log: LOG_FIELDS,
-          transaction: txFields(),
-        },
-        logs,
-      };
+
+      return logEnvelope(logs);
     },
+    logQueryShards: () => shardLogs(mergedLogRequests(), logEnvelope),
     traceQuery: () => {
       if (!needTraces) return undefined;
       return {

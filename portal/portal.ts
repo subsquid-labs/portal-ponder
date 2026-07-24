@@ -366,8 +366,14 @@ export const createPortalHistoricalSync = (
       gate.addRows(n);
     };
 
-    const lq = spec.logQuery();
-    if (lq)
+    // #194: a factory whose child set overflows one 256KiB Portal body is streamed as MULTIPLE
+    // byte-budgeted shards (disjoint address subsets, IDENTICAL fields/topics). Below the wall this is
+    // exactly ONE shard byte-identical to the un-sharded logQuery() — a no-op. The completeness gate
+    // (INV-1/INV-3/INV-11) is preserved BY CONSTRUCTION: this loop is INSIDE runStreams, so the chunk
+    // promise resolves (→ dataCache.set by idx / interval-cached) ONLY after EVERY shard has drained
+    // into `cd`. A shard throw propagates out of runStreams → rejects the chunk promise → G1 evict →
+    // the WHOLE chunk (all shards) retries fresh. There is NO partial-commit window between shards.
+    for (const lq of spec.logQueryShards())
       for await (const blocks of client.stream(lq, from, to, {
         neededMissing,
         onRows,
