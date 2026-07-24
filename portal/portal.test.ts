@@ -5,6 +5,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, beforeEach, expect, test } from 'vitest';
 import { createPortalHistoricalSync } from './portal.js';
+import { MAX_RAW_QUERY_SIZE } from './portal-filters.js';
 
 /**
  * Range-END cursor anchor for an IN-RANGE `/finalized-stream` window (issue #47). The real Portal
@@ -4467,19 +4468,42 @@ test('regression (#21 §1, INV-15 gate): a factory creation log BELOW factory.fr
   }
 });
 
-test('guard: an over-limit request body fails loud with the explicit size driver (never a silent Portal 400)', async () => {
-  // 12k filter addresses → batched bodies sum > 256KB MAX_RAW_QUERY_SIZE. The proactive guard must
-  // throw a clear, actionable error BEFORE the POST, not let the Portal reject it opaquely.
+test('#194: an over-limit LOG filter is SHARDED into ≤-cap bodies (no fail-loud), each body < MAX_RAW_QUERY_SIZE', async () => {
+  // 12k filter addresses → a single un-sharded body would sum > 256KB MAX_RAW_QUERY_SIZE. Historically
+  // portal.ts fed ONE oversized body to client.stream and the size guard hard-stopped the chain. Post-#194
+  // portal.ts streams `spec.logQueryShards()`: the address union is partitioned into multiple bodies, each
+  // < MAX_RAW_QUERY_SIZE, and UNIONed — so the chain no longer fails loud, it shards and completes. (The
+  // client-level size guard itself is unchanged and still fires on a single un-shardable body — see
+  // portal-client.test.ts 'body-size guard'; it protects the tx path, which is NOT sharded this pass.)
   const addrs = Array.from(
     { length: 12000 },
-    (_, i) => '0x' + i.toString(16).padStart(40, '0'),
+    (_, i) => `0x${i.toString(16).padStart(40, '0')}`,
   );
+  const bodies: number[] = [];
+  const naddrs: number[] = [];
   const srv = http.createServer((req, res) => {
     let b = '';
     req.on('data', (c) => {
       b += c;
     });
-    req.on('end', () => res.writeHead(204).end());
+    req.on('end', () => {
+      if (req.url?.includes('finalized-head')) {
+        res.writeHead(200, { 'content-type': 'application/json' });
+        res.end(JSON.stringify({ number: 1_000_000_000 }));
+        return;
+      }
+      // record each POST body's size + address count so we can prove the plan sharded UNDER the cap.
+      bodies.push(b.length);
+      const q = b ? JSON.parse(b) : {};
+      naddrs.push(
+        (q.logs ?? []).reduce(
+          (s: number, r: any) => s + (r.address?.length ?? 0),
+          0,
+        ),
+      );
+      const to = q.toBlock ?? 1e12;
+      anchorRes(res, to, []); // no matched blocks; terminate at the range-end anchor (issue #47)
+    });
   });
   const p = await new Promise<number>((r) =>
     srv.listen(0, () => r((srv.address() as AddressInfo).port)),
@@ -4490,7 +4514,7 @@ test('guard: an over-limit request body fails loud with the explicit size driver
       chainId: 1,
       sourceId: 'big',
       address: addrs,
-      topic0: '0x' + '11'.repeat(32),
+      topic0: `0x${'11'.repeat(32)}`,
       topic1: null,
       topic2: null,
       topic3: null,
@@ -4507,20 +4531,24 @@ test('guard: an over-limit request body fails loud with the explicit size driver
       childAddresses: new Map(),
       eventCallbacks: [{ filter }],
     } as any);
-    await expect(
-      sync.syncBlockRangeData({
-        interval: [0, 100],
-        requiredIntervals: [{ interval: [0, 100], filter }],
-        requiredFactoryIntervals: [],
-        syncStore: {
-          insertLogs() {},
-          insertBlocks() {},
-          insertTransactions() {},
-          insertTransactionReceipts() {},
-          insertTraces() {},
-        },
-      } as any),
-    ).rejects.toThrow(/exceeds MAX_RAW_QUERY_SIZE/);
+    // NO fail-loud: the sharded plan streams to completion.
+    await sync.syncBlockRangeData({
+      interval: [0, 100],
+      requiredIntervals: [{ interval: [0, 100], filter }],
+      requiredFactoryIntervals: [],
+      syncStore: {
+        insertLogs() {},
+        insertBlocks() {},
+        insertTransactions() {},
+        insertTransactionReceipts() {},
+        insertTraces() {},
+      },
+    } as any);
+
+    // ≥2 shard POSTs, EACH body strictly under the cap, and the union transported all 12k addresses.
+    expect(bodies.length).toBeGreaterThanOrEqual(2);
+    for (const len of bodies) expect(len).toBeLessThan(MAX_RAW_QUERY_SIZE);
+    expect(naddrs.reduce((s, n) => s + n, 0)).toBe(addrs.length);
   } finally {
     srv.close();
   }
