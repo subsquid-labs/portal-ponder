@@ -736,12 +736,22 @@ export function createPortalClient(deps: PortalClientDeps): PortalClient {
             // crash on (issue #116). Only throttles get enriched — a persistent NETWORK error keeps its
             // own diagnostic message (connectivity, not a shared-endpoint rate limit).
             if (err instanceof PortalThrottleError) {
+              // An authenticated request (an `x-api-key` header is set) is our principled proxy for a
+              // DEDICATED / private Portal, so redact the endpoint from this crash-path message — a private
+              // host leaking into a log that gets pasted into a public issue is an infra-info leak. The
+              // public default Portal is unkeyed, so its URL stays shown (useful diagnostic). Case-insensitive
+              // because header casing is not normalized here.
+              const redactEndpoint = Object.keys(headers).some(
+                (k) => k.toLowerCase() === 'x-api-key',
+              );
+
               throw new PortalThrottleExhaustedError(
                 err.status,
                 err.retryAfterMs,
                 portalUrl,
                 chainName,
                 attempt,
+                redactEndpoint,
               );
             }
 

@@ -190,6 +190,39 @@ test('issue #116: a PERSISTENT 429 exhausts the retry budget and throws an ACTIO
   expect(stats.retries).toBe(10);
 });
 
+test('endpoint-scrub: an AUTHENTICATED (x-api-key) persistent 429 redacts the private endpoint from the crash message (keeps chain + both levers)', async () => {
+  // Mirror of issue #116 but on the KEYED/private path: an `x-api-key` header is our proxy for a dedicated
+  // Portal, so the crash-path message must NOT leak the private host (it may be pasted into a public issue),
+  // while still carrying everything actionable. The public/unkeyed path (issue #116 test above) stays as-is.
+  const stats = createStats();
+  const client = mk({
+    stats,
+    chainName: 'mainnet',
+    portalUrl: 'https://portal.internal.example/datasets/ethereum-mainnet',
+    headers: { 'x-api-key': 'secret-key-value' },
+    fetchImpl: (async () => throttleRes(429)) as any,
+  });
+
+  const err = await collect(client.stream(QUERY, 0, 10)).then(
+    () => undefined,
+    (e) => e,
+  );
+
+  const msg = (err as Error).message;
+
+  // the private endpoint host / full URL is scrubbed, and no api-key ever appears in a message
+  expect(msg).not.toContain('portal.internal.example');
+  expect(msg).not.toContain(
+    'https://portal.internal.example/datasets/ethereum-mainnet',
+  );
+  expect(msg).not.toContain('secret-key-value');
+  // but the actionable payload survives: which chain, and BOTH levers
+  expect(err).toBeInstanceOf(PortalThrottleExhaustedError);
+  expect(msg).toContain('mainnet');
+  expect(msg).toMatch(/dedicated portal/i);
+  expect(msg).toMatch(/PONDER_END|endBlock/);
+});
+
 test('5xx and 409 are treated as throttle (retried)', async () => {
   for (const status of [500, 502, 503, 409]) {
     let n = 0;
