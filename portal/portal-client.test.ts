@@ -193,7 +193,9 @@ test('issue #116: a PERSISTENT 429 exhausts the retry budget and throws an ACTIO
 test('endpoint-scrub: an AUTHENTICATED (x-api-key) persistent 429 redacts the private endpoint from the crash message (keeps chain + both levers)', async () => {
   // Mirror of issue #116 but on the KEYED/private path: an `x-api-key` header is our proxy for a dedicated
   // Portal, so the crash-path message must NOT leak the private host (it may be pasted into a public issue),
-  // while still carrying everything actionable. The public/unkeyed path (issue #116 test above) stays as-is.
+  // while still carrying everything actionable. Redaction happens at the CALL SITE (the client runs the
+  // endpoint through `portalUrlForLog(portalUrl, hasPortalApiKeyHeader(headers))` before handing the error a
+  // final string). The public/unkeyed path (issue #116 test above) stays as-is.
   const stats = createStats();
   const client = mk({
     stats,

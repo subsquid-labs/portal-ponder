@@ -50,6 +50,7 @@ import {
   type PortalRealtimeEvent,
   portalRealtimeEvents,
 } from './portal-realtime.js';
+import { hasPortalApiKeyHeader, portalUrlForLog } from './portal-redaction.js';
 import { hx } from './portal-transform.js';
 
 // INV-17 finalize-path dedupe, re-exported so the wiring hook in runtime/realtime.ts imports it from the
@@ -354,10 +355,15 @@ export async function clampFinalizedToPortalHead(params: {
   // historical seam serves nothing for — while realtime starts ABOVE it: a permanent silent gap. The RPC
   // finality-gap fallback is SUPPRESSED in stream mode, so there is no safe conservative default; fail loud
   // at startup rather than run with a hole. (finding 6 / C11 / G4)
-  if (head === undefined)
+  if (head === undefined) {
+    // Redact the URL from this crash-path message on an authenticated (private/dedicated) Portal;
+    // `portalHeaders()` is the module's keyed signal (it sets x-api-key from PORTAL_API_KEY). (portal-redaction)
+    const keyed = hasPortalApiKeyHeader(portalHeaders());
+
     throw new Error(
-      `Portal ${chain.name}: /finalized-head probe failed in stream mode (PORTAL_REALTIME=stream) — cannot establish the finality boundary. Check Portal connectivity for ${portalUrl}.`,
+      `Portal ${chain.name}: /finalized-head probe failed in stream mode (PORTAL_REALTIME=stream) — cannot establish the finality boundary. Check Portal connectivity for ${portalUrlForLog(portalUrl, keyed)}.`,
     );
+  }
   // Persisted-finality floor: never adopt a boundary below finality ponder has already persisted (or
   // below the previously adopted boundary, at the cutover sites). Ponder's own migrate-time guard
   // ("Finalized block cannot move backwards") checks only the RPC finalized block, which is fetched

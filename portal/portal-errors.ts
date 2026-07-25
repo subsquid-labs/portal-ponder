@@ -58,14 +58,11 @@ export class PortalThrottleError extends Error {
  * levers a dev has: point at a DEDICATED Portal, or bound the range (`PONDER_END` / a per-source
  * `endBlock`) so the demo grinds through a smaller window. (issue #116)
  *
- * `redactEndpoint` scrubs the raw endpoint from the message: this error is thrown on a CRASH path, and a
- * crash log tends to get pasted into a public issue / support ticket. For an operator on a DEDICATED /
- * private Portal, the private endpoint HOST leaking that way is an infra-info leak (defense-in-depth — the
- * host is not a credential, so this is hardening, not a vuln fix), so an authenticated request (a Portal
- * API key is set) redacts it to a fixed placeholder. For the PUBLIC default Portal (unkeyed) the URL is not
- * secret and IS a useful diagnostic ("you're hammering the free public Portal"), so it is intentionally
- * still shown. `chainName` already identifies which chain, so the redacted form needs no dataset slug — it
- * keeps the attempt count, the shared/rate-limited cause line, and BOTH actionable levers. (endpoint-scrub)
+ * `endpoint` is expected PRE-SANITIZED by the caller: this error is thrown on a CRASH path, and a crash log
+ * tends to get pasted into a public issue / support ticket, so a private Portal host must not leak. The call
+ * site passes the endpoint already run through `portalUrlForLog` (see portal-redaction.ts) — the placeholder
+ * on an authenticated/private Portal, the verbatim URL on the public default. This class stays a dumb
+ * taxonomy carrier: it interpolates whatever final string it is handed and adds no policy of its own.
  */
 export class PortalThrottleExhaustedError extends PortalThrottleError {
   constructor(
@@ -74,15 +71,11 @@ export class PortalThrottleExhaustedError extends PortalThrottleError {
     endpoint: string,
     chainName: string,
     attempts: number,
-    redactEndpoint: boolean,
   ) {
     super(status, retryAfterMs);
     this.name = 'PortalThrottleExhaustedError';
-    const where = redactEndpoint
-      ? '<redacted — authenticated Portal>'
-      : endpoint;
     this.message =
-      `Portal ${status ?? 'throttle'} for ${chainName}: the endpoint kept throttling across ${attempts} attempts (${where}). ` +
+      `Portal ${status ?? 'throttle'} for ${chainName}: the endpoint kept throttling across ${attempts} attempts (${endpoint}). ` +
       'This usually means a SHARED / rate-limited Portal (e.g. the free public Portal under a full-history backfill). ' +
       'Use a DEDICATED Portal endpoint, or bound the backfill to a smaller window (set PONDER_END, or a per-source endBlock) so a rate-limited endpoint can keep up.';
   }
