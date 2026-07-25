@@ -5,6 +5,7 @@ import { createPortalHistoricalSync } from './portal.js';
 import { loadPortalConfig } from './portal-config.js';
 import { __resetSharedGate, sharedGate } from './portal-gate.js';
 import { InvariantViolation } from './portal-invariant.js';
+import { AUTHENTICATED_PORTAL_PLACEHOLDER } from './portal-redaction.js';
 
 /**
  * Seam-level regression tests for the orchestration shell (portal.ts): the G1/G3 fixes, the
@@ -170,6 +171,7 @@ afterEach(() => {
   delete process.env.PORTAL_FINALIZED_HEAD;
   delete process.env.PORTAL_REALTIME;
   delete process.env.PORTAL_CHECKS;
+  delete process.env.PORTAL_API_KEY;
 });
 
 // ── G1 (INV-13): a rejected chunk promise is evicted — the next call REFETCHES ──────────────────────
@@ -590,6 +592,88 @@ test('INV-9: stream-realtime mode with a KNOWN head below the interval is FATAL,
     srv.close();
   }
 });
+
+test('endpoint-scrub (stream-mode stale-LOW FATAL): the "past the probed finalized head" error REDACTS the Portal URL on an authenticated (private) Portal', async () => {
+  // Same stale-LOW FATAL as the INV-9 test above, but on the KEYED/private path: PORTAL_API_KEY is our
+  // proxy for a dedicated Portal, so this crash-path message ("Check <endpoint> replica consistency") must
+  // not leak the private host into a log that gets pasted into a public issue. (endpoint-scrub)
+  delete process.env.PORTAL_FINALIZED_HEAD;
+  process.env.PORTAL_REALTIME = 'stream';
+  process.env.PORTAL_API_KEY = 'secret-key-value';
+  const srv = headServer(() => 100);
+  const port = await listen(srv);
+  try {
+    const rpc: any = {
+      request: async () => [],
+    };
+    const filter = mkFilter({ fromBlock: 150, toBlock: 200 });
+    const sync = mkSync(port, filter, { rpc });
+    const interval: [number, number] = [150, 200]; // past head 100 → stale-LOW fatal
+
+    const err = await sync
+      .syncBlockRangeData({
+        interval,
+        requiredIntervals: [{ interval, filter }],
+        requiredFactoryIntervals: [],
+        syncStore: mkSyncStore(),
+      })
+      .then(
+        () => {
+          throw new Error('expected a stale-LOW throw');
+        },
+        (e: Error) => e,
+      );
+
+    // still the same actionable stale-LOW error, only the endpoint is scrubbed:
+    expect(err.message).toMatch(/stale-LOW/);
+    expect(err.message).toContain(AUTHENTICATED_PORTAL_PLACEHOLDER);
+    expect(err.message).not.toContain(`localhost:${port}`);
+    expect(err.message).not.toContain('secret-key-value');
+  } finally {
+    srv.close();
+  }
+});
+
+test('endpoint-scrub (stream-mode unknown-head FATAL): the "/finalized-head probe failed" error REDACTS the Portal URL on an authenticated (private) Portal', async () => {
+  // The stream-mode counterpart of the unknown-head fatal: a persistently-failing head probe leaves the
+  // historical↔realtime boundary unknown → fatal (never silently []-synced). On the KEYED/private path this
+  // crash-path message must not leak the private host into a public issue. (endpoint-scrub)
+  delete process.env.PORTAL_FINALIZED_HEAD;
+  process.env.PORTAL_REALTIME = 'stream';
+  process.env.PORTAL_API_KEY = 'secret-key-value';
+  const srv = headServer(() => 'fail');
+  const port = await listen(srv);
+  try {
+    const rpc: any = {
+      request: async () => [],
+    };
+    const filter = mkFilter({ fromBlock: 0, toBlock: 100 });
+    const sync = mkSync(port, filter, { rpc });
+    const interval: [number, number] = [0, 100];
+
+    const err = await sync
+      .syncBlockRangeData({
+        interval,
+        requiredIntervals: [{ interval, filter }],
+        requiredFactoryIntervals: [],
+        syncStore: mkSyncStore(),
+      })
+      .then(
+        () => {
+          throw new Error('expected a finalized-head-probe throw');
+        },
+        (e: Error) => e,
+      );
+
+    // still the same actionable "probe failed" error, only the endpoint is scrubbed:
+    expect(err.message).toMatch(/finalized-head probe failed/);
+    expect(err.message).toContain(AUTHENTICATED_PORTAL_PLACEHOLDER);
+    expect(err.message).not.toContain(`localhost:${port}`);
+    expect(err.message).not.toContain('secret-key-value');
+  } finally {
+    srv.close();
+  }
+}, 20_000); // the head probe retries with real backoff before giving up
 
 test('INV-9: the cached Portal head is MONOTONIC — a stale-LOW later probe cannot unserve an interval at/below the highest observed head (wave 4)', async () => {
   // Load-balanced Portal replicas answer probes independently, so a later probe can return a LOWER head.

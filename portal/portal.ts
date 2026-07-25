@@ -850,10 +850,11 @@ export const createPortalHistoricalSync = (
             // UNKNOWN (probe persistently failing) means we can't locate the historical↔realtime boundary:
             // returning [] would mark this interval synced with NO data while realtime streams only ABOVE
             // the head we can't find — a permanent silent gap. Fail loud. (finding 6 / C11 / INV-9)
-            if (portalHead === undefined)
+            if (portalHead === undefined) {
               throw new Error(
                 `Portal ${chain.name}: /finalized-head probe failed in stream mode (PORTAL_REALTIME=stream) — cannot establish the historical/realtime boundary for [${interval[0]},${interval[1]}]. Refusing to mark the range synced with no data. Check Portal connectivity for ${portalUrlForLog(portalUrl, keyed)}.`,
               );
+            }
 
             // A KNOWN head below the interval is ALSO fatal in stream mode (wave 4 review; this used to
             // debug + return [] as "realtime /stream covers it"). It never legitimately fires:
