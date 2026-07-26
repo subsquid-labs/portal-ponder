@@ -57,6 +57,12 @@ export class PortalThrottleError extends Error {
  * shared/rate-limited endpoint, e.g. the free public Portal under a full-history backfill) and the two
  * levers a dev has: point at a DEDICATED Portal, or bound the range (`PONDER_END` / a per-source
  * `endBlock`) so the demo grinds through a smaller window. (issue #116)
+ *
+ * `endpoint` is expected PRE-SANITIZED by the caller: this error is thrown on a CRASH path, and a crash log
+ * tends to get pasted into a public issue / support ticket, so a private Portal host must not leak. The call
+ * site passes the endpoint already run through `portalUrlForLog` (see portal-redaction.ts) — the placeholder
+ * on an authenticated/private Portal, the verbatim URL on the public default. This class stays a dumb
+ * taxonomy carrier: it interpolates whatever final string it is handed and adds no policy of its own.
  */
 export class PortalThrottleExhaustedError extends PortalThrottleError {
   constructor(

@@ -6,6 +6,7 @@ import { join } from 'node:path';
 import { afterEach, beforeEach, expect, test } from 'vitest';
 import { createPortalHistoricalSync } from './portal.js';
 import { MAX_RAW_QUERY_SIZE } from './portal-filters.js';
+import { AUTHENTICATED_PORTAL_PLACEHOLDER } from './portal-redaction.js';
 
 /**
  * Range-END cursor anchor for an IN-RANGE `/finalized-stream` window (issue #47). The real Portal
@@ -311,6 +312,58 @@ test('default logs: Portal startup and completion are visible without JSON-RPC w
   expect(completeLines[0]).toContain(
     'served entirely by the SQD Portal (0 JSON-RPC for history)',
   );
+});
+
+test('endpoint-scrub (site 5): the "Portal backfill active" startup log REDACTS the URL on an authenticated (private) Portal, and SHOWS it when unkeyed', () => {
+  // The startup INFO log fires synchronously at construction (before any await), so no sync run is needed.
+  // A `PORTAL_API_KEY` is our proxy for a private/dedicated Portal → the highest-frequency exposure site
+  // (every backfill start) must not leak the host into a log that may be pasted into a public issue.
+  const PRIVATE_HOST = 'portal.internal.example';
+  const PRIVATE_URL = `https://${PRIVATE_HOST}/datasets/ethereum-mainnet`;
+
+  const capture = () => {
+    const info: string[] = [];
+    createPortalHistoricalSync({
+      common: {
+        logger: {
+          debug() {},
+          info(entry: any) {
+            info.push(entry.msg);
+          },
+          warn() {},
+          error() {},
+          trace() {},
+        },
+      } as any,
+      chain: { id: 1, name: 'mainnet', portal: PRIVATE_URL } as any,
+      childAddresses: new Map(),
+      eventCallbacks: [],
+    } as any);
+
+    return info[0];
+  };
+
+  // KEYED: the placeholder is shown, the private host / full URL never appears, chain name is retained.
+  process.env.PORTAL_API_KEY = 'secret-key-value';
+  const keyedLine = capture();
+  delete process.env.PORTAL_API_KEY;
+
+  expect(keyedLine).toBe(
+    `Portal backfill active for mainnet: ${AUTHENTICATED_PORTAL_PLACEHOLDER}`,
+  );
+  expect(keyedLine).not.toContain(PRIVATE_HOST);
+  expect(keyedLine).not.toContain(PRIVATE_URL);
+  expect(keyedLine).not.toContain('secret-key-value');
+  expect(keyedLine).toContain('mainnet');
+
+  // UNKEYED (public default Portal): the URL is a useful diagnostic → shown verbatim.
+  delete process.env.PORTAL_API_KEY;
+  const unkeyedLine = capture();
+
+  expect(unkeyedLine).toBe(
+    `Portal backfill active for mainnet: ${PRIVATE_URL}`,
+  );
+  expect(unkeyedLine).toContain(PRIVATE_HOST);
 });
 
 test('regression (C1): a 2nd log filter sharing a chunk on a LATER call is still fetched — no silent gap', async () => {

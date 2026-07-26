@@ -28,6 +28,7 @@ import {
   toRealtimeSyncEvent,
   uniqueFactories,
 } from './portal-realtime-wire.js';
+import { AUTHENTICATED_PORTAL_PLACEHOLDER } from './portal-redaction.js';
 
 // ── euler-real constants ──
 const FACTORY_ADDR = '0x29a56a1b8214d9cf7c5561811750d5cbdb45cc8e';
@@ -85,11 +86,14 @@ const proxyLog = (proxy: string, over: Record<string, any> = {}): any => ({
 
 const savedEnv = process.env.PORTAL_REALTIME;
 const savedPin = process.env.PORTAL_FINALIZED_HEAD;
+const savedKey = process.env.PORTAL_API_KEY;
 afterEach(() => {
   if (savedEnv === undefined) delete process.env.PORTAL_REALTIME;
   else process.env.PORTAL_REALTIME = savedEnv;
   if (savedPin === undefined) delete process.env.PORTAL_FINALIZED_HEAD;
   else process.env.PORTAL_FINALIZED_HEAD = savedPin;
+  if (savedKey === undefined) delete process.env.PORTAL_API_KEY;
+  else process.env.PORTAL_API_KEY = savedKey;
 });
 
 // ─────────────────────────────── flag gating ───────────────────────────────
@@ -377,6 +381,44 @@ test('clampFinalizedToPortalHead: Portal head unknown in stream mode → FATAL (
       fetchImpl,
     }),
   ).rejects.toThrow(/finalized-head probe failed/);
+});
+
+test('endpoint-scrub (stream-mode probe FATAL): the finalized-head-probe error REDACTS the Portal URL on an authenticated (private) Portal', async () => {
+  // Same FATAL as the test above, but on the KEYED/private path: a Portal API key (x-api-key, set from
+  // PORTAL_API_KEY by portalHeaders()) is our proxy for a dedicated Portal, so this crash-path message —
+  // which tends to get pasted into a public issue — must not leak the private host. (endpoint-scrub)
+  process.env.PORTAL_REALTIME = 'stream';
+  process.env.PORTAL_API_KEY = 'secret-key-value';
+  const PRIVATE_HOST = 'portal.internal.example';
+  const PRIVATE_URL = `https://${PRIVATE_HOST}/datasets/mainnet`;
+  const fetchImpl = (async () => {
+    throw new Error('down');
+  }) as any;
+  const finalized = {
+    number: '0x3e8',
+    hash: '0xh',
+    parentHash: '0xp',
+    timestamp: '0x1',
+  } as LightBlock;
+
+  const err = await clampFinalizedToPortalHead({
+    chain: { portal: PRIVATE_URL, name: 'c' } as any,
+    rpc: {} as any,
+    finalizedBlock: finalized,
+    fetchImpl,
+  }).then(
+    () => {
+      throw new Error('expected a finalized-head-probe throw');
+    },
+    (e: Error) => e,
+  );
+
+  // still the same actionable error, only the endpoint is scrubbed:
+  expect(err.message).toMatch(/finalized-head probe failed/);
+  expect(err.message).toContain(AUTHENTICATED_PORTAL_PLACEHOLDER);
+  expect(err.message).not.toContain(PRIVATE_HOST);
+  expect(err.message).not.toContain(PRIVATE_URL);
+  expect(err.message).not.toContain('secret-key-value');
 });
 
 test('clampFinalizedToPortalHead: Portal head BELOW RPC finalized → refetch the block at the Portal head', async () => {

@@ -66,6 +66,7 @@ import {
   startProgressLog,
   writeMetrics,
 } from './portal-metrics.js';
+import { portalUrlForLog } from './portal-redaction.js';
 import { isFinalityGap } from './portal-transform.js';
 
 // #94: the table-qualified field keys of the receipt columns (RECEIPT_FIELDS ride the `transaction`
@@ -97,9 +98,15 @@ export const createPortalHistoricalSync = (
   const log = args.common.logger;
   const chain = args.chain;
   const portalUrl = chain.portal!.replace(/\/$/, '');
+  // A Portal API key is our principled proxy for a DEDICATED / private Portal: when it is set, the URL is
+  // scrubbed from every Portal-layer diagnostic (this startup log AND the stream-mode fatal errors below) —
+  // a private host leaking into a log pasted into a public issue is an infra-info leak. `cfg.apiKey` is the
+  // source of truth — the SAME truthiness test the `headers` build below uses to attach `x-api-key`, so the
+  // redaction signal can never diverge from the actual auth state. (portal-redaction)
+  const keyed = Boolean(cfg.apiKey);
   log.info({
     service: 'portal',
-    msg: `Portal backfill active for ${chain.name}: ${portalUrl}`,
+    msg: `Portal backfill active for ${chain.name}: ${portalUrlForLog(portalUrl, keyed)}`,
   });
   const headers: Record<string, string> = {
     'content-type': 'application/json',
@@ -843,10 +850,11 @@ export const createPortalHistoricalSync = (
             // UNKNOWN (probe persistently failing) means we can't locate the historical↔realtime boundary:
             // returning [] would mark this interval synced with NO data while realtime streams only ABOVE
             // the head we can't find — a permanent silent gap. Fail loud. (finding 6 / C11 / INV-9)
-            if (portalHead === undefined)
+            if (portalHead === undefined) {
               throw new Error(
-                `Portal ${chain.name}: /finalized-head probe failed in stream mode (PORTAL_REALTIME=stream) — cannot establish the historical/realtime boundary for [${interval[0]},${interval[1]}]. Refusing to mark the range synced with no data. Check Portal connectivity for ${portalUrl}.`,
+                `Portal ${chain.name}: /finalized-head probe failed in stream mode (PORTAL_REALTIME=stream) — cannot establish the historical/realtime boundary for [${interval[0]},${interval[1]}]. Refusing to mark the range synced with no data. Check Portal connectivity for ${portalUrlForLog(portalUrl, keyed)}.`,
               );
+            }
 
             // A KNOWN head below the interval is ALSO fatal in stream mode (wave 4 review; this used to
             // debug + return [] as "realtime /stream covers it"). It never legitimately fires:
@@ -858,7 +866,7 @@ export const createPortalHistoricalSync = (
             // means the lag persisted through all retries — the same "boundary cannot be located"
             // condition as an unknown head. Fail loud; a restart re-probes cleanly.
             throw new Error(
-              `Portal ${chain.name}: interval [${interval[0]},${interval[1]}] ends past the probed finalized head ${portalHead} in stream mode (PORTAL_REALTIME=stream). Historical intervals are bounded at the finality boundary, so this head is stale-LOW (a lagging Portal replica). Refusing to mark the range synced with no data — realtime streams only above the boundary. Check ${portalUrl} replica consistency, or pin PORTAL_FINALIZED_HEAD.`,
+              `Portal ${chain.name}: interval [${interval[0]},${interval[1]}] ends past the probed finalized head ${portalHead} in stream mode (PORTAL_REALTIME=stream). Historical intervals are bounded at the finality boundary, so this head is stale-LOW (a lagging Portal replica). Refusing to mark the range synced with no data — realtime streams only above the boundary. Check ${portalUrlForLog(portalUrl, keyed)} replica consistency, or pin PORTAL_FINALIZED_HEAD.`,
             );
           }
           delegated.add(ikey(interval));

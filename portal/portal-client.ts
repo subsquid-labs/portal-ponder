@@ -35,6 +35,7 @@ import {
 } from './portal-filters.js';
 import type { Gate } from './portal-gate.js';
 import type { PortalStats } from './portal-metrics.js';
+import { hasPortalApiKeyHeader, portalUrlForLog } from './portal-redaction.js';
 import type { RawBlock } from './portal-transform.js';
 
 const realSleep = (ms: number): Promise<void> =>
@@ -736,10 +737,15 @@ export function createPortalClient(deps: PortalClientDeps): PortalClient {
             // crash on (issue #116). Only throttles get enriched — a persistent NETWORK error keeps its
             // own diagnostic message (connectivity, not a shared-endpoint rate limit).
             if (err instanceof PortalThrottleError) {
+              // Sanitize the endpoint BEFORE it reaches the (dumb-carrier) error: an authenticated request
+              // (an `x-api-key` header is set) is our principled proxy for a DEDICATED / private Portal, so
+              // a private host must not leak into this crash-path message — it tends to get pasted into a
+              // public issue. `portalUrlForLog` returns the placeholder when keyed, the verbatim URL on the
+              // unkeyed public Portal (a useful "you're hammering the free Portal" diagnostic). (portal-redaction)
               throw new PortalThrottleExhaustedError(
                 err.status,
                 err.retryAfterMs,
-                portalUrl,
+                portalUrlForLog(portalUrl, hasPortalApiKeyHeader(headers)),
                 chainName,
                 attempt,
               );
