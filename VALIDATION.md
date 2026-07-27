@@ -63,7 +63,7 @@ whole-structure O(n) checks used in CI), and the suite proves them with property
 (`fast-check`, seed-pinned for deterministic runs).
 
 The suite runs **against every tracked upstream Ponder version** — `0.15.17`, `0.16.6`, `0.16.7`,
-`0.16.8`, `0.16.9`, `0.16.10`, `0.17.0`, and `0.17.1` (`compat.tested` in `versions.json`) — by grafting the
+`0.16.8`, `0.16.9`, `0.16.10`, `0.17.0`, `0.17.1`, and `0.17.2` (`compat.tested` in `versions.json`) — by grafting the
 Portal layer onto a pinned Ponder checkout:
 
 ```bash
@@ -75,6 +75,7 @@ scripts/sync-upstream.sh 0.16.9  --test
 scripts/sync-upstream.sh 0.16.10 --test
 scripts/sync-upstream.sh 0.17.0  --test
 scripts/sync-upstream.sh 0.17.1  --test
+scripts/sync-upstream.sh 0.17.2  --test
 ```
 
 (config `portal/vite.portal.config.ts`, files `portal/*.test.ts`). The seam
@@ -110,19 +111,33 @@ surface** (`sync-historical`, `runtime/historical`, `sync-store`, `rpc`, `sync`)
   trace/log read-back query in `sync-store/index.ts` to the block ranges of the active filters) —
   downstream of the Portal fetch/insert, so every wiring-touched file is byte-identical between `0.17.0`
   and `0.17.1`, the patch applies with zero rejects, and the seam is untouched.
+- `0.17.2` ([#200](../../pull/200)) applies the `0.17.1` wiring patch **verbatim** (a sha256-equal copy,
+  same 12 files); `0.17.1 → 0.17.2` is two upstream **patch-level bugfixes**, both off-seam or
+  non-overlapping so the fork passively inherits them: (a)
+  [`ponder-sh/ponder#2341`](https://github.com/ponder-sh/ponder/pull/2341) fixes rows returned by
+  `context.db.find()`/`insert()`/`update()` being mutated by a subsequent write to the same row —
+  implemented purely in `src/indexing-store/index.ts`, **off** the graft surface (like the `0.16.9`
+  bytea-COPY fix); and (b)
+  [`ponder-sh/ponder#2347`](https://github.com/ponder-sh/ponder/pull/2347) fixes realtime-discovered
+  factory child addresses being omitted from `ponder_sync.factory_addresses` when a factory is shared
+  across multiple event handlers — implemented in `src/sync-realtime/index.ts`, one of the 12 wiring
+  files, but in regions that do **not** overlap the wiring patch's two hunks (the import block and the
+  `#23` filtered-logs `shouldRequestLogs` fallback), so the patch applies with zero rejects. The graft
+  seam (`HistoricalSync.syncBlockRangeData` / `syncBlockData`) is untouched.
 
-The full current Portal suite is **379 tests across 20 files**, green on every tracked version via the
-one-command gate (verified in the `0.16.10` / `0.17.0` / `0.17.1` compat work). As with `0.15.17`, this basis is
+The full current Portal suite is **396 tests across 22 files**, green on every tracked version via the
+one-command gate (verified in the `0.16.10` / `0.17.0` / `0.17.1` / `0.17.2` compat work). As with `0.15.17`, this basis is
 **not** a fresh RPC byte-diff or cross-validation on the newer versions — the §3 / §5 byte-diff and A/B
 evidence remains on `0.16.6` (see below).
 
 **Evidence base version and seam-identity transfer.** The data-correctness evidence in §3 / §5 (the
 paid-matrix byte-diff and the A/B soak) was gathered on the `0.16.6` graft, whereas the published `latest`
-fork is now `@subsquid/ponder@0.17.1-sqd.2` (published 2026-07-24 with `--tag latest`, superseding
-`0.17.1-sqd.1`, which now installs by exact version; `0.16.10-sqd.1` remains under dist-tag
-`ponder-0.16.10`, `versions.json`). `0.17.1-sqd.2` re-cuts ponder@0.17.1 with the identical wiring patch as
-`0.17.1-sqd.1` plus the off-seam #194 factory log-query sharding fix (PR #195) inside the Portal fetch
-layer, so the transfer argument below is unaffected. That
+fork is now `@subsquid/ponder@0.17.2-sqd.1` (published 2026-07-27 with `--tag latest`, superseding
+`0.17.1-sqd.2`, which now installs by exact version, no dist-tag; `0.16.10-sqd.1` remains under dist-tag
+`ponder-0.16.10`, `versions.json`). `0.17.2-sqd.1` grafts the identical Portal layer onto ponder@0.17.2
+via a **verbatim** copy of the `0.17.1` wiring patch (sha256-equal, same 12 files), with `0.17.1 → 0.17.2`
+being the two off-seam / non-overlapping upstream bugfixes (Layer A above), so the transfer argument
+below is unaffected. That
 evidence **transfers to the shipped artifact by seam identity**: the Portal wiring patch is byte-identical
 (sha256-equal) across the `0.16.6` / `0.16.7` / `0.16.8` grafts and carries forward verbatim to `0.16.9`
 (and to `0.16.10`; `0.17.0` re-derives the patch but re-places every added wiring line byte-for-byte, and
@@ -130,7 +145,7 @@ evidence **transfers to the shipped artifact by seam identity**: the Portal wiri
 that range lands off the Portal graft surface. A version
 bump therefore does **not** invalidate the matrix or the soak, and we deliberately do **not** re-run the
 paid matrix or restart the soak for it. Alongside that transfer, three **direct anchors on the then-shipped
-`0.16.8-sqd.1` package** (now superseded by `0.17.1-sqd.2`; their assurance carries forward by the same
+`0.16.8-sqd.1` package** (now superseded by `0.17.2-sqd.1`; their assurance carries forward by the same
 seam identity) — two landed, one planned — tie the evidence to that exact published build:
 1. the examples end-to-end freshness gate ran against the **published** package
    ([#139](../../pull/139)) — the `euler-subgraph` example reproduced its exact baseline row counts
@@ -1247,13 +1262,14 @@ The injected fault-counter tallies differ run-to-run (injection timing is non-de
 load-bearing invariant — every expected fault fired and every in-scope store digest equals the baseline —
 holds identically on `0.17.0-sqd.1`. The `0.16.8-sqd.1` tarball, artifacts, and digest above remain the
 retained historical anchor; this note **adds** the direct confirmation on the current shipped build rather
-than replacing it. (`0.17.1-sqd.2`, published 2026-07-24 and now `latest`, grafts the identical Portal layer
-via a **verbatim** copy of `wiring/0.17.0.patch` (sha256-equal); the `0.17.0 → 0.17.1` upstream delta is
-a single off-seam `sync-store` read-query optimization, and the `-sqd.1 → -sqd.2` fork delta is the #194
-factory log-query sharding fix (PR #195) which lives off the seam in the Portal fetch layer and is a
-byte-identical no-op for this single-factory sub-cap scenario — so this direct `0.17.0-sqd.1` fault evidence
-carries forward unchanged to the current `0.17.1-sqd.2` build by verbatim-patch + seam identity; it was not
-re-run against `0.17.1-sqd.1` or `0.17.1-sqd.2`.)
+than replacing it. (`0.17.2-sqd.1`, published 2026-07-27 and now `latest`, grafts the identical Portal layer
+via a **verbatim** copy of `wiring/0.17.1.patch` (itself a sha256-equal verbatim copy of `wiring/0.17.0.patch`);
+the `0.17.0 → 0.17.1` upstream delta is a single off-seam `sync-store` read-query optimization, and
+`0.17.1 → 0.17.2` is two off-seam / non-overlapping upstream patch-level bugfixes (`ponder-sh/ponder#2341`
+in `indexing-store/index.ts`, off the graft surface, and `ponder-sh/ponder#2347` in `sync-realtime/index.ts`,
+in regions non-overlapping the wiring hunks) — so this direct `0.17.0-sqd.1` fault evidence
+carries forward unchanged to the current `0.17.2-sqd.1` build by verbatim-patch + seam identity; it was not
+re-run against `0.17.1-sqd.1`, `0.17.1-sqd.2`, or `0.17.2-sqd.1`.)
 
 **What this proves:**
 
@@ -2179,9 +2195,9 @@ is repaired or the RPC-realtime leg is retired.
 **Proven today (with reproducible evidence in this repo):**
 
 - The Portal layer's invariants (INV-1 … INV-25) hold under property-based tests **on every tracked
-  upstream Ponder version** (`0.15.17`, `0.16.6`, `0.16.7`, `0.16.8`, `0.16.9`, `0.16.10`, `0.17.0`, `0.17.1` —
+  upstream Ponder version** (`0.15.17`, `0.16.6`, `0.16.7`, `0.16.8`, `0.16.9`, `0.16.10`, `0.17.0`, `0.17.1`, `0.17.2` —
   each past `0.16.6` registered on a **seam-identity + full-suite** basis, *not* a fresh RPC byte-diff,
-  §2; the full current suite is **379 tests / 20 files**, green on all of them), and every fix is backed
+  §2; the full current suite is **396 tests / 22 files**, green on all of them), and every fix is backed
   by a mutation-verified regression test. The realtime `/stream` liveness invariants INV-22…INV-25 and
   the #175 rework of INV-17 (write-side idempotence on the realtime finalize path) are code +
   mutation-verified **unit-test** evidence on the **experimental** stream path (§5.2, §5.12), not a
