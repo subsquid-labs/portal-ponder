@@ -447,8 +447,16 @@ export const createPortalHistoricalSync = (
             cd.blockHeaders.set(bn, b.header);
         }
       }
-    const txq = spec.txQuery();
-    if (txq)
+    // #196: a factory whose child set feeds a TRANSACTION filter (from/to) can overflow one 256KiB
+    // Portal body just as a log filter can. `txQueryShards()` chunk-then-binpacks the tx-filter body
+    // into byte-budgeted shards (disjoint on the chunked from/to side, IDENTICAL fields). Below the wall
+    // this is exactly ONE shard byte-identical to the un-sharded txQuery() — a no-op. Like the
+    // logQueryShards loop above, this is INSIDE runStreams, so the chunk promise resolves ONLY after
+    // EVERY shard has drained into `cd.txBlocks`; a shard throw rejects the whole chunk → G1 evict →
+    // full retry. There is NO partial-commit window between shards. A tx matches exactly one chunk
+    // (AND semantics over disjoint from/to batches) and assemble dedupes by hash across shards, so the
+    // shard union is complete + non-duplicating by construction.
+    for (const txq of spec.txQueryShards())
       for await (const blocks of client.stream(txq, from, to, {
         neededMissing,
         onRows,
