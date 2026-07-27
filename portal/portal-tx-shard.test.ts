@@ -83,6 +83,29 @@ const factoryFromTxFilter = (
     ...over,
   }) as unknown as TransactionFilter;
 
+// The mirror: a transaction filter whose `toAddress` is the factory (the chunked DOMINANT side is `to`)
+// and whose `fromAddress` is a single plain address kept whole in each chunk. Exercises the
+// `chunkFrom = fromLen >= toLen` FALSE branch (chunk `to`, keep `from` whole) that the from-dominant
+// tests never hit on the green path.
+const KEEP_FROM = `0x${'d'.repeat(40)}`;
+const factoryToTxFilter = (
+  f: Factory,
+  over: Partial<TransactionFilter> = {},
+): TransactionFilter =>
+  ({
+    type: 'transaction',
+    chainId: 1,
+    sourceId: 'evault',
+    fromAddress: KEEP_FROM,
+    toAddress: f,
+    includeReverted: false,
+    fromBlock: 0,
+    toBlock: undefined,
+    hasTransactionReceipt: true,
+    include: [],
+    ...over,
+  }) as unknown as TransactionFilter;
+
 // Build a childAddresses map with `n` distinct children under one factory id. Each child's value is its
 // creation block; `createdAt` (default 1) sets it so a tx served at any block ≥ createdAt re-matches
 // (assembly's factory floor). The completeness tests serve txs at blocks 10/20, so children exist by 1.
@@ -191,6 +214,60 @@ test('#196: huge-from chunk-then-binpack partitions `from` (disjoint, union == o
     Array.from({ length: N }, (_, i) => childAt(i + 1).toLowerCase()),
   );
   expect(seen).toEqual(expected); // union == the original from set (complete)
+  expect(seen.size).toBe(N);
+});
+
+test('#196: huge-`to` chunk-then-binpack partitions `to` (disjoint, union == original) keeping `from` whole', () => {
+  // Mirror of the from-dominant test with the sides swapped: a plain single `fromAddress` (kept whole)
+  // and a factory `toAddress` whose child set overflows. Drives the `chunkFrom = fromLen >= toLen` FALSE
+  // branch (chunk `to`, keep `from` whole) — the ONLY green-path exercise of it; every other positive
+  // sharding test is from-dominant, so this branch was previously reached only by the throw test.
+  const f = factory('evault');
+  const N = 12_000;
+  const spec = compileFetchSpec(
+    [{ filter: factoryToTxFilter(f) }],
+    childrenMap('evault', N),
+  );
+
+  // The un-sharded single body overflows the cap — the wall #196 cures, on the `to` side this time.
+  const single = spec.txQuery()!;
+  expect(historicalBody(single, 0, 1_000_000).length).toBeGreaterThan(
+    MAX_RAW_QUERY_SIZE,
+  );
+
+  const shards = spec.txQueryShards();
+  expect(shards.length).toBeGreaterThanOrEqual(2);
+
+  const reqs = allTxRequests(shards);
+  // EVERY shard body strictly < budget (no shard can 400 server-side).
+  for (const shard of shards) {
+    const body = historicalBody(shard, 0, 1_000_000);
+    expect(body.length).toBeLessThan(SHARD_BODY_BUDGET);
+    expect(body.length).toBeLessThan(MAX_RAW_QUERY_SIZE);
+  }
+
+  // Every request keeps the OTHER side (`from`) WHOLE — the chunk step splits only the dominant `to`.
+  for (const r of reqs) {
+    expect(r.from).toEqual([KEEP_FROM.toLowerCase()]);
+    // each chunk's to is at most one PORTAL_MAX_ADDRESSES batch wide (the chunk width).
+    expect((r.to ?? []).length).toBeLessThanOrEqual(PORTAL_MAX_ADDRESSES);
+  }
+
+  // DISJOINT + UNION == original: the to-subsets across every request partition the child set exactly.
+  const seen = new Set<string>();
+  let dupes = 0;
+  for (const r of reqs)
+    for (const a of r.to ?? []) {
+      if (seen.has(a)) dupes++;
+
+      seen.add(a);
+    }
+  expect(dupes).toBe(0); // disjoint on the chunked side (a true partition, not a cover)
+
+  const expected = new Set(
+    Array.from({ length: N }, (_, i) => childAt(i + 1).toLowerCase()),
+  );
+  expect(seen).toEqual(expected); // union == the original to set (complete)
   expect(seen.size).toBe(N);
 });
 
@@ -427,5 +504,148 @@ test('#196 dedup: a tx delivered by TWO shards is stored ONCE (assemble seenTx a
   const uniqueHashes = new Set(hashes);
   // one hash, served by two shards → exactly ONE stored row (seenTx dedup), not two.
   expect(uniqueHashes.size).toBe(1);
+  expect(insertedTxs).toHaveLength(1);
+});
+
+// Drive [SHARED_BN, SHARED_BN] against a mock Portal for a spec with TWO tx filters, each on its OWN large
+// factory (so each filter's from[] overflows and chunk-then-binpacks into MANY shards independently), whose
+// child sets both contain ONE shared address (childAt(1)) → a tx `childAt(1) → KEEP_TO` matches BOTH filters.
+// Because each factory is 12k children, filter A's shard carrying childAt(1) and filter B's shard carrying
+// childAt(1) are DISTINCT bodies in DISTINCT stream calls (they cannot bin-pack together — each is ~full), so
+// the SAME tx (one hash) is delivered on the wire TWICE across two filters. This is the REALISTIC cross-
+// request over-fetch (a real tx has ONE `from`, so one filter's DISJOINT chunks never both serve it — but two
+// filters legitimately can), so assemble's seenTx hash-set must dedup it to exactly ONE stored row.
+const SHARED_CHILD = childAt(1);
+const SHARED_BN = 30;
+// factory `from` filter with an explicit sourceId (two distinct filters must differ so txRequestsFor keeps
+// both requests rather than collapsing identical ones).
+const factoryFromTxFilterId = (
+  f: Factory,
+  sourceId: string,
+): TransactionFilter =>
+  factoryFromTxFilter(f, { sourceId } as Partial<TransactionFilter>);
+// childAddresses map with the SAME shared child (childAt(1)) present under TWO factory ids, plus n-1 filler
+// children each so both requests overflow and shard.
+const twoFactoriesSharingChild = (
+  idA: string,
+  idB: string,
+  n: number,
+): ChildAddresses => {
+  const a = childrenMap(idA, n).get(idA)!;
+  const b = childrenMap(idB, n).get(idB)!;
+
+  return new Map([
+    [idA, a],
+    [idB, b],
+  ]);
+};
+const runTwoFactoriesSharingChild = async (): Promise<{
+  insertedTxs: any[];
+  sharedServes: number;
+}> => {
+  const hash = `0x${'f'.repeat(64)}`;
+  let sharedServes = 0;
+
+  const srv = http.createServer((req, res) => {
+    let body = '';
+    req.on('data', (c) => {
+      body += c;
+    });
+    req.on('end', () => {
+      if (req.url?.includes('finalized-head')) {
+        res.writeHead(200, { 'content-type': 'application/json' });
+        res.end(JSON.stringify({ number: 1_000_000_000 }));
+        return;
+      }
+      const q = body ? JSON.parse(body) : {};
+      const from = q.fromBlock ?? 0;
+      const to = q.toBlock ?? 1e12;
+      const wantsShared = requestsFrom(q.transactions, SHARED_CHILD);
+      if (wantsShared) sharedServes++;
+
+      const out: any[] = [];
+      if (wantsShared && from <= SHARED_BN && to >= SHARED_BN)
+        out.push(txBlock(SHARED_BN, SHARED_CHILD.toLowerCase(), hash));
+
+      const end = Math.min(to, 1_000_000_000);
+      const maxServed = out.reduce(
+        (m, b) => Math.max(m, (b as any).header?.number ?? -1),
+        -1,
+      );
+      const final =
+        maxServed >= end
+          ? out
+          : [
+              ...out,
+              { header: txBlock(end, SHARED_CHILD.toLowerCase(), hash).header },
+            ];
+      res.writeHead(200, { 'content-type': 'application/x-ndjson' });
+      res.end(`${final.map((b) => JSON.stringify(b)).join('\n')}\n`);
+    });
+  });
+
+  const port: number = await new Promise((r) =>
+    srv.listen(0, () => r((srv.address() as AddressInfo).port)),
+  );
+  try {
+    const insertedTxs: any[] = [];
+    const syncStore: any = {
+      insertLogs: () => {},
+      insertBlocks: () => {},
+      insertTransactions: (x: any) => insertedTxs.push(...x.transactions),
+      insertTransactionReceipts: () => {},
+      insertTraces: () => {},
+    };
+    const filterA = factoryFromTxFilterId(factory('evaultA'), 'srcA');
+    const filterB = factoryFromTxFilterId(factory('evaultB'), 'srcB');
+    (filterA as any).toBlock = 499_999;
+    (filterB as any).toBlock = 499_999;
+
+    const sync = createPortalHistoricalSync({
+      common: {
+        logger: { debug() {}, info() {}, warn() {}, error() {}, trace() {} },
+      } as any,
+      chain: {
+        id: 1,
+        name: 'mainnet',
+        portal: `http://localhost:${port}`,
+      } as any,
+      childAddresses: twoFactoriesSharingChild('evaultA', 'evaultB', 12_000),
+      eventCallbacks: [{ filter: filterA }, { filter: filterB }],
+    } as any);
+
+    const interval: [number, number] = [SHARED_BN, SHARED_BN];
+    const logs = await sync.syncBlockRangeData({
+      interval,
+      requiredIntervals: [
+        { interval, filter: filterA },
+        { interval, filter: filterB },
+      ],
+      requiredFactoryIntervals: [],
+      syncStore,
+    } as any);
+    await sync.syncBlockData({ interval, logs, syncStore } as any);
+
+    return { insertedTxs, sharedServes };
+  } finally {
+    srv.close();
+  }
+};
+
+test('#196 cross-request dedup: TWO factory filters sharing a child match the SAME tx ⇒ stored ONCE', async () => {
+  const { insertedTxs, sharedServes } = await runTwoFactoriesSharingChild();
+
+  // Sanity: the shared child was requested by MORE THAN ONE distinct shard body (filter A's shard AND filter
+  // B's shard), so the SAME tx really is delivered on the wire TWICE — the REAL cross-request over-fetch the
+  // dedup exists for, not the artificial one-filter-two-shards overlap (one filter's disjoint chunks can
+  // never both serve one tx).
+  expect(sharedServes).toBeGreaterThanOrEqual(2);
+
+  // …yet the tx is stored exactly ONCE. Two INDEPENDENT dedup layers guard this (defense-in-depth, so
+  // neutering EITHER alone is masked by the other — the mutation-check neuters BOTH): assemble's per-range
+  // seenTx hash-set (portal-assemble.ts, tx-filter branch) drops a tx already emitted this assemble call, and
+  // syncBlockData's final Map<hash, tx> (portal.ts) collapses any duplicate hash before insertTransactions.
+  const hashes = insertedTxs.map((t) => t.hash);
+  expect(new Set(hashes).size).toBe(1);
   expect(insertedTxs).toHaveLength(1);
 });

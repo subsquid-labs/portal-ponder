@@ -337,17 +337,20 @@ function shardLogs(
  * portal-assemble.ts:180/238/314 — drops non-matches so over-fetch is harmless, and assemble's seenTx /
  * seenReceipt hash-sets, portal-assemble.ts:446-482, drop any tx/receipt seen across shards.)
  *
- * both-sides-huge corner: when from AND to are EACH individually large enough that keeping the OTHER
- * whole still overflows, chunking one side does not help (a grid partition would blow up shard COUNT —
- * throughput, not correctness). We do NOT grid-partition here; the caller's per-element fail-loud
- * invariant fires (mirroring shardLogs:296 and portal-client.ts:509's "cannot be safely split").
+ * both-sides-huge corner: when a fixed PORTAL_MAX_ADDRESSES-wide chunk of the dominant side PLUS the
+ * whole other side STILL overflows the budget, fixed-width chunking of one side does not help (NEITHER
+ * side need individually exceed budget for this to bite — e.g. from=5000 + to=4800 leaves a first chunk
+ * `{from: 1000, to: 4800}` over-cap). Curing it needs adaptive sub-PORTAL_MAX_ADDRESSES chunking (or a
+ * grid partition, which would blow up shard COUNT) — a throughput enhancement, deliberately out of scope
+ * and field-unreachable today. We do NOT sub-chunk here; the caller's per-element fail-loud invariant
+ * fires (mirroring shardLogs:296 and portal-client.ts:509's "cannot be safely split").
  */
 function chunkTxRequest(
   req: TxRequest,
   envelope: (transactions: TxRequest[]) => PortalQuery,
 ): TxRequest[] {
   // Below the per-element wall (the common case incl. the whole validated corpus): keep the request
-  // WHOLE — same object reference, so a single-request plan is byte-identical to txQuery().
+  // WHOLE — return the SAME `req` object we received (by reference), so no chunk boundary is introduced.
   if (JSON.stringify(envelope([req])).length < SHARD_BODY_BUDGET) return [req];
 
   // Chunk the DOMINANT side (the larger address array); keep the other side whole in every chunk.
@@ -382,12 +385,16 @@ function chunkTxRequest(
  * shard). Guarantees, mirroring shardLogs: (a) EVERY shard body < SHARD_BODY_BUDGET < MAX_RAW_QUERY_SIZE;
  * (b) the shards partition the chunked array (order-preserving, union == the chunked input); (c) when the
  * WHOLE array's envelope is < SHARD_BODY_BUDGET the result is EXACTLY ONE shard whose `transactions` IS
- * the input array (same objects, same order) — byte-identical to the un-sharded query (the #194-style
- * no-op). NB: the no-op is scoped to < SHARD_BODY_BUDGET, NOT < MAX_RAW_QUERY_SIZE — a body in the
- * SHARD_SAFETY_MARGIN band still shards (completeness-preserving, just not a single-body no-op).
+ * this function's `transactions` arg (same objects, same order); wrapped in `envelope` its serialized body
+ * is byte-identical to txQuery()'s (the #194-style no-op). Cross-method this is byte-identity, NOT `===`:
+ * txQuery() and txQueryShards() each re-derive their TxRequest[] from txRequestsFor independently, so the
+ * arrays are distinct instances with identical serialized bodies. NB: the no-op is scoped to <
+ * SHARD_BODY_BUDGET, NOT < MAX_RAW_QUERY_SIZE — a body in the SHARD_SAFETY_MARGIN band still shards
+ * (completeness-preserving, just not a single-body no-op).
  *
  * both-sides-huge fail-loud: after chunking, a TxRequest whose OWN envelope is still ≥ SHARD_BODY_BUDGET
- * (from AND to each too large to fit with the other whole — see chunkTxRequest) fires an attributable
+ * (a fixed PORTAL_MAX_ADDRESSES-wide chunk of the dominant side plus the whole other side still overflows —
+ * see chunkTxRequest; NEITHER side need individually exceed budget) fires an attributable
  * `invariant('#196', …)` plan-build throw, NOT a Portal 400 at stream time. This mirrors shardLogs:296
  * and portal-client.ts:509's pre-existing "cannot be safely split" hard stop.
  */
@@ -398,7 +405,9 @@ function shardTxRequests(
   if (transactions.length === 0) return [];
 
   // A shard with ALL of `transactions` — the common (below-the-wall) case. One serialize; if it fits,
-  // the single shard is byte-identical to the un-sharded query (same `transactions` reference, order).
+  // the single shard wraps the SAME `transactions` array (by reference, order preserved) — so its
+  // serialized body is byte-identical to what txQuery() produces from the same TxRequest[] value (NOT
+  // the same `===` object: txQuery() re-derives its own array from txRequestsFor; see the FetchSpec doc).
   const whole = envelope(transactions);
   if (JSON.stringify(whole).length < SHARD_BODY_BUDGET) return [whole];
 
@@ -416,7 +425,7 @@ function shardTxRequests(
     invariant(
       '#196',
       entrySize < SHARD_BODY_BUDGET,
-      `#196: a single tx-filter request (${entrySize}B) exceeds SHARD_BODY_BUDGET after chunking — its from AND to sets are each too large to fit one request with the other whole (a grid partition would blow up shard count); narrow the filter`,
+      `#196: a single tx-filter request (${entrySize}B) exceeds SHARD_BODY_BUDGET (${SHARD_BODY_BUDGET}B) after chunking — a PORTAL_MAX_ADDRESSES-sized chunk of the dominant from/to side PLUS the whole other side still overflows the budget (adaptive sub-PORTAL_MAX_ADDRESSES chunking is deliberately out of scope — a throughput enhancement, field-unreachable today); narrow or split the filter`,
       () => ({ entrySize, budget: SHARD_BODY_BUDGET }),
     );
 
@@ -508,8 +517,10 @@ export type FetchSpec = Readonly<{
   /** includeAllBlocks header scan for block-interval sources; undefined when !needBlocks. */
   blockQuery(): PortalQuery | undefined;
   /** Account-transaction from/to query; undefined when !needTxFilter or no from/to sets.
-   * Equals `txQueryShards()[0]` when the whole body is < SHARD_BODY_BUDGET; kept as the single-body
-   * view for callers/tests that don't shard. */
+   * Byte-identical to `txQueryShards()[0]` when the whole body is < SHARD_BODY_BUDGET (each method
+   * re-derives its `transactions` from `txRequestsFor` independently — a distinct array instance whose
+   * serialized body is identical, NOT the same `===` reference); kept as the single-body view for
+   * callers/tests that don't shard. */
   txQuery(): PortalQuery | undefined;
   /** #196: byte-budgeted partition of `txQuery()`'s tx-filter body into ≥1 shards, each a full
    * PortalQuery with IDENTICAL fields and a subset of the `transactions: TxRequest[]` array whose
