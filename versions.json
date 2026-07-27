@@ -81,6 +81,7 @@
   ],
   "compat": {
     "tested": [
+      "0.17.2",
       "0.17.1",
       "0.17.0",
       "0.16.10",
@@ -90,7 +91,7 @@
       "0.16.6",
       "0.15.17"
     ],
-    "seamStableRange": "0.15.17 - 0.17.1 (verified identical by inspection; CI matrix promotes to 'tested' as patches land)",
+    "seamStableRange": "0.15.17 - 0.17.2 (verified identical by inspection; CI matrix promotes to 'tested' as patches land)",
     "howToAdd": "see PUBLISHING.md — scripts/sync-upstream.sh <ver> --test, then add the row here"
   }
 }
