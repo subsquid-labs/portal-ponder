@@ -319,6 +319,135 @@ function shardLogs(
   return shards;
 }
 
+/**
+ * #196: split ONE over-cap `TxRequest` into fitting pieces by CHUNKING its dominant address side.
+ *
+ * Unlike log requests — which `logRequestsFor` pre-batches into ≤PORTAL_MAX_ADDRESSES-address
+ * `PortalLogRequest` elements so a single element always fits — `txRequestsFor` packs ALL factory-child
+ * addresses into ONE `TxRequest.from` (or `.to`) array with no batching. So the over-cap lives INSIDE
+ * one TxRequest's from[]/to[] array, not across the `TxRequest[]` array. To restore the "single element
+ * always fits" invariant the bin-packer relies on, we split the DOMINANT (larger) side — `from` XOR
+ * `to` — into fixed-width disjoint batches of PORTAL_MAX_ADDRESSES (mirroring `logRequestsFor`'s
+ * `for (i += PORTAL_MAX_ADDRESSES)` batching), each batch keeping the OTHER side WHOLE.
+ *
+ * COMPLETE + NON-DUP BY CONSTRUCTION: a tx matches a TxRequest iff `from ∈ req.from AND to ∈ req.to`
+ * (AND within a request). Chunking the dominant side into disjoint batches Fi (other side whole) means a
+ * tx's from lands in exactly ONE Fi → it matches exactly one chunk; the union over chunks == the
+ * original request, disjoint on the chunked side. (Client re-match — `txFilterMatched`,
+ * portal-assemble.ts:180/238/314 — drops non-matches so over-fetch is harmless, and assemble's seenTx /
+ * seenReceipt hash-sets, portal-assemble.ts:446-482, drop any tx/receipt seen across shards.)
+ *
+ * both-sides-huge corner: when a fixed PORTAL_MAX_ADDRESSES-wide chunk of the dominant side PLUS the
+ * whole other side STILL overflows the budget, fixed-width chunking of one side does not help (NEITHER
+ * side need individually exceed budget for this to bite — e.g. from=5000 + to=4800 leaves a first chunk
+ * `{from: 1000, to: 4800}` over-cap). Curing it needs adaptive sub-PORTAL_MAX_ADDRESSES chunking (or a
+ * grid partition, which would blow up shard COUNT) — a throughput enhancement, deliberately out of scope
+ * and field-unreachable today. We do NOT sub-chunk here; the caller's per-element fail-loud invariant
+ * fires (mirroring shardLogs:296 and portal-client.ts:509's "cannot be safely split").
+ */
+function chunkTxRequest(
+  req: TxRequest,
+  envelope: (transactions: TxRequest[]) => PortalQuery,
+): TxRequest[] {
+  // Below the per-element wall (the common case incl. the whole validated corpus): keep the request
+  // WHOLE — return the SAME `req` object we received (by reference), so no chunk boundary is introduced.
+  if (JSON.stringify(envelope([req])).length < SHARD_BODY_BUDGET) return [req];
+
+  // Chunk the DOMINANT side (the larger address array); keep the other side whole in every chunk.
+  const fromLen = req.from?.length ?? 0;
+  const toLen = req.to?.length ?? 0;
+  const chunkFrom = fromLen >= toLen;
+  const side = chunkFrom ? req.from : req.to;
+  if (!side || side.length === 0) return [req]; // no address side to split → let the caller fail loud
+
+  const out: TxRequest[] = [];
+  for (let i = 0; i < side.length; i += PORTAL_MAX_ADDRESSES) {
+    const batch = side.slice(i, i + PORTAL_MAX_ADDRESSES);
+    if (chunkFrom) {
+      out.push(req.to ? { from: batch, to: req.to } : { from: batch });
+    } else {
+      out.push(req.from ? { from: req.from, to: batch } : { to: batch });
+    }
+  }
+
+  return out;
+}
+
+/**
+ * #196: partition a `transactions: TxRequest[]` array into byte-budgeted shards (chunk-then-binpack).
+ *
+ * STEP 1 — chunk: each TxRequest whose own envelope is ≥ SHARD_BODY_BUDGET is split (chunkTxRequest)
+ * into disjoint fixed-width batches of its dominant side, restoring the "single element always fits"
+ * invariant the bin-pack below relies on. Below the wall this leaves the array UNTOUCHED (same objects).
+ *
+ * STEP 2 — bin-pack: greedy pack the chunked `TxRequest[]` into shards under SHARD_BODY_BUDGET (a
+ * shardLogs-shaped packer: keep the current shard's serialized body under budget; else start a new
+ * shard). Guarantees, mirroring shardLogs: (a) EVERY shard body < SHARD_BODY_BUDGET < MAX_RAW_QUERY_SIZE;
+ * (b) the shards partition the chunked array (order-preserving, union == the chunked input); (c) when the
+ * WHOLE array's envelope is < SHARD_BODY_BUDGET the result is EXACTLY ONE shard whose `transactions` IS
+ * this function's `transactions` arg (same objects, same order); wrapped in `envelope` its serialized body
+ * is byte-identical to txQuery()'s (the #194-style no-op). Cross-method this is byte-identity, NOT `===`:
+ * txQuery() and txQueryShards() each re-derive their TxRequest[] from txRequestsFor independently, so the
+ * arrays are distinct instances with identical serialized bodies. NB: the no-op is scoped to <
+ * SHARD_BODY_BUDGET, NOT < MAX_RAW_QUERY_SIZE — a body in the SHARD_SAFETY_MARGIN band still shards
+ * (completeness-preserving, just not a single-body no-op).
+ *
+ * both-sides-huge fail-loud: after chunking, a TxRequest whose OWN envelope is still ≥ SHARD_BODY_BUDGET
+ * (a fixed PORTAL_MAX_ADDRESSES-wide chunk of the dominant side plus the whole other side still overflows —
+ * see chunkTxRequest; NEITHER side need individually exceed budget) fires an attributable
+ * `invariant('#196', …)` plan-build throw, NOT a Portal 400 at stream time. This mirrors shardLogs:296
+ * and portal-client.ts:509's pre-existing "cannot be safely split" hard stop.
+ */
+function shardTxRequests(
+  transactions: TxRequest[],
+  envelope: (transactions: TxRequest[]) => PortalQuery,
+): PortalQuery[] {
+  if (transactions.length === 0) return [];
+
+  // A shard with ALL of `transactions` — the common (below-the-wall) case. One serialize; if it fits,
+  // the single shard wraps the SAME `transactions` array (by reference, order preserved) — so its
+  // serialized body is byte-identical to what txQuery() produces from the same TxRequest[] value (NOT
+  // the same `===` object: txQuery() re-derives its own array from txRequestsFor; see the FetchSpec doc).
+  const whole = envelope(transactions);
+  if (JSON.stringify(whole).length < SHARD_BODY_BUDGET) return [whole];
+
+  // STEP 1 — chunk over-cap requests so every element fits (restores "single element always fits").
+  const chunked = transactions.flatMap((req) => chunkTxRequest(req, envelope));
+
+  const shards: PortalQuery[] = [];
+  let current: TxRequest[] = [];
+  for (const entry of chunked) {
+    // Guarantee (a) has teeth: a shard never starts smaller than one element, so an element whose own
+    // envelope is still ≥ budget (both-sides-huge, chunkTxRequest could not reduce it) would silently
+    // emit an oversized shard. Fail loud, attributably, at plan-build — NOT a 400 at stream time. Mirrors
+    // shardLogs:296 and portal-client.ts:509. Never fires below the wall (that returned `[whole]` above).
+    const entrySize = JSON.stringify(envelope([entry])).length;
+    invariant(
+      '#196',
+      entrySize < SHARD_BODY_BUDGET,
+      `#196: a single tx-filter request (${entrySize}B) exceeds SHARD_BODY_BUDGET (${SHARD_BODY_BUDGET}B) after chunking — a PORTAL_MAX_ADDRESSES-sized chunk of the dominant from/to side PLUS the whole other side still overflows the budget (adaptive sub-PORTAL_MAX_ADDRESSES chunking is deliberately out of scope — a throughput enhancement, field-unreachable today); narrow or split the filter`,
+      () => ({ entrySize, budget: SHARD_BODY_BUDGET }),
+    );
+
+    if (current.length === 0) {
+      current.push(entry);
+      continue;
+    }
+
+    const withEntry = [...current, entry];
+    if (JSON.stringify(envelope(withEntry)).length < SHARD_BODY_BUDGET) {
+      current = withEntry;
+      continue;
+    }
+
+    shards.push(envelope(current));
+    current = [entry];
+  }
+  if (current.length > 0) shards.push(envelope(current));
+
+  return shards;
+}
+
 /** The unique factories referenced by any filter (deduped by id). */
 export const uniqueFactories = (
   eventCallbacks: { filter: Filter }[],
@@ -387,8 +516,24 @@ export type FetchSpec = Readonly<{
   traceQuery(): PortalQuery | undefined;
   /** includeAllBlocks header scan for block-interval sources; undefined when !needBlocks. */
   blockQuery(): PortalQuery | undefined;
-  /** Account-transaction from/to query; undefined when !needTxFilter or no from/to sets. */
+  /** Account-transaction from/to query; undefined when !needTxFilter or no from/to sets.
+   * Byte-identical to `txQueryShards()[0]` when the whole body is < SHARD_BODY_BUDGET (each method
+   * re-derives its `transactions` from `txRequestsFor` independently — a distinct array instance whose
+   * serialized body is identical, NOT the same `===` reference); kept as the single-body view for
+   * callers/tests that don't shard. */
   txQuery(): PortalQuery | undefined;
+  /** #196: byte-budgeted partition of `txQuery()`'s tx-filter body into ≥1 shards, each a full
+   * PortalQuery with IDENTICAL fields and a subset of the `transactions: TxRequest[]` array whose
+   * serialized body is strictly < SHARD_BODY_BUDGET < MAX_RAW_QUERY_SIZE. Empty ⇒ [] (same as txQuery
+   * undefined). When the whole body is < SHARD_BODY_BUDGET it yields EXACTLY ONE shard byte-identical to
+   * txQuery() — the no-op (the #194-style guarantee for the whole validated corpus). Above the wall, a
+   * TxRequest whose own envelope overflows is first CHUNKED (its dominant from/to side split into
+   * disjoint PORTAL_MAX_ADDRESSES batches, the other side kept whole) so every resulting element fits,
+   * then the elements are bin-packed into byte-budgeted shards. The chunked side is DISJOINT across the
+   * chunks of one request and their union == the original side, so a tx matches exactly one chunk (AND
+   * semantics + client re-match + assemble's seenTx dedup make the shard union complete + non-dup by
+   * construction — see shardTxRequests). portal.ts streams these sequentially and UNIONs the rows. */
+  txQueryShards(): PortalQuery[];
 }>;
 
 /** Trace-index parity (INV-5): fetch EVERY trace (no server-side trace filter) so buildTraces ranks over
@@ -478,6 +623,19 @@ export function compileFetchSpec(
     logs,
   });
 
+  // The tx-filter query envelope. txQuery() wraps the whole TxRequest[] via this; txQueryShards()
+  // partitions it byte-budgeted through the SAME envelope so the single-shard case is byte-identical to
+  // txQuery() (#196 no-op) — exactly how logQuery()/logQueryShards() share logEnvelope. Receipt columns
+  // ALWAYS ride the tx query (see the note in txQuery below).
+  const txEnvelope = (transactions: TxRequest[]): PortalQuery => ({
+    type: 'evm',
+    fields: {
+      block: BLOCK_FIELDS,
+      transaction: { ...TX_FIELDS, ...RECEIPT_FIELDS },
+    },
+    transactions,
+  });
+
   const spec: FetchSpec = {
     id: Symbol('portal-fetch-spec'),
     logFilters,
@@ -532,15 +690,17 @@ export function compileFetchSpec(
       // these receipts unconditionally — if upstream ever relaxed that literal-true invariant, a tx
       // row without its receipt row would crash buildEvents (no receipts at all) or silently
       // mis-match a neighbor's receipt (sparse receipts). Projecting unconditionally makes the tx
-      // query correct on its own, without depending on that upstream invariant.
-      return {
-        type: 'evm',
-        fields: {
-          block: BLOCK_FIELDS,
-          transaction: { ...TX_FIELDS, ...RECEIPT_FIELDS },
-        },
-        transactions,
-      };
+      // query correct on its own, without depending on that upstream invariant. Built from txEnvelope
+      // so it is byte-identical to txQueryShards()[0] below the wall (#196 no-op).
+      return txEnvelope(transactions);
+    },
+    txQueryShards: () => {
+      if (!needTxFilter) return [];
+      const transactions = txRequestsFor(transactionFilters, childAddresses);
+
+      return transactions.length === 0
+        ? []
+        : shardTxRequests(transactions, txEnvelope);
     },
   };
   return Object.freeze(spec);
