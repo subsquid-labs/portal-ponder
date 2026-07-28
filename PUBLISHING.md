@@ -26,6 +26,37 @@ field per chain that routes the historical backfill through SQD Portal (realtime
   We publish a fork release **only for the ponder versions that are needed**, while tracking which past
   and future versions still hold.
 
+## Supported lines & the backport policy
+
+A **supported line** is a ponder version we advertise a **moving dist-tag** for — the newest under
+`latest`, plus each older line under its `ponder-<version>` tag. The set is **data, not lore**: it lives
+in `versions.json` under `supportedLines.lines` (today: `0.17.2`, `0.16.10`, `0.16.6`, `0.15.17`). The
+Portal layer (`portal/`) is version-agnostic, so **every supported line can carry the same layer** — and
+the policy below is what keeps them in sync.
+
+> **Current state (2026-07-28):** the supported lines are at *divergent* revs
+> (`0.17.2-sqd.1` / `0.16.10-sqd.1` / `0.16.6-sqd.2` / `0.15.17-sqd.2`) — a pre-policy artifact where
+> some fixes landed only on the newest line. The immediate catch-up wave rev-bumps every stale line onto
+> the current Portal layer; from then on the policy below keeps them in lockstep.
+
+Because the layer is shared, a fix must not live on only one line — going forward:
+
+- **Every fork-side fix release triggers a backport wave.** When a `-sqd.<rev>` bump lands on `latest`
+  (a Portal-layer fix, not just an upstream-parity version track), rev-bump **every other supported
+  line** onto the same layer and re-publish it under its `ponder-<version>` dist-tag. `latest` is never
+  clobbered — the release workflow tags non-newest versions with `ponder-<version>` automatically.
+- **Each line is gated independently.** `scripts/sync-upstream.sh <ver> --test` must be green (full
+  suite) for every line in the wave. A per-version gate failure **surfaces to a human** — ship the green
+  lines, never a red one, and never silently skip a line.
+- **This is a routine self-dispatch class** (shipped fixes, full gates, no new behavior) — the same
+  parity-release autonomy grant covers backport rev-bumps.
+- **Docs**: after a wave, the README version matrix shows each supported line's current `-sqd` rev plus a
+  one-line freshness statement ("all supported lines carry the current Portal layer as of `<release>`"),
+  and release notes list the wave.
+- **EOL**: dropping a line from support is an explicit `supportedLines.lines` edit **and** a README note
+  (human-visible in the PR) — never silent staleness. Pin-exact historical builds (no moving dist-tag)
+  are frozen and are **not** backported.
+
 ## Releasing — automated (npm Trusted Publishing via OIDC, no token)
 
 Releases run through [`.github/workflows/release.yml`](.github/workflows/release.yml) and

@@ -93,5 +93,9 @@
     ],
     "seamStableRange": "0.15.17 - 0.17.2 (verified identical by inspection; CI matrix promotes to 'tested' as patches land)",
     "howToAdd": "see PUBLISHING.md — scripts/sync-upstream.sh <ver> --test, then add the row here"
+  },
+  "supportedLines": {
+    "policy": "A SUPPORTED LINE is a ponder version we advertise a moving dist-tag for: the newest (`latest`) plus each `ponder-<version>` tag. The Portal layer is version-agnostic, so every supported line CAN carry the same layer — and this policy is what keeps them in sync. GOING FORWARD, every fork-side fix release (any `-sqd.<rev>` bump on `latest`) TRIGGERS a backport wave: the same portal layer is rev-bumped and re-published on every other supported line, each gated identically (`scripts/sync-upstream.sh <ver> --test` full suite green per version). A per-version gate failure surfaces to a human — never ship a red line, never silently skip one. Dropping a line from support is an explicit change here + a README note (never silent staleness). Pin-exact historical builds (versions with no moving dist-tag) are frozen and are NOT backported. NOTE (2026-07-28): the lines are currently at DIVERGENT revs (a pre-policy artifact); the immediate catch-up wave brings every stale line onto the current Portal layer, after which this policy keeps them in lockstep.",
+    "lines": ["0.17.2", "0.16.10", "0.16.6", "0.15.17"]
   }
 }
