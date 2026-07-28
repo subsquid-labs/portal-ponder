@@ -54,7 +54,7 @@ class of defect. A claim is only as strong as the layer that backs it.
 
 ### Layer A — Unit + invariant tests, on every supported upstream version
 
-The Portal layer (`portal/`) is organised around **explicit, numbered invariants** (INV-1 … INV-25,
+The Portal layer (`portal/`) is organised around **explicit, numbered invariants** (INV-1 … INV-27,
 IDs stable and chronological, not table order), each with a stable, grep-able identity across
 **doc ⟷ code ⟷ test**. The catalog and its rationale
 live in [`portal/INVARIANTS.md`](portal/INVARIANTS.md); the runtime asserts them under
@@ -2188,20 +2188,109 @@ configured floor remains a hard FAIL (unknown chains are never default-tolerated
 ever as sound as its external control; it is a **reported, spot-auditable exception**, removed when leg A
 is repaired or the RPC-realtime leg is retired.
 
+### 5.14 Query-sharding & realtime topic-only wildcard — store-state invariance (INV-26 / INV-27)
+
+This subsection records the two newest invariants: **INV-26** — query-sharding store-state invariance
+([#194](../../pull/194)/[#195](../../pull/195)/[#196](../../pull/196)/[#199](../../pull/199)) — and
+**INV-27** — realtime topic-only wildcard-trim parity ([#205](../../pull/205)/[#206](../../pull/206)).
+Both address the same failure mode from opposite ends of the pipeline: a Portal `/stream` body that grows
+past the raw-query cap (a factory whose child-address union no longer fits) must be split without changing
+the resulting store. As with everything in this document it states plainly what it does and does **not**
+prove. The evidence **class is the same as §5.12** (and §5.8(B)): *code + mutation-verified **unit**
+tests* — construction properties pinned by tests that go RED on the pre-fix code, **not** paid-matrix
+byte-identity (§3), the A/B soak differ (Layer D, §5.13), or the chaos kill-loop (Layer C, §4/§5.4/§5.11).
+They are Layer-A (property/unit) + Layer-B (mutation-verified regression) evidence on the same tier as
+INV-22…25.
+
+**INV-26 — Shard-plan store-state invariance ([#194](../../pull/194)/[#195](../../pull/195)/[#196](../../pull/196)/[#199](../../pull/199)).**
+When a merged log or tx request body would exceed the byte budget, `shardLogs` / `shardTxRequests` /
+`chunkTxRequest` (`portal-filters.ts`) partition it into disjoint, order-preserving, union-complete shards
+each strictly `< SHARD_BODY_BUDGET`, streamed sequentially and UNIONed. The invariant: for **ANY** shard
+plan and **ANY** server partition of `[from,to]` into per-shard response sequences (a load-balanced Portal
+answers each shard's `/stream` independently and may end each response at a different, arbitrary block
+boundary), the resulting **STORE STATE** — the `(chainId, blockNumber, logIndex)`-keyed log set, the
+hash-keyed txs/receipts, the number-keyed blocks — is IDENTICAL to the unsharded fetch, and because ponder
+emits events in checkpoint `(block, txIndex, logIndex)` order the store-state set fully determines the
+emitted event stream, so it too is identical. **Completeness by construction:** the shard loops live
+INSIDE `runStreams` (`portal.ts`), so a chunk promise resolves ONLY after every shard has drained its
+`[from,to]` range into `cd`, and a shard throw rejects the whole chunk → G1 evict + fresh full-plan
+refetch — **no partial-commit window**, no chunk marked complete over undelivered data.
+
+**INV-26 CANDOR CAVEAT (stated, not buried).** Strict byte-identity of the INSERT BATCHES holds only
+**BELOW** the `SHARD_BODY_BUDGET` wall — there the plan is a byte-identical single-shard no-op. **ABOVE**
+the wall the guarantee is store-set equality, not batch byte-identity: intra-block log order may permute
+with shard order, and an overlapping predicate split across shards may emit a log **more than once**. That
+is safe **only because nothing downstream is order- or multiplicity-sensitive** — events are
+checkpoint-ordered, and cross-shard duplicate logs are byte-identical and collapsed by `logs_pkey` +
+`onConflictDoNothing({target:[chainId,blockNumber,logIndex]})` in the store's `insertLogs` (INV-6 store
+dedupe; `assembleRange` deliberately does NOT dedup logs). The tx both-sides-huge corner (a
+`PORTAL_MAX_ADDRESSES`-wide chunk of the dominant from/to side PLUS the whole other side still overflows)
+is a **loud plan-build hard-stop** (`invariant('#196', …)` "narrow the filter"), unreachable in any
+validated/example config — the correct operator-facing outcome, **never a silent gap**.
+
+INV-26 is pinned by `portal-shard.test.ts` — the shard plan is a PARTITION whose union matches the
+un-sharded merged set, the below-wall single-shard byte-identical no-op, the per-shard `< SHARD_BODY_BUDGET`
+budget, a **drop-a-shard mutation guard**, and the `portal.ts` completeness gate (ALL shards drain and the
+LAST shard's rows land; two children in DIFFERENT shards emitting at the SAME block → BOTH logs survive the
+cross-shard union; a shard throw mid-plan REJECTS the chunk and a retry re-streams every shard);
+`portal-shard-fuzz.test.ts` — INV-26 (a) overlapping topic-only + factory predicate split across shards
+emits the child log TWICE byte-identical (the `logs_pkey`/`onConflictDoNothing` store-safety precondition),
+(b) the same rows under DIFFERENT server range-end partitions yield EQUAL assembled store SETS (with a
+mid-range shard throw rejecting the whole chunk, never a silent drop), (c) the below-wall single-shard
+no-op; and `portal-tx-shard.test.ts` — the #196/#199 tx analogue (chunk-then-binpack partition, cross-shard
++ cross-request `seenTx` dedup, both-sides-huge fail-loud). Mutation-verified: a `shardLogs` partition that
+drops its last element and a `runStreams` shard loop that `break`s after the first shard each fail their
+INV-26 target test and pass again when reverted.
+
+**INV-27 — Topic-only realtime wildcard parity ([#205](../../pull/205)/[#206](../../pull/206)).** When a
+factory-child address union would push a realtime `/stream` log request past the raw-query cap, the
+over-budget **non-discovery** request is flipped to a topic-only (address-stripped) wildcard by
+`stripLogAddressesOverBudget` (`portal-filters.ts`), which strips the largest non-discovery address lists
+first and returns **monotone** wildcard keys. That keeps the subscription body small at the cost of asking
+Portal for a topic-matched **superset**; the superset is safe only because the wire trims it back to
+exactly the matched children before the event reaches ponder's realtime runtime. In
+`getPortalRealtimeEventGenerator` (which owns the wildcard key set and logs each flip once), each
+wildcard-delivered block event is trimmed via `isLogFilterMatched` / `isLogFactoryMatched` and its parent
+transactions are pruned to surviving logs **BEFORE** `toRealtimeSyncEvent`, so the emitted
+`RealtimeSyncEvent` is **byte-equivalent** to the equivalent address-filtered subscription (store-parity is
+the gate). The flip is **monotone** — a filter that went wildcard stays wildcard, so an over-cap body is
+never re-posted on a same-cursor reopen (#206) — and **discovery / factory requests are NEVER stripped**.
+
+INV-27 is pinned by `portal-filters.test.ts` — *"#196 realtime wildcard: over-budget requests strip
+largest non-discovery address lists first and stay monotone"*; `portal-realtime.test.ts` — the **T1**
+growth-past-wall flip (*"T1 growth-past-wall: realtime /stream flips an over-budget log filter to topic-only
+wildcard instead of posting an over-cap body"*); and `portal-realtime-wire.test.ts` — **T2** superset-trim /
+store-parity (wildcard-delivered non-child logs and their parent txs removed before emit — the mutation-
+verified store-parity gate), **T3** same-block discovery + wildcard (a newly discovered child log from the
+same block survives trim without redelivery), **T4** under-cap byte-identical no-op (a small filter keeps
+its address, no wildcard trim), and **T5** fuzz wildcard toggle (409, reorg, and finalize output stay
+identical with and without a wildcard flip).
+
+**What this does NOT prove.** INV-26 and INV-27 are **construction/parity** invariants proven by
+mutation-verified **unit** tests — Layer A (property/unit) + Layer B (mutation-verified regression), the
+**same tier as INV-22…25**. They are **NOT** yet exercised by the paid matrix (Layer E, §3), the A/B soak
+differ (Layer D, §5.13), or the chaos kill-loop (Layer C, §4/§5.4/§5.11). INV-27, being a realtime-path
+property, sits behind the stream path's **experimental** label (§1, §6) exactly as §5.12 does; INV-26's
+store-state invariance holds on both the historical-backfill and realtime bodies, but its evidence is the
+same unit/mutation tier — no byte-diff or soak claim is made for it here.
+
 ---
 
 ## 6. Current status — what a reader can rely on today
 
 **Proven today (with reproducible evidence in this repo):**
 
-- The Portal layer's invariants (INV-1 … INV-25) hold under property-based tests **on every tracked
+- The Portal layer's invariants (INV-1 … INV-27) hold under property-based tests **on every tracked
   upstream Ponder version** (`0.15.17`, `0.16.6`, `0.16.7`, `0.16.8`, `0.16.9`, `0.16.10`, `0.17.0`, `0.17.1`, `0.17.2` —
   each past `0.16.6` registered on a **seam-identity + full-suite** basis, *not* a fresh RPC byte-diff,
   §2; the full current suite is **396 tests / 22 files**, green on all of them), and every fix is backed
   by a mutation-verified regression test. The realtime `/stream` liveness invariants INV-22…INV-25 and
   the #175 rework of INV-17 (write-side idempotence on the realtime finalize path) are code +
   mutation-verified **unit-test** evidence on the **experimental** stream path (§5.2, §5.12), not a
-  paid-matrix byte-identity or live-protocol claim.
+  paid-matrix byte-identity or live-protocol claim. The query-sharding store-state invariance (INV-26)
+  and the realtime topic-only wildcard-trim parity (INV-27) cluster (§5.14) are the **same evidence
+  tier** — code + mutation-verified **unit-test** — likewise **not** paid-matrix byte-identity, A/B soak,
+  or chaos-proven.
 - **Crash/resume is safe, and resume-from-partial-persisted-state is now proven.** Tier 0 (PGlite,
   §4.1): 203 kills across 41/41 completed backfills, `SIGKILL`-atomic and restart-idempotent,
   byte-identical to an unkilled baseline across all five row families, intervals tiling exactly, zero
