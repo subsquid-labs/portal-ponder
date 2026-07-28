@@ -125,7 +125,7 @@ surface** (`sync-historical`, `runtime/historical`, `sync-store`, `rpc`, `sync`)
   `#23` filtered-logs `shouldRequestLogs` fallback), so the patch applies with zero rejects. The graft
   seam (`HistoricalSync.syncBlockRangeData` / `syncBlockData`) is untouched.
 
-The full current Portal suite is **396 tests across 22 files**, green on every tracked version via the
+The full current Portal suite is **408 tests across 23 files**, green on every tracked version via the
 one-command gate (verified in the `0.16.10` / `0.17.0` / `0.17.1` / `0.17.2` compat work). As with `0.15.17`, this basis is
 **not** a fresh RPC byte-diff or cross-validation on the newer versions — the §3 / §5 byte-diff and A/B
 evidence remains on `0.16.6` (see below).
@@ -2283,7 +2283,7 @@ same unit/mutation tier — no byte-diff or soak claim is made for it here.
 - The Portal layer's invariants (INV-1 … INV-27) hold under property-based tests **on every tracked
   upstream Ponder version** (`0.15.17`, `0.16.6`, `0.16.7`, `0.16.8`, `0.16.9`, `0.16.10`, `0.17.0`, `0.17.1`, `0.17.2` —
   each past `0.16.6` registered on a **seam-identity + full-suite** basis, *not* a fresh RPC byte-diff,
-  §2; the full current suite is **396 tests / 22 files**, green on all of them), and every fix is backed
+  §2; the full current suite is **408 tests / 23 files**, green on all of them), and every fix is backed
   by a mutation-verified regression test. The realtime `/stream` liveness invariants INV-22…INV-25 and
   the #175 rework of INV-17 (write-side idempotence on the realtime finalize path) are code +
   mutation-verified **unit-test** evidence on the **experimental** stream path (§5.2, §5.12), not a
