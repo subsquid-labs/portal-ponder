@@ -34,10 +34,10 @@ in `versions.json` under `supportedLines.lines` (today: `0.17.2`, `0.16.10`, `0.
 Portal layer (`portal/`) is version-agnostic, so **every supported line can carry the same layer** — and
 the policy below is what keeps them in sync.
 
-> **Current state (2026-07-28):** the supported lines are at *divergent* revs
-> (`0.17.2-sqd.1` / `0.16.10-sqd.1` / `0.16.6-sqd.2` / `0.15.17-sqd.2`) — a pre-policy artifact where
-> some fixes landed only on the newest line. The immediate catch-up wave rev-bumps every stale line onto
-> the current Portal layer; from then on the policy below keeps them in lockstep.
+> **Current state (2026-07-28):** the catch-up wave has **landed** — every supported line now carries the
+> same current Portal layer (`0.17.2-sqd.1` / `0.16.10-sqd.2` / `0.16.6-sqd.3` / `0.15.17-sqd.3`, all built
+> from the same `portal/` tree and published 2026-07-28). The earlier pre-policy divergence (fixes landing
+> only on the newest line) is resolved; from here the policy below keeps them in lockstep.
 
 Because the layer is shared, a fix must not live on only one line — going forward:
 
