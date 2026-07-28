@@ -8,6 +8,8 @@ import {
   mergeLogRequests,
   PORTAL_MAX_ADDRESSES,
   type PortalLogRequest,
+  stripLogAddressesOverBudget,
+  wildcardLogRequestKey,
 } from './portal-filters.js';
 
 fc.configureGlobal({ seed: 1337 }); // deterministic CI
@@ -131,6 +133,56 @@ test('INV-11: an undefined topic0 absorbs all (kept broadest)', () => {
   ]);
   expect(merged).toHaveLength(1);
   expect(merged[0]!.topic0).toBeUndefined();
+});
+
+test('#196 realtime wildcard: over-budget requests strip largest non-discovery address lists first and stay monotone', () => {
+  const requests: PortalLogRequest[] = [
+    { address: ['0xa1', '0xa2'], topic0: ['0xsmall'] },
+    {
+      address: ['0xb1', '0xb2', '0xb3', '0xb4', '0xb5'],
+      topic0: ['0xlarge'],
+    },
+    {
+      address: ['0xfactory1', '0xfactory2', '0xfactory3', '0xfactory4'],
+      topic0: ['0xdiscovery'],
+    },
+  ];
+  const envelope = (logs: PortalLogRequest[]) => ({ type: 'evm', logs });
+  const largeStripped = requests.map((request, index) =>
+    index === 1 ? { topic0: request.topic0 } : request,
+  );
+  const budget = JSON.stringify(envelope(largeStripped)).length + 1;
+  const out = stripLogAddressesOverBudget({
+    requests,
+    envelope,
+    budget,
+    isDiscovery: (_request, index) => index === 2,
+  });
+
+  expect(out.flipped).toEqual([
+    {
+      key: wildcardLogRequestKey(requests[1]!),
+      addressCount: 5,
+    },
+  ]);
+  expect(out.requests[0]!.address).toEqual(['0xa1', '0xa2']);
+  expect(out.requests[1]!.address).toBeUndefined();
+  expect(out.requests[2]!.address).toEqual([
+    '0xfactory1',
+    '0xfactory2',
+    '0xfactory3',
+    '0xfactory4',
+  ]);
+
+  const monotone = stripLogAddressesOverBudget({
+    requests,
+    envelope,
+    budget: Number.MAX_SAFE_INTEGER,
+    wildcard: out.wildcard,
+    isDiscovery: (_request, index) => index === 2,
+  });
+  expect(monotone.flipped).toEqual([]);
+  expect(monotone.requests[1]!.address).toBeUndefined();
 });
 
 // ── batching + factory expansion ──────────────────────────────────────────────────────────────────

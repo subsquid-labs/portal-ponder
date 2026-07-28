@@ -28,11 +28,17 @@ import type {
   FactoryId,
   Filter,
   LightBlock,
+  LogFilter,
   SyncLog,
 } from '@/internal/types.js';
 import { eth_getBlockByNumber } from '@/rpc/actions.js';
 import type { Rpc } from '@/rpc/index.js';
-import { getChildAddress, isLogFactoryMatched } from '@/runtime/filter.js';
+import {
+  getChildAddress,
+  isAddressFactory,
+  isLogFactoryMatched,
+  isLogFilterMatched,
+} from '@/runtime/filter.js';
 import type { RealtimeSyncEvent } from '@/sync-realtime/index.js';
 import { decodeCheckpoint } from '@/utils/checkpoint.js';
 import { probeFinalizedHead } from './portal-client.js';
@@ -42,8 +48,12 @@ import {
   BLOCK_FIELDS,
   buildPortalLogRequests,
   LOG_FIELDS,
+  type PortalLogRequest,
   TX_FIELDS,
   uniqueFactories,
+  type WildcardLogFlip,
+  type WildcardLogRequestKey,
+  wildcardLogRequestKey,
 } from './portal-filters.js';
 import {
   type Light,
@@ -447,6 +457,71 @@ function applyDiscovered(
   return added;
 }
 
+const factoryAddressesFor = (factory: Factory): string[] | undefined => {
+  if (factory.address === undefined) return undefined;
+
+  return (
+    Array.isArray(factory.address) ? factory.address : [factory.address]
+  ).map((address) => address.toLowerCase());
+};
+
+function isDiscoveryLogRequestFor(
+  factories: Factory[],
+  request: PortalLogRequest,
+): boolean {
+  for (const factory of factories) {
+    if (
+      request.topic0?.includes(factory.eventSelector.toLowerCase()) !== true
+    ) {
+      continue;
+    }
+
+    const addresses = factoryAddressesFor(factory);
+    if (addresses === undefined) return true;
+    if (
+      request.address?.some((address) =>
+        addresses.includes(address.toLowerCase()),
+      ) === true
+    ) {
+      return true;
+    }
+  }
+
+  return false;
+}
+
+function hasAddressFilteredFactoryRequests(params: {
+  requests: PortalLogRequest[];
+  childAddresses: Map<FactoryId, Map<Address, number>>;
+  wildcardLogKeys: ReadonlySet<WildcardLogRequestKey>;
+  isDiscoveryLogRequest: (request: PortalLogRequest, index: number) => boolean;
+}): boolean {
+  const liveChildren = new Set<string>();
+  for (const [, addresses] of params.childAddresses) {
+    for (const address of addresses.keys())
+      liveChildren.add(address.toLowerCase());
+  }
+  if (liveChildren.size === 0) return false;
+
+  for (let index = 0; index < params.requests.length; index++) {
+    const request = params.requests[index]!;
+    if (params.isDiscoveryLogRequest(request, index)) continue;
+    if (request.address === undefined) continue;
+    if (
+      request.address.some((address) =>
+        liveChildren.has(address.toLowerCase()),
+      ) === false
+    ) {
+      continue;
+    }
+    if (params.wildcardLogKeys.has(wildcardLogRequestKey(request))) continue;
+
+    return true;
+  }
+
+  return false;
+}
+
 // ─────────────────────────────── event conversion ───────────────────────────────
 
 /** Portal `Light` (decimal number/timestamp) → ponder `LightBlock` (hex). */
@@ -456,6 +531,66 @@ export const lightToLightBlock = (l: Light): LightBlock => ({
   parentHash: l.parentHash as LightBlock['parentHash'],
   timestamp: hx(l.timestamp),
 });
+
+function logMatchesLiveChildFilter(
+  log: SyncLog,
+  logFilters: LogFilter[],
+  childAddresses: Map<FactoryId, Map<Address, number>>,
+): boolean {
+  const blockNumber = Number(log.blockNumber);
+  for (const filter of logFilters) {
+    if (isLogFilterMatched({ filter, log }) === false) continue;
+
+    if (isAddressFactory(filter.address)) {
+      const createdAt = childAddresses
+        .get(filter.address.id)
+        ?.get(log.address.toLowerCase() as Address);
+      if (createdAt !== undefined && createdAt <= blockNumber) return true;
+
+      continue;
+    }
+
+    return true;
+  }
+
+  return false;
+}
+
+function logMatchesDiscovery(log: SyncLog, factories: Factory[]): boolean {
+  for (const factory of factories) {
+    if (isLogFactoryMatched({ factory, log })) return true;
+  }
+
+  return false;
+}
+
+export function trimWildcardRealtimeEvent(
+  ev: Extract<PortalRealtimeEvent, { type: 'block' }>,
+  logFilters: LogFilter[],
+  factories: Factory[],
+  childAddresses: Map<FactoryId, Map<Address, number>>,
+): Extract<PortalRealtimeEvent, { type: 'block' }> {
+  const logs = ev.logs.filter(
+    (log) =>
+      logMatchesLiveChildFilter(log, logFilters, childAddresses) ||
+      logMatchesDiscovery(log, factories),
+  );
+  const transactionHashes = new Set<string>();
+  for (const log of logs) {
+    if (typeof log.transactionHash === 'string')
+      transactionHashes.add(log.transactionHash);
+  }
+  const transactions = ev.transactions.filter(
+    (tx) => tx.hash !== undefined && transactionHashes.has(tx.hash),
+  );
+
+  return {
+    ...ev,
+    logs,
+    transactions,
+    hasMatchedFilter: logs.length > 0,
+  };
+}
 
 /**
  * PortalRealtimeEvent → ponder RealtimeSyncEvent. `block` carries the matched logs AND their parent
@@ -586,6 +721,9 @@ export async function* getPortalRealtimeEventGenerator(params: {
   const portalUrl = cleanUrl(chain.portal!);
   const headers = portalHeaders();
   const factories = uniqueFactories(eventCallbacks);
+  const logFilters = eventCallbacks
+    .map((e) => e.filter)
+    .filter((filter): filter is LogFilter => filter.type === 'log');
 
   const startupFinalized = hexToNumber(syncProgress.finalized.number);
   const fromBlock = startupFinalized + 1; // finalized == Portal head (clamped) → stream (portal-head, tip]
@@ -599,6 +737,28 @@ export async function* getPortalRealtimeEventGenerator(params: {
   // Bumps on every `logs` rebuild; streamHotBlocks watches it and re-opens the /stream the moment it
   // advances so the widened server-side filter takes effect on the next block. (finding 4)
   let logsRevision = 0;
+  let wildcardLogKeys = new Set<WildcardLogRequestKey>();
+  const isDiscoveryLogRequest = (
+    request: PortalLogRequest,
+    _index: number,
+  ): boolean => isDiscoveryLogRequestFor(factories, request);
+  const setWildcardLogRequestKeys = (
+    next: Set<WildcardLogRequestKey>,
+    flipped: WildcardLogFlip[],
+  ): void => {
+    wildcardLogKeys = next;
+    logsRevision++;
+    for (const flip of flipped) {
+      common.logger.warn({
+        service: 'portal',
+        msg: 'Portal /stream log filter exceeded the byte budget — switched it to topic-only wildcard mode; the wire will trim the delivered superset before emit',
+        chain: chain.name,
+        chain_id: chain.id,
+        wildcard_log_key: flip.key,
+        wildcard_address_count: flip.addressCount,
+      });
+    }
+  };
 
   let childCount = 0;
   for (const [, m] of childAddresses) childCount += m.size;
@@ -731,6 +891,9 @@ export async function* getPortalRealtimeEventGenerator(params: {
       logFields: LOG_FIELDS,
       txFields: TX_FIELDS,
       getLogsRevision: () => logsRevision,
+      getWildcardLogRequestKeys: () => wildcardLogKeys,
+      setWildcardLogRequestKeys,
+      isDiscoveryLogRequest,
       // the reconcile anchor: the startup finalized block — an empty window appends ONLY a child of it
       anchor: {
         number: startupFinalized,
@@ -828,15 +991,33 @@ export async function* getPortalRealtimeEventGenerator(params: {
       }
       const discovered = discoverChildAddresses(ev.logs, factories);
       if (applyDiscovered(discovered, childAddresses, blockNumber)) {
-        rebuildLogs();
-        // NEW children in THIS block: its own logs from them were server-side filtered out on the
-        // connection it arrived on. Suppress the incomplete event and await the complete redelivery
-        // (streamHotBlocks re-opens from this block; converges — the child set only grows).
-        setAwaiting({ hash: ev.block.hash as string, number: blockNumber });
-        continue;
+        const nextRequests = buildPortalLogRequests(
+          eventCallbacks,
+          childAddresses,
+        );
+        if (
+          hasAddressFilteredFactoryRequests({
+            requests: nextRequests,
+            childAddresses,
+            wildcardLogKeys,
+            isDiscoveryLogRequest,
+          })
+        ) {
+          rebuildLogs();
+          // NEW children in THIS block: its own logs from them were server-side filtered out on the
+          // connection it arrived on. Suppress the incomplete event and await the complete redelivery
+          // (streamHotBlocks re-opens from this block; converges — the child set only grows).
+          setAwaiting({ hash: ev.block.hash as string, number: blockNumber });
+          continue;
+        }
       }
 
-      yield { chain, event: toRealtimeSyncEvent(ev, discovered) };
+      const emitEvent =
+        wildcardLogKeys.size > 0
+          ? trimWildcardRealtimeEvent(ev, logFilters, factories, childAddresses)
+          : ev;
+
+      yield { chain, event: toRealtimeSyncEvent(emitEvent, discovered) };
 
       // Drain a finalize held back during this block's redelivery, now that ponder has the block: block N
       // is forwarded above, then finalize N here. Otherwise the finalize (already consumed by

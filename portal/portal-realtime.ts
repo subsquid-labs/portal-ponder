@@ -30,6 +30,10 @@ import {
   BLOCK_FIELDS,
   DROPPABLE_FIELDS,
   LOG_FIELDS,
+  type PortalLogRequest,
+  stripLogAddressesOverBudget,
+  type WildcardLogFlip,
+  type WildcardLogRequestKey,
 } from './portal-filters.js';
 import { invariant } from './portal-invariant.js';
 import {
@@ -169,7 +173,7 @@ export type PortalRealtimeArgs = {
   /** first block to stream (exclusive of already-indexed finalized head): syncProgress.finalized.number + 1 */
   fromBlock: number;
   /** euler log filters (address/topics), already merged — passed straight into the Portal query */
-  logs: Array<Record<string, unknown>>;
+  logs: PortalLogRequest[];
   /** the block header fields ponder needs */
   blockFields?: Record<string, boolean>;
   logFields?: Record<string, boolean>;
@@ -239,6 +243,17 @@ export type PortalRealtimeArgs = {
    * the wire without this module importing a logger. Absent ⇒ silent (unit call sites). (RT-1 SC3)
    */
   onFetchError?: () => void;
+  /**
+   * Monotone realtime wildcard state (#196). When present, streamHotBlocks may strip over-budget log
+   * request addresses to topic-only and report the newly-flipped request keys. The wire owns the state so
+   * it can trim the delivered superset before converting the event.
+   */
+  getWildcardLogRequestKeys?: () => ReadonlySet<WildcardLogRequestKey>;
+  setWildcardLogRequestKeys?: (
+    wildcard: Set<WildcardLogRequestKey>,
+    flipped: WildcardLogFlip[],
+  ) => void;
+  isDiscoveryLogRequest?: (request: PortalLogRequest, index: number) => boolean;
   signal?: AbortSignal;
   fetchImpl?: typeof fetch;
 };
@@ -420,7 +435,10 @@ export async function* streamHotBlocks(
         args.blockFields ?? BLOCK_FIELDS,
         'block',
       );
-      body = JSON.stringify({
+      const requestLogs: PortalLogRequest[] = args.txFields
+        ? args.logs.map((r) => ({ ...r, transaction: true }))
+        : args.logs;
+      const envelope = (logs: PortalLogRequest[]) => ({
         type: 'evm',
         fromBlock: cursor,
         // omit the key entirely when we have no hash, so an unarmed legacy request is byte-identical to pre-#33
@@ -431,10 +449,26 @@ export async function* streamHotBlocks(
           log: args.logFields ?? LOG_FIELDS,
           ...(txFields ? { transaction: txFields } : {}),
         },
-        logs: args.txFields
-          ? args.logs.map((r) => ({ ...r, transaction: true }))
-          : args.logs,
+        logs,
       });
+      let bodyLogs = requestLogs;
+      const wildcardKeys = args.getWildcardLogRequestKeys?.();
+      if (wildcardKeys !== undefined) {
+        const wildcarded = stripLogAddressesOverBudget({
+          requests: requestLogs,
+          envelope,
+          wildcard: wildcardKeys,
+          isDiscovery: args.isDiscoveryLogRequest,
+        });
+        bodyLogs = wildcarded.requests;
+        if (wildcarded.flipped.length > 0) {
+          args.setWildcardLogRequestKeys?.(
+            wildcarded.wildcard,
+            wildcarded.flipped,
+          );
+        }
+      }
+      body = JSON.stringify(envelope(bodyLogs));
       cachedBody = body;
       cachedKey = bodyKey;
     }

@@ -257,6 +257,132 @@ export function mergeLogRequests(reqs: PortalLogRequest[]): PortalLogRequest[] {
   return [...groups.values()];
 }
 
+export type WildcardLogRequestKey = string;
+
+export type WildcardLogFlip = {
+  key: WildcardLogRequestKey;
+  addressCount: number;
+};
+
+export type WildcardLogRequestsResult = {
+  requests: PortalLogRequest[];
+  wildcard: Set<WildcardLogRequestKey>;
+  flipped: WildcardLogFlip[];
+};
+
+const normalizedTopicKeyPart = (xs: string[] | undefined): string[] | null =>
+  xs === undefined ? null : [...xs].sort();
+
+export function wildcardLogRequestKey(
+  request: PortalLogRequest,
+): WildcardLogRequestKey {
+  return JSON.stringify([
+    normalizedTopicKeyPart(request.topic0),
+    normalizedTopicKeyPart(request.topic1),
+    normalizedTopicKeyPart(request.topic2),
+    normalizedTopicKeyPart(request.topic3),
+  ]);
+}
+
+const withoutAddress = (request: PortalLogRequest): PortalLogRequest => {
+  const { address: _address, ...rest } = request;
+
+  return rest;
+};
+
+/**
+ * #196 realtime wildcard fallback. When a realtime log body crosses the same byte budget used by
+ * shardLogs, widen the largest address-heavy log filter(s) to topic-only and let the wire trim the
+ * delivered superset before conversion. Pure: callers own the monotone wildcard set and logging.
+ */
+export function stripLogAddressesOverBudget(args: {
+  requests: PortalLogRequest[];
+  envelope: (requests: PortalLogRequest[]) => unknown;
+  wildcard?: ReadonlySet<WildcardLogRequestKey>;
+  isDiscovery?: (request: PortalLogRequest, index: number) => boolean;
+  budget?: number;
+}): WildcardLogRequestsResult {
+  const budget = args.budget ?? SHARD_BODY_BUDGET;
+  const wildcard = new Set(args.wildcard ?? []);
+  const flipped: WildcardLogFlip[] = [];
+  const isDiscovery = (request: PortalLogRequest, index: number): boolean =>
+    args.isDiscovery?.(request, index) ?? false;
+  const fits = (requests: PortalLogRequest[]): boolean =>
+    JSON.stringify(args.envelope(requests)).length < budget;
+  const stripKey = (
+    input: PortalLogRequest[],
+    key: WildcardLogRequestKey,
+  ): PortalLogRequest[] => {
+    let output = input;
+    for (let index = 0; index < args.requests.length; index++) {
+      const request = args.requests[index]!;
+      if (isDiscovery(request, index)) continue;
+      if (wildcardLogRequestKey(request) !== key) continue;
+      if (request.address === undefined) continue;
+
+      if (output === input) output = [...input];
+      output[index] = withoutAddress(request);
+    }
+
+    return output;
+  };
+
+  let requests = args.requests;
+  for (let index = 0; index < args.requests.length; index++) {
+    const request = args.requests[index]!;
+    if (isDiscovery(request, index)) continue;
+
+    const key = wildcardLogRequestKey(request);
+    if (wildcard.has(key)) requests = stripKey(requests, key);
+  }
+
+  if (fits(requests)) return { requests, wildcard, flipped };
+
+  const candidates = args.requests
+    .map((request, index) => ({
+      index,
+      key: wildcardLogRequestKey(request),
+      addressCount: request.address?.length ?? 0,
+    }))
+    .filter((candidate) => {
+      if (candidate.addressCount === 0) return false;
+      if (wildcard.has(candidate.key)) return false;
+
+      return (
+        isDiscovery(args.requests[candidate.index]!, candidate.index) === false
+      );
+    })
+    .sort((a, b) => {
+      if (a.addressCount !== b.addressCount) {
+        return b.addressCount - a.addressCount;
+      }
+
+      return a.index - b.index;
+    });
+
+  for (const candidate of candidates) {
+    if (wildcard.has(candidate.key)) continue;
+
+    wildcard.add(candidate.key);
+    flipped.push({
+      key: candidate.key,
+      addressCount: candidate.addressCount,
+    });
+    requests = stripKey(requests, candidate.key);
+    if (fits(requests)) return { requests, wildcard, flipped };
+  }
+
+  const size = JSON.stringify(args.envelope(requests)).length;
+  invariant(
+    '#196',
+    size < budget,
+    `#196: realtime log request remains ${size}B after every non-discovery address filter was stripped to topic-only`,
+    () => ({ size, budget }),
+  );
+
+  return { requests, wildcard, flipped };
+}
+
 /**
  * #194: partition a merged `logs: PortalLogRequest[]` array into byte-budgeted shards. Each element is
  * already ≤ PORTAL_MAX_ADDRESSES (1000) addresses (`logRequestsFor` batches at that width ≈ 45 KiB),
