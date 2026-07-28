@@ -470,7 +470,12 @@ export async function* streamHotBlocks(
       }
       body = JSON.stringify(envelope(bodyLogs));
       cachedBody = body;
-      cachedKey = bodyKey;
+      // A wildcard flip above bumps `logsRevision` (setWildcardLogRequestKeys), so the pre-build
+      // `bodyKey` is now stale — caching under it would guarantee a miss on the next iteration and
+      // re-serialize this identical (monotone/sticky-wildcard) body once. Re-key from the POST-flip
+      // inputs instead: `cursor`/`droppedFields.size`/`parentBlockHash` are fixed for this iteration and
+      // only `getLogsRevision()` can have changed, so the next same-inputs iteration hits the cache. #206
+      cachedKey = `${cursor}|${args.getLogsRevision?.() ?? 0}|${droppedFields.size}|${parentBlockHash ?? ''}`;
     }
     let res: Response;
     try {

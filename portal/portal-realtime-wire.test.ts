@@ -1971,7 +1971,7 @@ test('T5 fuzz wildcard toggle: 409, reorg, and finalize output stay identical wi
       ).toBe(true);
       expect(wildcarded.events).toEqual(addressed.events);
     }),
-    { numRuns: 8, seed: 196 },
+    { numRuns: 40, seed: 196 },
   );
 });
 

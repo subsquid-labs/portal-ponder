@@ -185,6 +185,25 @@ test('#196 realtime wildcard: over-budget requests strip largest non-discovery a
   expect(monotone.requests[1]!.address).toBeUndefined();
 });
 
+test('#206 wildcard key: two requests with the same topics in DIFFERENT case (and order) key identically', () => {
+  // wildcardLogRequestKey normalizes topic ORDER and CASE at the key source. Topics are already lowercased
+  // upstream (buildPortalLogRequests/asArr), so this is defensive today — but if two requests ever carried
+  // the same topics in different case they must key identically, or one could flip to topic-only wildcard
+  // while its case-twin keeps its address list. Address is excluded from the key, so only the topics matter.
+  const upper: PortalLogRequest = {
+    address: ['0xa1'],
+    topic0: ['0xABCDEF', '0x123456'],
+    topic1: ['0xDEADBEEF'],
+  };
+  const lower: PortalLogRequest = {
+    address: ['0xb1', '0xb2'],
+    topic0: ['0x123456', '0xabcdef'], // same set, different case AND order
+    topic1: ['0xdeadbeef'],
+  };
+
+  expect(wildcardLogRequestKey(upper)).toBe(wildcardLogRequestKey(lower));
+});
+
 // ── batching + factory expansion ──────────────────────────────────────────────────────────────────
 
 test('logRequestsFor: plain-address batches by PORTAL_MAX_ADDRESSES', () => {

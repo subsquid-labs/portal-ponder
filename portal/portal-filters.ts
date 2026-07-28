@@ -270,8 +270,12 @@ export type WildcardLogRequestsResult = {
   flipped: WildcardLogFlip[];
 };
 
+// Normalize both ORDER and CASE at the key source. Topics are already lowercased upstream
+// (buildPortalLogRequests/asArr), so this is unreachable today — but if two requests ever carried the
+// same topics in different case they must key identically, or one could flip to wildcard while its
+// case-twin keeps its address list. Lowercase before sort to close that gap where the key is minted.
 const normalizedTopicKeyPart = (xs: string[] | undefined): string[] | null =>
-  xs === undefined ? null : [...xs].sort();
+  xs === undefined ? null : [...xs].map((x) => x.toLowerCase()).sort();
 
 export function wildcardLogRequestKey(
   request: PortalLogRequest,
