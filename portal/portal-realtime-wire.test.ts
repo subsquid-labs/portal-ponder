@@ -1,3 +1,4 @@
+import fc from 'fast-check';
 import { hexToNumber } from 'viem';
 import { afterEach, expect, test } from 'vitest';
 import type {
@@ -72,6 +73,7 @@ const logFilter = (over: Partial<LogFilter> = {}): LogFilter =>
 // a padded topic word carrying a 20-byte address in its low bytes (indexed address encoding)
 const topicAddr = (addr: string) =>
   `0x${'0'.repeat(24)}${addr.replace(/^0x/, '')}`;
+const childAddr = (n: number) => `0x${n.toString(16).padStart(40, '0')}`;
 const proxyLog = (proxy: string, over: Record<string, any> = {}): any => ({
   address: FACTORY_ADDR,
   topics: [PROXY_CREATED, topicAddr(proxy)],
@@ -82,6 +84,30 @@ const proxyLog = (proxy: string, over: Record<string, any> = {}): any => ({
   transactionIndex: '0x0',
   removed: false,
   ...over,
+});
+
+const depositLog = (
+  address: string,
+  txHash: string,
+  logIndex: number,
+  over: Record<string, any> = {},
+): any => ({
+  address,
+  topics: [DEPOSIT],
+  data: '0x',
+  blockNumber: 100,
+  logIndex,
+  transactionHash: txHash,
+  transactionIndex: logIndex,
+  removed: false,
+  ...over,
+});
+
+const tx = (hash: string, transactionIndex: number): any => ({
+  transactionIndex,
+  hash,
+  from: childAddr(90_000 + transactionIndex),
+  to: childAddr(91_000 + transactionIndex),
 });
 
 const savedEnv = process.env.PORTAL_REALTIME;
@@ -851,6 +877,222 @@ function mockPortalConns(
 const mockPortal = (batches: any[], finalizedHead: number) =>
   mockPortalConns([batches], finalizedHead);
 
+const testCommon = (warns: any[] = []) =>
+  ({
+    logger: {
+      info() {},
+      debug() {},
+      warn(line: any) {
+        warns.push(line);
+      },
+      trace() {},
+    },
+  }) as any;
+
+const largeChildMap = (first: string, count: number): Map<Address, number> => {
+  const out = new Map<Address, number>([[first as Address, 1]]);
+  for (let i = 0; out.size < count; i++) {
+    out.set(childAddr(i + 1_000) as Address, 1);
+  }
+
+  return out;
+};
+
+test('T2 superset-trim / store-parity: wildcard-delivered non-child logs and their parent txs are removed before emit', async () => {
+  process.env.PORTAL_REALTIME = 'stream';
+  const factory = eulerFactory();
+  const child = childAddr(1);
+  const nonChild = childAddr(70_000);
+  const bodies: any[] = [];
+  const warns: any[] = [];
+  const events: any[] = [];
+  for await (const { event } of getPortalRealtimeEventGenerator({
+    common: testCommon(warns),
+    chain: { id: 1, name: 'mainnet', portal: 'http://portal' } as any,
+    rpc: {} as any,
+    eventCallbacks: [{ filter: logFilter({ address: factory as any }) } as any],
+    syncProgress: {
+      finalized: {
+        number: '0x63',
+        hash: 'h99',
+        parentHash: 'h98',
+        timestamp: '0x1',
+      } as any,
+      end: { number: '0x64' } as any,
+    },
+    childAddresses: new Map<string, Map<Address, number>>([
+      ['euler-factory', largeChildMap(child, 7_000)],
+    ]),
+    fetchImpl: mockPortalConns(
+      [
+        [
+          {
+            header: {
+              number: 100,
+              hash: 'h100',
+              parentHash: 'h99',
+              timestamp: 1000,
+            },
+            logs: [
+              depositLog(child, '0xchildtx', 0),
+              depositLog(nonChild, '0xbadtx', 1),
+            ],
+            transactions: [tx('0xchildtx', 0), tx('0xbadtx', 1)],
+          },
+        ],
+      ],
+      0,
+      bodies,
+    ),
+  })) {
+    events.push(event);
+  }
+
+  const block = events.find((event) => event.type === 'block');
+  expect(block.logs.map((log: any) => log.address)).toEqual([child]);
+  expect(
+    block.transactions.map((transaction: any) => transaction.hash),
+  ).toEqual(['0xchildtx']);
+  expect(block.hasMatchedFilter).toBe(true);
+  const depositRequest = bodies[0]!.logs.find((request: any) =>
+    request.topic0?.includes(DEPOSIT),
+  );
+  expect(depositRequest.address).toBeUndefined();
+  const discoveryRequest = bodies[0]!.logs.find((request: any) =>
+    request.topic0?.includes(PROXY_CREATED),
+  );
+  expect(discoveryRequest.address).toEqual([FACTORY_ADDR]);
+  expect(warns).toHaveLength(1);
+});
+
+test('T3 same-block discovery + wildcard: a newly discovered child log from the same block survives trim without redelivery', async () => {
+  process.env.PORTAL_REALTIME = 'stream';
+  const factory = eulerFactory();
+  const existingChild = childAddr(2);
+  const newChild = childAddr(3);
+  const childAddresses = new Map<string, Map<Address, number>>([
+    ['euler-factory', largeChildMap(existingChild, 7_000)],
+  ]);
+  const bodies: any[] = [];
+  const warns: any[] = [];
+  const events: any[] = [];
+  for await (const { event } of getPortalRealtimeEventGenerator({
+    common: testCommon(warns),
+    chain: { id: 1, name: 'mainnet', portal: 'http://portal' } as any,
+    rpc: {} as any,
+    eventCallbacks: [{ filter: logFilter({ address: factory as any }) } as any],
+    syncProgress: {
+      finalized: {
+        number: '0x63',
+        hash: 'h99',
+        parentHash: 'h98',
+        timestamp: '0x1',
+      } as any,
+      end: { number: '0x64' } as any,
+    },
+    childAddresses,
+    fetchImpl: mockPortalConns(
+      [
+        [
+          {
+            header: {
+              number: 100,
+              hash: 'h100',
+              parentHash: 'h99',
+              timestamp: 1000,
+            },
+            logs: [
+              proxyLog(newChild, {
+                blockNumber: 100,
+                logIndex: 0,
+                transactionHash: '0xcreate',
+                transactionIndex: 0,
+              }),
+              depositLog(newChild, '0xnewtx', 1),
+            ],
+            transactions: [tx('0xcreate', 0), tx('0xnewtx', 1)],
+          },
+        ],
+      ],
+      0,
+      bodies,
+    ),
+  })) {
+    events.push(event);
+  }
+
+  const blocks = events.filter((event) => event.type === 'block');
+  expect(blocks).toHaveLength(1);
+  expect(
+    blocks[0]!.logs.some(
+      (log: any) => log.address === newChild && log.topics[0] === DEPOSIT,
+    ),
+  ).toBe(true);
+  expect(childAddresses.get('euler-factory')!.get(newChild as Address)).toBe(
+    100,
+  );
+  expect(bodies).toHaveLength(1);
+  expect(warns).toHaveLength(1);
+});
+
+test('T4 under-cap byte-identical no-op: a small realtime filter keeps its address and emits without wildcard trim', async () => {
+  process.env.PORTAL_REALTIME = 'stream';
+  const factory = eulerFactory();
+  const child = childAddr(4);
+  const bodies: any[] = [];
+  const warns: any[] = [];
+  const events: any[] = [];
+  for await (const { event } of getPortalRealtimeEventGenerator({
+    common: testCommon(warns),
+    chain: { id: 1, name: 'mainnet', portal: 'http://portal' } as any,
+    rpc: {} as any,
+    eventCallbacks: [{ filter: logFilter({ address: factory as any }) } as any],
+    syncProgress: {
+      finalized: {
+        number: '0x63',
+        hash: 'h99',
+        parentHash: 'h98',
+        timestamp: '0x1',
+      } as any,
+      end: { number: '0x64' } as any,
+    },
+    childAddresses: new Map<string, Map<Address, number>>([
+      ['euler-factory', new Map([[child as Address, 1]])],
+    ]),
+    fetchImpl: mockPortalConns(
+      [
+        [
+          {
+            header: {
+              number: 100,
+              hash: 'h100',
+              parentHash: 'h99',
+              timestamp: 1000,
+            },
+            logs: [depositLog(child, '0xchildtx', 0)],
+            transactions: [tx('0xchildtx', 0)],
+          },
+        ],
+      ],
+      0,
+      bodies,
+    ),
+  })) {
+    events.push(event);
+  }
+
+  const depositRequest = bodies[0]!.logs.find((request: any) =>
+    request.topic0?.includes(DEPOSIT),
+  );
+  expect(depositRequest.address).toEqual([child]);
+  expect(warns).toHaveLength(0);
+  const block = events.find((event) => event.type === 'block');
+  expect(block.logs.map((log: any) => log.address)).toEqual([child]);
+  expect(
+    block.transactions.map((transaction: any) => transaction.hash),
+  ).toEqual(['0xchildtx']);
+});
+
 test('getPortalRealtimeEventGenerator: a child discovered in block N gets N RE-DELIVERED complete — its SAME-BLOCK logs are not lost; terminates at endBlock', async () => {
   // The /stream filter is server-side and snapshotted at connection open, so a child created in block N
   // has its own block-N logs filtered out of the connection N arrived on. The old flow forwarded N's
@@ -1546,6 +1788,192 @@ function mockPortalConnsFork(
     return { status: 200, ok: true, body };
   }) as any;
 }
+
+const normalizeRealtimeEvents = (events: any[]) =>
+  events.map((event) => {
+    if (event.type === 'block') {
+      return {
+        type: 'block',
+        number: event.block.number,
+        hash: event.block.hash,
+        logs: event.logs.map((log: any) => ({
+          address: log.address,
+          logIndex: log.logIndex,
+          transactionHash: log.transactionHash,
+        })),
+        transactions: event.transactions.map((transaction: any) => ({
+          hash: transaction.hash,
+          transactionIndex: transaction.transactionIndex,
+        })),
+      };
+    }
+    if (event.type === 'reorg') {
+      return {
+        type: 'reorg',
+        hash: event.block.hash,
+        reorged: event.reorgedBlocks.map((block: any) => block.hash),
+      };
+    }
+
+    return {
+      type: 'finalize',
+      number: event.block.number,
+      hash: event.block.hash,
+    };
+  });
+
+async function runWildcardToggleFuzzCase(params: {
+  wildcard: boolean;
+  noiseCount: number;
+}): Promise<{ events: any[]; bodies: any[]; warns: any[] }> {
+  process.env.PORTAL_REALTIME = 'stream';
+  const factory = eulerFactory();
+  const child = childAddr(8);
+  const noiseLogs = (blockNumber: number) =>
+    params.wildcard
+      ? Array.from({ length: params.noiseCount }, (_, i) =>
+          depositLog(
+            childAddr(80_000 + i),
+            `0xnoise${blockNumber}${i}`,
+            i + 1,
+            {
+              blockNumber,
+            },
+          ),
+        )
+      : [];
+  const childLog = (blockNumber: number, hash: string) =>
+    depositLog(child, hash, 0, { blockNumber });
+  const block = (header: any, childHash: string) => {
+    const logs = [
+      childLog(header.number, childHash),
+      ...noiseLogs(header.number),
+    ];
+
+    return {
+      header,
+      logs,
+      transactions: logs.map((log: any, index) =>
+        tx(log.transactionHash, index),
+      ),
+    };
+  };
+  const conns = [
+    {
+      status: 200 as const,
+      blocks: [
+        block(
+          {
+            number: 100,
+            hash: 'h100',
+            parentHash: 'h99',
+            timestamp: 100,
+          },
+          '0xchild100',
+        ),
+        block(
+          {
+            number: 101,
+            hash: 'h101o',
+            parentHash: 'h100',
+            timestamp: 101,
+          },
+          '0xchild101o',
+        ),
+      ],
+    },
+    {
+      status: 409 as const,
+      previousBlocks: [
+        { number: 100, hash: 'h100' },
+        { number: 101, hash: 'h101c' },
+      ],
+    },
+    {
+      status: 200 as const,
+      blocks: [
+        block(
+          {
+            number: 101,
+            hash: 'h101c',
+            parentHash: 'h100',
+            timestamp: 101,
+          },
+          '0xchild101c',
+        ),
+        block(
+          {
+            number: 102,
+            hash: 'h102c',
+            parentHash: 'h101c',
+            timestamp: 102,
+          },
+          '0xchild102',
+        ),
+      ],
+    },
+  ];
+  const bodies: any[] = [];
+  const warns: any[] = [];
+  const events: any[] = [];
+  for await (const { event } of getPortalRealtimeEventGenerator({
+    common: testCommon(warns),
+    chain: { id: 1, name: 'mainnet', portal: 'http://portal' } as any,
+    rpc: {} as any,
+    eventCallbacks: [{ filter: logFilter({ address: factory as any }) } as any],
+    syncProgress: {
+      finalized: {
+        number: '0x63',
+        hash: 'h99',
+        parentHash: 'h98',
+        timestamp: '0x1',
+      } as any,
+      end: { number: '0x66' } as any,
+    },
+    childAddresses: new Map<string, Map<Address, number>>([
+      [
+        'euler-factory',
+        params.wildcard
+          ? largeChildMap(child, 7_000)
+          : new Map([[child as Address, 1]]),
+      ],
+    ]),
+    fetchImpl: mockPortalConnsFork(conns, 100, bodies),
+    finalizePollMs: 0,
+  })) {
+    events.push(event);
+  }
+
+  return { events: normalizeRealtimeEvents(events), bodies, warns };
+}
+
+test('T5 fuzz wildcard toggle: 409, reorg, and finalize output stay identical with and without a wildcard flip', async () => {
+  await fc.assert(
+    fc.asyncProperty(fc.integer({ min: 0, max: 3 }), async (noiseCount) => {
+      const addressed = await runWildcardToggleFuzzCase({
+        wildcard: false,
+        noiseCount,
+      });
+      const wildcarded = await runWildcardToggleFuzzCase({
+        wildcard: true,
+        noiseCount,
+      });
+
+      expect(wildcarded.warns).toHaveLength(1);
+      expect(
+        wildcarded.bodies.some((body) =>
+          body.logs.some(
+            (request: any) =>
+              request.topic0?.includes(DEPOSIT) &&
+              request.address === undefined,
+          ),
+        ),
+      ).toBe(true);
+      expect(wildcarded.events).toEqual(addressed.events);
+    }),
+    { numRuns: 8, seed: 196 },
+  );
+});
 
 test('getPortalRealtimeEventGenerator: a 1-block orphan at tip HEALS via 409 fork negotiation — the wire emits reorg→block→block with hex LightBlocks and the #26 child-prune fires on the reorg (issue #33 T5)', async () => {
   // End-to-end through the wire, combining the #26 same-block redelivery handshake with the #33 409 heal.

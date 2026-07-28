@@ -1,6 +1,12 @@
 import { getEventListeners } from 'node:events';
 import { afterEach, expect, test, vi } from 'vitest';
-import { BLOCK_FIELDS, TX_FIELDS } from './portal-filters.js';
+import {
+  BLOCK_FIELDS,
+  SHARD_BODY_BUDGET,
+  TX_FIELDS,
+  type WildcardLogFlip,
+  type WildcardLogRequestKey,
+} from './portal-filters.js';
 import {
   diagDump,
   type HotBatch,
@@ -99,6 +105,8 @@ function mockFetch(batches: any[], onExhausted?: () => void) {
     return { status: 200, ok: true, body };
   }) as any;
 }
+
+const addr = (n: number): string => `0x${n.toString(16).padStart(40, '0')}`;
 
 test('portalRealtimeEvents: streams block events (header + logs) and emits finalize from the head poll', async () => {
   const batches = [
@@ -355,6 +363,100 @@ test('streamHotBlocks: re-opens the /stream with the widened filter the moment t
   expect(bodies[1].logs[0].address).toContain('0xnewchild'); // reopened with the widened filter
 
   await gen.return(undefined); // stop the generator
+  ac.abort();
+});
+
+test('T1 growth-past-wall: realtime /stream flips an over-budget log filter to topic-only wildcard instead of posting an over-cap body', async () => {
+  const enc = new TextEncoder();
+  const streamOf = (block: any) =>
+    new ReadableStream({
+      start(c) {
+        c.enqueue(enc.encode(`${JSON.stringify(block)}\n`));
+        c.close();
+      },
+    });
+  const logs: any[] = [{ address: [addr(1), addr(2)], topic0: ['0xdeposit'] }];
+  let rev = 0;
+  let conn = 0;
+  let wildcard = new Set<WildcardLogRequestKey>();
+  const flips: WildcardLogFlip[] = [];
+  const bodies: any[] = [];
+  const fetchImpl = (async (_url: string, init: any) => {
+    bodies.push(JSON.parse(init.body));
+    if (init.body.length >= SHARD_BODY_BUDGET) {
+      return new Response('Query is too large', { status: 400 });
+    }
+
+    conn += 1;
+    if (conn === 1) {
+      return {
+        status: 200,
+        ok: true,
+        body: streamOf({
+          header: {
+            number: 100,
+            hash: 'h100',
+            parentHash: 'h99',
+            timestamp: 100,
+          },
+          logs: [],
+        }),
+      };
+    }
+
+    if (conn === 2) {
+      return {
+        status: 200,
+        ok: true,
+        body: streamOf({
+          header: {
+            number: 101,
+            hash: 'h101',
+            parentHash: 'h100',
+            timestamp: 101,
+          },
+          logs: [],
+        }),
+      };
+    }
+
+    return { status: 204, ok: false, body: null };
+  }) as any;
+
+  const ac = new AbortController();
+  const gen = streamHotBlocks({
+    portalUrl: 'http://portal',
+    headers: {},
+    fromBlock: 100,
+    logs,
+    getLogsRevision: () => rev,
+    getWildcardLogRequestKeys: () => wildcard,
+    setWildcardLogRequestKeys: (next, flipped) => {
+      wildcard = next;
+      flips.push(...flipped);
+      rev += 1;
+    },
+    fetchImpl,
+    signal: ac.signal,
+  });
+
+  const first = await nextBlock(gen);
+  expect(first.value?.header.number).toBe(100);
+
+  logs.length = 0;
+  logs.push({
+    address: Array.from({ length: 7_000 }, (_, i) => addr(i + 10)),
+    topic0: ['0xdeposit'],
+  });
+  rev += 1;
+
+  const second = await nextBlock(gen);
+  expect(second.value?.header.number).toBe(101);
+  expect(flips).toHaveLength(1);
+  expect(bodies[1]!.logs[0]!.address).toBeUndefined();
+  expect(JSON.stringify(bodies[1]).length).toBeLessThan(SHARD_BODY_BUDGET);
+
+  await gen.return(undefined);
   ac.abort();
 });
 
