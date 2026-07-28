@@ -421,8 +421,12 @@ export async function* streamHotBlocks(
     }
     // Rebuild the body only when an input changed; otherwise reuse the last serialization (see above). The
     // key is O(1) to compute — a change in the logs filter bumps `getLogsRevision`, a schema-degrade grows
-    // `droppedFields`, and a resume/reorg moves `cursor`/`parentBlockHash`.
-    const bodyKey = `${cursor}|${args.getLogsRevision?.() ?? 0}|${droppedFields.size}|${parentBlockHash ?? ''}`;
+    // `droppedFields`, and a resume/reorg moves `cursor`/`parentBlockHash`. ONE source for the key formula so
+    // the pre-build and post-flip recompute (below) can never drift; it reads the live per-iteration bindings
+    // at CALL time, so a call after a wildcard flip captures the bumped `getLogsRevision()`. (#206)
+    const computeBodyKey = (): string =>
+      `${cursor}|${args.getLogsRevision?.() ?? 0}|${droppedFields.size}|${parentBlockHash ?? ''}`;
+    const bodyKey = computeBodyKey();
     let body: string;
     if (bodyKey === cachedKey && cachedBody !== undefined) {
       body = cachedBody; // inputs unchanged — reuse the last serialization
@@ -470,7 +474,10 @@ export async function* streamHotBlocks(
       }
       body = JSON.stringify(envelope(bodyLogs));
       cachedBody = body;
-      cachedKey = bodyKey;
+      // A wildcard flip above bumps `logsRevision` (setWildcardLogRequestKeys), so the pre-build `bodyKey`
+      // is now stale; recompute from the POST-flip inputs so the next same-inputs iteration hits the cache
+      // instead of re-serializing this identical (monotone/sticky-wildcard) body. #206
+      cachedKey = computeBodyKey();
     }
     let res: Response;
     try {

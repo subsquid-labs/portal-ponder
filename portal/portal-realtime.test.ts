@@ -626,6 +626,109 @@ test('streamHotBlocks: the body-cache key pins CURSOR independently — a cursor
   ac.abort();
 });
 
+test('streamHotBlocks: a wildcard flip re-keys the cache from the POST-flip logs-revision — the identical sticky-wildcard body is serialized exactly ONCE across the flip iteration and the next same-cursor reopen (#206)', async () => {
+  // #206 nit 3: `setWildcardLogRequestKeys` bumps `logsRevision`, so the pre-build bodyKey computed at the
+  // top of the flip iteration is STALE the instant the flip lands. Caching the just-built (sticky-wildcard)
+  // body under that stale key guarantees a MISS on the very next same-cursor reopen — the body re-serializes
+  // once for nothing. The fix re-keys from the post-flip revision so the next same-inputs iteration HITS.
+  // conn1 is an empty 200 (reconnect at the SAME cursor 100, no block) — this is the second same-cursor
+  // iteration that must reuse the flip iteration's body; conn2 delivers block 100 to unblock the generator.
+  // The logs are over-budget from the start, so the flip fires on the FIRST build. `builds` counts body
+  // serializations via the instrumented `logs.map` (fires once per (re)build when txFields is set). Fix →
+  // builds === 1 (flip build reused on the reopen). Un-fixed → builds === 2 (stale-key miss re-serializes).
+  const enc = new TextEncoder();
+  const emptyStream = () =>
+    new ReadableStream({
+      start(c) {
+        c.close(); // 200 with no data → reconnect at the SAME cursor (no block delivered)
+      },
+    });
+  const streamOf = (block: any) =>
+    new ReadableStream({
+      start(c) {
+        c.enqueue(enc.encode(`${JSON.stringify(block)}\n`));
+        c.close();
+      },
+    });
+
+  // One over-budget address-heavy filter → the first body build flips it to topic-only wildcard.
+  const logs: any[] = [
+    {
+      address: Array.from({ length: 7_000 }, (_, i) => addr(i + 10)),
+      topic0: ['0xdeposit'],
+    },
+  ];
+  const realMap = Array.prototype.map;
+  let builds = 0;
+  // count body serializations: the body maps `args.logs` exactly once per (re)build when txFields is set
+  (logs as any).map = function (this: any[], ...a: any[]) {
+    builds += 1;
+
+    return (realMap as any).apply(this, a);
+  };
+
+  let rev = 0;
+  let wildcard = new Set<WildcardLogRequestKey>();
+  const flips: WildcardLogFlip[] = [];
+  const bodies: string[] = [];
+  let conn = 0;
+  const fetchImpl = (async (_url: string, init: any) => {
+    bodies.push(init.body);
+    conn += 1;
+    if (conn === 1) return { status: 200, ok: true, body: emptyStream() }; // cursor 100, no data → same-cursor reopen
+    if (conn === 2) {
+      return {
+        status: 200,
+        ok: true,
+        body: streamOf({
+          header: {
+            number: 100,
+            hash: 'h100',
+            parentHash: 'h99',
+            timestamp: 100,
+          },
+          logs: [],
+        }),
+      };
+    }
+
+    return { status: 204, ok: false, body: null };
+  }) as any;
+
+  const ac = new AbortController();
+  const gen = streamHotBlocks({
+    portalUrl: 'http://portal',
+    headers: {},
+    fromBlock: 100,
+    logs,
+    txFields: { hash: true },
+    getLogsRevision: () => rev,
+    getWildcardLogRequestKeys: () => wildcard,
+    setWildcardLogRequestKeys: (next, flipped) => {
+      wildcard = next;
+      flips.push(...flipped);
+      rev += 1;
+    },
+    fetchImpl,
+    signal: ac.signal,
+  });
+
+  const first = await nextBlock(gen); // conn1 flips + builds; conn2 reopens SAME cursor 100 → must reuse
+  expect(first.value?.header.number).toBe(100);
+
+  expect(flips).toHaveLength(1); // the over-budget filter flipped to topic-only wildcard exactly once
+  expect(bodies).toHaveLength(2); // conn1 (empty reopen) + conn2 (delivers 100)
+  // THE PIN: the two same-cursor bodies are byte-identical (sticky wildcard, unchanged inputs) and were
+  // serialized ONCE. Un-fixed, the flip's revision bump strands the cache under a stale key → conn2 misses
+  // and re-serializes the identical body (builds === 2). The fix re-keys from the post-flip revision → HIT.
+  expect(bodies[0]).toBe(bodies[1]);
+  expect(builds).toBe(1);
+  expect(JSON.parse(bodies[0]!).logs[0]!.address).toBeUndefined(); // topic-only after the flip
+
+  await gen.return(undefined);
+  ac.abort();
+});
+
 // ─────────────────────────────── /stream parentBlockHash + 409 fork negotiation (issue #33) ───────────────────────────────
 
 // A scripted Portal /stream mock: one entry per connection, each either a 200 that streams blocks then

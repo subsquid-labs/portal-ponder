@@ -501,6 +501,10 @@ function hasAddressFilteredFactoryRequests(params: {
     for (const address of addresses.keys())
       liveChildren.add(address.toLowerCase());
   }
+
+  // Unreachable at the current sole call site: applyDiscovered returning true (wire ~993) guarantees at
+  // least one live child was added, so childAddresses — and thus liveChildren — is non-empty here. Kept
+  // as a cheap defensive floor should this helper gain a caller with an empty child set.
   if (liveChildren.size === 0) return false;
 
   for (let index = 0; index < params.requests.length; index++) {
