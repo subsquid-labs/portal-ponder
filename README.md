@@ -102,14 +102,16 @@ Full adoption path — check, swap, run, validate, roll back — in [`MIGRATION.
 | 0.17.2 | `0.17.2-sqd.1` | **latest** |
 | 0.17.1 | `0.17.1-sqd.2` | published · pin exact (no dist-tag) |
 | 0.17.0 | `0.17.0-sqd.1` | published · pin exact (no dist-tag) |
-| 0.16.10 | `0.16.10-sqd.1` | published · dist-tag `ponder-0.16.10` |
+| 0.16.10 | `0.16.10-sqd.2` | published · dist-tag `ponder-0.16.10` |
 | 0.16.9 | `0.16.9-sqd.1` | published · pin exact (no dist-tag) |
 | 0.16.8 | `0.16.8-sqd.1` | published · pin exact (no dist-tag) |
 | 0.16.7 | `0.16.7-sqd.1` | published · pin exact (no dist-tag) |
-| 0.16.6 | `0.16.6-sqd.2` | published · dist-tag `ponder-0.16.6` |
-| 0.15.17 | `0.15.17-sqd.2` | published · dist-tag `ponder-0.15.17` |
+| 0.16.6 | `0.16.6-sqd.3` | published · dist-tag `ponder-0.16.6` |
+| 0.15.17 | `0.15.17-sqd.3` | published · dist-tag `ponder-0.15.17` |
 
 `npm install @subsquid/ponder` installs the latest; pin `@X.Y.Z-sqd.<rev>` to match your Ponder version. How versions work: [`PUBLISHING.md`](PUBLISHING.md).
+
+The four rows with a moving dist-tag — **latest**, `ponder-0.16.10`, `ponder-0.16.6`, `ponder-0.15.17` — are the **supported lines**: all four carry the same current Portal layer (as of 2026-07-28), so every fork-side fix is backported across them. Rows with no dist-tag are frozen pin-exact historical builds. See [`PUBLISHING.md`](PUBLISHING.md#supported-lines--the-backport-policy).
 
 ## Going to production
 
