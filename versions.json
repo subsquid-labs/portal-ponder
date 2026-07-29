@@ -7,6 +7,14 @@
   "seam": "HistoricalSync.syncBlockRangeData / syncBlockData (interval-scoped) — identical in shape across the tested range",
   "versions": [
     {
+      "ponder": "0.17.3",
+      "wiring": "wiring/0.17.3.patch",
+      "rev": 1,
+      "status": "verified",
+      "published": false,
+      "note": "0.17.3-sqd.1 grafts the current Portal layer onto ponder@0.17.3. wiring/0.17.3.patch is a VERBATIM copy of wiring/0.17.2.patch (sha256 23ad65db…, same 12 files) — the verbatim lineage now runs 0.17.0→0.17.1→0.17.2→0.17.3, one patch throughout. 0.17.2→0.17.3 is ONE upstream PATCH-level bugfix, ponder-sh/ponder#2350 (commit 80dd936, @kyscott18): 'Fixed a bug that caused realtime sync to retain unfiltered block transactions in memory until finalization. Memory usage for live indexing improved >10%.' The ENTIRE source delta in packages/core/src is one line in src/sync-realtime/index.ts, inside the reconcileBlock async generator (~L1140): `blockWithEventData.block.transactions = blockWithFilteredEventData.transactions` — previously `… = blockWithFilteredEventData.block.transactions`, a self-assignment (A = A) no-op that left the block's own transactions array pointing at the UNFILTERED set and thus un-GC-able; the fix repoints it at the already-filtered top-level `transactions` array so the unfiltered array is released. (A test-only change to src/sync-realtime/index.test.ts is not grafted.) sync-realtime/index.ts IS one of the 12 wiring files, BUT the #2350 edit at ~L1140 does NOT overlap the wiring patch's two hunks (the import block @L31 and the #23 filtered-logs shouldRequestLogs fallback @L308-347): the 0.17.2 patch applies to ponder@0.17.3 with ZERO rejects — all 12 files 'Applied … cleanly', the shouldRequestLogs hunk landing at 313 with the same +3-line offset carried since 0.17.2 (the two #2347 additions above it, unchanged in 0.17.3). RISK REVIEWED AND EMPIRICALLY REFUTED (candor): a review seat flagged that the change moves the yielded block's `block.transactions` from the unfiltered to the filtered set, so any consumer reading `yieldedBlock.block.transactions` expecting the FULL set (e.g. realtime access_list preservation, issue #27) would silently see fewer txs. Verified: (a) the `block.transactions` reads that exist in stock core — rpc/actions.ts RPC-response validation and the sync-realtime fetch/assembly (~L677) — all run UPSTREAM of the reassignment, on the RAW fetched block during fetch→validate→filter, never on the post-reassignment/yielded block; the L1140 site is the sole writer and no consumer of the yielded realtime event reads `event.block.transactions` (runtime/events.ts builds the indexed event from block header fields plus the top-level filtered `transactions`); (b) realtime transactions are persisted via insertTransactions from the TOP-LEVEL `transactions` field (filtered, byte-identical logic in 0.17.2 and 0.17.3), never from `block.transactions`; (c) the Portal layer reads only its own Portal-shaped blocks (b.transactions with b.header.number) and top-level ev.transactions/batch.transactions — never ponder's post-filter `yieldedBlock.block.transactions`. So the change persists NO different data on either the RPC or Portal /stream path; it only frees memory (and incidentally makes block.transactions consistent with the indexed filtered set). Inherited VERBATIM from upstream — not a Portal-side or wiring-introduced behavior change. The graft seam (HistoricalSync.syncBlockRangeData/syncBlockData, interval-scoped) is UNTOUCHED — 0.17.3 changed only src/sync-realtime/index.ts. It builds (tsc no error) and passes the full current Portal suite (408 tests, 23 files) on ponder@0.17.3 (CI=true scripts/sync-upstream.sh 0.17.3 --test, pnpm 11 per the clone's packageManager), biome clean; the realtime suites that exercise the reconcile/yield path — portal-realtime (55), portal-realtime-wire (50), portal-realtime-fuzz (1), realtime-standardize (10), realtime-getlogs-fallback (13), realtime-fallback-e2e (2) — are all green, the empirical backstop for the refutation above. both-version rests on the Portal layer being UNCHANGED from 0.17.2-sqd.1, already green on ponder@0.16.6 (pnpm 9 path) in the 2026-07-28 supported-lines wave. No fresh RPC byte-diff is claimed on 0.17.3; compat rests on seam-identity + verbatim-patch + the full suite, exactly as for 0.17.2-sqd.1. As the newest tracked ponder version (versions.json numeric max) it will publish with --tag latest, superseding 0.17.2-sqd.1 as the default `npm install @subsquid/ponder` (0.17.2-sqd.1 then installable by exact version — `npm i @subsquid/ponder@0.17.2-sqd.1`). PUBLISH IS A SEPARATE DELIBERATE STEP; this entry lands with published:false and is flipped to true by the post-publish reconcile."
+    },
+    {
       "ponder": "0.17.2",
       "wiring": "wiring/0.17.2.patch",
       "rev": 1,
@@ -81,6 +89,7 @@
   ],
   "compat": {
     "tested": [
+      "0.17.3",
       "0.17.2",
       "0.17.1",
       "0.17.0",
@@ -91,7 +100,7 @@
       "0.16.6",
       "0.15.17"
     ],
-    "seamStableRange": "0.15.17 - 0.17.2 (verified identical by inspection; CI matrix promotes to 'tested' as patches land)",
+    "seamStableRange": "0.15.17 - 0.17.3 (verified identical by inspection; CI matrix promotes to 'tested' as patches land)",
     "howToAdd": "see PUBLISHING.md — scripts/sync-upstream.sh <ver> --test, then add the row here"
   },
   "supportedLines": {
