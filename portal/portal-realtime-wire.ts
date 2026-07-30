@@ -891,6 +891,7 @@ export async function* getPortalRealtimeEventGenerator(params: {
       headers,
       fromBlock,
       logs,
+      chainId: Number(chain.id),
       blockFields: BLOCK_FIELDS,
       logFields: LOG_FIELDS,
       txFields: TX_FIELDS,

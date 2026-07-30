@@ -35,6 +35,7 @@ import {
   type WildcardLogFlip,
   type WildcardLogRequestKey,
 } from './portal-filters.js';
+import { emitFreshnessHook } from './portal-freshness-hooks.js';
 import { invariant } from './portal-invariant.js';
 import {
   type RawHeader,
@@ -256,6 +257,11 @@ export type PortalRealtimeArgs = {
   isDiscoveryLogRequest?: (request: PortalLogRequest, index: number) => boolean;
   signal?: AbortSignal;
   fetchImpl?: typeof fetch;
+  /**
+   * Ponder chain ID — passed to freshness hook emission when `PORTAL_FRESHNESS_HOOKS` is enabled.
+   * Absent in legacy/unit call sites ⇒ hooks emit `chainId: 0`.
+   */
+  chainId?: number;
 };
 
 /**
@@ -311,6 +317,7 @@ export async function* streamHotBlocks(
   const errorSleepMs = args.errorSleepMs ?? 1000;
   const idleMs = args.idleMs ?? 120_000;
   let cursor = args.fromBlock;
+  let streamBatchCounter = 0;
   // Delivered-hash ring: height → last-delivered hash at that height. Its semantics is "what is my
   // parentBlockHash if I resume at h+1" — so `ring.get(cursor − 1)` is sent on EVERY /stream request. It
   // opts the client into the Portal's fork negotiation: on a fork the server answers 409 with the canonical
@@ -665,6 +672,19 @@ export async function* streamHotBlocks(
         const batch = JSON.parse(line);
         if (batch?.header?.number != null) {
           const num = batch.header.number as number;
+          if (process.env.PORTAL_FRESHNESS_HOOKS === '1') {
+            emitFreshnessHook({
+              evt: 'batch-recv',
+              chainId: args.chainId ?? 0,
+              from: num,
+              to: num,
+              batchId: streamBatchCounter++,
+              batchSize: batch.logs?.length ?? 0,
+              mono: performance.now(),
+              wall: new Date().toISOString(),
+            });
+          }
+
           // Record this height's hash in the ring so the NEXT resume (at num+1) carries it as
           // parentBlockHash. Overwrite-per-height (a reorged/redelivered height replaces its prior hash).
           ring.set(num, batch.header.hash as string);
