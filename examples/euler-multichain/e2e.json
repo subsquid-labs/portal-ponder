@@ -1,5 +1,5 @@
 {
-  "pin": "0.17.2-sqd.1",
+  "pin": "0.17.3-sqd.1",
   "readyTimeoutMs": 360000,
   "chains": [{ "chainId": 1 }, { "chainId": 8453 }, { "chainId": 42161 }],
   "graphql": [
