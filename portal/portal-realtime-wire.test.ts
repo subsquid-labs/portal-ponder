@@ -1,3 +1,5 @@
+import { existsSync, readFileSync } from 'node:fs';
+import { join } from 'node:path';
 import fc from 'fast-check';
 import { hexToNumber } from 'viem';
 import { afterEach, expect, test } from 'vitest';
@@ -126,9 +128,11 @@ afterEach(() => {
   else process.env.PORTAL_FINALIZED_HEAD = savedPin;
   if (savedKey === undefined) delete process.env.PORTAL_API_KEY;
   else process.env.PORTAL_API_KEY = savedKey;
-  if (savedFreshnessFlag === undefined)
+  if (savedFreshnessFlag === undefined) {
     delete process.env.PORTAL_FRESHNESS_HOOKS;
-  else process.env.PORTAL_FRESHNESS_HOOKS = savedFreshnessFlag;
+  } else {
+    process.env.PORTAL_FRESHNESS_HOOKS = savedFreshnessFlag;
+  }
   setFreshnessHookCollector(undefined);
 });
 
@@ -438,7 +442,273 @@ test('T3 durability-binding: recv→ack latency measured post-commit; every ack.
   );
 });
 
-test('T4 graft-drift sentinel: RealtimeSyncEvent block variant carries blockCallback — a spy is set and accessed by identity (bites at re-graft if the field is renamed/dropped)', () => {
+const runtimeSourceFiles = [
+  'realtime.ts',
+  'isolated.ts',
+  'multichain.ts',
+  'omnichain.ts',
+] as const;
+
+type RuntimeSourceFile = (typeof runtimeSourceFiles)[number];
+
+const runtimeDirCandidates = [
+  join(__dirname, '..', 'runtime'),
+  join(__dirname, '..', 'src', 'runtime'),
+  join(__dirname, '..', '..', 'src', 'runtime'),
+];
+
+function locateGraftedRuntimeDir(): string {
+  const runtimeDir = runtimeDirCandidates.find((candidate) =>
+    runtimeSourceFiles.every((fileName) =>
+      existsSync(join(candidate, fileName)),
+    ),
+  );
+
+  if (runtimeDir === undefined) {
+    throw new Error(
+      `T4b graft-source sentinel: could not locate grafted ponder-core src/runtime from __dirname=${__dirname}; tried ${runtimeDirCandidates.join(', ')}`,
+    );
+  }
+
+  return runtimeDir;
+}
+
+function readGraftedRuntimeSource(fileName: RuntimeSourceFile): string {
+  const runtimeDir = locateGraftedRuntimeDir();
+  const sourcePath = join(runtimeDir, fileName);
+
+  try {
+    return readFileSync(sourcePath, 'utf8');
+  } catch (error) {
+    throw new Error(
+      `T4b graft-source sentinel: failed to read ${sourcePath}: ${String(error)}`,
+    );
+  }
+}
+
+function requireMatch(
+  source: string,
+  pattern: RegExp,
+  message: string,
+): RegExpExecArray {
+  const match = pattern.exec(source);
+  if (match === null) {
+    throw new Error(`T4b graft-source sentinel: ${message}`);
+  }
+
+  return match;
+}
+
+function requireBetween(
+  source: string,
+  startMarker: string,
+  endMarker: string,
+  label: string,
+): string {
+  const start = source.indexOf(startMarker);
+  if (start === -1) {
+    throw new Error(
+      `T4b graft-source sentinel: ${label} start marker missing (${startMarker})`,
+    );
+  }
+
+  const end = source.indexOf(endMarker, start + startMarker.length);
+  if (end === -1) {
+    throw new Error(
+      `T4b graft-source sentinel: ${label} end marker missing (${endMarker})`,
+    );
+  }
+
+  return source.slice(start, end);
+}
+
+function skipQuotedSource(
+  source: string,
+  start: number,
+  label: string,
+): number {
+  const quote = source[start]!;
+
+  for (let index = start + 1; index < source.length; index++) {
+    const char = source[index]!;
+    if (char === '\\') {
+      index++;
+      continue;
+    }
+
+    if (char === quote) return index;
+  }
+
+  throw new Error(
+    `T4b graft-source sentinel: unterminated ${quote} literal while scanning ${label}`,
+  );
+}
+
+function maskSourceSpan(source: string, start: number, end: number): string {
+  let masked = '';
+
+  for (let index = start; index < end; index++) {
+    masked += source[index] === '\n' ? '\n' : ' ';
+  }
+
+  return masked;
+}
+
+function maskCommentsAndStrings(source: string, label: string): string {
+  let masked = '';
+
+  for (let index = 0; index < source.length; index++) {
+    const char = source[index]!;
+    const next = source[index + 1];
+
+    if (char === '/' && next === '/') {
+      const lineEnd = source.indexOf('\n', index + 2);
+      const end = lineEnd === -1 ? source.length : lineEnd;
+      masked += maskSourceSpan(source, index, end);
+      index = end - 1;
+      continue;
+    }
+
+    if (char === '/' && next === '*') {
+      const commentEnd = source.indexOf('*/', index + 2);
+      if (commentEnd === -1) {
+        throw new Error(
+          `T4b graft-source sentinel: unterminated block comment while masking ${label}`,
+        );
+      }
+      masked += maskSourceSpan(source, index, commentEnd + 2);
+      index = commentEnd + 1;
+      continue;
+    }
+
+    if (char === "'" || char === '"' || char === '`') {
+      const stringEnd = skipQuotedSource(source, index, label);
+      masked += maskSourceSpan(source, index, stringEnd + 1);
+      index = stringEnd;
+      continue;
+    }
+
+    masked += char;
+  }
+
+  return masked;
+}
+
+function maskComments(source: string, label: string): string {
+  let masked = '';
+
+  for (let index = 0; index < source.length; index++) {
+    const char = source[index]!;
+    const next = source[index + 1];
+
+    if (char === '/' && next === '/') {
+      const lineEnd = source.indexOf('\n', index + 2);
+      const end = lineEnd === -1 ? source.length : lineEnd;
+      masked += maskSourceSpan(source, index, end);
+      index = end - 1;
+      continue;
+    }
+
+    if (char === '/' && next === '*') {
+      const commentEnd = source.indexOf('*/', index + 2);
+      if (commentEnd === -1) {
+        throw new Error(
+          `T4b graft-source sentinel: unterminated block comment while masking ${label}`,
+        );
+      }
+      masked += maskSourceSpan(source, index, commentEnd + 2);
+      index = commentEnd + 1;
+      continue;
+    }
+
+    masked += char;
+  }
+
+  return masked;
+}
+
+function findMatchingDelimiter(
+  source: string,
+  openIndex: number,
+  openChar: '(' | '{',
+  closeChar: ')' | '}',
+  label: string,
+): number {
+  let depth = 0;
+
+  for (let index = openIndex; index < source.length; index++) {
+    const char = source[index]!;
+    const next = source[index + 1];
+
+    if (char === '/' && next === '/') {
+      const lineEnd = source.indexOf('\n', index + 2);
+      if (lineEnd === -1) {
+        index = source.length;
+        continue;
+      }
+      index = lineEnd;
+      continue;
+    }
+
+    if (char === '/' && next === '*') {
+      const commentEnd = source.indexOf('*/', index + 2);
+      if (commentEnd === -1) {
+        throw new Error(
+          `T4b graft-source sentinel: unterminated block comment while scanning ${label}`,
+        );
+      }
+      index = commentEnd + 1;
+      continue;
+    }
+
+    if (char === "'" || char === '"' || char === '`') {
+      index = skipQuotedSource(source, index, label);
+      continue;
+    }
+
+    if (char === openChar) {
+      depth++;
+      continue;
+    }
+
+    if (char !== closeChar) continue;
+
+    depth--;
+    if (depth === 0) return index;
+  }
+
+  throw new Error(
+    `T4b graft-source sentinel: no matching ${closeChar} while scanning ${label}`,
+  );
+}
+
+function extractRuntimeBlockCase(
+  source: string,
+  fileName: RuntimeSourceFile,
+): string {
+  const sourceCode = maskComments(source, fileName);
+  const blockCaseMatches = [
+    ...sourceCode.matchAll(/case\s+["']block["']\s*:\s*\{/g),
+  ];
+  if (blockCaseMatches.length !== 1) {
+    throw new Error(
+      `T4b graft-source sentinel: expected exactly one block run-loop case in ${fileName}, found ${blockCaseMatches.length}`,
+    );
+  }
+
+  const openIndex = source.indexOf('{', blockCaseMatches[0]!.index);
+  const closeIndex = findMatchingDelimiter(
+    source,
+    openIndex,
+    '{',
+    '}',
+    `${fileName} block run-loop case`,
+  );
+
+  return source.slice(blockCaseMatches[0]!.index, closeIndex + 1);
+}
+
+test('T4a type sentinel: RealtimeSyncEvent block variant carries blockCallback — a spy is set and accessed by identity (bites at re-graft if the field is renamed/dropped)', () => {
   // The runtime pipeline (runtime/realtime.ts:735 isolated, :506 multichain, :240 omnichain)
   // copies blockCallback from the event:
   //   yield { type: "block", events, chain, checkpoint, blockCallback: event.blockCallback }
@@ -472,6 +742,87 @@ test('T4 graft-drift sentinel: RealtimeSyncEvent block variant carries blockCall
     blockCallback: event.blockCallback,
   };
   expect(copied.blockCallback).toBe(spy);
+});
+
+test('T4b graft-source sentinel: runtime generators preserve blockCallback and run loops ack only after userQB.transaction', () => {
+  const realtime = readGraftedRuntimeSource('realtime.ts');
+  const realtimeCode = maskCommentsAndStrings(realtime, 'realtime.ts');
+  const generatorCopyPattern = /blockCallback\s*:\s*event\.blockCallback/g;
+  const generatorCopies = [...realtimeCode.matchAll(generatorCopyPattern)];
+
+  if (generatorCopies.length !== 3) {
+    throw new Error(
+      `T4b graft-source sentinel: realtime.ts expected exactly 3 generator blockCallback copies, found ${generatorCopies.length}`,
+    );
+  }
+
+  const generatorFamilies = [
+    {
+      name: 'omnichain',
+      start: 'export async function* getRealtimeEventsOmnichain',
+      end: 'export async function* getRealtimeEventsMultichain',
+    },
+    {
+      name: 'multichain',
+      start: 'export async function* getRealtimeEventsMultichain',
+      end: 'export async function* getRealtimeEventsIsolated',
+    },
+    {
+      name: 'isolated',
+      start: 'export async function* getRealtimeEventsIsolated',
+      end: 'export async function* getRealtimeEventGenerator',
+    },
+  ];
+
+  for (const family of generatorFamilies) {
+    const region = requireBetween(
+      realtimeCode,
+      family.start,
+      family.end,
+      `realtime.ts ${family.name} generator`,
+    );
+    requireMatch(
+      region,
+      /blockCallback\s*:\s*event\.blockCallback/,
+      `realtime.ts ${family.name} generator must copy blockCallback: event.blockCallback`,
+    );
+  }
+
+  for (const fileName of [
+    'isolated.ts',
+    'multichain.ts',
+    'omnichain.ts',
+  ] as const) {
+    const blockCase = extractRuntimeBlockCase(
+      readGraftedRuntimeSource(fileName),
+      fileName,
+    );
+    const blockCaseCode = maskCommentsAndStrings(blockCase, fileName);
+    const transaction = requireMatch(
+      blockCaseCode,
+      /await\s+(?:[\w$]+\.)*userQB\.transaction\s*\(/,
+      `${fileName} block run loop must await userQB.transaction`,
+    );
+    const transactionOpen = blockCase.indexOf('(', transaction.index);
+    const transactionClose = findMatchingDelimiter(
+      blockCase,
+      transactionOpen,
+      '(',
+      ')',
+      `${fileName} awaited userQB.transaction`,
+    );
+    const callback = requireMatch(
+      blockCaseCode,
+      /event\.blockCallback\?\.\(\s*true\s*\)/,
+      `${fileName} block run loop must invoke event.blockCallback?.(true)`,
+    );
+
+    if (callback.index <= transactionClose) {
+      throw new Error(
+        `T4b graft-source sentinel: ${fileName} must invoke event.blockCallback?.(true) after awaited userQB.transaction completes`,
+      );
+    }
+  }
 });
 
 // ─────────────────────────────── log-request construction ───────────────────────────────
