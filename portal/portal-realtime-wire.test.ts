@@ -7,7 +7,12 @@ import type {
   LightBlock,
   LogFilter,
 } from '@/internal/types.js';
+import type { RealtimeSyncEvent } from '@/sync-realtime/index.js';
 import { encodeCheckpoint, ZERO_CHECKPOINT } from '@/utils/checkpoint.js';
+import {
+  type FreshnessHook,
+  setFreshnessHookCollector,
+} from './portal-freshness-hooks.js';
 import type { PortalRealtimeEvent } from './portal-realtime.js';
 import {
   assertStreamModeSupported,
@@ -113,6 +118,7 @@ const tx = (hash: string, transactionIndex: number): any => ({
 const savedEnv = process.env.PORTAL_REALTIME;
 const savedPin = process.env.PORTAL_FINALIZED_HEAD;
 const savedKey = process.env.PORTAL_API_KEY;
+const savedFreshnessFlag = process.env.PORTAL_FRESHNESS_HOOKS;
 afterEach(() => {
   if (savedEnv === undefined) delete process.env.PORTAL_REALTIME;
   else process.env.PORTAL_REALTIME = savedEnv;
@@ -120,6 +126,10 @@ afterEach(() => {
   else process.env.PORTAL_FINALIZED_HEAD = savedPin;
   if (savedKey === undefined) delete process.env.PORTAL_API_KEY;
   else process.env.PORTAL_API_KEY = savedKey;
+  if (savedFreshnessFlag === undefined)
+    delete process.env.PORTAL_FRESHNESS_HOOKS;
+  else process.env.PORTAL_FRESHNESS_HOOKS = savedFreshnessFlag;
+  setFreshnessHookCollector(undefined);
 });
 
 // ─────────────────────────────── flag gating ───────────────────────────────
@@ -272,6 +282,196 @@ test('toRealtimeSyncEvent: reorg / finalize pass through with hex LightBlocks', 
     type: 'finalize',
     block: { number: '0xc', hash: 'c', parentHash: 'b', timestamp: '0xc' },
   });
+});
+
+test('T2 durable-commit-ack wire attach: env-ON → block carries a function blockCallback whose invocation emits an ack with the recv batchId; finalize/reorg never carry it; env-OFF → blockCallback === undefined', () => {
+  process.env.PORTAL_FRESHNESS_HOOKS = '1';
+  const collected: FreshnessHook[] = [];
+  setFreshnessHookCollector((hook: FreshnessHook) => {
+    collected.push(hook);
+  });
+
+  // ON + batchId → function callback
+  const blockEv: PortalRealtimeEvent = {
+    type: 'block',
+    block: {
+      number: '0x65',
+      hash: '0xh',
+      parentHash: '0xp',
+      timestamp: '0x1',
+    } as any,
+    logs: [],
+    transactions: [],
+    hasMatchedFilter: false,
+    batchId: 42,
+    batchSize: 7,
+  };
+  const blockResult = toRealtimeSyncEvent(blockEv, new Map(), 1) as Extract<
+    ReturnType<typeof toRealtimeSyncEvent>,
+    { type: 'block' }
+  >;
+  expect(typeof blockResult.blockCallback).toBe('function');
+
+  // invoking the callback emits an ack with the matching batchId
+  (blockResult.blockCallback as (b: boolean) => void)(true);
+  expect(collected).toHaveLength(1);
+  expect(collected[0]!.evt).toBe('durable-commit-ack');
+  expect(collected[0]!.batchId).toBe(42);
+  expect(collected[0]!.batchSize).toBe(7);
+  expect(collected[0]!.chainId).toBe(1);
+  expect(collected[0]!.from).toBe(101);
+  expect(collected[0]!.to).toBe(101);
+
+  // finalize never carries blockCallback
+  const finalizeResult = toRealtimeSyncEvent(
+    {
+      type: 'finalize',
+      block: { number: 12, hash: 'c', parentHash: 'b', timestamp: 12 },
+    },
+    new Map(),
+    1,
+  );
+  expect((finalizeResult as any).blockCallback).toBeUndefined();
+
+  // reorg never carries blockCallback
+  const reorgResult = toRealtimeSyncEvent(
+    {
+      type: 'reorg',
+      block: { number: 10, hash: 'a', parentHash: 'z', timestamp: 10 },
+      reorgedBlocks: [
+        { number: 11, hash: 'b', parentHash: 'a', timestamp: 11 },
+      ],
+    },
+    new Map(),
+    1,
+  );
+  expect((reorgResult as any).blockCallback).toBeUndefined();
+
+  // env-OFF → blockCallback === undefined (byte-identical shape)
+  delete process.env.PORTAL_FRESHNESS_HOOKS;
+  collected.length = 0;
+  const blockOff = toRealtimeSyncEvent(blockEv, new Map(), 1) as Extract<
+    ReturnType<typeof toRealtimeSyncEvent>,
+    { type: 'block' }
+  >;
+  expect(blockOff.blockCallback).toBeUndefined();
+  expect(collected).toHaveLength(0);
+});
+
+test('T3 durability-binding: recv→ack latency measured post-commit; every ack.mono ≥ its commit-resolve mono; recv→ack joined by batchId', async () => {
+  process.env.PORTAL_REALTIME = 'stream';
+  process.env.PORTAL_FRESHNESS_HOOKS = '1';
+  const collectedHooks: FreshnessHook[] = [];
+  setFreshnessHookCollector((hook: FreshnessHook) => {
+    collectedHooks.push(hook);
+  });
+
+  const batches = [
+    {
+      header: {
+        number: 100,
+        hash: 'h100',
+        parentHash: 'h99',
+        timestamp: 1000,
+      },
+      logs: [],
+    },
+    {
+      header: {
+        number: 101,
+        hash: 'h101',
+        parentHash: 'h100',
+        timestamp: 1012,
+      },
+      logs: [],
+    },
+  ];
+
+  const gen = getPortalRealtimeEventGenerator({
+    common: {
+      logger: { info() {}, debug() {}, warn() {}, trace() {} },
+    } as any,
+    chain: { id: 1, name: 'mainnet', portal: 'http://portal' } as any,
+    rpc: {} as any,
+    eventCallbacks: [{ filter: logFilter() } as any],
+    syncProgress: {
+      finalized: {
+        number: '0x63',
+        hash: 'h99',
+        parentHash: 'h98',
+        timestamp: '0x1',
+      } as any,
+      end: { number: '0x65' } as any,
+    },
+    childAddresses: new Map<string, Map<Address, number>>(),
+    fetchImpl: mockPortal(batches, 0),
+  });
+
+  const commitMonos: number[] = [];
+  for await (const { event } of gen) {
+    if (event.type !== 'block') continue;
+
+    const blockEvent = event as Extract<typeof event, { type: 'block' }>;
+    if (blockEvent.blockCallback === undefined) continue;
+
+    // Simulate a deferred durable commit: wait, record the commit-resolve mono, then ack.
+    await new Promise((r) => setTimeout(r, 1));
+    const commitMono = performance.now();
+    commitMonos.push(commitMono);
+    blockEvent.blockCallback(true);
+  }
+
+  const recvHooks = collectedHooks.filter((h) => h.evt === 'batch-recv');
+  const ackHooks = collectedHooks.filter((h) => h.evt === 'durable-commit-ack');
+
+  expect(recvHooks.length).toBe(2);
+  expect(ackHooks.length).toBe(2);
+
+  // Every ack.mono ≥ its commit-resolve mono (durability ordering — ack fires post-commit)
+  for (let i = 0; i < ackHooks.length; i++) {
+    expect(ackHooks[i]!.mono).toBeGreaterThanOrEqual(commitMonos[i]!);
+  }
+
+  // recv→ack joined by batchId (same batchIds, same order)
+  expect(ackHooks.map((h) => h.batchId)).toEqual(
+    recvHooks.map((h) => h.batchId),
+  );
+});
+
+test('T4 graft-drift sentinel: RealtimeSyncEvent block variant carries blockCallback — a spy is set and accessed by identity (bites at re-graft if the field is renamed/dropped)', () => {
+  // The runtime pipeline (runtime/realtime.ts:735 isolated, :506 multichain, :240 omnichain)
+  // copies blockCallback from the event:
+  //   yield { type: "block", events, chain, checkpoint, blockCallback: event.blockCallback }
+  // This sentinel asserts a spy callback survives that copy by identity. If a future upstream
+  // bump renames or drops `blockCallback` on RealtimeSyncEvent, the `event.blockCallback`
+  // access below fails to COMPILE — the sentinel reddens at re-graft, never silently.
+  const spy = ((_a: boolean) => {}) as (isAccepted: boolean) => void;
+  const event: RealtimeSyncEvent = {
+    type: 'block',
+    hasMatchedFilter: false,
+    block: {
+      number: '0x65',
+      hash: '0xh',
+      parentHash: '0xp',
+      timestamp: '0x1',
+    } as any,
+    logs: [],
+    transactions: [],
+    transactionReceipts: [],
+    traces: [],
+    childAddresses: new Map(),
+    blockCallback: spy,
+  };
+
+  // Mirror the runtime's explicit-field copy pattern.
+  const copied = {
+    type: 'block' as const,
+    events: [] as any[],
+    chain: {} as any,
+    checkpoint: '0x0',
+    blockCallback: event.blockCallback,
+  };
+  expect(copied.blockCallback).toBe(spy);
 });
 
 // ─────────────────────────────── log-request construction ───────────────────────────────

@@ -58,3 +58,42 @@ export function emitFreshnessHook(hook: FreshnessHook): void {
 
   process.stderr.write(JSON.stringify(hook) + '\n');
 }
+
+/**
+ * Build a durable-commit-ack callback for a single block batch. Returns a function
+ * `(isAccepted: boolean) => void` that fires AT MOST ONCE (defensive idempotence — core
+ * guarantees exactly-once invocation) and emits ONLY when `isAccepted === true`.
+ *
+ * The ack is emitted via the same env-gated `emitFreshnessHook` + injectable collector
+ * as the batch-recv hook, so env-OFF ⇒ zero output and the callback is inert. `mono`
+ * and `wall` are sampled AT INVOCATION (post-commit) so the latency delta
+ * `ack.mono − recv.mono` measures true durability latency, not yield-resume.
+ */
+export function makeDurableCommitAck(meta: {
+  chainId: number;
+  from: number;
+  to: number;
+  batchId: number;
+  batchSize: number;
+}): (isAccepted: boolean) => void {
+  let fired = false;
+
+  return (isAccepted: boolean): void => {
+    if (fired) return;
+
+    fired = true;
+
+    if (isAccepted !== true) return;
+
+    emitFreshnessHook({
+      evt: 'durable-commit-ack',
+      chainId: meta.chainId,
+      from: meta.from,
+      to: meta.to,
+      batchId: meta.batchId,
+      batchSize: meta.batchSize,
+      mono: performance.now(),
+      wall: new Date().toISOString(),
+    });
+  };
+}

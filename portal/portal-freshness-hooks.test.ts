@@ -3,6 +3,7 @@ import { afterEach, beforeEach, describe, expect, test } from 'vitest';
 import {
   emitFreshnessHook,
   type FreshnessHook,
+  makeDurableCommitAck,
   setFreshnessHookCollector,
 } from './portal-freshness-hooks.js';
 import { streamHotBlocks } from './portal-realtime.js';
@@ -176,5 +177,63 @@ describe('portal-freshness-hooks', () => {
     });
 
     expect(collected).toEqual([]);
+  });
+
+  test('makeDurableCommitAck: emits exactly ONE durable-commit-ack on true; 2nd invocation no-op; false → no emit; env-off → no emit; mono ≥ pre-invocation floor', () => {
+    process.env.PORTAL_FRESHNESS_HOOKS = '1';
+
+    // true path: one emit, payload exact
+    const ack1 = makeDurableCommitAck({
+      chainId: 1,
+      from: 100,
+      to: 100,
+      batchId: 0,
+      batchSize: 3,
+    });
+    const floor = performance.now();
+    ack1(true);
+    expect(collected).toHaveLength(1);
+
+    const hook = collected[0]!;
+    expect(hook.evt).toBe('durable-commit-ack');
+    expect(hook.chainId).toBe(1);
+    expect(hook.from).toBe(100);
+    expect(hook.to).toBe(100);
+    expect(hook.batchId).toBe(0);
+    expect(hook.batchSize).toBe(3);
+    expect(typeof hook.mono).toBe('number');
+    expect(hook.mono).toBeGreaterThanOrEqual(floor);
+    expect(typeof hook.wall).toBe('string');
+
+    // 2nd invocation → no-op (idempotence)
+    ack1(true);
+    expect(collected).toHaveLength(1);
+
+    // false → no emit (and consumes the callback)
+    const ack2 = makeDurableCommitAck({
+      chainId: 1,
+      from: 101,
+      to: 101,
+      batchId: 1,
+      batchSize: 0,
+    });
+    ack2(false);
+    expect(collected).toHaveLength(1);
+
+    // a subsequent true on the same (false-consumed) callback is still a no-op
+    ack2(true);
+    expect(collected).toHaveLength(1);
+
+    // env-off → no emit (emitFreshnessHook gates before the collector)
+    delete process.env.PORTAL_FRESHNESS_HOOKS;
+    const ack3 = makeDurableCommitAck({
+      chainId: 1,
+      from: 102,
+      to: 102,
+      batchId: 2,
+      batchSize: 1,
+    });
+    ack3(true);
+    expect(collected).toHaveLength(1);
   });
 });
