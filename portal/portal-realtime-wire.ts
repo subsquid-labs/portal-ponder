@@ -55,6 +55,7 @@ import {
   type WildcardLogRequestKey,
   wildcardLogRequestKey,
 } from './portal-filters.js';
+import { makeDurableCommitAck } from './portal-freshness-hooks.js';
 import {
   type Light,
   type PortalRealtimeEvent,
@@ -606,10 +607,11 @@ export function trimWildcardRealtimeEvent(
 export function toRealtimeSyncEvent(
   ev: PortalRealtimeEvent,
   childAddresses: Map<Factory, Set<Address>>,
+  chainId?: number,
 ): RealtimeSyncEvent {
   switch (ev.type) {
-    case 'block':
-      return {
+    case 'block': {
+      const result: Extract<RealtimeSyncEvent, { type: 'block' }> = {
         type: 'block',
         hasMatchedFilter: ev.hasMatchedFilter,
         block: ev.block,
@@ -620,6 +622,22 @@ export function toRealtimeSyncEvent(
         childAddresses,
         blockCallback: undefined, // no rpc.subscribe backpressure hook in the stream path (optional-chained downstream)
       };
+      if (
+        process.env.PORTAL_FRESHNESS_HOOKS === '1' &&
+        ev.batchId !== undefined
+      ) {
+        const num = hexToNumber(ev.block.number);
+        result.blockCallback = makeDurableCommitAck({
+          chainId: chainId ?? 0,
+          from: num,
+          to: num,
+          batchId: ev.batchId,
+          batchSize: ev.batchSize ?? 0,
+        });
+      }
+
+      return result;
+    }
     case 'reorg':
       return {
         type: 'reorg',
@@ -877,7 +895,10 @@ export async function* getPortalRealtimeEventGenerator(params: {
     const n = ev.block.number;
     if (n <= startupFinalized || n <= lastFinalized) return;
     lastFinalized = n;
-    yield { chain, event: toRealtimeSyncEvent(ev, new Map()) };
+    yield {
+      chain,
+      event: toRealtimeSyncEvent(ev, new Map(), Number(chain.id)),
+    };
   }
   const rebuildLogs = (): void => {
     const next = buildPortalLogRequests(eventCallbacks, childAddresses);
@@ -979,7 +1000,10 @@ export async function* getPortalRealtimeEventGenerator(params: {
             }
         if (pruned) rebuildLogs();
 
-        yield { chain, event: toRealtimeSyncEvent(ev, new Map()) };
+        yield {
+          chain,
+          event: toRealtimeSyncEvent(ev, new Map(), Number(chain.id)),
+        };
         continue;
       }
 
@@ -1022,7 +1046,10 @@ export async function* getPortalRealtimeEventGenerator(params: {
           ? trimWildcardRealtimeEvent(ev, logFilters, factories, childAddresses)
           : ev;
 
-      yield { chain, event: toRealtimeSyncEvent(emitEvent, discovered) };
+      yield {
+        chain,
+        event: toRealtimeSyncEvent(emitEvent, discovered, Number(chain.id)),
+      };
 
       // Drain a finalize held back during this block's redelivery, now that ponder has the block: block N
       // is forwarded above, then finalize N here. Otherwise the finalize (already consumed by

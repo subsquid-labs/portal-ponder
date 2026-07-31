@@ -299,6 +299,8 @@ export type HotBatch = {
   header: RawHeader;
   logs: RawLog[];
   transactions: RawTx[];
+  batchId?: number;
+  batchSize?: number;
 };
 export type HotTick = { kind: 'tick' };
 export type HotItem = HotBatch | HotTick;
@@ -672,14 +674,19 @@ export async function* streamHotBlocks(
         const batch = JSON.parse(line);
         if (batch?.header?.number != null) {
           const num = batch.header.number as number;
+          let thisBatchId: number | undefined;
+          let batchSize: number | undefined;
           if (process.env.PORTAL_FRESHNESS_HOOKS === '1') {
+            thisBatchId = streamBatchCounter++;
+            const thisBatchSize = batch.logs?.length ?? 0;
+            batchSize = thisBatchSize;
             emitFreshnessHook({
               evt: 'batch-recv',
               chainId: args.chainId ?? 0,
               from: num,
               to: num,
-              batchId: streamBatchCounter++,
-              batchSize: batch.logs?.length ?? 0,
+              batchId: thisBatchId,
+              batchSize: thisBatchSize,
               mono: performance.now(),
               wall: new Date().toISOString(),
             });
@@ -697,6 +704,9 @@ export async function* streamHotBlocks(
             header: batch.header,
             logs: batch.logs ?? [],
             transactions: batch.transactions ?? [],
+            ...(thisBatchId !== undefined
+              ? { batchId: thisBatchId, batchSize }
+              : {}),
           };
           if ((args.getLogsRevision?.() ?? 0) !== openedRev) {
             // The filter widened while THIS block was being consumed — a factory child was discovered in
@@ -879,6 +889,8 @@ export type PortalRealtimeEvent =
       logs: SyncLog[];
       transactions: SyncTransaction[];
       hasMatchedFilter: boolean;
+      batchId?: number;
+      batchSize?: number;
     }
   | { type: 'reorg'; block: Light; reorgedBlocks: Light[] }
   | { type: 'finalize'; block: Light };
@@ -1228,6 +1240,9 @@ export async function* portalRealtimeEvents(
       logs: syncLogs,
       transactions: syncTxs,
       hasMatchedFilter: syncLogs.length > 0,
+      ...(item.batchId !== undefined
+        ? { batchId: item.batchId, batchSize: item.batchSize }
+        : {}),
     };
     yield* runFinalizeCadence();
   }
