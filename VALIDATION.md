@@ -221,20 +221,22 @@ matching third-party evidence (§5).
 **Soak closure (2026-08-05).** The A/B comparison window is now **closed** — the differ ran hourly for
 the full duration and has been retired. The cumulative verdict is decisive: **leg B (the Portal
 `/stream` path) ran complete and live for 25+ days** and matched the independent third-party evidence
-(Layer F / §5.7) throughout, while **every divergence the differ ever surfaced localised to leg A (the
-RPC leg)** and reduced to one of the pre-declared tolerated classes already catalogued in §5.3 (the
-realtime parent-transaction absence, the `access_list`-null benign class, and the single pinned
-tolerated row). Beyond those benign diffs, the RPC leg was also the **less reliable of the two legs
-operationally** — a controlled side-by-side result that is itself comparative evidence *for* the
-Portal path. Over the window leg A: (1) repeatedly **hit memory limits (OOM)** and had to be
-relaunched; (2) **silently dropped on-chain rows** that the differ and third-party evidence caught (a
-proven gap — the leg-A row-loss class of §5.1/§5.3, not a suspicion); (3) **fell progressively behind
-chain head** on the busiest chain (head starvation); and (4) after a relaunch **wedged terminally**,
-byte-frozen ~4.3M blocks behind the healthy Portal leg for ~12 days without recovering. In short, the
-side-by-side did its job: it **convicted the conventional RPC path, not the Portal path**. The Portal
-`/stream` leg was the durable, correct, live witness throughout. The differ records for this window are
-preserved in the operator's evidence archive; the differ schemas and records remain **frozen and
-untouched**.
+(Layer F / §5.7) throughout. Every divergence the differ ever surfaced reduced to one of the **four
+pre-declared tolerated A/B classes catalogued in §5.3** — the benign realtime parent-transaction
+availability gap on leg B (never wrong data: the shared transactions are byte-identical), and the
+`access_list`-null (#27), single-pinned-row (#32), and `onlyB` row-loss (#36) classes. In the two
+**confirmed data-correctness cases (#36 and #27)**, leg B's rows matched an independent public node
+**byte-for-byte, establishing leg A (the RPC leg) as the lossy side** (§5.1 / §5.3) — the #36 loss (leg
+A silently dropped on-chain `log`/`block` rows that leg B holds) was third-party β-confirmed. **No
+divergence ever convicted the Portal leg.** Leg A was also, separately, the **less reliable of the two
+legs operationally**: over the window it (1) repeatedly **hit memory limits (OOM)** and had to be
+relaunched; (2) **fell progressively behind chain head** on the busiest chain; and (3) after a relaunch
+**wedged terminally**, byte-frozen ~4.3M blocks behind the healthy Portal leg for ~12 days without
+recovering. In short, the side-by-side did its job: it localised every data-correctness divergence to
+the **conventional RPC leg** — and that leg carried three operational failures besides — so it
+**convicted the conventional path, not the Portal path**. The Portal `/stream` leg was the durable,
+correct, live witness throughout. The differ records for this window are preserved in the operator's
+evidence archive; the differ schemas and records remain **frozen and untouched**.
 
 ### Layer E — Paid validation matrix vs stock RPC (ground truth)
 
