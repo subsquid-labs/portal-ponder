@@ -37,8 +37,9 @@ following are **pending** and must not be read as proven:
 - The **flagship benchmark gate** (backfill speed reproduced within a stated tolerance of the
   published baseline) — tracked separately in a separate benchmarks document (pending publication),
   not asserted here.
-- A **long-duration soak** sign-off. The A/B soak differ runs hourly and its findings are already
-  public issues (below), but no multi-day green-soak claim is made in this document yet.
+- A **long-duration soak** sign-off. The A/B soak differ ran hourly until the comparison window closed
+  2026-08-05 (see Layer D), and its findings are already public issues (below), but no multi-day
+  green-soak claim is made in this document yet.
 - **Zero-RPC realtime** without an experimental label. The Portal `/stream` realtime path is under
   active hardening (see the stream-realtime issues and PR #26); the `/stream` **liveness hardening**
   stack (RT-1/RT-2/RT-3, INV-22…25, §5.12) has landed as **code + unit-test** evidence, but that raises
@@ -201,8 +202,8 @@ asserted to tile the range exactly (no gap, no overlap). Tooling: `harness/chaos
 
 ### Layer D — A/B dual-implementation soak with an hourly differ
 
-Two independently-synced, production-shaped stores are compared hourly on their **finalized overlap
-window**:
+Two independently-synced, production-shaped stores were compared hourly on their **finalized overlap
+window** (the comparison ran hourly until the window closed 2026-08-05 — see *Soak closure* below):
 
 - **Leg A** — realtime ingestion over **JSON-RPC** (the conventional Ponder path).
 - **Leg B** — realtime ingestion over the **Portal `/stream`** path.
@@ -216,6 +217,26 @@ and `_ponder_checkpoint` monotonicity. Any divergence outside the pre-declared t
 hard failure. Because both legs ingest the *same* chain independently, a disagreement localises the
 defect to one leg — and, so far, the divergences found have been **leg-A (RPC) defects**, with leg B
 matching third-party evidence (§5).
+
+**Soak closure (2026-08-05).** The A/B comparison window is now **closed** — the differ ran hourly for
+the full duration and has been retired. The cumulative verdict is decisive: **leg B (the Portal
+`/stream` path) ran complete and live for 25+ days** and matched the independent third-party evidence
+(Layer F / §5.7) throughout. Every divergence the differ ever surfaced reduced to one of the **four
+pre-declared tolerated A/B classes catalogued in §5.3** — the benign realtime parent-transaction
+availability gap on leg B (never wrong data: the shared transactions are byte-identical), and the
+`access_list`-null (#27), single-pinned-row (#32), and `onlyB` row-loss (#36) classes. In the two
+**confirmed data-correctness cases (#36 and #27)**, leg B's rows matched an independent public node
+**byte-for-byte, establishing leg A (the RPC leg) as the lossy side** (§5.1 / §5.3) — the #36 loss (leg
+A silently dropped on-chain `log`/`block` rows that leg B holds) was third-party β-confirmed. **No
+divergence ever convicted the Portal leg.** Leg A was also, separately, the **less reliable of the two
+legs operationally**: over the window it (1) repeatedly **hit memory limits (OOM)** and had to be
+relaunched; (2) **fell progressively behind chain head** on the busiest chain; and (3) after a relaunch
+**wedged terminally**, byte-frozen ~4.3M blocks behind the healthy Portal leg for ~12 days without
+recovering. In short, the side-by-side did its job: it localised every data-correctness divergence to
+the **conventional RPC leg** — and that leg carried three operational failures besides — so it
+**convicted the conventional path, not the Portal path**. The Portal `/stream` leg was the durable,
+correct, live witness throughout. The differ records for this window are preserved in the operator's
+evidence archive; the differ schemas and records remain **frozen and untouched**.
 
 ### Layer E — Paid validation matrix vs stock RPC (ground truth)
 
