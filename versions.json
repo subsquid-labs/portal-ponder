@@ -11,8 +11,8 @@
       "wiring": "wiring/0.17.6.patch",
       "rev": 1,
       "status": "verified",
-      "published": false,
-      "note": "grafts the Portal layer onto ponder@0.17.6; wiring re-derives ONLY rpc/actions.ts vs 0.17.4 (upstream moved address-chunking into eth_getLogs); 11/12 hunks verbatim; seam sync-historical unchanged"
+      "published": true,
+      "note": "0.17.6-sqd.1 grafts the current Portal layer onto ponder@0.17.6. wiring/0.17.6.patch re-derives ONLY rpc/actions.ts vs the verbatim 0.17.4 lineage (upstream moved address-chunking into eth_getLogs): 11/12 hunks land verbatim, and the one re-anchored hunk re-places the Portal helper block (buildFilteredBlockLogRequests/isResponseBodyTooLargeError) after the now-chunked eth_getLogs — eth_getFilteredBlockLogs depends only on eth_getLogs's unchanged in/out contract, so the chunking is a transparent internal detail with no behavior or public-surface change. Upstream's null-topic/zeroHash/address-chunking changes are confined to the RPC-mode plane, off the Portal /stream path. The graft seam (HistoricalSync.syncBlockRangeData/syncBlockData, interval-scoped) is UNTOUCHED. It builds (tsc no error) and passes the full current Portal suite (416 tests, 24 files) on ponder@0.17.6 (CI=true scripts/sync-upstream.sh 0.17.6 --test, pnpm 11 per the clone's packageManager), biome clean; both-version confirmed — the identical 416/24 suite is also green on ponder@0.16.6 (pnpm 9 path), and CI's fork-seam(0.17.6) job (added via 0.17.6 in compat.tested) is green on the tracking PR (#216). No fresh RPC byte-diff is claimed on 0.17.6; compat rests on seam-identity + re-derived-patch + the full suite. Published 0.17.6-sqd.1 with --tag latest on 2026-08-12 and it is now the default `npm install @subsquid/ponder`, superseding 0.17.4-sqd.1 as latest (0.17.4-sqd.1 now has no dist-tag, installable by exact version — `npm i @subsquid/ponder@0.17.4-sqd.1`). 0.17.5 was skipped (superseded by 0.17.6 before a cut was needed)."
     },
     {
       "ponder": "0.17.4",
