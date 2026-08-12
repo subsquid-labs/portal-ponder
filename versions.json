@@ -7,6 +7,14 @@
   "seam": "HistoricalSync.syncBlockRangeData / syncBlockData (interval-scoped) — identical in shape across the tested range",
   "versions": [
     {
+      "ponder": "0.17.6",
+      "wiring": "wiring/0.17.6.patch",
+      "rev": 1,
+      "status": "verified",
+      "published": false,
+      "note": "grafts the Portal layer onto ponder@0.17.6; wiring re-derives ONLY rpc/actions.ts vs 0.17.4 (upstream moved address-chunking into eth_getLogs); 11/12 hunks verbatim; seam sync-historical unchanged"
+    },
+    {
       "ponder": "0.17.4",
       "wiring": "wiring/0.17.4.patch",
       "rev": 1,
@@ -97,6 +105,7 @@
   ],
   "compat": {
     "tested": [
+      "0.17.6",
       "0.17.4",
       "0.17.3",
       "0.17.2",
