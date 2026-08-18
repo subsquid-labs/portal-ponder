@@ -118,7 +118,9 @@ type BuildOptionsCliOptions = Parameters<typeof buildOptions>[0]['cliOptions'];
 
 const mkCommon = (logger = stubLogger()) => {
   const cliOptions = {
-    command: 'dev',
+    // 'start' matches production: buildOptions can branch on command, so the doubles must not
+    // exercise a dev-only options shape. See portal.ts INV-9 RPC delegation.
+    command: 'start',
     version: '0.0.0',
     config: 'ponder.config.ts',
     logFormat: 'pretty',
