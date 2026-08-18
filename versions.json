@@ -7,6 +7,14 @@
   "seam": "HistoricalSync.syncBlockRangeData / syncBlockData (interval-scoped) — identical in shape across the tested range",
   "versions": [
     {
+      "ponder": "0.17.8",
+      "wiring": "wiring/0.17.8.patch",
+      "rev": 1,
+      "status": "verified",
+      "published": false,
+      "note": "0.17.8-sqd.1 grafts the current Portal layer onto ponder@0.17.8. wiring/0.17.8.patch is a BYTE-IDENTICAL re-derivation of the 0.17.6 patch: the 0.17.6 patch was applied to a fresh 0.17.8 clone, the resulting `git diff` regenerated, and `diff` against the original returned zero — 12 files, no drift, no hunk re-anchoring. The graft seam (HistoricalSync.syncBlockRangeData/syncBlockData, interval-scoped) is UNTOUCHED: both declared signatures are identical to 0.17.6; upstream added only a JSDoc `@returns Closest-to-tip synced block`, which our implementation already satisfies (portal/portal.ts returns `s.closest`). Upstream's ~115-line removal in this range sits at 0.17.6 lines 428-560, inside syncBlockRangeData (386-614) — the body we replace. runtime/filter.ts (+178) is internal batching plumbing (mergeLogFiltersToRequests) with the `Filter` union and the config surface untouched, so there is no new user-facing filter and hence no silent-data-gap class. portal/ references zero removed or renamed upstream symbols (EthGetLogsParams, childAddressesRecord, syncLogsDynamic). CANDOR — one TEST-ONLY change was required: upstream 0.17.8 added `common.options.factoryAddressCountThreshold`, read at sync-historical/index.ts:430 on the path our RPC fallback enters, and three Portal test doubles built `common: { logger } as any` with no `options` at all, so the gate was initially RED at 3 failed / 413 passed. PRODUCTION WAS NEVER AFFECTED — we use upstream's own options builder, which defaults the field to 1_000 at internal/options.ts. The doubles are now built from upstream's real buildOptions with `command: 'start'` to match production, so a future new upstream option cannot silently break them the same way. NO production code changed. Full suite green on BOTH versions: 416 tests / 24 files on ponder@0.17.8 AND the identical 416/24 on ponder@0.17.6 (CI=true scripts/sync-upstream.sh <ver> --test), biome 2.5.2 clean with zero findings on the touched file. Mutation-verified: neutering the RPC delegation at portal/portal.ts:894 (`return rpcFallback().syncBlockRangeData(params);` -> `return [];`) builds clean and turns exactly 4 tests red — the 3 INV-9 delegation tests plus the INV-15 x INV-9 regression in portal.test.ts — so the repaired tests are not vacuous. No fresh RPC byte-diff is claimed on 0.17.8; compat rests on seam-identity + the byte-identical re-derived patch + the full suite. Staged published:false pending the release workflow."
+    },
+    {
       "ponder": "0.17.6",
       "wiring": "wiring/0.17.6.patch",
       "rev": 1,
@@ -105,6 +113,7 @@
   ],
   "compat": {
     "tested": [
+      "0.17.8",
       "0.17.6",
       "0.17.4",
       "0.17.3",
