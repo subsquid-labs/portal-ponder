@@ -229,6 +229,7 @@ describe('portal-freshness-hooks', () => {
         '0x0000000000000000000000000000000000000000000000000000000000000065',
       blockTimestamp: 1_700_000_101,
     });
+    const floor = performance.now();
     ack(false);
     expect(collected).toHaveLength(1);
 
@@ -249,6 +250,12 @@ describe('portal-freshness-hooks', () => {
         '0x0000000000000000000000000000000000000000000000000000000000000065',
       blockTimestamp: 1_700_000_101,
     });
+
+    // The reject path is held to the SAME clock invariants as the ack path: mono is sampled AT
+    // INVOCATION (post-commit), not at callback construction.
+    expect(typeof hook.mono).toBe('number');
+    expect(hook.mono).toBeGreaterThanOrEqual(floor);
+    expect(typeof hook.wall).toBe('string');
 
     ack(true);
     expect(collected).toHaveLength(1);
