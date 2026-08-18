@@ -325,6 +325,10 @@ test('T2 durable-commit-ack wire attach: env-ON → block carries a function blo
   expect(collected[0]!.chainId).toBe(1);
   expect(collected[0]!.from).toBe(101);
   expect(collected[0]!.to).toBe(101);
+  expect(collected[0]!).toMatchObject({
+    blockHash: '0xh',
+    blockTimestamp: 1,
+  });
 
   // finalize never carries blockCallback
   const finalizeResult = toRealtimeSyncEvent(

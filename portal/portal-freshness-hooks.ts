@@ -1,15 +1,14 @@
 /**
  * Freshness hook emission — env-gated, OFF by default. When `PORTAL_FRESHNESS_HOOKS === '1'`, each
- * batch-recv (and later durable-commit-ack) site writes ONE NDJSON line to stderr so a journald-following
- * collector can parse them. A module-level injectable sink lets tests capture hooks without scraping
- * stderr.
+ * batch-recv and post-commit site writes ONE NDJSON line to stderr so a journald-following collector
+ * can parse them. `durable-commit-ack` means a block was durably committed; `durable-commit-reject`
+ * means the post-commit callback rejected the block. A module-level injectable sink lets tests capture
+ * hooks without scraping stderr.
  *
  * Flag unset/falsy ⇒ zero output, zero side effects (byte-identical to baseline).
  */
 
-/** The shape of a freshness hook line (NDJSON on stderr). */
-export type FreshnessHook = {
-  evt: 'batch-recv' | 'durable-commit-ack';
+type FreshnessHookBase = {
   chainId: number;
   from: number;
   to: number;
@@ -24,6 +23,20 @@ export type FreshnessHook = {
   /** Absolute wall-clock time (`new Date().toISOString()`) — for human/cross-process correlation. */
   wall: string;
 };
+
+/** The shape of a freshness hook line (NDJSON on stderr). */
+export type FreshnessHook =
+  | (FreshnessHookBase & { evt: 'batch-recv' })
+  | (FreshnessHookBase & {
+      evt: 'durable-commit-ack';
+      blockHash: string;
+      blockTimestamp: number;
+    })
+  | (FreshnessHookBase & {
+      evt: 'durable-commit-reject';
+      blockHash: string;
+      blockTimestamp: number;
+    });
 
 /**
  * Test-injectable collector. When set, `emitFreshnessHook` pushes the hook here INSTEAD OF (not in
@@ -62,9 +75,11 @@ export function emitFreshnessHook(hook: FreshnessHook): void {
 /**
  * Build a durable-commit-ack callback for a single block batch. Returns a function
  * `(isAccepted: boolean) => void` that fires AT MOST ONCE (defensive idempotence — core
- * guarantees exactly-once invocation) and emits ONLY when `isAccepted === true`.
+ * guarantees exactly-once invocation) and emits exactly one post-commit hook: `durable-commit-ack`
+ * when `isAccepted === true`, otherwise `durable-commit-reject`. The ack event name is reserved for
+ * durably committed blocks.
  *
- * The ack is emitted via the same env-gated `emitFreshnessHook` + injectable collector
+ * The post-commit hook is emitted via the same env-gated `emitFreshnessHook` + injectable collector
  * as the batch-recv hook, so env-OFF ⇒ zero output and the callback is inert. `mono`
  * and `wall` are sampled AT INVOCATION (post-commit) so the latency delta
  * `ack.mono − recv.mono` measures true durability latency, not yield-resume.
@@ -75,6 +90,8 @@ export function makeDurableCommitAck(meta: {
   to: number;
   batchId: number;
   batchSize: number;
+  blockHash: string;
+  blockTimestamp: number;
 }): (isAccepted: boolean) => void {
   let fired = false;
 
@@ -83,15 +100,18 @@ export function makeDurableCommitAck(meta: {
 
     fired = true;
 
-    if (isAccepted !== true) return;
+    const evt =
+      isAccepted === true ? 'durable-commit-ack' : 'durable-commit-reject';
 
     emitFreshnessHook({
-      evt: 'durable-commit-ack',
+      evt,
       chainId: meta.chainId,
       from: meta.from,
       to: meta.to,
       batchId: meta.batchId,
       batchSize: meta.batchSize,
+      blockHash: meta.blockHash,
+      blockTimestamp: meta.blockTimestamp,
       mono: performance.now(),
       wall: new Date().toISOString(),
     });

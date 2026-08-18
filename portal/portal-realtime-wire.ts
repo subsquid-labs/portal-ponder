@@ -627,12 +627,15 @@ export function toRealtimeSyncEvent(
         ev.batchId !== undefined
       ) {
         const num = hexToNumber(ev.block.number);
+        const timestamp = hexToNumber(ev.block.timestamp);
         result.blockCallback = makeDurableCommitAck({
           chainId: chainId ?? 0,
           from: num,
           to: num,
           batchId: ev.batchId,
           batchSize: ev.batchSize ?? 0,
+          blockHash: ev.block.hash,
+          blockTimestamp: timestamp,
         });
       }
 

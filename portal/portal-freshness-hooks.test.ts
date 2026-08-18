@@ -179,19 +179,21 @@ describe('portal-freshness-hooks', () => {
     expect(collected).toEqual([]);
   });
 
-  test('makeDurableCommitAck: emits exactly ONE durable-commit-ack on true; 2nd invocation no-op; false → no emit; env-off → no emit; mono ≥ pre-invocation floor', () => {
+  test('makeDurableCommitAck: accepted=true emits ONE durable-commit-ack with block identity', () => {
     process.env.PORTAL_FRESHNESS_HOOKS = '1';
 
-    // true path: one emit, payload exact
-    const ack1 = makeDurableCommitAck({
+    const ack = makeDurableCommitAck({
       chainId: 1,
       from: 100,
       to: 100,
       batchId: 0,
       batchSize: 3,
+      blockHash:
+        '0x0000000000000000000000000000000000000000000000000000000000000064',
+      blockTimestamp: 1_700_000_100,
     });
     const floor = performance.now();
-    ack1(true);
+    ack(true);
     expect(collected).toHaveLength(1);
 
     const hook = collected[0]!;
@@ -201,39 +203,89 @@ describe('portal-freshness-hooks', () => {
     expect(hook.to).toBe(100);
     expect(hook.batchId).toBe(0);
     expect(hook.batchSize).toBe(3);
+    expect(hook).toMatchObject({
+      blockHash:
+        '0x0000000000000000000000000000000000000000000000000000000000000064',
+      blockTimestamp: 1_700_000_100,
+    });
     expect(typeof hook.mono).toBe('number');
     expect(hook.mono).toBeGreaterThanOrEqual(floor);
     expect(typeof hook.wall).toBe('string');
 
-    // 2nd invocation → no-op (idempotence)
-    ack1(true);
+    ack(true);
     expect(collected).toHaveLength(1);
+  });
 
-    // false → no emit (and consumes the callback)
-    const ack2 = makeDurableCommitAck({
+  test('makeDurableCommitAck: accepted=false emits ONE durable-commit-reject and no durable-commit-ack', () => {
+    process.env.PORTAL_FRESHNESS_HOOKS = '1';
+
+    const ack = makeDurableCommitAck({
       chainId: 1,
       from: 101,
       to: 101,
       batchId: 1,
       batchSize: 0,
+      blockHash:
+        '0x0000000000000000000000000000000000000000000000000000000000000065',
+      blockTimestamp: 1_700_000_101,
     });
-    ack2(false);
+    const floor = performance.now();
+    ack(false);
     expect(collected).toHaveLength(1);
 
-    // a subsequent true on the same (false-consumed) callback is still a no-op
-    ack2(true);
-    expect(collected).toHaveLength(1);
+    const ackHooks = collected.filter(
+      (hook) => hook.evt === 'durable-commit-ack',
+    );
+    expect(ackHooks).toEqual([]);
 
-    // env-off → no emit (emitFreshnessHook gates before the collector)
+    const hook = collected[0]!;
+    expect(hook.evt).toBe('durable-commit-reject');
+    expect(hook).toMatchObject({
+      chainId: 1,
+      from: 101,
+      to: 101,
+      batchId: 1,
+      batchSize: 0,
+      blockHash:
+        '0x0000000000000000000000000000000000000000000000000000000000000065',
+      blockTimestamp: 1_700_000_101,
+    });
+
+    // The reject path is held to the SAME clock invariants as the ack path: mono is sampled AT
+    // INVOCATION (post-commit), not at callback construction.
+    expect(typeof hook.mono).toBe('number');
+    expect(hook.mono).toBeGreaterThanOrEqual(floor);
+    expect(typeof hook.wall).toBe('string');
+
+    ack(true);
+    expect(collected).toHaveLength(1);
+  });
+
+  test('makeDurableCommitAck: env-off emits ZERO post-commit hooks for accepted and rejected blocks', () => {
     delete process.env.PORTAL_FRESHNESS_HOOKS;
-    const ack3 = makeDurableCommitAck({
+
+    const acceptedAck = makeDurableCommitAck({
       chainId: 1,
       from: 102,
       to: 102,
       batchId: 2,
       batchSize: 1,
+      blockHash:
+        '0x0000000000000000000000000000000000000000000000000000000000000066',
+      blockTimestamp: 1_700_000_102,
     });
-    ack3(true);
-    expect(collected).toHaveLength(1);
+    const rejectedAck = makeDurableCommitAck({
+      chainId: 1,
+      from: 103,
+      to: 103,
+      batchId: 3,
+      batchSize: 1,
+      blockHash:
+        '0x0000000000000000000000000000000000000000000000000000000000000067',
+      blockTimestamp: 1_700_000_103,
+    });
+    acceptedAck(true);
+    rejectedAck(false);
+    expect(collected).toHaveLength(0);
   });
 });
