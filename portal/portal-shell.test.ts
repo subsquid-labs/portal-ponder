@@ -1,6 +1,7 @@
 import http from 'node:http';
 import type { AddressInfo } from 'node:net';
 import { afterEach, beforeEach, expect, test } from 'vitest';
+import { buildOptions } from '../internal/options.js';
 import { createPortalHistoricalSync } from './portal.js';
 import { loadPortalConfig } from './portal-config.js';
 import { __resetSharedGate, sharedGate } from './portal-gate.js';
@@ -113,6 +114,24 @@ const stubLogger = () => ({
   },
 });
 
+type BuildOptionsCliOptions = Parameters<typeof buildOptions>[0]['cliOptions'];
+
+const mkCommon = (logger = stubLogger()) => {
+  const cliOptions = {
+    command: 'dev',
+    version: '0.0.0',
+    config: 'ponder.config.ts',
+    logFormat: 'pretty',
+  } as BuildOptionsCliOptions;
+
+  return {
+    logger,
+    options: {
+      ...buildOptions({ cliOptions }),
+    },
+  };
+};
+
 const mkSyncStore = (inserted?: { logs: unknown[] }): any => ({
   insertLogs: (x: any) => inserted?.logs.push(...x.logs),
   insertBlocks: () => {},
@@ -144,7 +163,7 @@ const mkSync = (
   over: Record<string, unknown> = {},
 ) =>
   createPortalHistoricalSync({
-    common: { logger: stubLogger() } as any,
+    common: mkCommon() as any,
     chain: {
       id: 1,
       name: 'mainnet',
@@ -481,7 +500,7 @@ test('INV-9: an interval past the Portal head delegates WHOLE to RPC; the delega
     };
     const filter = mkFilter({ fromBlock: 150, toBlock: 200 });
     const sync = createPortalHistoricalSync({
-      common: { logger } as any,
+      common: mkCommon(logger) as any,
       chain: {
         id: 1,
         name: 'mainnet',
@@ -806,7 +825,7 @@ test('INV-9 (FIX 5): a PORTAL_FINALIZED_HEAD pin survives ensureChunkSize probin
     // one bounded source spanning both intervals; its toBlock past the pin does NOT relax the pin.
     const filter = mkFilter({ fromBlock: 0, toBlock: 200 });
     const sync = createPortalHistoricalSync({
-      common: { logger: stubLogger() } as any,
+      common: mkCommon() as any,
       chain: {
         id: 1,
         name: 'mainnet',
