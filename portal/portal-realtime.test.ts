@@ -1,5 +1,6 @@
 import { getEventListeners } from 'node:events';
 import { afterEach, expect, test, vi } from 'vitest';
+import type { BlockFilter } from '@/internal/types.js';
 import {
   BLOCK_FIELDS,
   SHARD_BODY_BUDGET,
@@ -8,6 +9,7 @@ import {
   type WildcardLogRequestKey,
 } from './portal-filters.js';
 import {
+  blockEventHasMatchedFilter,
   diagDump,
   type HotBatch,
   type HotItem,
@@ -27,6 +29,25 @@ const L = (number: number, hash: string, parentHash: string): Light => ({
   parentHash,
   timestamp: number,
 });
+
+const blockFilter = (over: Partial<BlockFilter> = {}): BlockFilter =>
+  ({
+    type: 'block',
+    chainId: 1,
+    sourceId: 'blocks',
+    interval: 1,
+    offset: 0,
+    fromBlock: undefined,
+    toBlock: undefined,
+    hasTransactionReceipt: false,
+    include: [],
+    ...over,
+  }) as BlockFilter;
+
+const syncHeader = (number: number) =>
+  ({
+    number: `0x${number.toString(16)}`,
+  }) as any;
 
 const nextBlock = async (
   gen: AsyncGenerator<HotItem>,
@@ -84,6 +105,23 @@ test('takeFinalized: splits the chain at the finalized number', () => {
   expect(finalizedTip?.hash).toBe('b');
   expect(remaining.map((b) => b.number)).toEqual([12]);
   expect(takeFinalized(chain, 9).finalizedTip).toBeUndefined();
+});
+
+test('T-match: blockEventHasMatchedFilter respects logs, block intervals, empty block filters, and absent block filters', () => {
+  expect(blockEventHasMatchedFilter([], [blockFilter()], syncHeader(100))).toBe(
+    true,
+  );
+  expect(
+    blockEventHasMatchedFilter(
+      [],
+      [blockFilter({ interval: 3, offset: 0 })],
+      syncHeader(101),
+    ),
+  ).toBe(false);
+  expect(blockEventHasMatchedFilter([], [], syncHeader(100))).toBe(false);
+  expect(blockEventHasMatchedFilter([], undefined, syncHeader(100))).toBe(
+    false,
+  );
 });
 
 // mock /stream: a Response whose body streams the NDJSON batches once, then 204 (→ caller aborts)

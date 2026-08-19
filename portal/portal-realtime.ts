@@ -17,10 +17,12 @@
  * are the I/O shell.
  */
 import type {
+  BlockFilter,
   SyncBlockHeader,
   SyncLog,
   SyncTransaction,
 } from '@/internal/types.js';
+import { isBlockFilterMatched } from '@/runtime/filter.js';
 import {
   ndjsonLines,
   parseSchemaFieldError,
@@ -175,6 +177,8 @@ export type PortalRealtimeArgs = {
   fromBlock: number;
   /** euler log filters (address/topics), already merged — passed straight into the Portal query */
   logs: PortalLogRequest[];
+  /** Ponder block filters; includeAllBlocks supplies the header densely in stream mode. */
+  blockFilters?: readonly BlockFilter[];
   /** the block header fields ponder needs */
   blockFields?: Record<string, boolean>;
   logFields?: Record<string, boolean>;
@@ -899,6 +903,23 @@ export type PortalRealtimeEvent =
  * wrong-fork finalize guard below. Absent hash ⇒ number-only finality (no hash check). */
 export type FinalizedHead = { number: number; hash?: string };
 
+export function blockEventHasMatchedFilter(
+  logs: readonly SyncLog[],
+  blockFilters: readonly BlockFilter[] | undefined,
+  block: SyncBlockHeader,
+): boolean {
+  if (logs.length > 0) return true;
+
+  if (blockFilters === undefined) return false;
+
+  return blockFilters.some((filter) =>
+    isBlockFilterMatched({
+      filter,
+      block,
+    }),
+  );
+}
+
 export async function* portalRealtimeEvents(
   args: PortalRealtimeArgs & {
     finalizedHead: () => Promise<FinalizedHead | undefined>;
@@ -1239,7 +1260,11 @@ export async function* portalRealtimeEvents(
       block,
       logs: syncLogs,
       transactions: syncTxs,
-      hasMatchedFilter: syncLogs.length > 0,
+      hasMatchedFilter: blockEventHasMatchedFilter(
+        syncLogs,
+        args.blockFilters,
+        block,
+      ),
       ...(item.batchId !== undefined
         ? { batchId: item.batchId, batchSize: item.batchSize }
         : {}),
