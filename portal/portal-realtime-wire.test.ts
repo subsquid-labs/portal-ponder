@@ -166,6 +166,13 @@ const savedEnv = process.env.PORTAL_REALTIME;
 const savedPin = process.env.PORTAL_FINALIZED_HEAD;
 const savedKey = process.env.PORTAL_API_KEY;
 const savedFreshnessFlag = process.env.PORTAL_FRESHNESS_HOOKS;
+const hasRuntimeHarness =
+  typeof createIndexingStore === 'function' &&
+  typeof createIndexing === 'function' &&
+  typeof createIndexingCache === 'function' &&
+  typeof createCachedViemClient === 'function' &&
+  typeof getEventCount === 'function' &&
+  typeof createColumnAccessPattern === 'function';
 afterEach(() => {
   if (savedEnv === undefined) delete process.env.PORTAL_REALTIME;
   else process.env.PORTAL_REALTIME = savedEnv;
@@ -2178,182 +2185,191 @@ test('T-finalize: wire finalize persists a log-empty block header for a block so
   expect(withoutBlockFilters).toEqual([]);
 });
 
-test('T-fire: stream mode block source with no log sources invokes the block handler and commits its context.db write', async () => {
-  process.env.PORTAL_REALTIME = 'stream';
-  const firedBlocks: number[] = [];
-  const blockFireRows = onchainTable('t_fire_rows', (p) => ({
-    blockNumber: p.bigint().primaryKey(),
-    blockHash: p.hex().notNull(),
-  }));
-  const schema = { blockFireRows };
-  const runtime = await setupRuntimeDatabase(schema);
-  const { common, database, syncStore } = runtime;
-  const chain = {
-    id: 1,
-    name: 'mainnet',
-    portal: 'http://portal',
-    rpc: 'http://localhost',
-    ws: undefined,
-    pollingInterval: 1_000,
-    finalityBlockCount: 1_000_000,
-    disableCache: false,
-    ethGetLogsBlockRange: undefined,
-    viemChain: undefined,
-  } as any;
-  const eventCallback = {
-    filter: blockFilter(),
-    name: 'blocks:block',
-    type: 'block',
-    chain,
-    fn: async ({
-      context,
-      event,
-    }: {
-      context: IndexingContext;
-      event: any;
-    }) => {
-      firedBlocks.push(Number(event.block.number));
-      await context.db.insert(blockFireRows).values({
-        blockNumber: BigInt(event.block.number),
-        blockHash: event.block.hash,
-      });
-    },
-  };
-  const eventCallbacks = [eventCallback] as any[];
-  const indexingFunctions = [
-    { name: eventCallback.name, fn: eventCallback.fn },
-  ] as any[];
-  const eventCount = getEventCount(indexingFunctions);
-  const cachedViemClient = createCachedViemClient({
-    common,
-    indexingBuild: {
-      chains: [chain],
-      rpcs: [{ request: async () => undefined }] as any[],
-    },
-    syncStore,
-    eventCount,
-  });
-  const indexingErrorHandler: any = {
-    getRetryableError: () => indexingErrorHandler.error,
-    setRetryableError: (error: any) => {
-      indexingErrorHandler.error = error;
-    },
-    clearRetryableError: () => {
-      indexingErrorHandler.error = undefined;
-    },
-    error: undefined,
-  };
-  const indexingCache = createIndexingCache({
-    common,
-    schemaBuild: { schema },
-    crashRecoveryCheckpoint: undefined,
-    eventCount,
-  });
-  const indexingStore = createIndexingStore({
-    common,
-    schemaBuild: { schema },
-    indexingCache,
-    indexingErrorHandler,
-  });
-  const indexing = createIndexing({
-    common,
-    indexingBuild: {
-      eventCallbacks: [eventCallbacks],
-      setupCallbacks: [[]],
-      chains: [chain],
-      contracts: [{}],
-      indexingFunctions,
-    },
-    indexingStore,
-    indexingCache,
-    client: cachedViemClient,
-    indexingErrorHandler,
-    columnAccessPattern: createColumnAccessPattern({
-      indexingBuild: { indexingFunctions },
-    }),
-    eventCount,
-  });
-  const syncProgress = makeSyncProgress({
-    chainId: 1,
-    finalized: lightBlock(99),
-    end: lightBlock(100),
-  });
-  const originalFetch = globalThis.fetch;
-
-  globalThis.fetch = mockPortal([{ header: fullHeader(100), logs: [] }], 99);
-  try {
-    const realtimeEvents: any[] = [];
-    for await (const event of getRealtimeEventsMultichain({
+// The fork's compat matrix spans ponder 0.15.17 through 0.17.8. This harness
+// needs the modern indexing runtime API that is absent on 0.15.x, so the skip
+// is deliberately capability-based instead of pinned to specific versions.
+// `hasMatchedFilter` is consumed only by finalize-time `insertBlocks`; this test
+// does not reach finalize, so it cannot pin the helper. T-finalize covers that,
+// while this remains proof that the full stream path serves a block source.
+test.skipIf(!hasRuntimeHarness)(
+  'T-fire (end-to-end integration; NOT coverage of blockEventHasMatchedFilter): stream mode block source with no log sources invokes the block handler and commits its context.db write',
+  async () => {
+    process.env.PORTAL_REALTIME = 'stream';
+    const firedBlocks: number[] = [];
+    const blockFireRows = onchainTable('t_fire_rows', (p) => ({
+      blockNumber: p.bigint().primaryKey(),
+      blockHash: p.hex().notNull(),
+    }));
+    const schema = { blockFireRows };
+    const runtime = await setupRuntimeDatabase(schema);
+    const { common, database, syncStore } = runtime;
+    const chain = {
+      id: 1,
+      name: 'mainnet',
+      portal: 'http://portal',
+      rpc: 'http://localhost',
+      ws: undefined,
+      pollingInterval: 1_000,
+      finalityBlockCount: 1_000_000,
+      disableCache: false,
+      ethGetLogsBlockRange: undefined,
+      viemChain: undefined,
+    } as any;
+    const eventCallback = {
+      filter: blockFilter(),
+      name: 'blocks:block',
+      type: 'block',
+      chain,
+      fn: async ({
+        context,
+        event,
+      }: {
+        context: IndexingContext;
+        event: any;
+      }) => {
+        firedBlocks.push(Number(event.block.number));
+        await context.db.insert(blockFireRows).values({
+          blockNumber: BigInt(event.block.number),
+          blockHash: event.block.hash,
+        });
+      },
+    };
+    const eventCallbacks = [eventCallback] as any[];
+    const indexingFunctions = [
+      { name: eventCallback.name, fn: eventCallback.fn },
+    ] as any[];
+    const eventCount = getEventCount(indexingFunctions);
+    const cachedViemClient = createCachedViemClient({
+      common,
+      indexingBuild: {
+        chains: [chain],
+        rpcs: [{ request: async () => undefined }] as any[],
+      },
+      syncStore,
+      eventCount,
+    });
+    const indexingErrorHandler: any = {
+      getRetryableError: () => indexingErrorHandler.error,
+      setRetryableError: (error: any) => {
+        indexingErrorHandler.error = error;
+      },
+      clearRetryableError: () => {
+        indexingErrorHandler.error = undefined;
+      },
+      error: undefined,
+    };
+    const indexingCache = createIndexingCache({
+      common,
+      schemaBuild: { schema },
+      crashRecoveryCheckpoint: undefined,
+      eventCount,
+    });
+    const indexingStore = createIndexingStore({
+      common,
+      schemaBuild: { schema },
+      indexingCache,
+      indexingErrorHandler,
+    });
+    const indexing = createIndexing({
       common,
       indexingBuild: {
         eventCallbacks: [eventCallbacks],
+        setupCallbacks: [[]],
         chains: [chain],
-        rpcs: [{ request: async () => undefined }] as any[],
-        finalizedBlocks: [lightBlock(99)],
+        contracts: [{}],
+        indexingFunctions,
       },
-      perChainSync: new Map([
-        [
-          chain,
-          {
-            syncProgress,
-            childAddresses: new Map<string, Map<Address, number>>(),
-            unfinalizedBlocks: [],
-          },
-        ],
-      ]),
-      database,
-    })) {
-      realtimeEvents.push(event);
-    }
-
-    const blockEvent = realtimeEvents.find((event) => event.type === 'block');
-    expect(blockEvent?.events).toHaveLength(1);
-
-    await createTriggers(database.userQB, { tables: [blockFireRows] });
-    indexingCache.qb = database.userQB;
-    await Promise.all([
-      indexingCache.prefetch({ events: blockEvent.events }),
-      cachedViemClient.prefetch({ events: blockEvent.events }),
-    ]);
-
-    const committedCheckpoints: string[] = [];
-    await database.userQB.transaction(async (tx: any) => {
-      for (const { checkpoint, events } of splitEvents(blockEvent.events)) {
-        committedCheckpoints.push(checkpoint);
-        indexingStore.qb = tx;
-        indexingStore.isProcessingEvents = true;
-        indexingCache.qb = tx;
-
-        await indexing.processRealtimeEvents({ events });
-        indexingStore.isProcessingEvents = false;
-        await indexingCache.flush();
-        await commitBlock(tx, {
-          checkpoint,
-          table: blockFireRows,
-          preBuild: { ordering: 'multichain' },
-        });
-      }
+      indexingStore,
+      indexingCache,
+      client: cachedViemClient,
+      indexingErrorHandler,
+      columnAccessPattern: createColumnAccessPattern({
+        indexingBuild: { indexingFunctions },
+      }),
+      eventCount,
     });
+    const syncProgress = makeSyncProgress({
+      chainId: 1,
+      finalized: lightBlock(99),
+      end: lightBlock(100),
+    });
+    const originalFetch = globalThis.fetch;
 
-    const rows = await database.userQB.raw.select().from(blockFireRows);
-    expect(firedBlocks).toEqual([100]);
-    expect(rows).toEqual([{ blockNumber: 100n, blockHash: wordHash(100) }]);
-    const reorgRows = await database.userQB.wrap((db: any) =>
-      db.execute('SELECT checkpoint FROM _reorg__t_fire_rows'),
-    );
-    expect(reorgRows.rows.map((row: any) => row.checkpoint)).toEqual(
-      committedCheckpoints,
-    );
-    expect(
-      blockEvent.events.map((event: any) =>
-        Number(decodeCheckpoint(event.checkpoint).blockNumber),
-      ),
-    ).toEqual([100]);
-  } finally {
-    globalThis.fetch = originalFetch;
-    await runtime.close();
-  }
-});
+    globalThis.fetch = mockPortal([{ header: fullHeader(100), logs: [] }], 99);
+    try {
+      const realtimeEvents: any[] = [];
+      for await (const event of getRealtimeEventsMultichain({
+        common,
+        indexingBuild: {
+          eventCallbacks: [eventCallbacks],
+          chains: [chain],
+          rpcs: [{ request: async () => undefined }] as any[],
+          finalizedBlocks: [lightBlock(99)],
+        },
+        perChainSync: new Map([
+          [
+            chain,
+            {
+              syncProgress,
+              childAddresses: new Map<string, Map<Address, number>>(),
+              unfinalizedBlocks: [],
+            },
+          ],
+        ]),
+        database,
+      })) {
+        realtimeEvents.push(event);
+      }
+
+      const blockEvent = realtimeEvents.find((event) => event.type === 'block');
+      expect(blockEvent?.events).toHaveLength(1);
+
+      await createTriggers(database.userQB, { tables: [blockFireRows] });
+      indexingCache.qb = database.userQB;
+      await Promise.all([
+        indexingCache.prefetch({ events: blockEvent.events }),
+        cachedViemClient.prefetch({ events: blockEvent.events }),
+      ]);
+
+      const committedCheckpoints: string[] = [];
+      await database.userQB.transaction(async (tx: any) => {
+        for (const { checkpoint, events } of splitEvents(blockEvent.events)) {
+          committedCheckpoints.push(checkpoint);
+          indexingStore.qb = tx;
+          indexingStore.isProcessingEvents = true;
+          indexingCache.qb = tx;
+
+          await indexing.processRealtimeEvents({ events });
+          indexingStore.isProcessingEvents = false;
+          await indexingCache.flush();
+          await commitBlock(tx, {
+            checkpoint,
+            table: blockFireRows,
+            preBuild: { ordering: 'multichain' },
+          });
+        }
+      });
+
+      const rows = await database.userQB.raw.select().from(blockFireRows);
+      expect(firedBlocks).toEqual([100]);
+      expect(rows).toEqual([{ blockNumber: 100n, blockHash: wordHash(100) }]);
+      const reorgRows = await database.userQB.wrap((db: any) =>
+        db.execute('SELECT checkpoint FROM _reorg__t_fire_rows'),
+      );
+      expect(reorgRows.rows.map((row: any) => row.checkpoint)).toEqual(
+        committedCheckpoints,
+      );
+      expect(
+        blockEvent.events.map((event: any) =>
+          Number(decodeCheckpoint(event.checkpoint).blockNumber),
+        ),
+      ).toEqual([100]);
+    } finally {
+      globalThis.fetch = originalFetch;
+      await runtime.close();
+    }
+  },
+);
 
 test('getPortalRealtimeEventGenerator: a redelivery that never lands is bounded by a watchdog and fails loud (recommended)', async () => {
   // Block N discovers a child and is suppressed for its same-block redelivery; streamHotBlocks re-opens

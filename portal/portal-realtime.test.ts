@@ -1,6 +1,6 @@
 import { getEventListeners } from 'node:events';
 import { afterEach, expect, test, vi } from 'vitest';
-import type { BlockFilter } from '@/internal/types.js';
+import type { BlockFilter, SyncLog } from '@/internal/types.js';
 import {
   BLOCK_FIELDS,
   SHARD_BODY_BUDGET,
@@ -108,6 +108,8 @@ test('takeFinalized: splits the chain at the finalized number', () => {
 });
 
 test('T-match: blockEventHasMatchedFilter respects logs, block intervals, empty block filters, and absent block filters', () => {
+  const matchedLogs = [{}] as unknown as SyncLog[];
+
   expect(blockEventHasMatchedFilter([], [blockFilter()], syncHeader(100))).toBe(
     true,
   );
@@ -118,6 +120,27 @@ test('T-match: blockEventHasMatchedFilter respects logs, block intervals, empty 
       syncHeader(101),
     ),
   ).toBe(false);
+  expect(
+    blockEventHasMatchedFilter(
+      [],
+      [blockFilter({ fromBlock: 101 })],
+      syncHeader(100),
+    ),
+  ).toBe(false);
+  expect(
+    blockEventHasMatchedFilter(
+      [],
+      [blockFilter({ toBlock: 99 })],
+      syncHeader(100),
+    ),
+  ).toBe(false);
+  expect(
+    blockEventHasMatchedFilter(
+      matchedLogs,
+      [blockFilter({ fromBlock: 101 })],
+      syncHeader(100),
+    ),
+  ).toBe(true);
   expect(blockEventHasMatchedFilter([], [], syncHeader(100))).toBe(false);
   expect(blockEventHasMatchedFilter([], undefined, syncHeader(100))).toBe(
     false,
