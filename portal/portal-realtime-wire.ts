@@ -22,6 +22,7 @@
 import { type Address, hexToNumber, numberToHex } from 'viem';
 import type { Common } from '@/internal/common.js';
 import type {
+  BlockFilter,
   Chain,
   EventCallback,
   Factory,
@@ -57,6 +58,7 @@ import {
 } from './portal-filters.js';
 import { makeDurableCommitAck } from './portal-freshness-hooks.js';
 import {
+  blockEventHasMatchedFilter,
   type Light,
   type PortalRealtimeEvent,
   portalRealtimeEvents,
@@ -571,6 +573,7 @@ function logMatchesDiscovery(log: SyncLog, factories: Factory[]): boolean {
 
 export function trimWildcardRealtimeEvent(
   ev: Extract<PortalRealtimeEvent, { type: 'block' }>,
+  blockFilters: readonly BlockFilter[] | undefined,
   logFilters: LogFilter[],
   factories: Factory[],
   childAddresses: Map<FactoryId, Map<Address, number>>,
@@ -593,16 +596,17 @@ export function trimWildcardRealtimeEvent(
     ...ev,
     logs,
     transactions,
-    hasMatchedFilter: logs.length > 0,
+    hasMatchedFilter: blockEventHasMatchedFilter(logs, blockFilters, ev.block),
   };
 }
 
 /**
- * PortalRealtimeEvent → ponder RealtimeSyncEvent. `block` carries the matched logs AND their parent
- * transactions (the stream projects TX_FIELDS via the log requests' `transaction: true` — same relation
- * as the historical logQuery, so `event.transaction` works and the finalize-time store insert matches
- * the backfill's rows). Receipts/traces stay unserved — `assertStreamModeSupported` refuses those
- * configs up front. `reorg`/`finalize` pass through with hex LightBlocks.
+ * PortalRealtimeEvent → ponder RealtimeSyncEvent. `block` carries the header, matched logs, and their
+ * parent transactions (the stream projects TX_FIELDS via the log requests' `transaction: true` — same
+ * relation as the historical logQuery, so `event.transaction` works and the finalize-time store insert
+ * matches the backfill's rows). Block filters need only the header, served densely by includeAllBlocks.
+ * Receipts/traces stay unserved — `assertStreamModeSupported` refuses those configs up front.
+ * `reorg`/`finalize` pass through with hex LightBlocks.
  */
 export function toRealtimeSyncEvent(
   ev: PortalRealtimeEvent,
@@ -655,9 +659,10 @@ export function toRealtimeSyncEvent(
 // ─────────────────────────────── stream-mode capability gate ───────────────────────────────
 
 /**
- * Stream mode only emits `block` events carrying LOGS and their parent TRANSACTIONS — no receipts or
- * traces (see `toRealtimeSyncEvent`). So a non-log source (trace/transfer/transaction/block filter) would
- * receive NO realtime events, yet ponder still finalizes its intervals as cached → a permanent, SILENT
+ * Stream mode emits dense block headers plus matched LOGS and their parent TRANSACTIONS — no receipts or
+ * traces (see `toRealtimeSyncEvent`). Block filters need only the dense header served by
+ * includeAllBlocks, so log and block sources are supported. Trace/transfer/transaction sources would
+ * receive NO realtime events, yet ponder still finalizes their intervals as cached → a permanent, SILENT
  * gap. Likewise a log source that requested transaction receipts (`hasTransactionReceipt`) can't be
  * served. Refuse to start rather than corrupt. The historical Portal backfill supports every source type
  * up to the finalized head, so this rejects only PORTAL_REALTIME=stream — not the chain. (finding 5)
@@ -666,12 +671,16 @@ export function assertStreamModeSupported(
   filters: Filter[],
   chainName: string,
 ): void {
-  const nonLog = [
-    ...new Set(filters.filter((f) => f.type !== 'log').map((f) => f.type)),
+  const unsupported = [
+    ...new Set(
+      filters
+        .filter((f) => f.type !== 'log' && f.type !== 'block')
+        .map((f) => f.type),
+    ),
   ].sort();
-  if (nonLog.length > 0)
+  if (unsupported.length > 0)
     throw new Error(
-      `Portal ${chainName}: PORTAL_REALTIME=stream serves only log sources, but this chain has ${nonLog.join(', ')} source(s). Realtime would silently skip their events while marking the range synced. Use the default RPC realtime (unset PORTAL_REALTIME) or remove the non-log sources.`,
+      `Portal ${chainName}: PORTAL_REALTIME=stream serves only log and block sources, but this chain has ${unsupported.join(', ')} source(s). Realtime would silently skip their events while marking the range synced. Use the default RPC realtime (unset PORTAL_REALTIME) or remove the unsupported sources.`,
     );
 
   const needsReceipts = filters.some((f) => f.hasTransactionReceipt === true);
@@ -749,6 +758,9 @@ export async function* getPortalRealtimeEventGenerator(params: {
   const logFilters = eventCallbacks
     .map((e) => e.filter)
     .filter((filter): filter is LogFilter => filter.type === 'log');
+  const blockFilters = eventCallbacks
+    .map((e) => e.filter)
+    .filter((filter): filter is BlockFilter => filter.type === 'block');
 
   const startupFinalized = hexToNumber(syncProgress.finalized.number);
   const fromBlock = startupFinalized + 1; // finalized == Portal head (clamped) → stream (portal-head, tip]
@@ -915,6 +927,7 @@ export async function* getPortalRealtimeEventGenerator(params: {
       headers,
       fromBlock,
       logs,
+      blockFilters,
       chainId: Number(chain.id),
       blockFields: BLOCK_FIELDS,
       logFields: LOG_FIELDS,
@@ -1046,7 +1059,13 @@ export async function* getPortalRealtimeEventGenerator(params: {
 
       const emitEvent =
         wildcardLogKeys.size > 0
-          ? trimWildcardRealtimeEvent(ev, logFilters, factories, childAddresses)
+          ? trimWildcardRealtimeEvent(
+              ev,
+              blockFilters,
+              logFilters,
+              factories,
+              childAddresses,
+            )
           : ev;
 
       yield {
